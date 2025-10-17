@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.20)
 project(corvus-sv-compiler VERSION 0.1.0 LANGUAGES CXX)
 
 # Set C++ standard
