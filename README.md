@@ -1,9 +1,9 @@
-# corvus-sv-compiler
+# wolf-sv-compiler
 支持SystemVerilog的自动RTL划片编译器
 
 ## 项目简介
 
-Corvus-SV-Compiler 是一个基于 [slang](https://github.com/MikePopoloski/slang) 的 SystemVerilog 编译器，用于分析和处理 SystemVerilog RTL 设计。
+Wolf-SV-Compiler 是一个基于 [slang](https://github.com/MikePopoloski/slang) 的 SystemVerilog 编译器，用于分析和处理 SystemVerilog RTL 设计。
 
 ## 构建项目
 
@@ -17,8 +17,8 @@ Corvus-SV-Compiler 是一个基于 [slang](https://github.com/MikePopoloski/slan
 
 ```bash
 # 克隆仓库（包含子模块）
-git clone --recursive https://github.com/Wolf-Tungsten/corvus-sv-compiler.git
-cd corvus-sv-compiler
+git clone --recursive https://github.com/Wolf-Tungsten/wolf-sv-compiler.git
+cd wolf-sv-compiler
 
 # 如果已经克隆但没有子模块，运行：
 git submodule update --init --recursive
@@ -30,7 +30,7 @@ cmake ..
 cmake --build . -j$(nproc)
 ```
 
-构建完成后，可执行文件将生成在 `build/corvus-sv-compiler`。
+构建完成后，可执行文件将生成在 `build/wolf-sv-compiler`。
 
 ## 使用方法
 
@@ -38,18 +38,18 @@ cmake --build . -j$(nproc)
 
 ```bash
 # 编译单个 SystemVerilog 文件
-./corvus-sv-compiler <file.sv>
+./wolf-sv-compiler <file.sv>
 
 # 编译多个文件
-./corvus-sv-compiler file1.sv file2.sv
+./wolf-sv-compiler file1.sv file2.sv
 
 # 指定顶层模块
-./corvus-sv-compiler --top <module_name> <file.sv>
+./wolf-sv-compiler --top <module_name> <file.sv>
 ```
 
 ### 支持的选项
 
-corvus-sv-compiler 支持 slang 的所有标准命令行选项，包括：
+wolf-sv-compiler 支持 slang 的所有标准命令行选项，包括：
 
 - `--top <name>` - 指定顶层模块
 - `--define <macro>=<value>` - 定义预处理宏
@@ -62,7 +62,7 @@ corvus-sv-compiler 支持 slang 的所有标准命令行选项，包括：
 ## 项目结构
 
 ```
-corvus-sv-compiler/
+wolf-sv-compiler/
 ├── CMakeLists.txt          # CMake 构建配置
 ├── src/                    # 源代码目录
 │   └── main.cpp           # 主程序入口

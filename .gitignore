@@ -33,4 +33,4 @@ _deps
 .DS_Store
 
 # Executables
-corvus-sv-compiler
+wolf-sv-compiler

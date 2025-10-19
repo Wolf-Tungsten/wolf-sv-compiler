@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(corvus-sv-compiler VERSION 0.1.0 LANGUAGES CXX)
+project(wolf-sv-compiler VERSION 0.1.0 LANGUAGES CXX)
 
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 20)
@@ -21,10 +21,10 @@ set(SOURCES
 )
 
 # Create executable
-add_executable(corvus-sv-compiler ${SOURCES})
+add_executable(wolf-sv-compiler ${SOURCES})
 
 # Link against slang
-target_link_libraries(corvus-sv-compiler PRIVATE slang::slang)
+target_link_libraries(wolf-sv-compiler PRIVATE slang::slang)
 
 # Installation rules
-install(TARGETS corvus-sv-compiler DESTINATION bin)
+install(TARGETS wolf-sv-compiler DESTINATION bin)
