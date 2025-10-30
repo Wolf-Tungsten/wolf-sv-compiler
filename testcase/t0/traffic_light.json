@@ -1,0 +1,1315 @@
+Top level design units:
+    traffic_light_top
+
+=== AST JSON ===
+{
+  "name": "$root",
+  "kind": "Root",
+  "addr": 2199025310016,
+  "members": [
+    {
+      "name": "",
+      "kind": "CompilationUnit",
+      "addr": 2199026719840
+    },
+    {
+      "name": "traffic_light_top",
+      "kind": "Instance",
+      "addr": 2199026720696,
+      "body": {
+        "name": "traffic_light_top",
+        "kind": "InstanceBody",
+        "addr": 2199026720232,
+        "members": [
+          {
+            "name": "clk",
+            "kind": "Port",
+            "addr": 2199026720848,
+            "type": "logic",
+            "direction": "In",
+            "internalSymbol": "2199026721024 clk"
+          },
+          {
+            "name": "clk",
+            "kind": "Variable",
+            "addr": 2199026721024,
+            "type": "logic",
+            "lifetime": "Static"
+          },
+          {
+            "name": "rst_n",
+            "kind": "Port",
+            "addr": 2199026721200,
+            "type": "logic",
+            "direction": "In",
+            "internalSymbol": "2199026721376 rst_n"
+          },
+          {
+            "name": "rst_n",
+            "kind": "Variable",
+            "addr": 2199026721376,
+            "type": "logic",
+            "lifetime": "Static"
+          },
+          {
+            "name": "lights",
+            "kind": "Port",
+            "addr": 2199026721552,
+            "type": "logic[2:0]",
+            "direction": "Out",
+            "internalSymbol": "2199026721728 lights"
+          },
+          {
+            "name": "lights",
+            "kind": "Variable",
+            "addr": 2199026721728,
+            "type": "logic[2:0]",
+            "lifetime": "Static"
+          },
+          {
+            "name": "lights1",
+            "kind": "Port",
+            "addr": 2199026721904,
+            "type": "logic[2:0]",
+            "direction": "Out",
+            "internalSymbol": "2199026722080 lights1"
+          },
+          {
+            "name": "lights1",
+            "kind": "Variable",
+            "addr": 2199026722080,
+            "type": "logic[2:0]",
+            "lifetime": "Static"
+          },
+          {
+            "name": "u_ctrl",
+            "kind": "Instance",
+            "addr": 2199026722288,
+            "body": {
+              "name": "traffic_light_controller",
+              "kind": "InstanceBody",
+              "addr": 2199026722432,
+              "members": [
+                {
+                  "name": "GREEN_TICKS",
+                  "kind": "Parameter",
+                  "addr": 2199026723856,
+                  "type": "int",
+                  "initializer": {
+                    "kind": "IntegerLiteral",
+                    "type": "int",
+                    "value": "4",
+                    "constant": "4"
+                  },
+                  "value": "4",
+                  "isLocal": false,
+                  "isPort": true,
+                  "isBody": false
+                },
+                {
+                  "name": "YELLOW_TICKS",
+                  "kind": "Parameter",
+                  "addr": 2199026724064,
+                  "type": "int",
+                  "initializer": {
+                    "kind": "IntegerLiteral",
+                    "type": "int",
+                    "value": "2",
+                    "constant": "2"
+                  },
+                  "value": "2",
+                  "isLocal": false,
+                  "isPort": true,
+                  "isBody": false
+                },
+                {
+                  "name": "RED_TICKS",
+                  "kind": "Parameter",
+                  "addr": 2199026724272,
+                  "type": "int",
+                  "initializer": {
+                    "kind": "IntegerLiteral",
+                    "type": "int",
+                    "value": "6",
+                    "constant": "6"
+                  },
+                  "value": "6",
+                  "isLocal": false,
+                  "isPort": true,
+                  "isBody": false
+                },
+                {
+                  "name": "clk",
+                  "kind": "Port",
+                  "addr": 2199024637696,
+                  "type": "logic",
+                  "direction": "In",
+                  "internalSymbol": "2199024637872 clk"
+                },
+                {
+                  "name": "clk",
+                  "kind": "Variable",
+                  "addr": 2199024637872,
+                  "type": "logic",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "rst_n",
+                  "kind": "Port",
+                  "addr": 2199024638048,
+                  "type": "logic",
+                  "direction": "In",
+                  "internalSymbol": "2199024638224 rst_n"
+                },
+                {
+                  "name": "rst_n",
+                  "kind": "Variable",
+                  "addr": 2199024638224,
+                  "type": "logic",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "green_on",
+                  "kind": "Port",
+                  "addr": 2199024638400,
+                  "type": "logic",
+                  "direction": "Out",
+                  "internalSymbol": "2199024638576 green_on"
+                },
+                {
+                  "name": "green_on",
+                  "kind": "Variable",
+                  "addr": 2199024638576,
+                  "type": "logic",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "yellow_on",
+                  "kind": "Port",
+                  "addr": 2199024638752,
+                  "type": "logic",
+                  "direction": "Out",
+                  "internalSymbol": "2199024645136 yellow_on"
+                },
+                {
+                  "name": "yellow_on",
+                  "kind": "Variable",
+                  "addr": 2199024645136,
+                  "type": "logic",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "red_on",
+                  "kind": "Port",
+                  "addr": 2199024645312,
+                  "type": "logic",
+                  "direction": "Out",
+                  "internalSymbol": "2199024645488 red_on"
+                },
+                {
+                  "name": "red_on",
+                  "kind": "Variable",
+                  "addr": 2199024645488,
+                  "type": "logic",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "state_t",
+                  "kind": "EnumType",
+                  "addr": 2199024636360,
+                  "members": [
+                    {
+                      "name": "STATE_GREEN",
+                      "kind": "EnumValue",
+                      "addr": 2199024636528,
+                      "value": "2'b0"
+                    },
+                    {
+                      "name": "STATE_YELLOW",
+                      "kind": "EnumValue",
+                      "addr": 2199024636800,
+                      "value": "2'b1"
+                    },
+                    {
+                      "name": "STATE_RED",
+                      "kind": "EnumValue",
+                      "addr": 2199024637072,
+                      "value": "2'b10"
+                    }
+                  ],
+                  "baseType": "logic[1:0]"
+                },
+                {
+                  "name": "state_t",
+                  "kind": "TypeAlias",
+                  "addr": 2199026724656,
+                  "target": "2199024636360 traffic_light_controller.state_t"
+                },
+                {
+                  "name": "state",
+                  "kind": "Variable",
+                  "addr": 2199024637344,
+                  "type": "2199026724656 traffic_light_controller.state_t",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "next_state",
+                  "kind": "Variable",
+                  "addr": 2199024637520,
+                  "type": "2199026724656 traffic_light_controller.state_t",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "counter",
+                  "kind": "Variable",
+                  "addr": 2199026724928,
+                  "type": "int",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "next_counter",
+                  "kind": "Variable",
+                  "addr": 2199026725104,
+                  "type": "int",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "",
+                  "kind": "ProceduralBlock",
+                  "addr": 2199026725280,
+                  "procedureKind": "AlwaysFF",
+                  "body": {
+                    "kind": "Timed",
+                    "timing": {
+                      "kind": "EventList",
+                      "events": [
+                        {
+                          "kind": "SignalEvent",
+                          "expr": {
+                            "kind": "NamedValue",
+                            "type": "logic",
+                            "symbol": "2199024637872 clk"
+                          },
+                          "edge": "PosEdge"
+                        },
+                        {
+                          "kind": "SignalEvent",
+                          "expr": {
+                            "kind": "NamedValue",
+                            "type": "logic",
+                            "symbol": "2199024638224 rst_n"
+                          },
+                          "edge": "NegEdge"
+                        }
+                      ]
+                    },
+                    "stmt": {
+                      "kind": "Block",
+                      "blockKind": "Sequential",
+                      "body": {
+                        "kind": "Conditional",
+                        "conditions": [
+                          {
+                            "expr": {
+                              "kind": "UnaryOp",
+                              "type": "logic",
+                              "op": "LogicalNot",
+                              "operand": {
+                                "kind": "NamedValue",
+                                "type": "logic",
+                                "symbol": "2199024638224 rst_n"
+                              }
+                            }
+                          }
+                        ],
+                        "check": "None",
+                        "ifTrue": {
+                          "kind": "Block",
+                          "blockKind": "Sequential",
+                          "body": {
+                            "kind": "List",
+                            "list": [
+                              {
+                                "kind": "ExpressionStatement",
+                                "expr": {
+                                  "kind": "Assignment",
+                                  "type": "2199026724656 traffic_light_controller.state_t",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "2199026724656 traffic_light_controller.state_t",
+                                    "symbol": "2199024637344 state"
+                                  },
+                                  "right": {
+                                    "kind": "NamedValue",
+                                    "type": "2199024636360 traffic_light_controller.state_t",
+                                    "symbol": "2199024637072 STATE_RED",
+                                    "constant": "2'b10"
+                                  },
+                                  "isNonBlocking": true
+                                }
+                              },
+                              {
+                                "kind": "ExpressionStatement",
+                                "expr": {
+                                  "kind": "Assignment",
+                                  "type": "int",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "int",
+                                    "symbol": "2199026724928 counter"
+                                  },
+                                  "right": {
+                                    "kind": "NamedValue",
+                                    "type": "int",
+                                    "symbol": "2199026724272 RED_TICKS",
+                                    "constant": "6"
+                                  },
+                                  "isNonBlocking": true
+                                }
+                              }
+                            ]
+                          }
+                        },
+                        "ifFalse": {
+                          "kind": "Block",
+                          "blockKind": "Sequential",
+                          "body": {
+                            "kind": "List",
+                            "list": [
+                              {
+                                "kind": "ExpressionStatement",
+                                "expr": {
+                                  "kind": "Assignment",
+                                  "type": "2199026724656 traffic_light_controller.state_t",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "2199026724656 traffic_light_controller.state_t",
+                                    "symbol": "2199024637344 state"
+                                  },
+                                  "right": {
+                                    "kind": "NamedValue",
+                                    "type": "2199026724656 traffic_light_controller.state_t",
+                                    "symbol": "2199024637520 next_state"
+                                  },
+                                  "isNonBlocking": true
+                                }
+                              },
+                              {
+                                "kind": "ExpressionStatement",
+                                "expr": {
+                                  "kind": "Assignment",
+                                  "type": "int",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "int",
+                                    "symbol": "2199026724928 counter"
+                                  },
+                                  "right": {
+                                    "kind": "NamedValue",
+                                    "type": "int",
+                                    "symbol": "2199026725104 next_counter"
+                                  },
+                                  "isNonBlocking": true
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "",
+                  "kind": "ProceduralBlock",
+                  "addr": 2199026725408,
+                  "procedureKind": "AlwaysComb",
+                  "body": {
+                    "kind": "Block",
+                    "blockKind": "Sequential",
+                    "body": {
+                      "kind": "List",
+                      "list": [
+                        {
+                          "kind": "ExpressionStatement",
+                          "expr": {
+                            "kind": "Assignment",
+                            "type": "2199026724656 traffic_light_controller.state_t",
+                            "left": {
+                              "kind": "NamedValue",
+                              "type": "2199026724656 traffic_light_controller.state_t",
+                              "symbol": "2199024637520 next_state"
+                            },
+                            "right": {
+                              "kind": "NamedValue",
+                              "type": "2199026724656 traffic_light_controller.state_t",
+                              "symbol": "2199024637344 state"
+                            },
+                            "isNonBlocking": false
+                          }
+                        },
+                        {
+                          "kind": "ExpressionStatement",
+                          "expr": {
+                            "kind": "Assignment",
+                            "type": "int",
+                            "left": {
+                              "kind": "NamedValue",
+                              "type": "int",
+                              "symbol": "2199026725104 next_counter"
+                            },
+                            "right": {
+                              "kind": "NamedValue",
+                              "type": "int",
+                              "symbol": "2199026724928 counter"
+                            },
+                            "isNonBlocking": false
+                          }
+                        },
+                        {
+                          "kind": "Case",
+                          "condition": "Normal",
+                          "check": "Unique",
+                          "expr": {
+                            "kind": "NamedValue",
+                            "type": "2199026724656 traffic_light_controller.state_t",
+                            "symbol": "2199024637344 state"
+                          },
+                          "items": [
+                            {
+                              "expressions": [
+                                {
+                                  "kind": "NamedValue",
+                                  "type": "2199024636360 traffic_light_controller.state_t",
+                                  "symbol": "2199024636528 STATE_GREEN",
+                                  "constant": "2'b0"
+                                }
+                              ],
+                              "stmt": {
+                                "kind": "Block",
+                                "blockKind": "Sequential",
+                                "body": {
+                                  "kind": "Conditional",
+                                  "conditions": [
+                                    {
+                                      "expr": {
+                                        "kind": "BinaryOp",
+                                        "type": "bit",
+                                        "op": "Equality",
+                                        "left": {
+                                          "kind": "NamedValue",
+                                          "type": "int",
+                                          "symbol": "2199026724928 counter"
+                                        },
+                                        "right": {
+                                          "kind": "IntegerLiteral",
+                                          "type": "int",
+                                          "value": "0",
+                                          "constant": "0"
+                                        }
+                                      }
+                                    }
+                                  ],
+                                  "check": "None",
+                                  "ifTrue": {
+                                    "kind": "Block",
+                                    "blockKind": "Sequential",
+                                    "body": {
+                                      "kind": "List",
+                                      "list": [
+                                        {
+                                          "kind": "ExpressionStatement",
+                                          "expr": {
+                                            "kind": "Assignment",
+                                            "type": "2199026724656 traffic_light_controller.state_t",
+                                            "left": {
+                                              "kind": "NamedValue",
+                                              "type": "2199026724656 traffic_light_controller.state_t",
+                                              "symbol": "2199024637520 next_state"
+                                            },
+                                            "right": {
+                                              "kind": "NamedValue",
+                                              "type": "2199024636360 traffic_light_controller.state_t",
+                                              "symbol": "2199024636800 STATE_YELLOW",
+                                              "constant": "2'b1"
+                                            },
+                                            "isNonBlocking": false
+                                          }
+                                        },
+                                        {
+                                          "kind": "ExpressionStatement",
+                                          "expr": {
+                                            "kind": "Assignment",
+                                            "type": "int",
+                                            "left": {
+                                              "kind": "NamedValue",
+                                              "type": "int",
+                                              "symbol": "2199026725104 next_counter"
+                                            },
+                                            "right": {
+                                              "kind": "BinaryOp",
+                                              "type": "int",
+                                              "op": "Subtract",
+                                              "left": {
+                                                "kind": "NamedValue",
+                                                "type": "int",
+                                                "symbol": "2199026724064 YELLOW_TICKS",
+                                                "constant": "2"
+                                              },
+                                              "right": {
+                                                "kind": "IntegerLiteral",
+                                                "type": "int",
+                                                "value": "1",
+                                                "constant": "1"
+                                              },
+                                              "constant": "1"
+                                            },
+                                            "isNonBlocking": false
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "ifFalse": {
+                                    "kind": "Block",
+                                    "blockKind": "Sequential",
+                                    "body": {
+                                      "kind": "ExpressionStatement",
+                                      "expr": {
+                                        "kind": "Assignment",
+                                        "type": "int",
+                                        "left": {
+                                          "kind": "NamedValue",
+                                          "type": "int",
+                                          "symbol": "2199026725104 next_counter"
+                                        },
+                                        "right": {
+                                          "kind": "BinaryOp",
+                                          "type": "int",
+                                          "op": "Subtract",
+                                          "left": {
+                                            "kind": "NamedValue",
+                                            "type": "int",
+                                            "symbol": "2199026724928 counter"
+                                          },
+                                          "right": {
+                                            "kind": "IntegerLiteral",
+                                            "type": "int",
+                                            "value": "1",
+                                            "constant": "1"
+                                          }
+                                        },
+                                        "isNonBlocking": false
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            {
+                              "expressions": [
+                                {
+                                  "kind": "NamedValue",
+                                  "type": "2199024636360 traffic_light_controller.state_t",
+                                  "symbol": "2199024636800 STATE_YELLOW",
+                                  "constant": "2'b1"
+                                }
+                              ],
+                              "stmt": {
+                                "kind": "Block",
+                                "blockKind": "Sequential",
+                                "body": {
+                                  "kind": "Conditional",
+                                  "conditions": [
+                                    {
+                                      "expr": {
+                                        "kind": "BinaryOp",
+                                        "type": "bit",
+                                        "op": "Equality",
+                                        "left": {
+                                          "kind": "NamedValue",
+                                          "type": "int",
+                                          "symbol": "2199026724928 counter"
+                                        },
+                                        "right": {
+                                          "kind": "IntegerLiteral",
+                                          "type": "int",
+                                          "value": "0",
+                                          "constant": "0"
+                                        }
+                                      }
+                                    }
+                                  ],
+                                  "check": "None",
+                                  "ifTrue": {
+                                    "kind": "Block",
+                                    "blockKind": "Sequential",
+                                    "body": {
+                                      "kind": "List",
+                                      "list": [
+                                        {
+                                          "kind": "ExpressionStatement",
+                                          "expr": {
+                                            "kind": "Assignment",
+                                            "type": "2199026724656 traffic_light_controller.state_t",
+                                            "left": {
+                                              "kind": "NamedValue",
+                                              "type": "2199026724656 traffic_light_controller.state_t",
+                                              "symbol": "2199024637520 next_state"
+                                            },
+                                            "right": {
+                                              "kind": "NamedValue",
+                                              "type": "2199024636360 traffic_light_controller.state_t",
+                                              "symbol": "2199024637072 STATE_RED",
+                                              "constant": "2'b10"
+                                            },
+                                            "isNonBlocking": false
+                                          }
+                                        },
+                                        {
+                                          "kind": "ExpressionStatement",
+                                          "expr": {
+                                            "kind": "Assignment",
+                                            "type": "int",
+                                            "left": {
+                                              "kind": "NamedValue",
+                                              "type": "int",
+                                              "symbol": "2199026725104 next_counter"
+                                            },
+                                            "right": {
+                                              "kind": "BinaryOp",
+                                              "type": "int",
+                                              "op": "Subtract",
+                                              "left": {
+                                                "kind": "NamedValue",
+                                                "type": "int",
+                                                "symbol": "2199026724272 RED_TICKS",
+                                                "constant": "6"
+                                              },
+                                              "right": {
+                                                "kind": "IntegerLiteral",
+                                                "type": "int",
+                                                "value": "1",
+                                                "constant": "1"
+                                              },
+                                              "constant": "5"
+                                            },
+                                            "isNonBlocking": false
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "ifFalse": {
+                                    "kind": "Block",
+                                    "blockKind": "Sequential",
+                                    "body": {
+                                      "kind": "ExpressionStatement",
+                                      "expr": {
+                                        "kind": "Assignment",
+                                        "type": "int",
+                                        "left": {
+                                          "kind": "NamedValue",
+                                          "type": "int",
+                                          "symbol": "2199026725104 next_counter"
+                                        },
+                                        "right": {
+                                          "kind": "BinaryOp",
+                                          "type": "int",
+                                          "op": "Subtract",
+                                          "left": {
+                                            "kind": "NamedValue",
+                                            "type": "int",
+                                            "symbol": "2199026724928 counter"
+                                          },
+                                          "right": {
+                                            "kind": "IntegerLiteral",
+                                            "type": "int",
+                                            "value": "1",
+                                            "constant": "1"
+                                          }
+                                        },
+                                        "isNonBlocking": false
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            {
+                              "expressions": [
+                                {
+                                  "kind": "NamedValue",
+                                  "type": "2199024636360 traffic_light_controller.state_t",
+                                  "symbol": "2199024637072 STATE_RED",
+                                  "constant": "2'b10"
+                                }
+                              ],
+                              "stmt": {
+                                "kind": "Block",
+                                "blockKind": "Sequential",
+                                "body": {
+                                  "kind": "Conditional",
+                                  "conditions": [
+                                    {
+                                      "expr": {
+                                        "kind": "BinaryOp",
+                                        "type": "bit",
+                                        "op": "Equality",
+                                        "left": {
+                                          "kind": "NamedValue",
+                                          "type": "int",
+                                          "symbol": "2199026724928 counter"
+                                        },
+                                        "right": {
+                                          "kind": "IntegerLiteral",
+                                          "type": "int",
+                                          "value": "0",
+                                          "constant": "0"
+                                        }
+                                      }
+                                    }
+                                  ],
+                                  "check": "None",
+                                  "ifTrue": {
+                                    "kind": "Block",
+                                    "blockKind": "Sequential",
+                                    "body": {
+                                      "kind": "List",
+                                      "list": [
+                                        {
+                                          "kind": "ExpressionStatement",
+                                          "expr": {
+                                            "kind": "Assignment",
+                                            "type": "2199026724656 traffic_light_controller.state_t",
+                                            "left": {
+                                              "kind": "NamedValue",
+                                              "type": "2199026724656 traffic_light_controller.state_t",
+                                              "symbol": "2199024637520 next_state"
+                                            },
+                                            "right": {
+                                              "kind": "NamedValue",
+                                              "type": "2199024636360 traffic_light_controller.state_t",
+                                              "symbol": "2199024636528 STATE_GREEN",
+                                              "constant": "2'b0"
+                                            },
+                                            "isNonBlocking": false
+                                          }
+                                        },
+                                        {
+                                          "kind": "ExpressionStatement",
+                                          "expr": {
+                                            "kind": "Assignment",
+                                            "type": "int",
+                                            "left": {
+                                              "kind": "NamedValue",
+                                              "type": "int",
+                                              "symbol": "2199026725104 next_counter"
+                                            },
+                                            "right": {
+                                              "kind": "BinaryOp",
+                                              "type": "int",
+                                              "op": "Subtract",
+                                              "left": {
+                                                "kind": "NamedValue",
+                                                "type": "int",
+                                                "symbol": "2199026723856 GREEN_TICKS",
+                                                "constant": "4"
+                                              },
+                                              "right": {
+                                                "kind": "IntegerLiteral",
+                                                "type": "int",
+                                                "value": "1",
+                                                "constant": "1"
+                                              },
+                                              "constant": "3"
+                                            },
+                                            "isNonBlocking": false
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "ifFalse": {
+                                    "kind": "Block",
+                                    "blockKind": "Sequential",
+                                    "body": {
+                                      "kind": "ExpressionStatement",
+                                      "expr": {
+                                        "kind": "Assignment",
+                                        "type": "int",
+                                        "left": {
+                                          "kind": "NamedValue",
+                                          "type": "int",
+                                          "symbol": "2199026725104 next_counter"
+                                        },
+                                        "right": {
+                                          "kind": "BinaryOp",
+                                          "type": "int",
+                                          "op": "Subtract",
+                                          "left": {
+                                            "kind": "NamedValue",
+                                            "type": "int",
+                                            "symbol": "2199026724928 counter"
+                                          },
+                                          "right": {
+                                            "kind": "IntegerLiteral",
+                                            "type": "int",
+                                            "value": "1",
+                                            "constant": "1"
+                                          }
+                                        },
+                                        "isNonBlocking": false
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          ],
+                          "defaultCase": {
+                            "kind": "Block",
+                            "blockKind": "Sequential",
+                            "body": {
+                              "kind": "List",
+                              "list": [
+                                {
+                                  "kind": "ExpressionStatement",
+                                  "expr": {
+                                    "kind": "Assignment",
+                                    "type": "2199026724656 traffic_light_controller.state_t",
+                                    "left": {
+                                      "kind": "NamedValue",
+                                      "type": "2199026724656 traffic_light_controller.state_t",
+                                      "symbol": "2199024637520 next_state"
+                                    },
+                                    "right": {
+                                      "kind": "NamedValue",
+                                      "type": "2199024636360 traffic_light_controller.state_t",
+                                      "symbol": "2199024637072 STATE_RED",
+                                      "constant": "2'b10"
+                                    },
+                                    "isNonBlocking": false
+                                  }
+                                },
+                                {
+                                  "kind": "ExpressionStatement",
+                                  "expr": {
+                                    "kind": "Assignment",
+                                    "type": "int",
+                                    "left": {
+                                      "kind": "NamedValue",
+                                      "type": "int",
+                                      "symbol": "2199026725104 next_counter"
+                                    },
+                                    "right": {
+                                      "kind": "BinaryOp",
+                                      "type": "int",
+                                      "op": "Subtract",
+                                      "left": {
+                                        "kind": "NamedValue",
+                                        "type": "int",
+                                        "symbol": "2199026724272 RED_TICKS",
+                                        "constant": "6"
+                                      },
+                                      "right": {
+                                        "kind": "IntegerLiteral",
+                                        "type": "int",
+                                        "value": "1",
+                                        "constant": "1"
+                                      },
+                                      "constant": "5"
+                                    },
+                                    "isNonBlocking": false
+                                  }
+                                }
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "kind": "Empty"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "name": "",
+                  "kind": "ContinuousAssign",
+                  "addr": 2199024645704,
+                  "assignment": {
+                    "kind": "Assignment",
+                    "type": "logic",
+                    "left": {
+                      "kind": "NamedValue",
+                      "type": "logic",
+                      "symbol": "2199024638576 green_on"
+                    },
+                    "right": {
+                      "kind": "BinaryOp",
+                      "type": "logic",
+                      "op": "Equality",
+                      "left": {
+                        "kind": "NamedValue",
+                        "type": "2199026724656 traffic_light_controller.state_t",
+                        "symbol": "2199024637344 state"
+                      },
+                      "right": {
+                        "kind": "NamedValue",
+                        "type": "2199024636360 traffic_light_controller.state_t",
+                        "symbol": "2199024636528 STATE_GREEN",
+                        "constant": "2'b0"
+                      }
+                    },
+                    "isNonBlocking": false
+                  }
+                },
+                {
+                  "name": "",
+                  "kind": "ContinuousAssign",
+                  "addr": 2199024645808,
+                  "assignment": {
+                    "kind": "Assignment",
+                    "type": "logic",
+                    "left": {
+                      "kind": "NamedValue",
+                      "type": "logic",
+                      "symbol": "2199024645136 yellow_on"
+                    },
+                    "right": {
+                      "kind": "BinaryOp",
+                      "type": "logic",
+                      "op": "Equality",
+                      "left": {
+                        "kind": "NamedValue",
+                        "type": "2199026724656 traffic_light_controller.state_t",
+                        "symbol": "2199024637344 state"
+                      },
+                      "right": {
+                        "kind": "NamedValue",
+                        "type": "2199024636360 traffic_light_controller.state_t",
+                        "symbol": "2199024636800 STATE_YELLOW",
+                        "constant": "2'b1"
+                      }
+                    },
+                    "isNonBlocking": false
+                  }
+                },
+                {
+                  "name": "",
+                  "kind": "ContinuousAssign",
+                  "addr": 2199024645912,
+                  "assignment": {
+                    "kind": "Assignment",
+                    "type": "logic",
+                    "left": {
+                      "kind": "NamedValue",
+                      "type": "logic",
+                      "symbol": "2199024645488 red_on"
+                    },
+                    "right": {
+                      "kind": "BinaryOp",
+                      "type": "logic",
+                      "op": "Equality",
+                      "left": {
+                        "kind": "NamedValue",
+                        "type": "2199026724656 traffic_light_controller.state_t",
+                        "symbol": "2199024637344 state"
+                      },
+                      "right": {
+                        "kind": "NamedValue",
+                        "type": "2199024636360 traffic_light_controller.state_t",
+                        "symbol": "2199024637072 STATE_RED",
+                        "constant": "2'b10"
+                      }
+                    },
+                    "isNonBlocking": false
+                  }
+                }
+              ],
+              "definition": "2199026794496 traffic_light_controller"
+            },
+            "connections": [
+              {
+                "port": {
+                  "name": "clk",
+                  "kind": "Port",
+                  "addr": 2199024637696,
+                  "type": "logic",
+                  "direction": "In",
+                  "internalSymbol": "2199024637872 clk"
+                },
+                "expr": {
+                  "kind": "NamedValue",
+                  "type": "logic",
+                  "symbol": "2199026721024 clk"
+                }
+              },
+              {
+                "port": {
+                  "name": "rst_n",
+                  "kind": "Port",
+                  "addr": 2199024638048,
+                  "type": "logic",
+                  "direction": "In",
+                  "internalSymbol": "2199024638224 rst_n"
+                },
+                "expr": {
+                  "kind": "NamedValue",
+                  "type": "logic",
+                  "symbol": "2199026721376 rst_n"
+                }
+              },
+              {
+                "port": {
+                  "name": "green_on",
+                  "kind": "Port",
+                  "addr": 2199024638400,
+                  "type": "logic",
+                  "direction": "Out",
+                  "internalSymbol": "2199024638576 green_on"
+                },
+                "expr": {
+                  "kind": "Assignment",
+                  "type": "logic",
+                  "left": {
+                    "kind": "ElementSelect",
+                    "type": "logic",
+                    "value": {
+                      "kind": "NamedValue",
+                      "type": "logic[2:0]",
+                      "symbol": "2199026721728 lights"
+                    },
+                    "selector": {
+                      "kind": "IntegerLiteral",
+                      "type": "int",
+                      "value": "0",
+                      "constant": "0"
+                    }
+                  },
+                  "right": {
+                    "kind": "EmptyArgument",
+                    "type": "logic"
+                  },
+                  "isNonBlocking": false
+                }
+              },
+              {
+                "port": {
+                  "name": "yellow_on",
+                  "kind": "Port",
+                  "addr": 2199024638752,
+                  "type": "logic",
+                  "direction": "Out",
+                  "internalSymbol": "2199024645136 yellow_on"
+                },
+                "expr": {
+                  "kind": "Assignment",
+                  "type": "logic",
+                  "left": {
+                    "kind": "ElementSelect",
+                    "type": "logic",
+                    "value": {
+                      "kind": "NamedValue",
+                      "type": "logic[2:0]",
+                      "symbol": "2199026721728 lights"
+                    },
+                    "selector": {
+                      "kind": "IntegerLiteral",
+                      "type": "int",
+                      "value": "1",
+                      "constant": "1"
+                    }
+                  },
+                  "right": {
+                    "kind": "EmptyArgument",
+                    "type": "logic"
+                  },
+                  "isNonBlocking": false
+                }
+              },
+              {
+                "port": {
+                  "name": "red_on",
+                  "kind": "Port",
+                  "addr": 2199024645312,
+                  "type": "logic",
+                  "direction": "Out",
+                  "internalSymbol": "2199024645488 red_on"
+                },
+                "expr": {
+                  "kind": "Assignment",
+                  "type": "logic",
+                  "left": {
+                    "kind": "ElementSelect",
+                    "type": "logic",
+                    "value": {
+                      "kind": "NamedValue",
+                      "type": "logic[2:0]",
+                      "symbol": "2199026721728 lights"
+                    },
+                    "selector": {
+                      "kind": "IntegerLiteral",
+                      "type": "int",
+                      "value": "2",
+                      "constant": "2"
+                    }
+                  },
+                  "right": {
+                    "kind": "EmptyArgument",
+                    "type": "logic"
+                  },
+                  "isNonBlocking": false
+                }
+              }
+            ]
+          },
+          {
+            "name": "u_ctrl_1",
+            "kind": "Instance",
+            "addr": 2199026725824,
+            "body": "2199026722432 traffic_light_controller",
+            "connections": [
+              {
+                "port": {
+                  "name": "clk",
+                  "kind": "Port",
+                  "addr": 2199024669208,
+                  "type": "logic",
+                  "direction": "In",
+                  "internalSymbol": "2199024669384 clk"
+                },
+                "expr": {
+                  "kind": "NamedValue",
+                  "type": "logic",
+                  "symbol": "2199026721024 clk"
+                }
+              },
+              {
+                "port": {
+                  "name": "rst_n",
+                  "kind": "Port",
+                  "addr": 2199024670736,
+                  "type": "logic",
+                  "direction": "In",
+                  "internalSymbol": "2199024670912 rst_n"
+                },
+                "expr": {
+                  "kind": "NamedValue",
+                  "type": "logic",
+                  "symbol": "2199026721376 rst_n"
+                }
+              },
+              {
+                "port": {
+                  "name": "green_on",
+                  "kind": "Port",
+                  "addr": 2199024671088,
+                  "type": "logic",
+                  "direction": "Out",
+                  "internalSymbol": "2199024671264 green_on"
+                },
+                "expr": {
+                  "kind": "Assignment",
+                  "type": "logic",
+                  "left": {
+                    "kind": "ElementSelect",
+                    "type": "logic",
+                    "value": {
+                      "kind": "NamedValue",
+                      "type": "logic[2:0]",
+                      "symbol": "2199026722080 lights1"
+                    },
+                    "selector": {
+                      "kind": "IntegerLiteral",
+                      "type": "int",
+                      "value": "0",
+                      "constant": "0"
+                    }
+                  },
+                  "right": {
+                    "kind": "EmptyArgument",
+                    "type": "logic"
+                  },
+                  "isNonBlocking": false
+                }
+              },
+              {
+                "port": {
+                  "name": "yellow_on",
+                  "kind": "Port",
+                  "addr": 2199024671440,
+                  "type": "logic",
+                  "direction": "Out",
+                  "internalSymbol": "2199024671616 yellow_on"
+                },
+                "expr": {
+                  "kind": "Assignment",
+                  "type": "logic",
+                  "left": {
+                    "kind": "ElementSelect",
+                    "type": "logic",
+                    "value": {
+                      "kind": "NamedValue",
+                      "type": "logic[2:0]",
+                      "symbol": "2199026722080 lights1"
+                    },
+                    "selector": {
+                      "kind": "IntegerLiteral",
+                      "type": "int",
+                      "value": "1",
+                      "constant": "1"
+                    }
+                  },
+                  "right": {
+                    "kind": "EmptyArgument",
+                    "type": "logic"
+                  },
+                  "isNonBlocking": false
+                }
+              },
+              {
+                "port": {
+                  "name": "red_on",
+                  "kind": "Port",
+                  "addr": 2199024671792,
+                  "type": "logic",
+                  "direction": "Out",
+                  "internalSymbol": "2199024671968 red_on"
+                },
+                "expr": {
+                  "kind": "Assignment",
+                  "type": "logic",
+                  "left": {
+                    "kind": "ElementSelect",
+                    "type": "logic",
+                    "value": {
+                      "kind": "NamedValue",
+                      "type": "logic[2:0]",
+                      "symbol": "2199026722080 lights1"
+                    },
+                    "selector": {
+                      "kind": "IntegerLiteral",
+                      "type": "int",
+                      "value": "2",
+                      "constant": "2"
+                    }
+                  },
+                  "right": {
+                    "kind": "EmptyArgument",
+                    "type": "logic"
+                  },
+                  "isNonBlocking": false
+                }
+              }
+            ]
+          }
+        ],
+        "definition": "2199026795392 traffic_light_top"
+      },
+      "connections": [
+      ]
+    }
+  ]
+}Build succeeded: 0 errors, 0 warnings

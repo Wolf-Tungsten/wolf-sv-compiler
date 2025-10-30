@@ -77,7 +77,8 @@ endmodule
 module traffic_light_top (
     input  logic clk,
     input  logic rst_n,
-    output logic [2:0] lights
+    output logic [2:0] lights,
+    output logic [2:0] lights1
 );
     traffic_light_controller #(
         .GREEN_TICKS(4),
@@ -89,5 +90,17 @@ module traffic_light_top (
         .green_on  (lights[0]),
         .yellow_on (lights[1]),
         .red_on    (lights[2])
+    );
+
+    traffic_light_controller #(
+        .GREEN_TICKS(4),
+        .YELLOW_TICKS(2),
+        .RED_TICKS(6)
+    ) u_ctrl_1 (
+        .clk       (clk),
+        .rst_n     (rst_n),
+        .green_on  (lights1[0]),
+        .yellow_on (lights1[1]),
+        .red_on    (lights1[2])
     );
 endmodule

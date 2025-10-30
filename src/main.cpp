@@ -2,6 +2,7 @@
 #include <optional>
 #include <string>
 
+#include "slang/ast/ASTSerializer.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/Scope.h"
 #include "slang/ast/Symbol.h"
@@ -9,6 +10,7 @@
 #include "slang/ast/symbols/InstanceSymbols.h"
 #include "slang/analysis/AnalysisManager.h"
 #include "slang/driver/Driver.h"
+#include "slang/text/Json.h"
 
 using namespace slang::driver;
 
@@ -67,14 +69,27 @@ int main(int argc, char **argv)
     auto compilation = driver.createCompilation();
     driver.reportCompilation(*compilation, /* quiet */ false);
 
-    auto &root = compilation->getRoot();
-
     driver.runAnalysis(*compilation);
 
-    std::cout << "=== AST summary ===\n";
-    std::cout << "Top-level instances: " << root.topInstances.size() << '\n';
-    std::cout << "Compilation units : " << root.compilationUnits.size() << '\n';
-    dumpScope(root);
+    auto &root = compilation->getRoot();
+
+    if (dumpAst == true) {
+        std::cout << "=== AST JSON ===\n";
+
+        slang::JsonWriter writer;
+        writer.setPrettyPrint(true);
+
+        slang::ast::ASTSerializer serializer(*compilation, writer);
+        serializer.serialize(root);
+        writer.writeNewLine();
+
+        std::cout << writer.view();
+    }
+
+    // std::cout << "=== AST summary ===\n";
+    // std::cout << "Top-level instances: " << root.topInstances.size() << '\n';
+    // std::cout << "Compilation units : " << root.compilationUnits.size() << '\n';
+    // dumpScope(root);
 
     bool ok = driver.reportDiagnostics(/* quiet */ false);
     return ok ? 0 : 4;
