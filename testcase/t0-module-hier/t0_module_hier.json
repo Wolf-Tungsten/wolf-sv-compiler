@@ -1,0 +1,2036 @@
+Top level design units:
+    t0_module_hier_top
+
+=== AST JSON ===
+{
+  "name": "$root",
+  "kind": "Root",
+  "addr": 2199025310016,
+  "members": [
+    {
+      "name": "",
+      "kind": "CompilationUnit",
+      "addr": 2199026730080,
+      "members": [
+        {
+          "name": "request_t",
+          "kind": "TypeAlias",
+          "addr": 2199026730472,
+          "target": "struct packed{logic[15:0] data;logic[3:0] id;logic valid;}s$1"
+        }
+      ]
+    },
+    {
+      "name": "t0_module_hier_top",
+      "kind": "Instance",
+      "addr": 2199026732168,
+      "body": {
+        "name": "t0_module_hier_top",
+        "kind": "InstanceBody",
+        "addr": 2199026730656,
+        "members": [
+          {
+            "name": "WIDTH",
+            "kind": "Parameter",
+            "addr": 2199026730856,
+            "type": "int",
+            "initializer": {
+              "kind": "IntegerLiteral",
+              "type": "int",
+              "value": "16",
+              "constant": "16"
+            },
+            "value": "16",
+            "isLocal": false,
+            "isPort": true,
+            "isBody": false
+          },
+          {
+            "name": "LEAF_COUNT",
+            "kind": "Parameter",
+            "addr": 2199026731064,
+            "type": "int",
+            "initializer": {
+              "kind": "IntegerLiteral",
+              "type": "int",
+              "value": "3",
+              "constant": "3"
+            },
+            "value": "3",
+            "isLocal": false,
+            "isPort": true,
+            "isBody": false
+          },
+          {
+            "name": "clk",
+            "kind": "Port",
+            "addr": 2199026734976,
+            "type": "logic",
+            "direction": "In",
+            "internalSymbol": "2199026735152 clk"
+          },
+          {
+            "name": "clk",
+            "kind": "Variable",
+            "addr": 2199026735152,
+            "type": "logic",
+            "lifetime": "Static"
+          },
+          {
+            "name": "upstream",
+            "kind": "Port",
+            "addr": 2199026735328,
+            "type": "2199026730472 request_t",
+            "direction": "In",
+            "internalSymbol": "2199026735504 upstream"
+          },
+          {
+            "name": "upstream",
+            "kind": "Variable",
+            "addr": 2199026735504,
+            "type": "2199026730472 request_t",
+            "lifetime": "Static"
+          },
+          {
+            "name": "combined",
+            "kind": "Port",
+            "addr": 2199026735680,
+            "type": "logic[15:0]",
+            "direction": "Out",
+            "internalSymbol": "2199026735856 combined"
+          },
+          {
+            "name": "combined",
+            "kind": "Variable",
+            "addr": 2199026735856,
+            "type": "logic[15:0]",
+            "lifetime": "Static"
+          },
+          {
+            "name": "staged_req",
+            "kind": "Variable",
+            "addr": 2199026734800,
+            "type": "2199026730472 request_t",
+            "lifetime": "Static"
+          },
+          {
+            "name": "",
+            "kind": "ContinuousAssign",
+            "addr": 2199026736056,
+            "assignment": {
+              "kind": "Assignment",
+              "type": "2199026730472 request_t",
+              "left": {
+                "kind": "NamedValue",
+                "type": "2199026730472 request_t",
+                "symbol": "2199026734800 staged_req"
+              },
+              "right": {
+                "kind": "StructuredAssignmentPattern",
+                "type": "2199026730472 request_t",
+                "memberSetters": [
+                  {
+                    "member": "2199026732792 data",
+                    "expr": {
+                      "kind": "MemberAccess",
+                      "type": "logic[15:0]",
+                      "member": "2199026732792 data",
+                      "value": {
+                        "kind": "NamedValue",
+                        "type": "2199026730472 request_t",
+                        "symbol": "2199026735504 upstream"
+                      }
+                    }
+                  },
+                  {
+                    "member": "2199026734416 id",
+                    "expr": {
+                      "kind": "Conversion",
+                      "type": "logic[3:0]",
+                      "operand": {
+                        "kind": "BinaryOp",
+                        "type": "logic[31:0]",
+                        "op": "Add",
+                        "left": {
+                          "kind": "Conversion",
+                          "type": "logic[31:0]",
+                          "operand": {
+                            "kind": "MemberAccess",
+                            "type": "logic[3:0]",
+                            "member": "2199026734416 id",
+                            "value": {
+                              "kind": "NamedValue",
+                              "type": "2199026730472 request_t",
+                              "symbol": "2199026735504 upstream"
+                            }
+                          }
+                        },
+                        "right": {
+                          "kind": "Conversion",
+                          "type": "logic[31:0]",
+                          "operand": {
+                            "kind": "IntegerLiteral",
+                            "type": "int",
+                            "value": "1",
+                            "constant": "1"
+                          },
+                          "constant": "32'd1"
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "member": "2199026734608 valid",
+                    "expr": {
+                      "kind": "MemberAccess",
+                      "type": "logic",
+                      "member": "2199026734608 valid",
+                      "value": {
+                        "kind": "NamedValue",
+                        "type": "2199026730472 request_t",
+                        "symbol": "2199026735504 upstream"
+                      }
+                    }
+                  }
+                ]
+              },
+              "isNonBlocking": false
+            }
+          },
+          {
+            "name": "aggregate_value",
+            "kind": "Variable",
+            "addr": 2199026731536,
+            "type": "logic[15:0]",
+            "lifetime": "Static"
+          },
+          {
+            "name": "config_value",
+            "kind": "Variable",
+            "addr": 2199026731712,
+            "type": "logic[15:0]",
+            "lifetime": "Static"
+          },
+          {
+            "name": "u_aggregator",
+            "kind": "Instance",
+            "addr": 2199026736160,
+            "body": {
+              "name": "aggregator",
+              "kind": "InstanceBody",
+              "addr": 2199026736304,
+              "members": [
+                {
+                  "name": "WIDTH",
+                  "kind": "Parameter",
+                  "addr": 2199026736504,
+                  "type": "int",
+                  "initializer": {
+                    "kind": "NamedValue",
+                    "type": "int",
+                    "symbol": "2199026730856 WIDTH",
+                    "constant": "16"
+                  },
+                  "value": "16",
+                  "isLocal": false,
+                  "isPort": true,
+                  "isBody": false
+                },
+                {
+                  "name": "COUNT",
+                  "kind": "Parameter",
+                  "addr": 2199026736712,
+                  "type": "int",
+                  "initializer": {
+                    "kind": "NamedValue",
+                    "type": "int",
+                    "symbol": "2199026731064 LEAF_COUNT",
+                    "constant": "3"
+                  },
+                  "value": "3",
+                  "isLocal": false,
+                  "isPort": true,
+                  "isBody": false
+                },
+                {
+                  "name": "clk",
+                  "kind": "Port",
+                  "addr": 2199026750264,
+                  "type": "logic",
+                  "direction": "In",
+                  "internalSymbol": "2199026750440 clk"
+                },
+                {
+                  "name": "clk",
+                  "kind": "Variable",
+                  "addr": 2199026750440,
+                  "type": "logic",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "upstream",
+                  "kind": "Port",
+                  "addr": 2199026750616,
+                  "type": "2199026730472 request_t",
+                  "direction": "In",
+                  "internalSymbol": "2199026750792 upstream"
+                },
+                {
+                  "name": "upstream",
+                  "kind": "Variable",
+                  "addr": 2199026750792,
+                  "type": "2199026730472 request_t",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "aggregated",
+                  "kind": "Port",
+                  "addr": 2199026750968,
+                  "type": "logic[15:0]",
+                  "direction": "Out",
+                  "internalSymbol": "2199026751144 aggregated"
+                },
+                {
+                  "name": "aggregated",
+                  "kind": "Variable",
+                  "addr": 2199026751144,
+                  "type": "logic[15:0]",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "leaf_data",
+                  "kind": "Variable",
+                  "addr": 2199026737008,
+                  "type": "logic[15:0]$[0:2]",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "g",
+                  "kind": "Genvar",
+                  "addr": 2199026737184
+                },
+                {
+                  "name": "gen_leafs",
+                  "kind": "GenerateBlockArray",
+                  "addr": 2199026751344,
+                  "members": [
+                    {
+                      "name": "",
+                      "kind": "GenerateBlock",
+                      "addr": 2199026753040,
+                      "members": [
+                        {
+                          "name": "g",
+                          "kind": "Parameter",
+                          "addr": 2199026753192,
+                          "type": "integer",
+                          "value": "0",
+                          "isLocal": true,
+                          "isPort": false,
+                          "isBody": true
+                        },
+                        {
+                          "name": "OFFSET",
+                          "kind": "Parameter",
+                          "addr": 2199026754576,
+                          "type": "int",
+                          "initializer": {
+                            "kind": "Conversion",
+                            "type": "int",
+                            "operand": {
+                              "kind": "BinaryOp",
+                              "type": "integer",
+                              "op": "Multiply",
+                              "left": {
+                                "kind": "NamedValue",
+                                "type": "integer",
+                                "symbol": "2199026753192 g",
+                                "constant": "0"
+                              },
+                              "right": {
+                                "kind": "Conversion",
+                                "type": "integer",
+                                "operand": {
+                                  "kind": "IntegerLiteral",
+                                  "type": "int",
+                                  "value": "2",
+                                  "constant": "2"
+                                },
+                                "constant": "2"
+                              },
+                              "constant": "0"
+                            },
+                            "constant": "0"
+                          },
+                          "value": "0",
+                          "isLocal": true,
+                          "isPort": false,
+                          "isBody": true
+                        },
+                        {
+                          "name": "u_leaf",
+                          "kind": "Instance",
+                          "addr": 2199026760160,
+                          "body": {
+                            "name": "leaf_stage",
+                            "kind": "InstanceBody",
+                            "addr": 2199026760304,
+                            "members": [
+                              {
+                                "name": "WIDTH",
+                                "kind": "Parameter",
+                                "addr": 2199026760504,
+                                "type": "int",
+                                "initializer": {
+                                  "kind": "NamedValue",
+                                  "type": "int",
+                                  "symbol": "2199026736504 WIDTH",
+                                  "constant": "16"
+                                },
+                                "value": "16",
+                                "isLocal": false,
+                                "isPort": true,
+                                "isBody": false
+                              },
+                              {
+                                "name": "OFFSET",
+                                "kind": "Parameter",
+                                "addr": 2199026760712,
+                                "type": "int",
+                                "initializer": {
+                                  "kind": "NamedValue",
+                                  "type": "int",
+                                  "symbol": "2199026754576 OFFSET",
+                                  "constant": "0"
+                                },
+                                "value": "0",
+                                "isLocal": false,
+                                "isPort": true,
+                                "isBody": false
+                              },
+                              {
+                                "name": "clk",
+                                "kind": "Port",
+                                "addr": 2199026762008,
+                                "type": "logic",
+                                "direction": "In",
+                                "internalSymbol": "2199026762184 clk"
+                              },
+                              {
+                                "name": "clk",
+                                "kind": "Variable",
+                                "addr": 2199026762184,
+                                "type": "logic",
+                                "lifetime": "Static"
+                              },
+                              {
+                                "name": "req",
+                                "kind": "Port",
+                                "addr": 2199026762360,
+                                "type": "2199026730472 request_t",
+                                "direction": "In",
+                                "internalSymbol": "2199026762536 req"
+                              },
+                              {
+                                "name": "req",
+                                "kind": "Variable",
+                                "addr": 2199026762536,
+                                "type": "2199026730472 request_t",
+                                "lifetime": "Static"
+                              },
+                              {
+                                "name": "masked_out",
+                                "kind": "Port",
+                                "addr": 2199026762712,
+                                "type": "logic[15:0]",
+                                "direction": "Out",
+                                "internalSymbol": "2199026762888 masked_out"
+                              },
+                              {
+                                "name": "masked_out",
+                                "kind": "Variable",
+                                "addr": 2199026762888,
+                                "type": "logic[15:0]",
+                                "lifetime": "Static"
+                              },
+                              {
+                                "name": "id_ext",
+                                "kind": "Variable",
+                                "addr": 2199026761008,
+                                "type": "logic[15:0]",
+                                "lifetime": "Static"
+                              },
+                              {
+                                "name": "",
+                                "kind": "ContinuousAssign",
+                                "addr": 2199026763088,
+                                "assignment": {
+                                  "kind": "Assignment",
+                                  "type": "logic[15:0]",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[15:0]",
+                                    "symbol": "2199026761008 id_ext"
+                                  },
+                                  "right": {
+                                    "kind": "Concatenation",
+                                    "type": "logic[15:0]",
+                                    "operands": [
+                                      {
+                                        "kind": "Replication",
+                                        "type": "bit[11:0]",
+                                        "count": {
+                                          "kind": "BinaryOp",
+                                          "type": "int",
+                                          "op": "Subtract",
+                                          "left": {
+                                            "kind": "NamedValue",
+                                            "type": "int",
+                                            "symbol": "2199026760504 WIDTH",
+                                            "constant": "16"
+                                          },
+                                          "right": {
+                                            "kind": "IntegerLiteral",
+                                            "type": "int",
+                                            "value": "4",
+                                            "constant": "4"
+                                          },
+                                          "constant": "12"
+                                        },
+                                        "concat": {
+                                          "kind": "Concatenation",
+                                          "type": "bit[0:0]",
+                                          "operands": [
+                                            {
+                                              "kind": "IntegerLiteral",
+                                              "type": "bit[0:0]",
+                                              "value": "1'b0",
+                                              "constant": "1'b0"
+                                            }
+                                          ],
+                                          "constant": "1'b0"
+                                        },
+                                        "constant": "12'd0"
+                                      },
+                                      {
+                                        "kind": "MemberAccess",
+                                        "type": "logic[3:0]",
+                                        "member": "2199026734416 id",
+                                        "value": {
+                                          "kind": "NamedValue",
+                                          "type": "2199026730472 request_t",
+                                          "symbol": "2199026762536 req"
+                                        }
+                                      }
+                                    ]
+                                  },
+                                  "isNonBlocking": false
+                                }
+                              },
+                              {
+                                "name": "",
+                                "kind": "ContinuousAssign",
+                                "addr": 2199026763192,
+                                "assignment": {
+                                  "kind": "Assignment",
+                                  "type": "logic[15:0]",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[15:0]",
+                                    "symbol": "2199026762888 masked_out"
+                                  },
+                                  "right": {
+                                    "kind": "BinaryOp",
+                                    "type": "logic[15:0]",
+                                    "op": "BinaryXor",
+                                    "left": {
+                                      "kind": "BinaryOp",
+                                      "type": "logic[15:0]",
+                                      "op": "LogicalShiftRight",
+                                      "left": {
+                                        "kind": "MemberAccess",
+                                        "type": "logic[15:0]",
+                                        "member": "2199026732792 data",
+                                        "value": {
+                                          "kind": "NamedValue",
+                                          "type": "2199026730472 request_t",
+                                          "symbol": "2199026762536 req"
+                                        }
+                                      },
+                                      "right": {
+                                        "kind": "NamedValue",
+                                        "type": "int",
+                                        "symbol": "2199026760712 OFFSET",
+                                        "constant": "0"
+                                      }
+                                    },
+                                    "right": {
+                                      "kind": "ConditionalOp",
+                                      "type": "logic[15:0]",
+                                      "conditions": [
+                                        {
+                                          "expr": {
+                                            "kind": "MemberAccess",
+                                            "type": "logic",
+                                            "member": "2199026734608 valid",
+                                            "value": {
+                                              "kind": "NamedValue",
+                                              "type": "2199026730472 request_t",
+                                              "symbol": "2199026762536 req"
+                                            }
+                                          }
+                                        }
+                                      ],
+                                      "left": {
+                                        "kind": "NamedValue",
+                                        "type": "logic[15:0]",
+                                        "symbol": "2199026761008 id_ext"
+                                      },
+                                      "right": {
+                                        "kind": "UnbasedUnsizedIntegerLiteral",
+                                        "type": "logic[15:0]",
+                                        "value": "16'd0",
+                                        "constant": "16'd0"
+                                      }
+                                    }
+                                  },
+                                  "isNonBlocking": false
+                                }
+                              }
+                            ],
+                            "definition": "2199026794496 leaf_stage"
+                          },
+                          "connections": [
+                            {
+                              "port": {
+                                "name": "clk",
+                                "kind": "Port",
+                                "addr": 2199026762008,
+                                "type": "logic",
+                                "direction": "In",
+                                "internalSymbol": "2199026762184 clk"
+                              },
+                              "expr": {
+                                "kind": "NamedValue",
+                                "type": "logic",
+                                "symbol": "2199026750440 clk"
+                              }
+                            },
+                            {
+                              "port": {
+                                "name": "req",
+                                "kind": "Port",
+                                "addr": 2199026762360,
+                                "type": "2199026730472 request_t",
+                                "direction": "In",
+                                "internalSymbol": "2199026762536 req"
+                              },
+                              "expr": {
+                                "kind": "NamedValue",
+                                "type": "2199026730472 request_t",
+                                "symbol": "2199026750792 upstream"
+                              }
+                            },
+                            {
+                              "port": {
+                                "name": "masked_out",
+                                "kind": "Port",
+                                "addr": 2199026762712,
+                                "type": "logic[15:0]",
+                                "direction": "Out",
+                                "internalSymbol": "2199026762888 masked_out"
+                              },
+                              "expr": {
+                                "kind": "Assignment",
+                                "type": "logic[15:0]",
+                                "left": {
+                                  "kind": "ElementSelect",
+                                  "type": "logic[15:0]",
+                                  "value": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[15:0]$[0:2]",
+                                    "symbol": "2199026737008 leaf_data"
+                                  },
+                                  "selector": {
+                                    "kind": "NamedValue",
+                                    "type": "integer",
+                                    "symbol": "2199026753192 g",
+                                    "constant": "0"
+                                  }
+                                },
+                                "right": {
+                                  "kind": "EmptyArgument",
+                                  "type": "logic[15:0]"
+                                },
+                                "isNonBlocking": false
+                              }
+                            }
+                          ]
+                        }
+                      ],
+                      "constructIndex": 0,
+                      "isUninstantiated": false
+                    },
+                    {
+                      "name": "",
+                      "kind": "GenerateBlock",
+                      "addr": 2199026754872,
+                      "members": [
+                        {
+                          "name": "g",
+                          "kind": "Parameter",
+                          "addr": 2199026755024,
+                          "type": "integer",
+                          "value": "1",
+                          "isLocal": true,
+                          "isPort": false,
+                          "isBody": true
+                        },
+                        {
+                          "name": "OFFSET",
+                          "kind": "Parameter",
+                          "addr": 2199026755232,
+                          "type": "int",
+                          "initializer": {
+                            "kind": "Conversion",
+                            "type": "int",
+                            "operand": {
+                              "kind": "BinaryOp",
+                              "type": "integer",
+                              "op": "Multiply",
+                              "left": {
+                                "kind": "NamedValue",
+                                "type": "integer",
+                                "symbol": "2199026755024 g",
+                                "constant": "1"
+                              },
+                              "right": {
+                                "kind": "Conversion",
+                                "type": "integer",
+                                "operand": {
+                                  "kind": "IntegerLiteral",
+                                  "type": "int",
+                                  "value": "2",
+                                  "constant": "2"
+                                },
+                                "constant": "2"
+                              },
+                              "constant": "2"
+                            },
+                            "constant": "2"
+                          },
+                          "value": "2",
+                          "isLocal": true,
+                          "isPort": false,
+                          "isBody": true
+                        },
+                        {
+                          "name": "u_leaf",
+                          "kind": "Instance",
+                          "addr": 2199026770544,
+                          "body": {
+                            "name": "leaf_stage",
+                            "kind": "InstanceBody",
+                            "addr": 2199026770688,
+                            "members": [
+                              {
+                                "name": "WIDTH",
+                                "kind": "Parameter",
+                                "addr": 2199026770888,
+                                "type": "int",
+                                "initializer": {
+                                  "kind": "NamedValue",
+                                  "type": "int",
+                                  "symbol": "2199026736504 WIDTH",
+                                  "constant": "16"
+                                },
+                                "value": "16",
+                                "isLocal": false,
+                                "isPort": true,
+                                "isBody": false
+                              },
+                              {
+                                "name": "OFFSET",
+                                "kind": "Parameter",
+                                "addr": 2199026771096,
+                                "type": "int",
+                                "initializer": {
+                                  "kind": "NamedValue",
+                                  "type": "int",
+                                  "symbol": "2199026755232 OFFSET",
+                                  "constant": "2"
+                                },
+                                "value": "2",
+                                "isLocal": false,
+                                "isPort": true,
+                                "isBody": false
+                              },
+                              {
+                                "name": "clk",
+                                "kind": "Port",
+                                "addr": 2199026772392,
+                                "type": "logic",
+                                "direction": "In",
+                                "internalSymbol": "2199026772568 clk"
+                              },
+                              {
+                                "name": "clk",
+                                "kind": "Variable",
+                                "addr": 2199026772568,
+                                "type": "logic",
+                                "lifetime": "Static"
+                              },
+                              {
+                                "name": "req",
+                                "kind": "Port",
+                                "addr": 2199026772744,
+                                "type": "2199026730472 request_t",
+                                "direction": "In",
+                                "internalSymbol": "2199026772920 req"
+                              },
+                              {
+                                "name": "req",
+                                "kind": "Variable",
+                                "addr": 2199026772920,
+                                "type": "2199026730472 request_t",
+                                "lifetime": "Static"
+                              },
+                              {
+                                "name": "masked_out",
+                                "kind": "Port",
+                                "addr": 2199026773096,
+                                "type": "logic[15:0]",
+                                "direction": "Out",
+                                "internalSymbol": "2199026773272 masked_out"
+                              },
+                              {
+                                "name": "masked_out",
+                                "kind": "Variable",
+                                "addr": 2199026773272,
+                                "type": "logic[15:0]",
+                                "lifetime": "Static"
+                              },
+                              {
+                                "name": "id_ext",
+                                "kind": "Variable",
+                                "addr": 2199026771392,
+                                "type": "logic[15:0]",
+                                "lifetime": "Static"
+                              },
+                              {
+                                "name": "",
+                                "kind": "ContinuousAssign",
+                                "addr": 2199026773472,
+                                "assignment": {
+                                  "kind": "Assignment",
+                                  "type": "logic[15:0]",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[15:0]",
+                                    "symbol": "2199026771392 id_ext"
+                                  },
+                                  "right": {
+                                    "kind": "Concatenation",
+                                    "type": "logic[15:0]",
+                                    "operands": [
+                                      {
+                                        "kind": "Replication",
+                                        "type": "bit[11:0]",
+                                        "count": {
+                                          "kind": "BinaryOp",
+                                          "type": "int",
+                                          "op": "Subtract",
+                                          "left": {
+                                            "kind": "NamedValue",
+                                            "type": "int",
+                                            "symbol": "2199026770888 WIDTH",
+                                            "constant": "16"
+                                          },
+                                          "right": {
+                                            "kind": "IntegerLiteral",
+                                            "type": "int",
+                                            "value": "4",
+                                            "constant": "4"
+                                          },
+                                          "constant": "12"
+                                        },
+                                        "concat": {
+                                          "kind": "Concatenation",
+                                          "type": "bit[0:0]",
+                                          "operands": [
+                                            {
+                                              "kind": "IntegerLiteral",
+                                              "type": "bit[0:0]",
+                                              "value": "1'b0",
+                                              "constant": "1'b0"
+                                            }
+                                          ],
+                                          "constant": "1'b0"
+                                        },
+                                        "constant": "12'd0"
+                                      },
+                                      {
+                                        "kind": "MemberAccess",
+                                        "type": "logic[3:0]",
+                                        "member": "2199026734416 id",
+                                        "value": {
+                                          "kind": "NamedValue",
+                                          "type": "2199026730472 request_t",
+                                          "symbol": "2199026772920 req"
+                                        }
+                                      }
+                                    ]
+                                  },
+                                  "isNonBlocking": false
+                                }
+                              },
+                              {
+                                "name": "",
+                                "kind": "ContinuousAssign",
+                                "addr": 2199026773576,
+                                "assignment": {
+                                  "kind": "Assignment",
+                                  "type": "logic[15:0]",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[15:0]",
+                                    "symbol": "2199026773272 masked_out"
+                                  },
+                                  "right": {
+                                    "kind": "BinaryOp",
+                                    "type": "logic[15:0]",
+                                    "op": "BinaryXor",
+                                    "left": {
+                                      "kind": "BinaryOp",
+                                      "type": "logic[15:0]",
+                                      "op": "LogicalShiftRight",
+                                      "left": {
+                                        "kind": "MemberAccess",
+                                        "type": "logic[15:0]",
+                                        "member": "2199026732792 data",
+                                        "value": {
+                                          "kind": "NamedValue",
+                                          "type": "2199026730472 request_t",
+                                          "symbol": "2199026772920 req"
+                                        }
+                                      },
+                                      "right": {
+                                        "kind": "NamedValue",
+                                        "type": "int",
+                                        "symbol": "2199026771096 OFFSET",
+                                        "constant": "2"
+                                      }
+                                    },
+                                    "right": {
+                                      "kind": "ConditionalOp",
+                                      "type": "logic[15:0]",
+                                      "conditions": [
+                                        {
+                                          "expr": {
+                                            "kind": "MemberAccess",
+                                            "type": "logic",
+                                            "member": "2199026734608 valid",
+                                            "value": {
+                                              "kind": "NamedValue",
+                                              "type": "2199026730472 request_t",
+                                              "symbol": "2199026772920 req"
+                                            }
+                                          }
+                                        }
+                                      ],
+                                      "left": {
+                                        "kind": "NamedValue",
+                                        "type": "logic[15:0]",
+                                        "symbol": "2199026771392 id_ext"
+                                      },
+                                      "right": {
+                                        "kind": "UnbasedUnsizedIntegerLiteral",
+                                        "type": "logic[15:0]",
+                                        "value": "16'd0",
+                                        "constant": "16'd0"
+                                      }
+                                    }
+                                  },
+                                  "isNonBlocking": false
+                                }
+                              }
+                            ],
+                            "definition": "2199026794496 leaf_stage"
+                          },
+                          "connections": [
+                            {
+                              "port": {
+                                "name": "clk",
+                                "kind": "Port",
+                                "addr": 2199026772392,
+                                "type": "logic",
+                                "direction": "In",
+                                "internalSymbol": "2199026772568 clk"
+                              },
+                              "expr": {
+                                "kind": "NamedValue",
+                                "type": "logic",
+                                "symbol": "2199026750440 clk"
+                              }
+                            },
+                            {
+                              "port": {
+                                "name": "req",
+                                "kind": "Port",
+                                "addr": 2199026772744,
+                                "type": "2199026730472 request_t",
+                                "direction": "In",
+                                "internalSymbol": "2199026772920 req"
+                              },
+                              "expr": {
+                                "kind": "NamedValue",
+                                "type": "2199026730472 request_t",
+                                "symbol": "2199026750792 upstream"
+                              }
+                            },
+                            {
+                              "port": {
+                                "name": "masked_out",
+                                "kind": "Port",
+                                "addr": 2199026773096,
+                                "type": "logic[15:0]",
+                                "direction": "Out",
+                                "internalSymbol": "2199026773272 masked_out"
+                              },
+                              "expr": {
+                                "kind": "Assignment",
+                                "type": "logic[15:0]",
+                                "left": {
+                                  "kind": "ElementSelect",
+                                  "type": "logic[15:0]",
+                                  "value": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[15:0]$[0:2]",
+                                    "symbol": "2199026737008 leaf_data"
+                                  },
+                                  "selector": {
+                                    "kind": "NamedValue",
+                                    "type": "integer",
+                                    "symbol": "2199026755024 g",
+                                    "constant": "1"
+                                  }
+                                },
+                                "right": {
+                                  "kind": "EmptyArgument",
+                                  "type": "logic[15:0]"
+                                },
+                                "isNonBlocking": false
+                              }
+                            }
+                          ]
+                        }
+                      ],
+                      "constructIndex": 1,
+                      "isUninstantiated": false
+                    },
+                    {
+                      "name": "",
+                      "kind": "GenerateBlock",
+                      "addr": 2199026755528,
+                      "members": [
+                        {
+                          "name": "g",
+                          "kind": "Parameter",
+                          "addr": 2199026755680,
+                          "type": "integer",
+                          "value": "2",
+                          "isLocal": true,
+                          "isPort": false,
+                          "isBody": true
+                        },
+                        {
+                          "name": "OFFSET",
+                          "kind": "Parameter",
+                          "addr": 2199026755888,
+                          "type": "int",
+                          "initializer": {
+                            "kind": "Conversion",
+                            "type": "int",
+                            "operand": {
+                              "kind": "BinaryOp",
+                              "type": "integer",
+                              "op": "Multiply",
+                              "left": {
+                                "kind": "NamedValue",
+                                "type": "integer",
+                                "symbol": "2199026755680 g",
+                                "constant": "2"
+                              },
+                              "right": {
+                                "kind": "Conversion",
+                                "type": "integer",
+                                "operand": {
+                                  "kind": "IntegerLiteral",
+                                  "type": "int",
+                                  "value": "2",
+                                  "constant": "2"
+                                },
+                                "constant": "2"
+                              },
+                              "constant": "4"
+                            },
+                            "constant": "4"
+                          },
+                          "value": "4",
+                          "isLocal": true,
+                          "isPort": false,
+                          "isBody": true
+                        },
+                        {
+                          "name": "u_leaf",
+                          "kind": "Instance",
+                          "addr": 2199026780592,
+                          "body": {
+                            "name": "leaf_stage",
+                            "kind": "InstanceBody",
+                            "addr": 2199026780736,
+                            "members": [
+                              {
+                                "name": "WIDTH",
+                                "kind": "Parameter",
+                                "addr": 2199026780936,
+                                "type": "int",
+                                "initializer": {
+                                  "kind": "NamedValue",
+                                  "type": "int",
+                                  "symbol": "2199026736504 WIDTH",
+                                  "constant": "16"
+                                },
+                                "value": "16",
+                                "isLocal": false,
+                                "isPort": true,
+                                "isBody": false
+                              },
+                              {
+                                "name": "OFFSET",
+                                "kind": "Parameter",
+                                "addr": 2199026781144,
+                                "type": "int",
+                                "initializer": {
+                                  "kind": "NamedValue",
+                                  "type": "int",
+                                  "symbol": "2199026755888 OFFSET",
+                                  "constant": "4"
+                                },
+                                "value": "4",
+                                "isLocal": false,
+                                "isPort": true,
+                                "isBody": false
+                              },
+                              {
+                                "name": "clk",
+                                "kind": "Port",
+                                "addr": 2199026782440,
+                                "type": "logic",
+                                "direction": "In",
+                                "internalSymbol": "2199026782616 clk"
+                              },
+                              {
+                                "name": "clk",
+                                "kind": "Variable",
+                                "addr": 2199026782616,
+                                "type": "logic",
+                                "lifetime": "Static"
+                              },
+                              {
+                                "name": "req",
+                                "kind": "Port",
+                                "addr": 2199026782792,
+                                "type": "2199026730472 request_t",
+                                "direction": "In",
+                                "internalSymbol": "2199026782968 req"
+                              },
+                              {
+                                "name": "req",
+                                "kind": "Variable",
+                                "addr": 2199026782968,
+                                "type": "2199026730472 request_t",
+                                "lifetime": "Static"
+                              },
+                              {
+                                "name": "masked_out",
+                                "kind": "Port",
+                                "addr": 2199026783144,
+                                "type": "logic[15:0]",
+                                "direction": "Out",
+                                "internalSymbol": "2199026783320 masked_out"
+                              },
+                              {
+                                "name": "masked_out",
+                                "kind": "Variable",
+                                "addr": 2199026783320,
+                                "type": "logic[15:0]",
+                                "lifetime": "Static"
+                              },
+                              {
+                                "name": "id_ext",
+                                "kind": "Variable",
+                                "addr": 2199026781440,
+                                "type": "logic[15:0]",
+                                "lifetime": "Static"
+                              },
+                              {
+                                "name": "",
+                                "kind": "ContinuousAssign",
+                                "addr": 2199026783520,
+                                "assignment": {
+                                  "kind": "Assignment",
+                                  "type": "logic[15:0]",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[15:0]",
+                                    "symbol": "2199026781440 id_ext"
+                                  },
+                                  "right": {
+                                    "kind": "Concatenation",
+                                    "type": "logic[15:0]",
+                                    "operands": [
+                                      {
+                                        "kind": "Replication",
+                                        "type": "bit[11:0]",
+                                        "count": {
+                                          "kind": "BinaryOp",
+                                          "type": "int",
+                                          "op": "Subtract",
+                                          "left": {
+                                            "kind": "NamedValue",
+                                            "type": "int",
+                                            "symbol": "2199026780936 WIDTH",
+                                            "constant": "16"
+                                          },
+                                          "right": {
+                                            "kind": "IntegerLiteral",
+                                            "type": "int",
+                                            "value": "4",
+                                            "constant": "4"
+                                          },
+                                          "constant": "12"
+                                        },
+                                        "concat": {
+                                          "kind": "Concatenation",
+                                          "type": "bit[0:0]",
+                                          "operands": [
+                                            {
+                                              "kind": "IntegerLiteral",
+                                              "type": "bit[0:0]",
+                                              "value": "1'b0",
+                                              "constant": "1'b0"
+                                            }
+                                          ],
+                                          "constant": "1'b0"
+                                        },
+                                        "constant": "12'd0"
+                                      },
+                                      {
+                                        "kind": "MemberAccess",
+                                        "type": "logic[3:0]",
+                                        "member": "2199026734416 id",
+                                        "value": {
+                                          "kind": "NamedValue",
+                                          "type": "2199026730472 request_t",
+                                          "symbol": "2199026782968 req"
+                                        }
+                                      }
+                                    ]
+                                  },
+                                  "isNonBlocking": false
+                                }
+                              },
+                              {
+                                "name": "",
+                                "kind": "ContinuousAssign",
+                                "addr": 2199026783624,
+                                "assignment": {
+                                  "kind": "Assignment",
+                                  "type": "logic[15:0]",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[15:0]",
+                                    "symbol": "2199026783320 masked_out"
+                                  },
+                                  "right": {
+                                    "kind": "BinaryOp",
+                                    "type": "logic[15:0]",
+                                    "op": "BinaryXor",
+                                    "left": {
+                                      "kind": "BinaryOp",
+                                      "type": "logic[15:0]",
+                                      "op": "LogicalShiftRight",
+                                      "left": {
+                                        "kind": "MemberAccess",
+                                        "type": "logic[15:0]",
+                                        "member": "2199026732792 data",
+                                        "value": {
+                                          "kind": "NamedValue",
+                                          "type": "2199026730472 request_t",
+                                          "symbol": "2199026782968 req"
+                                        }
+                                      },
+                                      "right": {
+                                        "kind": "NamedValue",
+                                        "type": "int",
+                                        "symbol": "2199026781144 OFFSET",
+                                        "constant": "4"
+                                      }
+                                    },
+                                    "right": {
+                                      "kind": "ConditionalOp",
+                                      "type": "logic[15:0]",
+                                      "conditions": [
+                                        {
+                                          "expr": {
+                                            "kind": "MemberAccess",
+                                            "type": "logic",
+                                            "member": "2199026734608 valid",
+                                            "value": {
+                                              "kind": "NamedValue",
+                                              "type": "2199026730472 request_t",
+                                              "symbol": "2199026782968 req"
+                                            }
+                                          }
+                                        }
+                                      ],
+                                      "left": {
+                                        "kind": "NamedValue",
+                                        "type": "logic[15:0]",
+                                        "symbol": "2199026781440 id_ext"
+                                      },
+                                      "right": {
+                                        "kind": "UnbasedUnsizedIntegerLiteral",
+                                        "type": "logic[15:0]",
+                                        "value": "16'd0",
+                                        "constant": "16'd0"
+                                      }
+                                    }
+                                  },
+                                  "isNonBlocking": false
+                                }
+                              }
+                            ],
+                            "definition": "2199026794496 leaf_stage"
+                          },
+                          "connections": [
+                            {
+                              "port": {
+                                "name": "clk",
+                                "kind": "Port",
+                                "addr": 2199026782440,
+                                "type": "logic",
+                                "direction": "In",
+                                "internalSymbol": "2199026782616 clk"
+                              },
+                              "expr": {
+                                "kind": "NamedValue",
+                                "type": "logic",
+                                "symbol": "2199026750440 clk"
+                              }
+                            },
+                            {
+                              "port": {
+                                "name": "req",
+                                "kind": "Port",
+                                "addr": 2199026782792,
+                                "type": "2199026730472 request_t",
+                                "direction": "In",
+                                "internalSymbol": "2199026782968 req"
+                              },
+                              "expr": {
+                                "kind": "NamedValue",
+                                "type": "2199026730472 request_t",
+                                "symbol": "2199026750792 upstream"
+                              }
+                            },
+                            {
+                              "port": {
+                                "name": "masked_out",
+                                "kind": "Port",
+                                "addr": 2199026783144,
+                                "type": "logic[15:0]",
+                                "direction": "Out",
+                                "internalSymbol": "2199026783320 masked_out"
+                              },
+                              "expr": {
+                                "kind": "Assignment",
+                                "type": "logic[15:0]",
+                                "left": {
+                                  "kind": "ElementSelect",
+                                  "type": "logic[15:0]",
+                                  "value": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[15:0]$[0:2]",
+                                    "symbol": "2199026737008 leaf_data"
+                                  },
+                                  "selector": {
+                                    "kind": "NamedValue",
+                                    "type": "integer",
+                                    "symbol": "2199026755680 g",
+                                    "constant": "2"
+                                  }
+                                },
+                                "right": {
+                                  "kind": "EmptyArgument",
+                                  "type": "logic[15:0]"
+                                },
+                                "isNonBlocking": false
+                              }
+                            }
+                          ]
+                        }
+                      ],
+                      "constructIndex": 2,
+                      "isUninstantiated": false
+                    }
+                  ],
+                  "constructIndex": 1
+                },
+                {
+                  "name": "u_blackbox",
+                  "kind": "Instance",
+                  "addr": 2199026756208,
+                  "body": {
+                    "name": "blackbox_stage",
+                    "kind": "InstanceBody",
+                    "addr": 2199026756352,
+                    "members": [
+                      {
+                        "name": "WIDTH",
+                        "kind": "Parameter",
+                        "addr": 2199026756552,
+                        "type": "int",
+                        "initializer": {
+                          "kind": "NamedValue",
+                          "type": "int",
+                          "symbol": "2199026736504 WIDTH",
+                          "constant": "16"
+                        },
+                        "value": "16",
+                        "isLocal": false,
+                        "isPort": true,
+                        "isBody": false
+                      },
+                      {
+                        "name": "clk",
+                        "kind": "Port",
+                        "addr": 2199024640288,
+                        "type": "logic",
+                        "direction": "In",
+                        "internalSymbol": "2199024640464 clk"
+                      },
+                      {
+                        "name": "clk",
+                        "kind": "Variable",
+                        "addr": 2199024640464,
+                        "type": "logic",
+                        "lifetime": "Static"
+                      },
+                      {
+                        "name": "req",
+                        "kind": "Port",
+                        "addr": 2199024640640,
+                        "type": "2199026730472 request_t",
+                        "direction": "In",
+                        "internalSymbol": "2199024640816 req"
+                      },
+                      {
+                        "name": "req",
+                        "kind": "Variable",
+                        "addr": 2199024640816,
+                        "type": "2199026730472 request_t",
+                        "lifetime": "Static"
+                      },
+                      {
+                        "name": "shaped_out",
+                        "kind": "Port",
+                        "addr": 2199024640992,
+                        "type": "logic[15:0]",
+                        "direction": "Out",
+                        "internalSymbol": "2199024641168 shaped_out"
+                      },
+                      {
+                        "name": "shaped_out",
+                        "kind": "Variable",
+                        "addr": 2199024641168,
+                        "type": "logic[15:0]",
+                        "lifetime": "Static"
+                      }
+                    ],
+                    "definition": "2199026795392 blackbox_stage"
+                  },
+                  "connections": [
+                    {
+                      "port": {
+                        "name": "clk",
+                        "kind": "Port",
+                        "addr": 2199024640288,
+                        "type": "logic",
+                        "direction": "In",
+                        "internalSymbol": "2199024640464 clk"
+                      },
+                      "expr": {
+                        "kind": "NamedValue",
+                        "type": "logic",
+                        "symbol": "2199026750440 clk"
+                      }
+                    },
+                    {
+                      "port": {
+                        "name": "req",
+                        "kind": "Port",
+                        "addr": 2199024640640,
+                        "type": "2199026730472 request_t",
+                        "direction": "In",
+                        "internalSymbol": "2199024640816 req"
+                      },
+                      "expr": {
+                        "kind": "NamedValue",
+                        "type": "2199026730472 request_t",
+                        "symbol": "2199026750792 upstream"
+                      }
+                    },
+                    {
+                      "port": {
+                        "name": "shaped_out",
+                        "kind": "Port",
+                        "addr": 2199024640992,
+                        "type": "logic[15:0]",
+                        "direction": "Out",
+                        "internalSymbol": "2199024641168 shaped_out"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "name": "",
+                  "kind": "StatementBlock",
+                  "addr": 2199026737568,
+                  "members": [
+                    {
+                      "name": "i",
+                      "kind": "Variable",
+                      "addr": 2199026737736,
+                      "type": "int",
+                      "initializer": {
+                        "kind": "IntegerLiteral",
+                        "type": "int",
+                        "value": "0",
+                        "constant": "0"
+                      },
+                      "lifetime": "Automatic"
+                    }
+                  ]
+                },
+                {
+                  "name": "",
+                  "kind": "ProceduralBlock",
+                  "addr": 2199026737440,
+                  "procedureKind": "AlwaysComb",
+                  "body": {
+                    "kind": "Block",
+                    "blockKind": "Sequential",
+                    "body": {
+                      "kind": "List",
+                      "list": [
+                        {
+                          "kind": "ExpressionStatement",
+                          "expr": {
+                            "kind": "Assignment",
+                            "type": "logic[15:0]",
+                            "left": {
+                              "kind": "NamedValue",
+                              "type": "logic[15:0]",
+                              "symbol": "2199026751144 aggregated"
+                            },
+                            "right": {
+                              "kind": "UnbasedUnsizedIntegerLiteral",
+                              "type": "logic[15:0]",
+                              "value": "16'd0",
+                              "constant": "16'd0"
+                            },
+                            "isNonBlocking": false
+                          }
+                        },
+                        {
+                          "kind": "Block",
+                          "blockKind": "Sequential",
+                          "block": "2199026737568 ",
+                          "body": {
+                            "kind": "List",
+                            "list": [
+                              {
+                                "kind": "VariableDeclaration",
+                                "symbol": "2199026737736 i"
+                              },
+                              {
+                                "kind": "ForLoop",
+                                "initializers": [
+                                ],
+                                "stopExpr": {
+                                  "kind": "BinaryOp",
+                                  "type": "bit",
+                                  "op": "LessThan",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "int",
+                                    "symbol": "2199026737736 i"
+                                  },
+                                  "right": {
+                                    "kind": "NamedValue",
+                                    "type": "int",
+                                    "symbol": "2199026736712 COUNT",
+                                    "constant": "3"
+                                  }
+                                },
+                                "steps": [
+                                  {
+                                    "kind": "UnaryOp",
+                                    "type": "int",
+                                    "op": "Postincrement",
+                                    "operand": {
+                                      "kind": "NamedValue",
+                                      "type": "int",
+                                      "symbol": "2199026737736 i"
+                                    }
+                                  }
+                                ],
+                                "body": {
+                                  "kind": "Block",
+                                  "blockKind": "Sequential",
+                                  "body": {
+                                    "kind": "ExpressionStatement",
+                                    "expr": {
+                                      "kind": "Assignment",
+                                      "type": "logic[15:0]",
+                                      "left": {
+                                        "kind": "NamedValue",
+                                        "type": "logic[15:0]",
+                                        "symbol": "2199026751144 aggregated"
+                                      },
+                                      "right": {
+                                        "kind": "BinaryOp",
+                                        "type": "logic[15:0]",
+                                        "op": "BinaryXor",
+                                        "left": {
+                                          "kind": "LValueReference",
+                                          "type": "logic[15:0]"
+                                        },
+                                        "right": {
+                                          "kind": "ElementSelect",
+                                          "type": "logic[15:0]",
+                                          "value": {
+                                            "kind": "NamedValue",
+                                            "type": "logic[15:0]$[0:2]",
+                                            "symbol": "2199026737008 leaf_data"
+                                          },
+                                          "selector": {
+                                            "kind": "NamedValue",
+                                            "type": "int",
+                                            "symbol": "2199026737736 i"
+                                          }
+                                        }
+                                      },
+                                      "isNonBlocking": false,
+                                      "op": "BinaryXor"
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              ],
+              "definition": "2199026796288 aggregator"
+            },
+            "connections": [
+              {
+                "port": {
+                  "name": "clk",
+                  "kind": "Port",
+                  "addr": 2199026750264,
+                  "type": "logic",
+                  "direction": "In",
+                  "internalSymbol": "2199026750440 clk"
+                },
+                "expr": {
+                  "kind": "NamedValue",
+                  "type": "logic",
+                  "symbol": "2199026735152 clk"
+                }
+              },
+              {
+                "port": {
+                  "name": "upstream",
+                  "kind": "Port",
+                  "addr": 2199026750616,
+                  "type": "2199026730472 request_t",
+                  "direction": "In",
+                  "internalSymbol": "2199026750792 upstream"
+                },
+                "expr": {
+                  "kind": "NamedValue",
+                  "type": "2199026730472 request_t",
+                  "symbol": "2199026734800 staged_req"
+                }
+              },
+              {
+                "port": {
+                  "name": "aggregated",
+                  "kind": "Port",
+                  "addr": 2199026750968,
+                  "type": "logic[15:0]",
+                  "direction": "Out",
+                  "internalSymbol": "2199026751144 aggregated"
+                },
+                "expr": {
+                  "kind": "Assignment",
+                  "type": "logic[15:0]",
+                  "left": {
+                    "kind": "NamedValue",
+                    "type": "logic[15:0]",
+                    "symbol": "2199026731536 aggregate_value"
+                  },
+                  "right": {
+                    "kind": "EmptyArgument",
+                    "type": "logic[15:0]"
+                  },
+                  "isNonBlocking": false
+                }
+              }
+            ]
+          },
+          {
+            "name": "u_config_leaf",
+            "kind": "Instance",
+            "addr": 2199026737936,
+            "body": {
+              "name": "leaf_stage",
+              "kind": "InstanceBody",
+              "addr": 2199026739216,
+              "members": [
+                {
+                  "name": "WIDTH",
+                  "kind": "Parameter",
+                  "addr": 2199026739416,
+                  "type": "int",
+                  "initializer": {
+                    "kind": "NamedValue",
+                    "type": "int",
+                    "symbol": "2199026730856 WIDTH",
+                    "constant": "16"
+                  },
+                  "value": "16",
+                  "isLocal": false,
+                  "isPort": true,
+                  "isBody": false
+                },
+                {
+                  "name": "OFFSET",
+                  "kind": "Parameter",
+                  "addr": 2199026739624,
+                  "type": "int",
+                  "initializer": {
+                    "kind": "IntegerLiteral",
+                    "type": "int",
+                    "value": "1",
+                    "constant": "1"
+                  },
+                  "value": "1",
+                  "isLocal": false,
+                  "isPort": true,
+                  "isBody": false
+                },
+                {
+                  "name": "clk",
+                  "kind": "Port",
+                  "addr": 2199024646264,
+                  "type": "logic",
+                  "direction": "In",
+                  "internalSymbol": "2199024646440 clk"
+                },
+                {
+                  "name": "clk",
+                  "kind": "Variable",
+                  "addr": 2199024646440,
+                  "type": "logic",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "req",
+                  "kind": "Port",
+                  "addr": 2199024646616,
+                  "type": "2199026730472 request_t",
+                  "direction": "In",
+                  "internalSymbol": "2199024646792 req"
+                },
+                {
+                  "name": "req",
+                  "kind": "Variable",
+                  "addr": 2199024646792,
+                  "type": "2199026730472 request_t",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "masked_out",
+                  "kind": "Port",
+                  "addr": 2199024646968,
+                  "type": "logic[15:0]",
+                  "direction": "Out",
+                  "internalSymbol": "2199024647144 masked_out"
+                },
+                {
+                  "name": "masked_out",
+                  "kind": "Variable",
+                  "addr": 2199024647144,
+                  "type": "logic[15:0]",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "id_ext",
+                  "kind": "Variable",
+                  "addr": 2199026739920,
+                  "type": "logic[15:0]",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "",
+                  "kind": "ContinuousAssign",
+                  "addr": 2199024647344,
+                  "assignment": {
+                    "kind": "Assignment",
+                    "type": "logic[15:0]",
+                    "left": {
+                      "kind": "NamedValue",
+                      "type": "logic[15:0]",
+                      "symbol": "2199026739920 id_ext"
+                    },
+                    "right": {
+                      "kind": "Concatenation",
+                      "type": "logic[15:0]",
+                      "operands": [
+                        {
+                          "kind": "Replication",
+                          "type": "bit[11:0]",
+                          "count": {
+                            "kind": "BinaryOp",
+                            "type": "int",
+                            "op": "Subtract",
+                            "left": {
+                              "kind": "NamedValue",
+                              "type": "int",
+                              "symbol": "2199026739416 WIDTH",
+                              "constant": "16"
+                            },
+                            "right": {
+                              "kind": "IntegerLiteral",
+                              "type": "int",
+                              "value": "4",
+                              "constant": "4"
+                            },
+                            "constant": "12"
+                          },
+                          "concat": {
+                            "kind": "Concatenation",
+                            "type": "bit[0:0]",
+                            "operands": [
+                              {
+                                "kind": "IntegerLiteral",
+                                "type": "bit[0:0]",
+                                "value": "1'b0",
+                                "constant": "1'b0"
+                              }
+                            ],
+                            "constant": "1'b0"
+                          },
+                          "constant": "12'd0"
+                        },
+                        {
+                          "kind": "MemberAccess",
+                          "type": "logic[3:0]",
+                          "member": "2199026734416 id",
+                          "value": {
+                            "kind": "NamedValue",
+                            "type": "2199026730472 request_t",
+                            "symbol": "2199024646792 req"
+                          }
+                        }
+                      ]
+                    },
+                    "isNonBlocking": false
+                  }
+                },
+                {
+                  "name": "",
+                  "kind": "ContinuousAssign",
+                  "addr": 2199024647448,
+                  "assignment": {
+                    "kind": "Assignment",
+                    "type": "logic[15:0]",
+                    "left": {
+                      "kind": "NamedValue",
+                      "type": "logic[15:0]",
+                      "symbol": "2199024647144 masked_out"
+                    },
+                    "right": {
+                      "kind": "BinaryOp",
+                      "type": "logic[15:0]",
+                      "op": "BinaryXor",
+                      "left": {
+                        "kind": "BinaryOp",
+                        "type": "logic[15:0]",
+                        "op": "LogicalShiftRight",
+                        "left": {
+                          "kind": "MemberAccess",
+                          "type": "logic[15:0]",
+                          "member": "2199026732792 data",
+                          "value": {
+                            "kind": "NamedValue",
+                            "type": "2199026730472 request_t",
+                            "symbol": "2199024646792 req"
+                          }
+                        },
+                        "right": {
+                          "kind": "NamedValue",
+                          "type": "int",
+                          "symbol": "2199026739624 OFFSET",
+                          "constant": "1"
+                        }
+                      },
+                      "right": {
+                        "kind": "ConditionalOp",
+                        "type": "logic[15:0]",
+                        "conditions": [
+                          {
+                            "expr": {
+                              "kind": "MemberAccess",
+                              "type": "logic",
+                              "member": "2199026734608 valid",
+                              "value": {
+                                "kind": "NamedValue",
+                                "type": "2199026730472 request_t",
+                                "symbol": "2199024646792 req"
+                              }
+                            }
+                          }
+                        ],
+                        "left": {
+                          "kind": "NamedValue",
+                          "type": "logic[15:0]",
+                          "symbol": "2199026739920 id_ext"
+                        },
+                        "right": {
+                          "kind": "UnbasedUnsizedIntegerLiteral",
+                          "type": "logic[15:0]",
+                          "value": "16'd0",
+                          "constant": "16'd0"
+                        }
+                      }
+                    },
+                    "isNonBlocking": false
+                  }
+                }
+              ],
+              "definition": "2199026794496 leaf_stage"
+            },
+            "connections": [
+              {
+                "port": {
+                  "name": "clk",
+                  "kind": "Port",
+                  "addr": 2199024646264,
+                  "type": "logic",
+                  "direction": "In",
+                  "internalSymbol": "2199024646440 clk"
+                },
+                "expr": {
+                  "kind": "NamedValue",
+                  "type": "logic",
+                  "symbol": "2199026735152 clk"
+                }
+              },
+              {
+                "port": {
+                  "name": "req",
+                  "kind": "Port",
+                  "addr": 2199024646616,
+                  "type": "2199026730472 request_t",
+                  "direction": "In",
+                  "internalSymbol": "2199024646792 req"
+                },
+                "expr": {
+                  "kind": "NamedValue",
+                  "type": "2199026730472 request_t",
+                  "symbol": "2199026734800 staged_req"
+                }
+              },
+              {
+                "port": {
+                  "name": "masked_out",
+                  "kind": "Port",
+                  "addr": 2199024646968,
+                  "type": "logic[15:0]",
+                  "direction": "Out",
+                  "internalSymbol": "2199024647144 masked_out"
+                },
+                "expr": {
+                  "kind": "Assignment",
+                  "type": "logic[15:0]",
+                  "left": {
+                    "kind": "NamedValue",
+                    "type": "logic[15:0]",
+                    "symbol": "2199026731712 config_value"
+                  },
+                  "right": {
+                    "kind": "EmptyArgument",
+                    "type": "logic[15:0]"
+                  },
+                  "isNonBlocking": false
+                }
+              }
+            ]
+          },
+          {
+            "name": "",
+            "kind": "ContinuousAssign",
+            "addr": 2199026740288,
+            "assignment": {
+              "kind": "Assignment",
+              "type": "logic[15:0]",
+              "left": {
+                "kind": "NamedValue",
+                "type": "logic[15:0]",
+                "symbol": "2199026735856 combined"
+              },
+              "right": {
+                "kind": "BinaryOp",
+                "type": "logic[15:0]",
+                "op": "BinaryXor",
+                "left": {
+                  "kind": "NamedValue",
+                  "type": "logic[15:0]",
+                  "symbol": "2199026731712 config_value"
+                },
+                "right": {
+                  "kind": "NamedValue",
+                  "type": "logic[15:0]",
+                  "symbol": "2199026731536 aggregate_value"
+                }
+              },
+              "isNonBlocking": false
+            }
+          }
+        ],
+        "definition": "2199026797184 t0_module_hier_top"
+      },
+      "connections": [
+      ]
+    }
+  ]
+}Build succeeded: 0 errors, 0 warnings

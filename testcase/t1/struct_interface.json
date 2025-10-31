@@ -1,0 +1,475 @@
+Top level design units:
+    struct_interface_top
+
+=== AST JSON ===
+{
+  "name": "$root",
+  "kind": "Root",
+  "addr": 2199025310016,
+  "members": [
+    {
+      "name": "",
+      "kind": "CompilationUnit",
+      "addr": 2199026745440,
+      "members": [
+        {
+          "name": "packet_t",
+          "kind": "TypeAlias",
+          "addr": 2199026745832,
+          "target": "struct packed{logic[7:0] payload;logic valid;logic[1:0] channel;}s$1"
+        }
+      ]
+    },
+    {
+      "name": "struct_interface_top",
+      "kind": "Instance",
+      "addr": 2199026746568,
+      "body": {
+        "name": "struct_interface_top",
+        "kind": "InstanceBody",
+        "addr": 2199026746016,
+        "members": [
+          {
+            "name": "clk",
+            "kind": "Port",
+            "addr": 2199026749456,
+            "type": "logic",
+            "direction": "In",
+            "internalSymbol": "2199026749632 clk"
+          },
+          {
+            "name": "clk",
+            "kind": "Variable",
+            "addr": 2199026749632,
+            "type": "logic",
+            "lifetime": "Static"
+          },
+          {
+            "name": "rst_n",
+            "kind": "Port",
+            "addr": 2199026749808,
+            "type": "logic",
+            "direction": "In",
+            "internalSymbol": "2199026749984 rst_n"
+          },
+          {
+            "name": "rst_n",
+            "kind": "Variable",
+            "addr": 2199026749984,
+            "type": "logic",
+            "lifetime": "Static"
+          },
+          {
+            "name": "upstream",
+            "kind": "Port",
+            "addr": 2199026750160,
+            "type": "2199026745832 packet_t",
+            "direction": "In",
+            "internalSymbol": "2199026750336 upstream"
+          },
+          {
+            "name": "upstream",
+            "kind": "Variable",
+            "addr": 2199026750336,
+            "type": "2199026745832 packet_t",
+            "lifetime": "Static"
+          },
+          {
+            "name": "downstream",
+            "kind": "Port",
+            "addr": 2199026750512,
+            "type": "2199026745832 packet_t",
+            "direction": "Out",
+            "internalSymbol": "2199026750688 downstream"
+          },
+          {
+            "name": "downstream",
+            "kind": "Variable",
+            "addr": 2199026750688,
+            "type": "2199026745832 packet_t",
+            "lifetime": "Static"
+          },
+          {
+            "name": "stage_pkt",
+            "kind": "Variable",
+            "addr": 2199026748088,
+            "type": "2199026745832 packet_t",
+            "lifetime": "Static"
+          },
+          {
+            "name": "u_reg",
+            "kind": "Instance",
+            "addr": 2199026750896,
+            "body": {
+              "name": "packet_register",
+              "kind": "InstanceBody",
+              "addr": 2199026751040,
+              "members": [
+                {
+                  "name": "clk",
+                  "kind": "Port",
+                  "addr": 2199026752328,
+                  "type": "logic",
+                  "direction": "In",
+                  "internalSymbol": "2199026752504 clk"
+                },
+                {
+                  "name": "clk",
+                  "kind": "Variable",
+                  "addr": 2199026752504,
+                  "type": "logic",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "rst_n",
+                  "kind": "Port",
+                  "addr": 2199026752680,
+                  "type": "logic",
+                  "direction": "In",
+                  "internalSymbol": "2199026752856 rst_n"
+                },
+                {
+                  "name": "rst_n",
+                  "kind": "Variable",
+                  "addr": 2199026752856,
+                  "type": "logic",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "in_pkt",
+                  "kind": "Port",
+                  "addr": 2199026753032,
+                  "type": "2199026745832 packet_t",
+                  "direction": "In",
+                  "internalSymbol": "2199026753208 in_pkt"
+                },
+                {
+                  "name": "in_pkt",
+                  "kind": "Variable",
+                  "addr": 2199026753208,
+                  "type": "2199026745832 packet_t",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "out_pkt",
+                  "kind": "Port",
+                  "addr": 2199026754576,
+                  "type": "2199026745832 packet_t",
+                  "direction": "Out",
+                  "internalSymbol": "2199026754752 out_pkt"
+                },
+                {
+                  "name": "out_pkt",
+                  "kind": "Variable",
+                  "addr": 2199026754752,
+                  "type": "2199026745832 packet_t",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "pkt_reg",
+                  "kind": "Variable",
+                  "addr": 2199026752152,
+                  "type": "2199026745832 packet_t",
+                  "lifetime": "Static"
+                },
+                {
+                  "name": "",
+                  "kind": "ProceduralBlock",
+                  "addr": 2199026751416,
+                  "procedureKind": "AlwaysFF",
+                  "body": {
+                    "kind": "Timed",
+                    "timing": {
+                      "kind": "EventList",
+                      "events": [
+                        {
+                          "kind": "SignalEvent",
+                          "expr": {
+                            "kind": "NamedValue",
+                            "type": "logic",
+                            "symbol": "2199026752504 clk"
+                          },
+                          "edge": "PosEdge"
+                        },
+                        {
+                          "kind": "SignalEvent",
+                          "expr": {
+                            "kind": "NamedValue",
+                            "type": "logic",
+                            "symbol": "2199026752856 rst_n"
+                          },
+                          "edge": "NegEdge"
+                        }
+                      ]
+                    },
+                    "stmt": {
+                      "kind": "Block",
+                      "blockKind": "Sequential",
+                      "body": {
+                        "kind": "Conditional",
+                        "conditions": [
+                          {
+                            "expr": {
+                              "kind": "UnaryOp",
+                              "type": "logic",
+                              "op": "LogicalNot",
+                              "operand": {
+                                "kind": "NamedValue",
+                                "type": "logic",
+                                "symbol": "2199026752856 rst_n"
+                              }
+                            }
+                          }
+                        ],
+                        "check": "None",
+                        "ifTrue": {
+                          "kind": "ExpressionStatement",
+                          "expr": {
+                            "kind": "Assignment",
+                            "type": "2199026745832 packet_t",
+                            "left": {
+                              "kind": "NamedValue",
+                              "type": "2199026745832 packet_t",
+                              "symbol": "2199026752152 pkt_reg"
+                            },
+                            "right": {
+                              "kind": "StructuredAssignmentPattern",
+                              "type": "2199026745832 packet_t",
+                              "defaultSetter": {
+                                "kind": "UnbasedUnsizedIntegerLiteral",
+                                "type": "bit[0:0]",
+                                "value": "1'b0",
+                                "constant": "1'b0"
+                              },
+                              "constant": "11'd0"
+                            },
+                            "isNonBlocking": true
+                          }
+                        },
+                        "ifFalse": {
+                          "kind": "ExpressionStatement",
+                          "expr": {
+                            "kind": "Assignment",
+                            "type": "logic[7:0]",
+                            "left": {
+                              "kind": "MemberAccess",
+                              "type": "logic[7:0]",
+                              "member": "2199026747192 payload",
+                              "value": {
+                                "kind": "NamedValue",
+                                "type": "2199026745832 packet_t",
+                                "symbol": "2199026752152 pkt_reg"
+                              }
+                            },
+                            "right": {
+                              "kind": "MemberAccess",
+                              "type": "logic[7:0]",
+                              "member": "2199026747192 payload",
+                              "value": {
+                                "kind": "NamedValue",
+                                "type": "2199026745832 packet_t",
+                                "symbol": "2199026753208 in_pkt"
+                              }
+                            },
+                            "isNonBlocking": true
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "",
+                  "kind": "ContinuousAssign",
+                  "addr": 2199026754960,
+                  "assignment": {
+                    "kind": "Assignment",
+                    "type": "2199026745832 packet_t",
+                    "left": {
+                      "kind": "NamedValue",
+                      "type": "2199026745832 packet_t",
+                      "symbol": "2199026754752 out_pkt"
+                    },
+                    "right": {
+                      "kind": "NamedValue",
+                      "type": "2199026745832 packet_t",
+                      "symbol": "2199026752152 pkt_reg"
+                    },
+                    "isNonBlocking": false
+                  }
+                }
+              ],
+              "definition": "2199026794496 packet_register"
+            },
+            "connections": [
+              {
+                "port": {
+                  "name": "clk",
+                  "kind": "Port",
+                  "addr": 2199026752328,
+                  "type": "logic",
+                  "direction": "In",
+                  "internalSymbol": "2199026752504 clk"
+                },
+                "expr": {
+                  "kind": "NamedValue",
+                  "type": "logic",
+                  "symbol": "2199026749632 clk"
+                }
+              },
+              {
+                "port": {
+                  "name": "rst_n",
+                  "kind": "Port",
+                  "addr": 2199026752680,
+                  "type": "logic",
+                  "direction": "In",
+                  "internalSymbol": "2199026752856 rst_n"
+                },
+                "expr": {
+                  "kind": "NamedValue",
+                  "type": "logic",
+                  "symbol": "2199026749984 rst_n"
+                }
+              },
+              {
+                "port": {
+                  "name": "in_pkt",
+                  "kind": "Port",
+                  "addr": 2199026753032,
+                  "type": "2199026745832 packet_t",
+                  "direction": "In",
+                  "internalSymbol": "2199026753208 in_pkt"
+                },
+                "expr": {
+                  "kind": "NamedValue",
+                  "type": "2199026745832 packet_t",
+                  "symbol": "2199026750336 upstream"
+                }
+              },
+              {
+                "port": {
+                  "name": "out_pkt",
+                  "kind": "Port",
+                  "addr": 2199026754576,
+                  "type": "2199026745832 packet_t",
+                  "direction": "Out",
+                  "internalSymbol": "2199026754752 out_pkt"
+                },
+                "expr": {
+                  "kind": "Assignment",
+                  "type": "2199026745832 packet_t",
+                  "left": {
+                    "kind": "NamedValue",
+                    "type": "2199026745832 packet_t",
+                    "symbol": "2199026748088 stage_pkt"
+                  },
+                  "right": {
+                    "kind": "EmptyArgument",
+                    "type": "2199026745832 packet_t"
+                  },
+                  "isNonBlocking": false
+                }
+              }
+            ]
+          },
+          {
+            "name": "",
+            "kind": "ContinuousAssign",
+            "addr": 2199026751632,
+            "assignment": {
+              "kind": "Assignment",
+              "type": "2199026745832 packet_t",
+              "left": {
+                "kind": "NamedValue",
+                "type": "2199026745832 packet_t",
+                "symbol": "2199026750688 downstream"
+              },
+              "right": {
+                "kind": "StructuredAssignmentPattern",
+                "type": "2199026745832 packet_t",
+                "memberSetters": [
+                  {
+                    "member": "2199026747192 payload",
+                    "expr": {
+                      "kind": "BinaryOp",
+                      "type": "logic[7:0]",
+                      "op": "Add",
+                      "left": {
+                        "kind": "MemberAccess",
+                        "type": "logic[7:0]",
+                        "member": "2199026747192 payload",
+                        "value": {
+                          "kind": "NamedValue",
+                          "type": "2199026745832 packet_t",
+                          "symbol": "2199026748088 stage_pkt"
+                        }
+                      },
+                      "right": {
+                        "kind": "Conversion",
+                        "type": "logic[7:0]",
+                        "operand": {
+                          "kind": "IntegerLiteral",
+                          "type": "bit[7:0]",
+                          "value": "8'd1",
+                          "constant": "8'd1"
+                        },
+                        "constant": "8'd1"
+                      }
+                    }
+                  },
+                  {
+                    "member": "2199026747384 valid",
+                    "expr": {
+                      "kind": "MemberAccess",
+                      "type": "logic",
+                      "member": "2199026747384 valid",
+                      "value": {
+                        "kind": "NamedValue",
+                        "type": "2199026745832 packet_t",
+                        "symbol": "2199026748088 stage_pkt"
+                      }
+                    }
+                  },
+                  {
+                    "member": "2199026747896 channel",
+                    "expr": {
+                      "kind": "BinaryOp",
+                      "type": "logic[1:0]",
+                      "op": "BinaryXor",
+                      "left": {
+                        "kind": "MemberAccess",
+                        "type": "logic[1:0]",
+                        "member": "2199026747896 channel",
+                        "value": {
+                          "kind": "NamedValue",
+                          "type": "2199026745832 packet_t",
+                          "symbol": "2199026748088 stage_pkt"
+                        }
+                      },
+                      "right": {
+                        "kind": "Conversion",
+                        "type": "logic[1:0]",
+                        "operand": {
+                          "kind": "IntegerLiteral",
+                          "type": "bit[1:0]",
+                          "value": "2'b11",
+                          "constant": "2'b11"
+                        },
+                        "constant": "2'b11"
+                      }
+                    }
+                  }
+                ]
+              },
+              "isNonBlocking": false
+            }
+          }
+        ],
+        "definition": "2199026795392 struct_interface_top"
+      },
+      "connections": [
+      ]
+    }
+  ]
+}Build succeeded: 0 errors, 0 warnings

@@ -1,0 +1,1388 @@
+Top level design units:
+    ifstmt_top
+
+=== AST JSON ===
+{
+  "name": "$root",
+  "kind": "Root",
+  "addr": 2199025310016,
+  "members": [
+    {
+      "name": "",
+      "kind": "CompilationUnit",
+      "addr": 2199026719840
+    },
+    {
+      "name": "ifstmt_top",
+      "kind": "Instance",
+      "addr": 2199026721216,
+      "body": {
+        "name": "ifstmt_top",
+        "kind": "InstanceBody",
+        "addr": 2199026720232,
+        "members": [
+          {
+            "name": "clk",
+            "kind": "Port",
+            "addr": 2199026721368,
+            "type": "logic",
+            "direction": "In",
+            "internalSymbol": "2199026721544 clk"
+          },
+          {
+            "name": "clk",
+            "kind": "Variable",
+            "addr": 2199026721544,
+            "type": "logic",
+            "lifetime": "Static"
+          },
+          {
+            "name": "rst_n",
+            "kind": "Port",
+            "addr": 2199026721720,
+            "type": "logic",
+            "direction": "In",
+            "internalSymbol": "2199026721896 rst_n"
+          },
+          {
+            "name": "rst_n",
+            "kind": "Variable",
+            "addr": 2199026721896,
+            "type": "logic",
+            "lifetime": "Static"
+          },
+          {
+            "name": "sel",
+            "kind": "Port",
+            "addr": 2199026722072,
+            "type": "logic[3:0]",
+            "direction": "In",
+            "internalSymbol": "2199026722248 sel"
+          },
+          {
+            "name": "sel",
+            "kind": "Variable",
+            "addr": 2199026722248,
+            "type": "logic[3:0]",
+            "lifetime": "Static"
+          },
+          {
+            "name": "data_in",
+            "kind": "Port",
+            "addr": 2199026722424,
+            "type": "logic[7:0]",
+            "direction": "In",
+            "internalSymbol": "2199026722600 data_in"
+          },
+          {
+            "name": "data_in",
+            "kind": "Variable",
+            "addr": 2199026722600,
+            "type": "logic[7:0]",
+            "lifetime": "Static"
+          },
+          {
+            "name": "data_out",
+            "kind": "Port",
+            "addr": 2199026723856,
+            "type": "logic[7:0]",
+            "direction": "Out",
+            "internalSymbol": "2199026724032 data_out"
+          },
+          {
+            "name": "data_out",
+            "kind": "Variable",
+            "addr": 2199026724032,
+            "type": "logic[7:0]",
+            "lifetime": "Static"
+          },
+          {
+            "name": "branch_flag",
+            "kind": "Port",
+            "addr": 2199026724208,
+            "type": "logic",
+            "direction": "Out",
+            "internalSymbol": "2199026724384 branch_flag"
+          },
+          {
+            "name": "branch_flag",
+            "kind": "Variable",
+            "addr": 2199026724384,
+            "type": "logic",
+            "lifetime": "Static"
+          },
+          {
+            "name": "comb_preview",
+            "kind": "Port",
+            "addr": 2199026724560,
+            "type": "logic[7:0]",
+            "direction": "Out",
+            "internalSymbol": "2199026724736 comb_preview"
+          },
+          {
+            "name": "comb_preview",
+            "kind": "Variable",
+            "addr": 2199026724736,
+            "type": "logic[7:0]",
+            "lifetime": "Static"
+          },
+          {
+            "name": "buffer",
+            "kind": "Variable",
+            "addr": 2199026720520,
+            "type": "logic[7:0]",
+            "lifetime": "Static"
+          },
+          {
+            "name": "comb_result",
+            "kind": "Variable",
+            "addr": 2199026720696,
+            "type": "logic[7:0]",
+            "lifetime": "Static"
+          },
+          {
+            "name": "",
+            "kind": "ProceduralBlock",
+            "addr": 2199026720872,
+            "procedureKind": "AlwaysFF",
+            "body": {
+              "kind": "Timed",
+              "timing": {
+                "kind": "EventList",
+                "events": [
+                  {
+                    "kind": "SignalEvent",
+                    "expr": {
+                      "kind": "NamedValue",
+                      "type": "logic",
+                      "symbol": "2199026721544 clk"
+                    },
+                    "edge": "PosEdge"
+                  },
+                  {
+                    "kind": "SignalEvent",
+                    "expr": {
+                      "kind": "NamedValue",
+                      "type": "logic",
+                      "symbol": "2199026721896 rst_n"
+                    },
+                    "edge": "NegEdge"
+                  }
+                ]
+              },
+              "stmt": {
+                "kind": "Block",
+                "blockKind": "Sequential",
+                "body": {
+                  "kind": "List",
+                  "list": [
+                    {
+                      "kind": "Conditional",
+                      "conditions": [
+                        {
+                          "expr": {
+                            "kind": "UnaryOp",
+                            "type": "logic",
+                            "op": "LogicalNot",
+                            "operand": {
+                              "kind": "NamedValue",
+                              "type": "logic",
+                              "symbol": "2199026721896 rst_n"
+                            }
+                          }
+                        }
+                      ],
+                      "check": "None",
+                      "ifTrue": {
+                        "kind": "Block",
+                        "blockKind": "Sequential",
+                        "body": {
+                          "kind": "List",
+                          "list": [
+                            {
+                              "kind": "ExpressionStatement",
+                              "expr": {
+                                "kind": "Assignment",
+                                "type": "logic[7:0]",
+                                "left": {
+                                  "kind": "NamedValue",
+                                  "type": "logic[7:0]",
+                                  "symbol": "2199026724032 data_out"
+                                },
+                                "right": {
+                                  "kind": "UnbasedUnsizedIntegerLiteral",
+                                  "type": "logic[7:0]",
+                                  "value": "8'd0",
+                                  "constant": "8'd0"
+                                },
+                                "isNonBlocking": true
+                              }
+                            },
+                            {
+                              "kind": "ExpressionStatement",
+                              "expr": {
+                                "kind": "Assignment",
+                                "type": "logic[7:0]",
+                                "left": {
+                                  "kind": "NamedValue",
+                                  "type": "logic[7:0]",
+                                  "symbol": "2199026720520 buffer"
+                                },
+                                "right": {
+                                  "kind": "UnbasedUnsizedIntegerLiteral",
+                                  "type": "logic[7:0]",
+                                  "value": "8'd0",
+                                  "constant": "8'd0"
+                                },
+                                "isNonBlocking": true
+                              }
+                            },
+                            {
+                              "kind": "ExpressionStatement",
+                              "expr": {
+                                "kind": "Assignment",
+                                "type": "logic",
+                                "left": {
+                                  "kind": "NamedValue",
+                                  "type": "logic",
+                                  "symbol": "2199026724384 branch_flag"
+                                },
+                                "right": {
+                                  "kind": "Conversion",
+                                  "type": "logic",
+                                  "operand": {
+                                    "kind": "IntegerLiteral",
+                                    "type": "bit[0:0]",
+                                    "value": "1'b0",
+                                    "constant": "1'b0"
+                                  },
+                                  "constant": "1'b0"
+                                },
+                                "isNonBlocking": true
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      "ifFalse": {
+                        "kind": "Conditional",
+                        "conditions": [
+                          {
+                            "expr": {
+                              "kind": "ElementSelect",
+                              "type": "logic",
+                              "value": {
+                                "kind": "NamedValue",
+                                "type": "logic[3:0]",
+                                "symbol": "2199026722248 sel"
+                              },
+                              "selector": {
+                                "kind": "IntegerLiteral",
+                                "type": "int",
+                                "value": "3",
+                                "constant": "3"
+                              }
+                            }
+                          }
+                        ],
+                        "check": "None",
+                        "ifTrue": {
+                          "kind": "Block",
+                          "blockKind": "Sequential",
+                          "body": {
+                            "kind": "List",
+                            "list": [
+                              {
+                                "kind": "ExpressionStatement",
+                                "expr": {
+                                  "kind": "Assignment",
+                                  "type": "logic[7:0]",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[7:0]",
+                                    "symbol": "2199026720520 buffer"
+                                  },
+                                  "right": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[7:0]",
+                                    "symbol": "2199026722600 data_in"
+                                  },
+                                  "isNonBlocking": true
+                                }
+                              },
+                              {
+                                "kind": "ExpressionStatement",
+                                "expr": {
+                                  "kind": "Assignment",
+                                  "type": "logic[7:0]",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[7:0]",
+                                    "symbol": "2199026724032 data_out"
+                                  },
+                                  "right": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[7:0]",
+                                    "symbol": "2199026722600 data_in"
+                                  },
+                                  "isNonBlocking": true
+                                }
+                              },
+                              {
+                                "kind": "ExpressionStatement",
+                                "expr": {
+                                  "kind": "Assignment",
+                                  "type": "logic",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "logic",
+                                    "symbol": "2199026724384 branch_flag"
+                                  },
+                                  "right": {
+                                    "kind": "Conversion",
+                                    "type": "logic",
+                                    "operand": {
+                                      "kind": "IntegerLiteral",
+                                      "type": "bit[0:0]",
+                                      "value": "1'b1",
+                                      "constant": "1'b1"
+                                    },
+                                    "constant": "1'b1"
+                                  },
+                                  "isNonBlocking": true
+                                }
+                              }
+                            ]
+                          }
+                        },
+                        "ifFalse": {
+                          "kind": "Conditional",
+                          "conditions": [
+                            {
+                              "expr": {
+                                "kind": "BinaryOp",
+                                "type": "logic",
+                                "op": "Equality",
+                                "left": {
+                                  "kind": "RangeSelect",
+                                  "type": "logic[2:1]",
+                                  "selectionKind": "Simple",
+                                  "value": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[3:0]",
+                                    "symbol": "2199026722248 sel"
+                                  },
+                                  "left": {
+                                    "kind": "IntegerLiteral",
+                                    "type": "int",
+                                    "value": "2",
+                                    "constant": "2"
+                                  },
+                                  "right": {
+                                    "kind": "IntegerLiteral",
+                                    "type": "int",
+                                    "value": "1",
+                                    "constant": "1"
+                                  }
+                                },
+                                "right": {
+                                  "kind": "Conversion",
+                                  "type": "logic[1:0]",
+                                  "operand": {
+                                    "kind": "IntegerLiteral",
+                                    "type": "bit[1:0]",
+                                    "value": "2'b10",
+                                    "constant": "2'b10"
+                                  },
+                                  "constant": "2'b10"
+                                }
+                              }
+                            }
+                          ],
+                          "check": "None",
+                          "ifTrue": {
+                            "kind": "Block",
+                            "blockKind": "Sequential",
+                            "body": {
+                              "kind": "List",
+                              "list": [
+                                {
+                                  "kind": "ExpressionStatement",
+                                  "expr": {
+                                    "kind": "Assignment",
+                                    "type": "logic[7:0]",
+                                    "left": {
+                                      "kind": "NamedValue",
+                                      "type": "logic[7:0]",
+                                      "symbol": "2199026720520 buffer"
+                                    },
+                                    "right": {
+                                      "kind": "UnaryOp",
+                                      "type": "logic[7:0]",
+                                      "op": "BitwiseNot",
+                                      "operand": {
+                                        "kind": "NamedValue",
+                                        "type": "logic[7:0]",
+                                        "symbol": "2199026722600 data_in"
+                                      }
+                                    },
+                                    "isNonBlocking": true
+                                  }
+                                },
+                                {
+                                  "kind": "ExpressionStatement",
+                                  "expr": {
+                                    "kind": "Assignment",
+                                    "type": "logic[7:0]",
+                                    "left": {
+                                      "kind": "NamedValue",
+                                      "type": "logic[7:0]",
+                                      "symbol": "2199026724032 data_out"
+                                    },
+                                    "right": {
+                                      "kind": "UnaryOp",
+                                      "type": "logic[7:0]",
+                                      "op": "BitwiseNot",
+                                      "operand": {
+                                        "kind": "NamedValue",
+                                        "type": "logic[7:0]",
+                                        "symbol": "2199026722600 data_in"
+                                      }
+                                    },
+                                    "isNonBlocking": true
+                                  }
+                                },
+                                {
+                                  "kind": "ExpressionStatement",
+                                  "expr": {
+                                    "kind": "Assignment",
+                                    "type": "logic",
+                                    "left": {
+                                      "kind": "NamedValue",
+                                      "type": "logic",
+                                      "symbol": "2199026724384 branch_flag"
+                                    },
+                                    "right": {
+                                      "kind": "Conversion",
+                                      "type": "logic",
+                                      "operand": {
+                                        "kind": "IntegerLiteral",
+                                        "type": "bit[0:0]",
+                                        "value": "1'b0",
+                                        "constant": "1'b0"
+                                      },
+                                      "constant": "1'b0"
+                                    },
+                                    "isNonBlocking": true
+                                  }
+                                }
+                              ]
+                            }
+                          },
+                          "ifFalse": {
+                            "kind": "Block",
+                            "blockKind": "Sequential",
+                            "body": {
+                              "kind": "List",
+                              "list": [
+                                {
+                                  "kind": "Conditional",
+                                  "conditions": [
+                                    {
+                                      "expr": {
+                                        "kind": "ElementSelect",
+                                        "type": "logic",
+                                        "value": {
+                                          "kind": "NamedValue",
+                                          "type": "logic[3:0]",
+                                          "symbol": "2199026722248 sel"
+                                        },
+                                        "selector": {
+                                          "kind": "IntegerLiteral",
+                                          "type": "int",
+                                          "value": "0",
+                                          "constant": "0"
+                                        }
+                                      }
+                                    }
+                                  ],
+                                  "check": "None",
+                                  "ifTrue": {
+                                    "kind": "Block",
+                                    "blockKind": "Sequential",
+                                    "body": {
+                                      "kind": "List",
+                                      "list": [
+                                        {
+                                          "kind": "ExpressionStatement",
+                                          "expr": {
+                                            "kind": "Assignment",
+                                            "type": "logic[7:0]",
+                                            "left": {
+                                              "kind": "NamedValue",
+                                              "type": "logic[7:0]",
+                                              "symbol": "2199026720520 buffer"
+                                            },
+                                            "right": {
+                                              "kind": "Concatenation",
+                                              "type": "logic[7:0]",
+                                              "operands": [
+                                                {
+                                                  "kind": "RangeSelect",
+                                                  "type": "logic[6:0]",
+                                                  "selectionKind": "Simple",
+                                                  "value": {
+                                                    "kind": "NamedValue",
+                                                    "type": "logic[7:0]",
+                                                    "symbol": "2199026724032 data_out"
+                                                  },
+                                                  "left": {
+                                                    "kind": "IntegerLiteral",
+                                                    "type": "int",
+                                                    "value": "6",
+                                                    "constant": "6"
+                                                  },
+                                                  "right": {
+                                                    "kind": "IntegerLiteral",
+                                                    "type": "int",
+                                                    "value": "0",
+                                                    "constant": "0"
+                                                  }
+                                                },
+                                                {
+                                                  "kind": "ElementSelect",
+                                                  "type": "logic",
+                                                  "value": {
+                                                    "kind": "NamedValue",
+                                                    "type": "logic[7:0]",
+                                                    "symbol": "2199026722600 data_in"
+                                                  },
+                                                  "selector": {
+                                                    "kind": "IntegerLiteral",
+                                                    "type": "int",
+                                                    "value": "0",
+                                                    "constant": "0"
+                                                  }
+                                                }
+                                              ]
+                                            },
+                                            "isNonBlocking": true
+                                          }
+                                        },
+                                        {
+                                          "kind": "ExpressionStatement",
+                                          "expr": {
+                                            "kind": "Assignment",
+                                            "type": "logic",
+                                            "left": {
+                                              "kind": "NamedValue",
+                                              "type": "logic",
+                                              "symbol": "2199026724384 branch_flag"
+                                            },
+                                            "right": {
+                                              "kind": "UnaryOp",
+                                              "type": "logic",
+                                              "op": "BitwiseNot",
+                                              "operand": {
+                                                "kind": "NamedValue",
+                                                "type": "logic",
+                                                "symbol": "2199026724384 branch_flag"
+                                              }
+                                            },
+                                            "isNonBlocking": true
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "ifFalse": {
+                                    "kind": "Block",
+                                    "blockKind": "Sequential",
+                                    "body": {
+                                      "kind": "List",
+                                      "list": [
+                                        {
+                                          "kind": "ExpressionStatement",
+                                          "expr": {
+                                            "kind": "Assignment",
+                                            "type": "logic[7:0]",
+                                            "left": {
+                                              "kind": "NamedValue",
+                                              "type": "logic[7:0]",
+                                              "symbol": "2199026720520 buffer"
+                                            },
+                                            "right": {
+                                              "kind": "BinaryOp",
+                                              "type": "logic[7:0]",
+                                              "op": "Add",
+                                              "left": {
+                                                "kind": "NamedValue",
+                                                "type": "logic[7:0]",
+                                                "symbol": "2199026724032 data_out"
+                                              },
+                                              "right": {
+                                                "kind": "Conversion",
+                                                "type": "logic[7:0]",
+                                                "operand": {
+                                                  "kind": "IntegerLiteral",
+                                                  "type": "bit[7:0]",
+                                                  "value": "8'd1",
+                                                  "constant": "8'd1"
+                                                },
+                                                "constant": "8'd1"
+                                              }
+                                            },
+                                            "isNonBlocking": true
+                                          }
+                                        },
+                                        {
+                                          "kind": "ExpressionStatement",
+                                          "expr": {
+                                            "kind": "Assignment",
+                                            "type": "logic",
+                                            "left": {
+                                              "kind": "NamedValue",
+                                              "type": "logic",
+                                              "symbol": "2199026724384 branch_flag"
+                                            },
+                                            "right": {
+                                              "kind": "Conversion",
+                                              "type": "logic",
+                                              "operand": {
+                                                "kind": "IntegerLiteral",
+                                                "type": "bit[0:0]",
+                                                "value": "1'b0",
+                                                "constant": "1'b0"
+                                              },
+                                              "constant": "1'b0"
+                                            },
+                                            "isNonBlocking": true
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  }
+                                },
+                                {
+                                  "kind": "Conditional",
+                                  "conditions": [
+                                    {
+                                      "expr": {
+                                        "kind": "ElementSelect",
+                                        "type": "logic",
+                                        "value": {
+                                          "kind": "NamedValue",
+                                          "type": "logic[7:0]",
+                                          "symbol": "2199026720520 buffer"
+                                        },
+                                        "selector": {
+                                          "kind": "IntegerLiteral",
+                                          "type": "int",
+                                          "value": "0",
+                                          "constant": "0"
+                                        }
+                                      }
+                                    }
+                                  ],
+                                  "check": "None",
+                                  "ifTrue": {
+                                    "kind": "ExpressionStatement",
+                                    "expr": {
+                                      "kind": "Assignment",
+                                      "type": "logic[7:0]",
+                                      "left": {
+                                        "kind": "NamedValue",
+                                        "type": "logic[7:0]",
+                                        "symbol": "2199026724032 data_out"
+                                      },
+                                      "right": {
+                                        "kind": "NamedValue",
+                                        "type": "logic[7:0]",
+                                        "symbol": "2199026720520 buffer"
+                                      },
+                                      "isNonBlocking": true
+                                    }
+                                  },
+                                  "ifFalse": {
+                                    "kind": "ExpressionStatement",
+                                    "expr": {
+                                      "kind": "Assignment",
+                                      "type": "logic[7:0]",
+                                      "left": {
+                                        "kind": "NamedValue",
+                                        "type": "logic[7:0]",
+                                        "symbol": "2199026724032 data_out"
+                                      },
+                                      "right": {
+                                        "kind": "BinaryOp",
+                                        "type": "logic[7:0]",
+                                        "op": "BinaryXor",
+                                        "left": {
+                                          "kind": "NamedValue",
+                                          "type": "logic[7:0]",
+                                          "symbol": "2199026720520 buffer"
+                                        },
+                                        "right": {
+                                          "kind": "Conversion",
+                                          "type": "logic[7:0]",
+                                          "operand": {
+                                            "kind": "IntegerLiteral",
+                                            "type": "bit[7:0]",
+                                            "value": "8'd255",
+                                            "constant": "8'd255"
+                                          },
+                                          "constant": "8'd255"
+                                        }
+                                      },
+                                      "isNonBlocking": true
+                                    }
+                                  }
+                                },
+                                {
+                                  "kind": "Conditional",
+                                  "conditions": [
+                                    {
+                                      "expr": {
+                                        "kind": "BinaryOp",
+                                        "type": "logic",
+                                        "op": "Equality",
+                                        "left": {
+                                          "kind": "NamedValue",
+                                          "type": "logic[3:0]",
+                                          "symbol": "2199026722248 sel"
+                                        },
+                                        "right": {
+                                          "kind": "Conversion",
+                                          "type": "logic[3:0]",
+                                          "operand": {
+                                            "kind": "IntegerLiteral",
+                                            "type": "bit[3:0]",
+                                            "value": "4'b0",
+                                            "constant": "4'b0"
+                                          },
+                                          "constant": "4'b0"
+                                        }
+                                      }
+                                    }
+                                  ],
+                                  "check": "None",
+                                  "ifTrue": {
+                                    "kind": "ExpressionStatement",
+                                    "expr": {
+                                      "kind": "Assignment",
+                                      "type": "logic[7:0]",
+                                      "left": {
+                                        "kind": "NamedValue",
+                                        "type": "logic[7:0]",
+                                        "symbol": "2199026724032 data_out"
+                                      },
+                                      "right": {
+                                        "kind": "Conversion",
+                                        "type": "logic[7:0]",
+                                        "operand": {
+                                          "kind": "IntegerLiteral",
+                                          "type": "bit[7:0]",
+                                          "value": "8'd170",
+                                          "constant": "8'd170"
+                                        },
+                                        "constant": "8'd170"
+                                      },
+                                      "isNonBlocking": true
+                                    }
+                                  }
+                                }
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "kind": "Conditional",
+                      "conditions": [
+                        {
+                          "expr": {
+                            "kind": "BinaryOp",
+                            "type": "logic",
+                            "op": "LogicalAnd",
+                            "left": {
+                              "kind": "ElementSelect",
+                              "type": "logic",
+                              "value": {
+                                "kind": "NamedValue",
+                                "type": "logic[3:0]",
+                                "symbol": "2199026722248 sel"
+                              },
+                              "selector": {
+                                "kind": "IntegerLiteral",
+                                "type": "int",
+                                "value": "3",
+                                "constant": "3"
+                              }
+                            },
+                            "right": {
+                              "kind": "ElementSelect",
+                              "type": "logic",
+                              "value": {
+                                "kind": "NamedValue",
+                                "type": "logic[3:0]",
+                                "symbol": "2199026722248 sel"
+                              },
+                              "selector": {
+                                "kind": "IntegerLiteral",
+                                "type": "int",
+                                "value": "0",
+                                "constant": "0"
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      "check": "None",
+                      "ifTrue": {
+                        "kind": "ExpressionStatement",
+                        "expr": {
+                          "kind": "Assignment",
+                          "type": "logic[7:0]",
+                          "left": {
+                            "kind": "NamedValue",
+                            "type": "logic[7:0]",
+                            "symbol": "2199026724032 data_out"
+                          },
+                          "right": {
+                            "kind": "BinaryOp",
+                            "type": "logic[7:0]",
+                            "op": "BinaryOr",
+                            "left": {
+                              "kind": "NamedValue",
+                              "type": "logic[7:0]",
+                              "symbol": "2199026724032 data_out"
+                            },
+                            "right": {
+                              "kind": "Conversion",
+                              "type": "logic[7:0]",
+                              "operand": {
+                                "kind": "IntegerLiteral",
+                                "type": "bit[7:0]",
+                                "value": "8'd85",
+                                "constant": "8'd85"
+                              },
+                              "constant": "8'd85"
+                            }
+                          },
+                          "isNonBlocking": true
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "name": "",
+            "kind": "ProceduralBlock",
+            "addr": 2199026721000,
+            "procedureKind": "AlwaysComb",
+            "body": {
+              "kind": "Block",
+              "blockKind": "Sequential",
+              "body": {
+                "kind": "List",
+                "list": [
+                  {
+                    "kind": "ExpressionStatement",
+                    "expr": {
+                      "kind": "Assignment",
+                      "type": "logic[7:0]",
+                      "left": {
+                        "kind": "NamedValue",
+                        "type": "logic[7:0]",
+                        "symbol": "2199026720696 comb_result"
+                      },
+                      "right": {
+                        "kind": "NamedValue",
+                        "type": "logic[7:0]",
+                        "symbol": "2199026722600 data_in"
+                      },
+                      "isNonBlocking": false
+                    }
+                  },
+                  {
+                    "kind": "Conditional",
+                    "conditions": [
+                      {
+                        "expr": {
+                          "kind": "ElementSelect",
+                          "type": "logic",
+                          "value": {
+                            "kind": "NamedValue",
+                            "type": "logic[3:0]",
+                            "symbol": "2199026722248 sel"
+                          },
+                          "selector": {
+                            "kind": "IntegerLiteral",
+                            "type": "int",
+                            "value": "3",
+                            "constant": "3"
+                          }
+                        }
+                      }
+                    ],
+                    "check": "None",
+                    "ifTrue": {
+                      "kind": "Block",
+                      "blockKind": "Sequential",
+                      "body": {
+                        "kind": "ExpressionStatement",
+                        "expr": {
+                          "kind": "Assignment",
+                          "type": "logic[7:0]",
+                          "left": {
+                            "kind": "NamedValue",
+                            "type": "logic[7:0]",
+                            "symbol": "2199026720696 comb_result"
+                          },
+                          "right": {
+                            "kind": "BinaryOp",
+                            "type": "logic[7:0]",
+                            "op": "BinaryXor",
+                            "left": {
+                              "kind": "NamedValue",
+                              "type": "logic[7:0]",
+                              "symbol": "2199026722600 data_in"
+                            },
+                            "right": {
+                              "kind": "Conversion",
+                              "type": "logic[7:0]",
+                              "operand": {
+                                "kind": "IntegerLiteral",
+                                "type": "bit[7:0]",
+                                "value": "8'd60",
+                                "constant": "8'd60"
+                              },
+                              "constant": "8'd60"
+                            }
+                          },
+                          "isNonBlocking": false
+                        }
+                      }
+                    },
+                    "ifFalse": {
+                      "kind": "Conditional",
+                      "conditions": [
+                        {
+                          "expr": {
+                            "kind": "ElementSelect",
+                            "type": "logic",
+                            "value": {
+                              "kind": "NamedValue",
+                              "type": "logic[3:0]",
+                              "symbol": "2199026722248 sel"
+                            },
+                            "selector": {
+                              "kind": "IntegerLiteral",
+                              "type": "int",
+                              "value": "2",
+                              "constant": "2"
+                            }
+                          }
+                        }
+                      ],
+                      "check": "None",
+                      "ifTrue": {
+                        "kind": "Block",
+                        "blockKind": "Sequential",
+                        "body": {
+                          "kind": "ExpressionStatement",
+                          "expr": {
+                            "kind": "Assignment",
+                            "type": "logic[7:0]",
+                            "left": {
+                              "kind": "NamedValue",
+                              "type": "logic[7:0]",
+                              "symbol": "2199026720696 comb_result"
+                            },
+                            "right": {
+                              "kind": "Concatenation",
+                              "type": "logic[7:0]",
+                              "operands": [
+                                {
+                                  "kind": "NamedValue",
+                                  "type": "logic[3:0]",
+                                  "symbol": "2199026722248 sel"
+                                },
+                                {
+                                  "kind": "RangeSelect",
+                                  "type": "logic[3:0]",
+                                  "selectionKind": "Simple",
+                                  "value": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[7:0]",
+                                    "symbol": "2199026722600 data_in"
+                                  },
+                                  "left": {
+                                    "kind": "IntegerLiteral",
+                                    "type": "int",
+                                    "value": "3",
+                                    "constant": "3"
+                                  },
+                                  "right": {
+                                    "kind": "IntegerLiteral",
+                                    "type": "int",
+                                    "value": "0",
+                                    "constant": "0"
+                                  }
+                                }
+                              ]
+                            },
+                            "isNonBlocking": false
+                          }
+                        }
+                      },
+                      "ifFalse": {
+                        "kind": "Block",
+                        "blockKind": "Sequential",
+                        "body": {
+                          "kind": "List",
+                          "list": [
+                            {
+                              "kind": "Conditional",
+                              "conditions": [
+                                {
+                                  "expr": {
+                                    "kind": "BinaryOp",
+                                    "type": "logic",
+                                    "op": "Equality",
+                                    "left": {
+                                      "kind": "RangeSelect",
+                                      "type": "logic[1:0]",
+                                      "selectionKind": "Simple",
+                                      "value": {
+                                        "kind": "NamedValue",
+                                        "type": "logic[3:0]",
+                                        "symbol": "2199026722248 sel"
+                                      },
+                                      "left": {
+                                        "kind": "IntegerLiteral",
+                                        "type": "int",
+                                        "value": "1",
+                                        "constant": "1"
+                                      },
+                                      "right": {
+                                        "kind": "IntegerLiteral",
+                                        "type": "int",
+                                        "value": "0",
+                                        "constant": "0"
+                                      }
+                                    },
+                                    "right": {
+                                      "kind": "Conversion",
+                                      "type": "logic[1:0]",
+                                      "operand": {
+                                        "kind": "IntegerLiteral",
+                                        "type": "bit[1:0]",
+                                        "value": "2'b1",
+                                        "constant": "2'b1"
+                                      },
+                                      "constant": "2'b1"
+                                    }
+                                  }
+                                }
+                              ],
+                              "check": "None",
+                              "ifTrue": {
+                                "kind": "ExpressionStatement",
+                                "expr": {
+                                  "kind": "Assignment",
+                                  "type": "logic[7:0]",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[7:0]",
+                                    "symbol": "2199026720696 comb_result"
+                                  },
+                                  "right": {
+                                    "kind": "BinaryOp",
+                                    "type": "logic[7:0]",
+                                    "op": "Add",
+                                    "left": {
+                                      "kind": "NamedValue",
+                                      "type": "logic[7:0]",
+                                      "symbol": "2199026720520 buffer"
+                                    },
+                                    "right": {
+                                      "kind": "Conversion",
+                                      "type": "logic[7:0]",
+                                      "operand": {
+                                        "kind": "IntegerLiteral",
+                                        "type": "bit[7:0]",
+                                        "value": "8'd2",
+                                        "constant": "8'd2"
+                                      },
+                                      "constant": "8'd2"
+                                    }
+                                  },
+                                  "isNonBlocking": false
+                                }
+                              },
+                              "ifFalse": {
+                                "kind": "Conditional",
+                                "conditions": [
+                                  {
+                                    "expr": {
+                                      "kind": "BinaryOp",
+                                      "type": "logic",
+                                      "op": "Equality",
+                                      "left": {
+                                        "kind": "RangeSelect",
+                                        "type": "logic[1:0]",
+                                        "selectionKind": "Simple",
+                                        "value": {
+                                          "kind": "NamedValue",
+                                          "type": "logic[3:0]",
+                                          "symbol": "2199026722248 sel"
+                                        },
+                                        "left": {
+                                          "kind": "IntegerLiteral",
+                                          "type": "int",
+                                          "value": "1",
+                                          "constant": "1"
+                                        },
+                                        "right": {
+                                          "kind": "IntegerLiteral",
+                                          "type": "int",
+                                          "value": "0",
+                                          "constant": "0"
+                                        }
+                                      },
+                                      "right": {
+                                        "kind": "Conversion",
+                                        "type": "logic[1:0]",
+                                        "operand": {
+                                          "kind": "IntegerLiteral",
+                                          "type": "bit[1:0]",
+                                          "value": "2'b10",
+                                          "constant": "2'b10"
+                                        },
+                                        "constant": "2'b10"
+                                      }
+                                    }
+                                  }
+                                ],
+                                "check": "None",
+                                "ifTrue": {
+                                  "kind": "ExpressionStatement",
+                                  "expr": {
+                                    "kind": "Assignment",
+                                    "type": "logic[7:0]",
+                                    "left": {
+                                      "kind": "NamedValue",
+                                      "type": "logic[7:0]",
+                                      "symbol": "2199026720696 comb_result"
+                                    },
+                                    "right": {
+                                      "kind": "BinaryOp",
+                                      "type": "logic[7:0]",
+                                      "op": "Subtract",
+                                      "left": {
+                                        "kind": "NamedValue",
+                                        "type": "logic[7:0]",
+                                        "symbol": "2199026720520 buffer"
+                                      },
+                                      "right": {
+                                        "kind": "Conversion",
+                                        "type": "logic[7:0]",
+                                        "operand": {
+                                          "kind": "IntegerLiteral",
+                                          "type": "bit[7:0]",
+                                          "value": "8'd2",
+                                          "constant": "8'd2"
+                                        },
+                                        "constant": "8'd2"
+                                      }
+                                    },
+                                    "isNonBlocking": false
+                                  }
+                                },
+                                "ifFalse": {
+                                  "kind": "ExpressionStatement",
+                                  "expr": {
+                                    "kind": "Assignment",
+                                    "type": "logic[7:0]",
+                                    "left": {
+                                      "kind": "NamedValue",
+                                      "type": "logic[7:0]",
+                                      "symbol": "2199026720696 comb_result"
+                                    },
+                                    "right": {
+                                      "kind": "NamedValue",
+                                      "type": "logic[7:0]",
+                                      "symbol": "2199026720520 buffer"
+                                    },
+                                    "isNonBlocking": false
+                                  }
+                                }
+                              }
+                            },
+                            {
+                              "kind": "Conditional",
+                              "conditions": [
+                                {
+                                  "expr": {
+                                    "kind": "NamedValue",
+                                    "type": "logic",
+                                    "symbol": "2199026724384 branch_flag"
+                                  }
+                                }
+                              ],
+                              "check": "None",
+                              "ifTrue": {
+                                "kind": "ExpressionStatement",
+                                "expr": {
+                                  "kind": "Assignment",
+                                  "type": "logic[7:0]",
+                                  "left": {
+                                    "kind": "NamedValue",
+                                    "type": "logic[7:0]",
+                                    "symbol": "2199026720696 comb_result"
+                                  },
+                                  "right": {
+                                    "kind": "BinaryOp",
+                                    "type": "logic[7:0]",
+                                    "op": "BinaryAnd",
+                                    "left": {
+                                      "kind": "NamedValue",
+                                      "type": "logic[7:0]",
+                                      "symbol": "2199026720696 comb_result"
+                                    },
+                                    "right": {
+                                      "kind": "Conversion",
+                                      "type": "logic[7:0]",
+                                      "operand": {
+                                        "kind": "IntegerLiteral",
+                                        "type": "bit[7:0]",
+                                        "value": "8'd240",
+                                        "constant": "8'd240"
+                                      },
+                                      "constant": "8'd240"
+                                    }
+                                  },
+                                  "isNonBlocking": false
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "kind": "Conditional",
+                    "conditions": [
+                      {
+                        "expr": {
+                          "kind": "BinaryOp",
+                          "type": "logic",
+                          "op": "LogicalAnd",
+                          "left": {
+                            "kind": "UnaryOp",
+                            "type": "logic",
+                            "op": "LogicalNot",
+                            "operand": {
+                              "kind": "NamedValue",
+                              "type": "logic",
+                              "symbol": "2199026724384 branch_flag"
+                            }
+                          },
+                          "right": {
+                            "kind": "BinaryOp",
+                            "type": "logic",
+                            "op": "Equality",
+                            "left": {
+                              "kind": "NamedValue",
+                              "type": "logic[3:0]",
+                              "symbol": "2199026722248 sel"
+                            },
+                            "right": {
+                              "kind": "Conversion",
+                              "type": "logic[3:0]",
+                              "operand": {
+                                "kind": "IntegerLiteral",
+                                "type": "bit[3:0]",
+                                "value": "4'b1111",
+                                "constant": "4'b1111"
+                              },
+                              "constant": "4'b1111"
+                            }
+                          }
+                        }
+                      }
+                    ],
+                    "check": "None",
+                    "ifTrue": {
+                      "kind": "ExpressionStatement",
+                      "expr": {
+                        "kind": "Assignment",
+                        "type": "logic[7:0]",
+                        "left": {
+                          "kind": "NamedValue",
+                          "type": "logic[7:0]",
+                          "symbol": "2199026720696 comb_result"
+                        },
+                        "right": {
+                          "kind": "BinaryOp",
+                          "type": "logic[7:0]",
+                          "op": "BinaryOr",
+                          "left": {
+                            "kind": "NamedValue",
+                            "type": "logic[7:0]",
+                            "symbol": "2199026720696 comb_result"
+                          },
+                          "right": {
+                            "kind": "Conversion",
+                            "type": "logic[7:0]",
+                            "operand": {
+                              "kind": "IntegerLiteral",
+                              "type": "bit[7:0]",
+                              "value": "8'd15",
+                              "constant": "8'd15"
+                            },
+                            "constant": "8'd15"
+                          }
+                        },
+                        "isNonBlocking": false
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "name": "",
+            "kind": "ContinuousAssign",
+            "addr": 2199026724968,
+            "assignment": {
+              "kind": "Assignment",
+              "type": "logic[7:0]",
+              "left": {
+                "kind": "NamedValue",
+                "type": "logic[7:0]",
+                "symbol": "2199026724736 comb_preview"
+              },
+              "right": {
+                "kind": "NamedValue",
+                "type": "logic[7:0]",
+                "symbol": "2199026720696 comb_result"
+              },
+              "isNonBlocking": false
+            }
+          }
+        ],
+        "definition": "2199026794496 ifstmt_top"
+      },
+      "connections": [
+      ]
+    }
+  ]
+}Build succeeded: 0 errors, 0 warnings
