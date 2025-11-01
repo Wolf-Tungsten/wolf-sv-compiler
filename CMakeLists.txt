@@ -10,6 +10,7 @@ add_subdirectory(external/slang)
 
 # Source files
 set(SOURCES
+    src/elaborate.cpp
     src/main.cpp
 )
 
@@ -18,6 +19,11 @@ add_executable(wolf-sv-compiler ${SOURCES})
 
 # Link against slang
 target_link_libraries(wolf-sv-compiler PRIVATE slang::slang)
+
+target_include_directories(wolf-sv-compiler
+    PRIVATE
+        include
+)
 
 # Installation rules
 install(TARGETS wolf-sv-compiler DESTINATION bin)

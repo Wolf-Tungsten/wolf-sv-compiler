@@ -12,6 +12,8 @@
 #include "slang/driver/Driver.h"
 #include "slang/text/Json.h"
 
+#include "elaborate.hpp"
+
 using namespace slang::driver;
 
 namespace
@@ -49,6 +51,7 @@ namespace
 int main(int argc, char **argv)
 {
     Driver driver;
+    driver.options.compilationFlags[slang::ast::CompilationFlags::AllowTopLevelIfacePorts] = true;
     driver.addStandardArgs();
 
     std::optional<bool> dumpAst;
@@ -86,10 +89,9 @@ int main(int argc, char **argv)
         std::cout << writer.view();
     }
 
-    // std::cout << "=== AST summary ===\n";
-    // std::cout << "Top-level instances: " << root.topInstances.size() << '\n';
-    // std::cout << "Compilation units : " << root.compilationUnits.size() << '\n';
-    // dumpScope(root);
+    wolf_sv::Elaborate elaborator;
+    auto netlist = elaborator.convert(root);
+    (void)netlist;
 
     bool ok = driver.reportDiagnostics(/* quiet */ false);
     return ok ? 0 : 4;
