@@ -3972,53 +3972,79 @@ namespace wolvrix::lib::transform
                           return lhs.to < rhs.to;
                       });
 
-            DisjointSet dsu(view.members.size());
-            std::vector<uint32_t> sizes(view.members.size(), 0);
+            auto buildMergedClusters = [&](DisjointSet &dsu) {
+                std::unordered_map<uint32_t, uint32_t> rootToCluster;
+                std::vector<std::vector<uint32_t>> out;
+                for (uint32_t id = 0; id < view.members.size(); ++id)
+                {
+                    const uint32_t root = dsu.find(id);
+                    auto [it, inserted] = rootToCluster.emplace(root, static_cast<uint32_t>(out.size()));
+                    if (inserted)
+                    {
+                        out.push_back({});
+                    }
+                    out[it->second].insert(out[it->second].end(), view.members[id].begin(), view.members[id].end());
+                }
+                return canonicalizeNodeClusters(std::move(out), nodeTopoPos);
+            };
+
+            DisjointSet batchDsu(view.members.size());
+            std::vector<uint32_t> batchSizes(view.members.size(), 0);
+            std::vector<uint8_t> usedInBatch(view.members.size(), 0);
             for (uint32_t id = 0; id < view.members.size(); ++id)
             {
-                sizes[id] = static_cast<uint32_t>(view.members[id].size());
+                batchSizes[id] = static_cast<uint32_t>(view.members[id].size());
             }
-
-            bool changed = false;
+            bool batchChanged = false;
             for (const auto &candidate : candidates)
             {
-                uint32_t lhs = dsu.find(candidate.from);
-                uint32_t rhs = dsu.find(candidate.to);
-                if (lhs == rhs || static_cast<std::size_t>(sizes[lhs] + sizes[rhs]) > maxNodes)
+                uint32_t lhs = batchDsu.find(candidate.from);
+                uint32_t rhs = batchDsu.find(candidate.to);
+                if (lhs == rhs || usedInBatch[lhs] || usedInBatch[rhs] ||
+                    static_cast<std::size_t>(batchSizes[lhs] + batchSizes[rhs]) > maxNodes)
                 {
                     continue;
                 }
-                if (dsu.unite(lhs, rhs))
+                if (batchDsu.unite(lhs, rhs))
                 {
-                    const uint32_t root = dsu.find(lhs);
-                    sizes[root] = sizes[lhs] + sizes[rhs];
-                    changed = true;
+                    const uint32_t root = batchDsu.find(lhs);
+                    batchSizes[root] = batchSizes[lhs] + batchSizes[rhs];
+                    usedInBatch[root] = 1;
+                    batchChanged = true;
                 }
             }
-            if (!changed)
+            if (batchChanged)
             {
-                return false;
+                auto out = buildMergedClusters(batchDsu);
+                if (orderNodeClustersTopologically(out, nodeDag, nodeCount, &rewrite, &graph))
+                {
+                    clusters = std::move(out);
+                    return true;
+                }
             }
 
-            std::unordered_map<uint32_t, uint32_t> rootToCluster;
-            std::vector<std::vector<uint32_t>> out;
-            for (uint32_t id = 0; id < view.members.size(); ++id)
+            for (const auto &candidate : candidates)
             {
-                const uint32_t root = dsu.find(id);
-                auto [it, inserted] = rootToCluster.emplace(root, static_cast<uint32_t>(out.size()));
-                if (inserted)
+                if (static_cast<std::size_t>(view.members[candidate.from].size()) +
+                        static_cast<std::size_t>(view.members[candidate.to].size()) >
+                    maxNodes)
                 {
-                    out.push_back({});
+                    continue;
                 }
-                out[it->second].insert(out[it->second].end(), view.members[id].begin(), view.members[id].end());
+                std::vector<std::vector<uint32_t>> out = view.members;
+                out[candidate.from].insert(out[candidate.from].end(),
+                                           out[candidate.to].begin(),
+                                           out[candidate.to].end());
+                out.erase(out.begin() + static_cast<std::ptrdiff_t>(candidate.to));
+                out = canonicalizeNodeClusters(std::move(out), nodeTopoPos);
+                if (!orderNodeClustersTopologically(out, nodeDag, nodeCount, &rewrite, &graph))
+                {
+                    continue;
+                }
+                clusters = std::move(out);
+                return true;
             }
-            out = canonicalizeNodeClusters(std::move(out), nodeTopoPos);
-            if (!orderNodeClustersTopologically(out, nodeDag, nodeCount, &rewrite, &graph))
-            {
-                return false;
-            }
-            clusters = std::move(out);
-            return true;
+            return false;
         }
 
         bool tryMergeNodeOut1(std::vector<std::vector<uint32_t>> &clusters,
@@ -6497,6 +6523,7 @@ namespace wolvrix::lib::transform
             const auto coarsenStart = std::chrono::steady_clock::now();
             if (options.enableCoarsen)
             {
+                const std::size_t coarsenMaxNodes = std::numeric_limits<std::size_t>::max();
                 if (options.enableEssentCoarsen)
                 {
                     auto logPhase = [&](std::string message) {
@@ -6812,7 +6839,7 @@ namespace wolvrix::lib::transform
                                                            rewrite.computeDag,
                                                            rewrite.computeNodes.size(),
                                                            nodeTopoPos,
-                                                           maxOpsPerComputeSupernode,
+                                                           coarsenMaxNodes,
                                                            rewrite,
                                                            graph);
                             if (out1Changed && perf)
@@ -6828,7 +6855,7 @@ namespace wolvrix::lib::transform
                                                          rewrite.computeDag,
                                                          rewrite.computeNodes.size(),
                                                          nodeTopoPos,
-                                                         maxOpsPerComputeSupernode,
+                                                         coarsenMaxNodes,
                                                          rewrite,
                                                          graph);
                             if (in1Changed && perf)
@@ -6844,7 +6871,7 @@ namespace wolvrix::lib::transform
                                                                    rewrite.computeDag,
                                                                    rewrite.computeNodes.size(),
                                                                    nodeTopoPos,
-                                                                   maxOpsPerComputeSupernode,
+                                                                   coarsenMaxNodes,
                                                                    rewrite,
                                                                    graph);
                         if (boundaryChanged && perf)
@@ -6934,7 +6961,6 @@ namespace wolvrix::lib::transform
             {
                 std::vector<wolvrix::lib::grh::OperationId> ops;
                 std::vector<uint32_t> supernodeComputeNodes;
-                std::size_t supernodeOpCount = 0;
                 auto flushComputeSupernode = [&]() -> bool
                 {
                     if (ops.empty())
@@ -6952,7 +6978,6 @@ namespace wolvrix::lib::transform
                     noteNonSplitSupernode();
                     ops.clear();
                     supernodeComputeNodes.clear();
-                    supernodeOpCount = 0;
                     return true;
                 };
 
@@ -6963,15 +6988,6 @@ namespace wolvrix::lib::transform
                         continue;
                     }
                     const auto &nodeOps = rewrite.computeNodes[computeNodeId].ops;
-                    if (maxOpsPerComputeSupernode != 0 &&
-                        !ops.empty() &&
-                        supernodeOpCount + nodeOps.size() > maxOpsPerComputeSupernode)
-                    {
-                        if (!flushComputeSupernode())
-                        {
-                            return false;
-                        }
-                    }
                     if (options.splitOversizeComputeNodes &&
                         maxOpsPerSplitComputeNode != 0 &&
                         nodeOps.size() > maxOpsPerSplitComputeNode)
@@ -7004,7 +7020,6 @@ namespace wolvrix::lib::transform
                     }
                     ops.insert(ops.end(), nodeOps.begin(), nodeOps.end());
                     supernodeComputeNodes.push_back(computeNodeId);
-                    supernodeOpCount += nodeOps.size();
                 }
                 if (!flushComputeSupernode())
                 {
