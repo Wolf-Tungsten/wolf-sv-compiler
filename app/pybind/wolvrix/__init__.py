@@ -598,64 +598,22 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
 
     string_options = [
         ("path", "-path"),
-        ("cost_model", "-cost-model"),
     ]
     size_options = [
         ("max_op_in_compute_supernode", "-max-op-in-compute-supernode"),
-        ("max_op_in_compute_node", "-max-op-in-compute-node"),
         ("max_op_in_commit_supernode", "-max-op-in-commit-supernode"),
-        ("local_shared_compute_max_fanout", "-local-shared-compute-max-fanout"),
-        ("local_shared_compute_max_width", "-local-shared-compute-max-width"),
-        ("essent_small_part_cutoff", "-essent-small-part-cutoff"),
-        ("essent_small_sibling_max_preds", "-essent-small-sibling-max-preds"),
-        ("essent_small_sibling_candidate_budget", "-essent-small-sibling-candidate-budget"),
-        ("essent_small_overlap_candidate_budget", "-essent-small-overlap-candidate-budget"),
-        ("essent_cycle_guard_max_visits", "-essent-cycle-guard-max-visits"),
-        ("split_oversize_compute_node_max_ops", "-split-oversize-compute-node-max-ops"),
-    ]
-    float_options = [
-        ("essent_overlap_threshold1", "-essent-overlap-threshold1"),
-        ("essent_overlap_threshold2", "-essent-overlap-threshold2"),
-    ]
-    bool_options = [
-        ("enable_coarsen", "-enable-coarsen"),
-        ("enable_chain_merge", "-enable-chain-merge"),
-        ("enable_local_shared_compute", "-enable-local-shared-compute"),
-        ("enable_essent_mffc_build", "-enable-essent-mffc-build"),
-        ("enable_essent_coarsen", "-enable-essent-coarsen"),
-        ("enable_essent_single_parent_merge", "-enable-essent-single-parent-merge"),
-        ("enable_essent_small_sibling_merge", "-enable-essent-small-sibling-merge"),
-        ("enable_essent_small_overlap_merge", "-enable-essent-small-overlap-merge"),
-        ("enable_essent_down_merge", "-enable-essent-down-merge"),
-        ("split_oversize_compute_nodes", "-split-oversize-compute-nodes"),
-        ("dump_essent_dag_stats", "-dump-essent-dag-stats"),
     ]
 
     for key, arg in string_options:
         value = _pop_named(local, key, None)
         if value is not None:
             out.extend([arg, str(value)])
-    legacy_max_compute_node = _pop_named(local, "max_compute_node_in_compute_supernode", None)
-    if "max_op_in_compute_supernode" not in local and legacy_max_compute_node is not None:
-        local["max_op_in_compute_supernode"] = legacy_max_compute_node
     for key, arg in size_options:
         value = _pop_named(local, key, None)
         if value is not None:
             if not isinstance(value, int) or value < 0:
                 raise ValueError(f"activity-schedule {key} must be a non-negative integer")
             out.extend([arg, str(value)])
-    for key, arg in float_options:
-        value = _pop_named(local, key, None)
-        if value is not None:
-            if not isinstance(value, (int, float)):
-                raise ValueError(f"activity-schedule {key} must be numeric")
-            out.extend([arg, str(float(value))])
-    for key, arg in bool_options:
-        value = _pop_named(local, key, None)
-        if value is not None:
-            if not isinstance(value, bool):
-                raise ValueError(f"activity-schedule {key} must be a boolean")
-            out.extend([arg, "true" if value else "false"])
 
     _ensure_no_extra_named("activity-schedule", local)
     return out

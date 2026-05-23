@@ -1180,13 +1180,19 @@ namespace wolvrix::lib::emit
 
         std::string scalarShlExpr(const std::string &valueExpr,
                                   const std::string &shiftExpr,
-                                  std::size_t width)
+                                  std::size_t width,
+                                  std::optional<std::size_t> shiftWidth = std::nullopt)
         {
             if (width == 0)
             {
                 return "UINT64_C(0)";
             }
             const std::string shift = scalarShiftAmountExpr(shiftExpr);
+            if (shiftWidth && *shiftWidth <= 6u)
+            {
+                return scalarTruncExpr("(" + scalarTruncExpr(valueExpr, width) + " << static_cast<unsigned>(" + shift + "))",
+                                       width);
+            }
             return "((" + shift + " >= UINT64_C(64)) ? UINT64_C(0) : " +
                    scalarTruncExpr("(" + scalarTruncExpr(valueExpr, width) + " << static_cast<unsigned>(" + shift + "))",
                                    width) +
@@ -1195,13 +1201,18 @@ namespace wolvrix::lib::emit
 
         std::string scalarLShrExpr(const std::string &valueExpr,
                                    const std::string &shiftExpr,
-                                   std::size_t width)
+                                   std::size_t width,
+                                   std::optional<std::size_t> shiftWidth = std::nullopt)
         {
             if (width == 0)
             {
                 return "UINT64_C(0)";
             }
             const std::string shift = scalarShiftAmountExpr(shiftExpr);
+            if (shiftWidth && *shiftWidth <= 6u)
+            {
+                return "(" + scalarTruncExpr(valueExpr, width) + " >> static_cast<unsigned>(" + shift + "))";
+            }
             return "((" + shift + " >= UINT64_C(64)) ? UINT64_C(0) : (" +
                    scalarTruncExpr(valueExpr, width) + " >> static_cast<unsigned>(" + shift + ")))";
         }
@@ -1209,13 +1220,14 @@ namespace wolvrix::lib::emit
         std::string scalarSliceDynamicExpr(const std::string &valueExpr,
                                            std::size_t valueWidth,
                                            const std::string &startExpr,
-                                           std::size_t sliceWidth)
+                                           std::size_t sliceWidth,
+                                           std::optional<std::size_t> startWidth = std::nullopt)
         {
             if (sliceWidth == 0)
             {
                 return "UINT64_C(0)";
             }
-            return scalarTruncExpr(scalarLShrExpr(valueExpr, startExpr, valueWidth), sliceWidth);
+            return scalarTruncExpr(scalarLShrExpr(valueExpr, startExpr, valueWidth, startWidth), sliceWidth);
         }
 
         std::string scalarSliceArrayExpr(const std::string &valueExpr,
@@ -9961,6 +9973,24 @@ namespace wolvrix::lib::emit
                 const std::size_t width = compareWidth();
                 const bool signedMode =
                     graph.valueSigned(op.operands()[0]) && graph.valueSigned(op.operands()[1]);
+                if (!signedMode && width <= 64u)
+                {
+                    const std::string lhs = operandExpr(0, width);
+                    const std::string rhs = operandExpr(1, width);
+                    switch (kind)
+                    {
+                    case OperationKind::kLt:
+                        return ScalarLogicExpr{"((" + lhs + ") < (" + rhs + "))", true};
+                    case OperationKind::kLe:
+                        return ScalarLogicExpr{"((" + lhs + ") <= (" + rhs + "))", true};
+                    case OperationKind::kGt:
+                        return ScalarLogicExpr{"((" + lhs + ") > (" + rhs + "))", true};
+                    case OperationKind::kGe:
+                        return ScalarLogicExpr{"((" + lhs + ") >= (" + rhs + "))", true};
+                    default:
+                        break;
+                    }
+                }
                 const std::string cmpExpr = signedMode
                                                 ? "grhsim_compare_signed_u64(" + operandExpr(0, width) + ", " +
                                                       operandExpr(1, width) + ", " + std::to_string(width) + ")"
@@ -10001,11 +10031,17 @@ namespace wolvrix::lib::emit
                 return ScalarLogicExpr{"grhsim_reduce_xnor_u64(" + operands[0] + ", " + std::to_string(graph.valueWidth(op.operands()[0])) + ")", true};
             case OperationKind::kShl:
                 return ScalarLogicExpr{
-                    scalarShlExpr(operandExpr(0, resultWidth), operands[1], static_cast<std::size_t>(resultWidth)),
+                    scalarShlExpr(operandExpr(0, resultWidth),
+                                  operands[1],
+                                  static_cast<std::size_t>(resultWidth),
+                                  static_cast<std::size_t>(graph.valueWidth(op.operands()[1]))),
                     true};
             case OperationKind::kLShr:
                 return ScalarLogicExpr{
-                    scalarLShrExpr(operandExpr(0, resultWidth), operands[1], static_cast<std::size_t>(resultWidth)),
+                    scalarLShrExpr(operandExpr(0, resultWidth),
+                                   operands[1],
+                                   static_cast<std::size_t>(resultWidth),
+                                   static_cast<std::size_t>(graph.valueWidth(op.operands()[1]))),
                     true};
             case OperationKind::kAShr:
                 return ScalarLogicExpr{"grhsim_ashr_u64(" + operandExpr(0, resultWidth) + ", " + operands[1] + ", " + std::to_string(resultWidth) + ")", true};
@@ -10106,7 +10142,8 @@ namespace wolvrix::lib::emit
                     scalarSliceDynamicExpr(operands[0],
                                            static_cast<std::size_t>(graph.valueWidth(op.operands()[0])),
                                            operands[1],
-                                           static_cast<std::size_t>(sliceWidth)),
+                                           static_cast<std::size_t>(sliceWidth),
+                                           static_cast<std::size_t>(graph.valueWidth(op.operands()[1]))),
                     true};
             }
             case OperationKind::kSliceArray:

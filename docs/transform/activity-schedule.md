@@ -9,12 +9,12 @@
 - 为缺失 symbol 的可分区 op 补内部 symbol
 - 冻结 graph
 - 显式分类 `source` / `sink` / `compute` / `declaration`
-- 先按 event guard 构造 `commitSupernode`
 - 将 `kConstant` / `kRegisterReadPort` / `kLatchReadPort` 的 compute 侧 use 前置 clone
-- 直接按 source/compute op 初始化 compute 侧调度原子
-- 以这些 op 级调度原子做 topo / coarsen / 连续分段，生成最终 `computeSupernode`
+- 重新冻结并重建 op topo 数据
+- 通过 `buildComputeNodeRewrite(...)` 构造 compute node / commit node 中间模型
+- 在 compute-node cluster DAG 上做 topo ordering / coarsen / 连续分段，生成最终 `computeSupernode`
 - 展开并导出最终 `computeSupernode` / `commitSupernode` 调度模型
-- 导出 `supernode_to_ops` / `op_to_supernode` / `supernode_kind` / `value_fanout` / `topo_order` / `state_read_supernodes`
+- 导出 `supernode_to_ops` / `op_to_supernode` / `dag` / `supernode_kind` / `compute_nodes_by_supernode` / `value_fanout` / `topo_order` / `state_read_supernodes` / `summary_stats`
 
 这个 pass 目前主要服务于 `grhsim-cpp` emit。
 
@@ -29,19 +29,13 @@
 
 ## 主要选项
 
-`ActivityScheduleOptions` 定义在 [activity_schedule.hpp](/workspace/gaoruihao-dev-gpu/wolvrix-playground/wolvrix/include/transform/activity_schedule.hpp)。
+`ActivityScheduleOptions` 定义在 [activity_schedule.hpp](../../include/transform/activity_schedule.hpp)。这里按 `testcase/xs-components` GrhSIM flow 显式传入的参数列文档入口；C++ 里仍保留的兼容/实验参数不作为当前推荐接口。
 
 | 选项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `-path` | 无 | 目标 graph / 实例路径，必填 |
-| `-max-op-in-compute-supernode` | `128` | 单个 `computeSupernode` 最多包含的 compute 侧调度原子数；XiangShan flow 当前默认用 `108` 与 GSIM `--supernode-max-size=15` 的超节点数量对齐 |
-| `-max-op-in-compute-node` | `8192` | 兼容旧 CLI/脚本的保留参数；当前 op 级主路径不再使用 |
+| `-max-op-in-compute-supernode` | `128` | 连续 DP 分段时的目标 op 数上限；它不是 coarsen merge 上限，也不是最终 `supernode_to_ops[i].size()` 的硬上限 |
 | `-max-op-in-commit-supernode` | `4096` | 单个 `commitSupernode` 最多包含的 sink op 数 |
-| `-enable-coarsen` | `true` | 是否在 compute 侧调度原子 DAG 上执行 coarsen pipeline |
-| `-enable-chain-merge` | `true` | 是否启用 `out1` / `in1` chain merge 策略 |
-| `-cost-model` | `edge-cut` | 兼容旧 CLI/脚本的保留参数；当前主路径使用固定的 boundary-aware coarsen/DP |
-
-兼容说明：旧参数 `-max-compute-node-in-compute-supernode` 仍会被解析为 `-max-op-in-compute-supernode`，但新代码和新脚本应使用后者。`-max-op-in-compute-node` 已不参与当前主路径，保留它只是为了避免旧命令行失败。
 
 ## Session 输出
 
@@ -49,21 +43,27 @@
 
 - `<target>.activity_schedule.supernode_to_ops`
 - `<target>.activity_schedule.op_to_supernode`
+- `<target>.activity_schedule.dag`
 - `<target>.activity_schedule.supernode_kind`
+- `<target>.activity_schedule.compute_nodes_by_supernode`
 - `<target>.activity_schedule.value_fanout`
 - `<target>.activity_schedule.topo_order`
 - `<target>.activity_schedule.state_read_supernodes`
+- `<target>.activity_schedule.summary_stats`
 
-这些 key 的写入位置见 [activity_schedule.cpp](/workspace/gaoruihao-dev-gpu/wolvrix-playground/wolvrix/lib/transform/activity_schedule.cpp)。
+这些 key 的写入位置见 [activity_schedule.cpp](../../lib/transform/activity_schedule.cpp)。
 
-## 当前 computeNode / commitSupernode 语义
+## 当前 compute node / commit node 语义
 
-截至 `2026-05-13`，`activity-schedule` 主路径保留 `source` / `compute` / `sink` 语义分类，但 compute 侧不再反向构造独立的 `computeNode` 层：
+截至 `2026-05-23`，`activity-schedule` 主路径保留 `source` / `compute` / `sink` / `declaration` 语义分类，并显式构造 `ComputeRewriteBuild` 中间模型：
 
-1. `commitSupernode` 只包含 sink op，按 event key 聚类，再按 `maxOpInCommitSupernode` 切 chunk。
-2. source op 到 compute op 的 use 在调度初始化前被 clone，并把 compute operand 改接到 clone value。
-3. compute 侧初始调度原子直接来自 source/compute op；每个原子初始只包含一个 op。
-4. `computeSupernode` 由这些 op 级调度原子经 topo / coarsen / 连续 topo 分段得到，`maxOpInComputeSupernode` 当前统计的是调度原子数量。
+1. 初次 `buildActivityOpData(...)` 只收集可分区 op，并按 operand def 建 op topo DAG。
+2. `cloneSourceUsesForCompute(...)` 会把 source op 到 compute op 的每个 use 前置 clone，并把 compute operand 改接到 clone value；source -> commit 仍保留原始 source value。
+3. 如果发生 clone，pass 会重新 `freeze()` 并重建 `ActivityOpData` / `opClasses`。
+4. `buildComputeNodeRewrite(...)` 先按 sink event key 构造 `commitNodes`，再为仍有调度用途的 source op 和每个 compute op 构造 `computeNodes`。
+5. 当前默认 `ComputeNode` 通常只含一个 op；其 `boundaryInputs` 是由其他 compute node 产生、并被本 node 读取的 operand value。
+6. `buildComputeDag(...)` 基于 `boundaryInputs` 建 compute-node DAG。
+7. `materializeComputeNodeSchedule(...)` 在 compute-node DAG 上做 cluster topo / coarsen / DP 分段，然后展开成最终 `computeSupernode`；随后追加 `commitSupernode`。
 
 `sink op` 包括：
 
@@ -88,27 +88,30 @@
 - sink op 只出现在 `commitSupernode`
 - `commitSupernode` 不作为 value producer 产生出边
 - `supernode_kind` 显式标记最终 supernode 是 `compute` 还是 `commit`
+- `compute_nodes_by_supernode` 记录最终 compute supernode 由哪些 compute node 展开得到；commit supernode 对应空列表
 
 ## 当前 computeSupernode 调度算法
 
-截至 `2026-05-13`，主路径的 `computeSupernode` 调度逻辑对应 source 前置 clone + `buildComputeNodeRewrite(...)` + `materializeComputeNodeSchedule(...)`，行为如下：
+截至 `2026-05-23`，主路径的 `computeSupernode` 调度逻辑对应 source 前置 clone + `buildComputeNodeRewrite(...)` + `materializeComputeNodeSchedule(...)`，行为如下：
 
 1. 对 source -> compute use 前置 clone；source -> commit 仍保留 direct source dependency。
-2. 对每个仍有调度用途的 source op 和每个 compute op 初始化一个 compute 侧调度原子，再按 operand def 建 DAG。
-3. 初始 cluster 是“每个调度原子各自一个 cluster”，并先按 DAG topo 排序；topo ready tie-break 会优先选择与前一个 cluster 有更多 activation 连接的候选。
+2. 对每个仍有调度用途的 source op 和每个 compute op 初始化一个 compute node，并按 boundary input 建 compute-node DAG。
+3. 初始 cluster 是“每个 compute node 各自一个 cluster”，按 compute-node topo order 初始化，再通过 `orderNodeClustersTopologically(...)` 重新排序；topo ready tie-break 会优先选择与前一个 cluster 有更多 activation 连接的候选。
 4. 如果启用 coarsen，按小流水线反复执行策略：
   - `out1`：当前 cluster 只有一个后继时，按 activation gain 从高到低尝试与该后继合并。
   - `in1`：当前 cluster 只有一个前驱时，按 activation gain 从高到低尝试与该前驱合并。
-  - `boundary-gain`：按跨 cluster boundary activation edge 减少量从高到低尝试合并相邻依赖 cluster。
-  - 当前三种 merge 都受 `maxOpInComputeSupernode` 约束。
-5. coarsen 之后，按 topo 顺序做连续分段 DP；约束是单个 segment 的调度原子数不超过 `maxOpInComputeSupernode`，目标是最小化 segment 间 boundary activation edge，并带一个轻量 segment 数惩罚。
+  - `boundary-gain`：按跨 cluster boundary activation edge weight 从高到低尝试合并 producer/consumer cluster。
+  - 当前代码把 coarsen merge 上限设为 `std::numeric_limits<std::size_t>::max()`，所以 coarsen 本身不受 `maxOpInComputeSupernode` 约束。
+5. coarsen 之后，按 topo 顺序做连续分段 DP；DP 用 `maxOpInComputeSupernode` 限制一个 segment 内的 op 数，但不会拆开已经 coarsen 到一起的单个 cluster。
+6. DP segment 被 flatten 成 compute node 列表，再展开为最终 `computeSupernode` op 列表；每个 supernode 内会再做一次 local op topo sort。
+7. 最终追加 commit supernode，并从实际 supernode 内容重新构造 `op_to_supernode` / `dag` / `value_fanout` / `state_read_supernodes` / `topo_order`。
 
 当前主路径里：
 
-- 分段输入只包含 compute 侧调度原子，不混入 `commitSupernode`
+- 分段输入只包含 compute node cluster，不混入 `commitSupernode`
 - 不再使用旧 `WorkingPartition` 路径里的 `fixedBoundary`
 - 当前 DP 只优化 topo 连续段，不做任意 DAG partition
-- `-cost-model=edge-cut` 目前只保留为运行入口的兼容性检查
+- `maxOpInComputeSupernode` 是 DP 目标约束，不是 coarsen 硬约束；如果 coarsen 产生 oversized cluster，DP 会把该 cluster 保留为单独 segment
 
 ### Boundary activation 权重
 
@@ -124,7 +127,7 @@
 - `boundary-gain` coarsen
 - 连续分段 DP 的 activation cost
 
-它只统计 compute 侧调度原子之间的 value 依赖；commit 输入依赖仍在最终 `value_fanout` materialize 阶段处理。
+它只统计 compute node cluster 之间的 value 依赖；commit 输入依赖仍在最终 `value_fanout` materialize 阶段处理。
 
 当前优化目标以 `boundary_activation_edges` 为主，因为它同时覆盖：
 
@@ -149,22 +152,26 @@ coarsen 阶段是一个小流水线，每轮按固定顺序执行策略，直到
 
 1. `out1`
    - 当前 cluster 只有一个后继时，尝试合并到该后继。
-   - 候选按 producer -> consumer activation weight 降序处理。
+   - 候选要求 producer -> consumer activation weight 非零，并按该 weight 降序处理。
+   - 使用 DSU 批量合并候选，之后统一 canonicalize，并用 topo check 验证结果。
    - 适合吞掉线性 producer -> consumer 链。
 2. `in1`
    - 当前 cluster 只有一个前驱时，尝试合并到该前驱。
-   - 候选按 producer -> consumer activation weight 降序处理。
+   - 候选要求 producer -> consumer activation weight 非零，并按该 weight 降序处理。
+   - 同样使用 DSU 批量合并，最后统一做 topo check。
    - 适合吞掉线性 consumer tail。
 3. `boundary-gain`
    - 按 cluster pair 的 boundary activation edge weight 从高到低尝试合并。
    - 目标是优先消掉 activation 连接最紧的 supernode 边。
+   - 先尝试一轮 batch matching：同一 batch 内每个 cluster 最多参与一次 merge。
+   - 如果 batch merge 后无法得到合法 topo order，则退回到按候选逐个尝试，接受第一个 topo 合法的 merge。
 
-所有策略共享同一个硬约束：
+所有策略共享的合法性约束：
 
-- 合并后的 compute 侧调度原子数不能超过 `maxOpInComputeSupernode`。
 - 合并后必须能重新得到合法 topo order。
+- 当前代码没有对 coarsen 后 cluster 大小设置 `maxOpInComputeSupernode` 上限。
 
-后续新增策略应作为新的 pipeline stage 插入，而不是绕开统一约束。每个 stage 应只负责产生候选 merge；合法性仍由 size guard 和 topo check 兜底。
+后续新增策略应作为新的 pipeline stage 插入，而不是绕开统一约束。每个 stage 应只负责产生候选 merge；合法性仍由 topo check 兜底。如果需要把 `maxOpInComputeSupernode` 变成 coarsen 硬约束，应先修改 `materializeComputeNodeSchedule(...)` 里传给 `tryMergeNode*` 的 `coarsenMaxNodes`。
 
 ### Boundary-aware DP
 
@@ -172,7 +179,7 @@ coarsen 后，DP 只在 topo-ordered cluster 序列上做连续分段，不做�
 
 约束：
 
-- 单个 segment 的调度原子数不超过 `maxOpInComputeSupernode`。
+- 单个 segment 的 compute-node op 总数不超过 `maxOpInComputeSupernode`。
 - 如果单个 cluster 已经超过上限，保留为单独 segment。
 
 目标函数：
@@ -256,19 +263,17 @@ DP 只决定最终 computeSupernode 的连续分段边界。最终 `value_fanout
 
 此外，旧路径里还会把 `sink-only cluster` 标成 `fixedBoundary`，用于阻止旧的 `WorkingPartition` merge / DP 跨过 sink cluster；这部分逻辑同样不在当前主路径里生效。
 
-## replication 后置拆分
+## 历史：replication 后置拆分
 
-截至 `2026-04-12`，`activity-schedule` 在 replication 之后、最终 materialize 之前新增了一步 oversized symbol cluster 拆分：
+这段只记录旧实现背景；截至 `2026-05-23`，当前 `activity_schedule.cpp` 主路径不再包含 replication / `splitOversizedSymbolClusters(...)` 阶段。
+
+旧实现曾在 replication 之后、最终 materialize 之前增加 oversized symbol cluster 拆分：
 
 - 先基于 replication 之后的 graph 重新建立 topo
 - 对每个 symbol cluster 收集 live op symbol，并按 topo 顺序排序
 - 如果某个 cluster 的 live op 数超过 `max-op-in-compute-supernode`，就按连续 topo chunk 重新切开
 
-这样做的目的不是改变 DP 的 cost model，而是修复 replication 把单个 supernode 膨胀到远超上限、从而导致极端大 `sched_*.cpp` 的问题。
-
-这个修复对应的代码在 [activity_schedule.cpp](/workspace/gaoruihao-dev-gpu/wolvrix-playground/wolvrix/lib/transform/activity_schedule.cpp) 的 `splitOversizedSymbolClusters(...)`。
-
-这次调整对应的代码在 [activity_schedule.cpp](/workspace/gaoruihao-dev-gpu/wolvrix-playground/wolvrix/lib/transform/activity_schedule.cpp)。
+这样做的目的不是改变 DP 的 cost model，而是修复 replication 把单个 supernode 膨胀到远超上限、从而导致极端大 `sched_*.cpp` 的问题。当前主路径改为 `materializeComputeNodeSchedule(...)` 中的 compute-node coarsen / DP / optional oversize compute-node split。
 
 ## XiangShan 实测记录
 
