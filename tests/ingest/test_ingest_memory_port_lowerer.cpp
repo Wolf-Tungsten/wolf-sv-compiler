@@ -297,6 +297,152 @@ int testReadSeqSelfHold(const std::filesystem::path& sourcePath) {
     return 0;
 }
 
+int testReadElementBit(const std::filesystem::path& sourcePath) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    if (!buildMemoryPlan(sourcePath, "mem_read_element_bit", diagnostics, plan, lowering)) {
+        return fail("Failed to build element bit memory plan for " + sourcePath.string());
+    }
+
+    if (lowering.memoryReads.empty()) {
+        return fail("Expected memory read entries in element bit read");
+    }
+    bool sawElementReplacement = false;
+    for (const auto& entry : lowering.memoryReads) {
+        if (entry.replacement == wolvrix::lib::ingest::kInvalidPlanIndex ||
+            entry.replacement >= lowering.values.size()) {
+            return fail("Missing element read replacement expression");
+        }
+        if (entry.data != entry.replacement) {
+            sawElementReplacement = true;
+        }
+        const auto& replacement = lowering.values[entry.replacement];
+        if (replacement.kind != wolvrix::lib::ingest::ExprNodeKind::Operation ||
+            replacement.op != wolvrix::lib::grh::OperationKind::kSliceDynamic) {
+            return fail("Unexpected element read replacement node");
+        }
+        const auto& addrNode = lowering.values[entry.address];
+        if (addrNode.kind != wolvrix::lib::ingest::ExprNodeKind::Symbol ||
+            plan.symbolTable.text(addrNode.symbol) != std::string_view("addr")) {
+            return fail("Unexpected element bit read address symbol");
+        }
+    }
+    if (!sawElementReplacement) {
+        return fail("Expected bit selects to remain above the memory read expression");
+    }
+    if (diagnostics.hasError()) {
+        return fail("Unexpected Convert diagnostics errors in element bit read");
+    }
+    return 0;
+}
+
+int testReadCast(const std::filesystem::path& sourcePath) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    if (!buildMemoryPlan(sourcePath, "mem_read_cast", diagnostics, plan, lowering)) {
+        return fail("Failed to build cast memory plan for " + sourcePath.string());
+    }
+
+    if (lowering.memoryReads.size() != 1) {
+        return fail("Expected one cast-wrapped memory read");
+    }
+    const auto& entry = lowering.memoryReads.front();
+    if (entry.address == wolvrix::lib::ingest::kInvalidPlanIndex ||
+        entry.address >= lowering.values.size()) {
+        return fail("Missing cast read address");
+    }
+    const auto& addrNode = lowering.values[entry.address];
+    if (addrNode.kind != wolvrix::lib::ingest::ExprNodeKind::Symbol ||
+        plan.symbolTable.text(addrNode.symbol) != std::string_view("addr")) {
+        return fail("Unexpected cast read address symbol");
+    }
+    if (diagnostics.hasError()) {
+        return fail("Unexpected Convert diagnostics errors in cast read");
+    }
+    return 0;
+}
+
+int testPackedAggregateWholeReg(const std::filesystem::path& sourcePath) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    if (!buildMemoryPlan(sourcePath, "packed_aggregate_whole_reg", diagnostics, plan, lowering)) {
+        return fail("Failed to build packed aggregate whole-reg plan for " + sourcePath.string());
+    }
+
+    if (!lowering.memoryReads.empty() || !lowering.memoryWrites.empty() ||
+        !lowering.memoryFills.empty()) {
+        return fail("Expected whole packed aggregate registers to avoid memory ports");
+    }
+    if (diagnostics.hasError()) {
+        std::string errors;
+        for (const auto& message : diagnostics.messages()) {
+            if (message.kind == wolvrix::lib::ingest::ConvertDiagnosticKind::Error) {
+                if (!errors.empty()) {
+                    errors.append("; ");
+                }
+                errors.append(message.message);
+            }
+        }
+        return fail("Unexpected Convert diagnostics errors in packed aggregate whole-reg: " +
+                    errors);
+    }
+    return 0;
+}
+
+int testPackedAggregateIndexedMem(const std::filesystem::path& sourcePath) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    if (!buildMemoryPlan(sourcePath, "packed_aggregate_indexed_mem", diagnostics, plan,
+                         lowering)) {
+        return fail("Failed to build packed aggregate indexed-memory plan for " +
+                    sourcePath.string());
+    }
+
+    if (lowering.memoryReads.size() != 1) {
+        return fail("Expected one indexed read from packed aggregate memory");
+    }
+    if (lowering.memoryWrites.size() != 1) {
+        return fail("Expected one indexed write to packed aggregate memory");
+    }
+    if (diagnostics.hasError()) {
+        return fail("Unexpected Convert diagnostics errors in packed aggregate indexed-memory");
+    }
+    return 0;
+}
+
+int testPackedAggregatePriorityRowWrite(const std::filesystem::path& sourcePath) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    if (!buildMemoryPlan(sourcePath, "packed_aggregate_priority_row_write", diagnostics, plan,
+                         lowering)) {
+        return fail("Failed to build packed aggregate priority row-write plan for " +
+                    sourcePath.string());
+    }
+
+    if (lowering.memoryReads.size() != 1) {
+        return fail("Expected one indexed read from priority row-write memory");
+    }
+    if (lowering.memoryWrites.size() != 1) {
+        return fail("Expected priority writes to the same row to merge into one write port");
+    }
+    const auto& write = lowering.memoryWrites.front();
+    if (countOpInExpr(lowering, write.data, wolvrix::lib::grh::OperationKind::kMux) == 0) {
+        return fail("Expected merged priority row-write data to contain a mux");
+    }
+    if (countOpInExpr(lowering, write.updateCond, wolvrix::lib::grh::OperationKind::kLogicOr) == 0) {
+        return fail("Expected merged priority row-write update condition to contain an OR");
+    }
+    if (diagnostics.hasError()) {
+        return fail("Unexpected Convert diagnostics errors in packed aggregate priority row-write");
+    }
+    return 0;
+}
+
 int testWriteDynamicUp(const std::filesystem::path& sourcePath) {
     wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
     wolvrix::lib::ingest::ModulePlan plan;
@@ -762,6 +908,21 @@ int main() {
         return result;
     }
     if (int result = testReadSeqSelfHold(sourcePath); result != 0) {
+        return result;
+    }
+    if (int result = testReadElementBit(sourcePath); result != 0) {
+        return result;
+    }
+    if (int result = testReadCast(sourcePath); result != 0) {
+        return result;
+    }
+    if (int result = testPackedAggregateWholeReg(sourcePath); result != 0) {
+        return result;
+    }
+    if (int result = testPackedAggregateIndexedMem(sourcePath); result != 0) {
+        return result;
+    }
+    if (int result = testPackedAggregatePriorityRowWrite(sourcePath); result != 0) {
         return result;
     }
     if (int result = testMaskedWrite(sourcePath); result != 0) {

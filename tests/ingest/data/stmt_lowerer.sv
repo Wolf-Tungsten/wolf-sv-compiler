@@ -537,3 +537,18 @@ module stmt_lowerer_dpi_return(
         dpi_sum(a, b);
     end
 endmodule
+
+module stmt_lowerer_procedural_local(
+    input logic clk,
+    input logic [2:0] a,
+    input logic [2:0] b,
+    output logic [2:0] y
+);
+    always_ff @(posedge clk) begin
+        automatic logic [2:0] tmp;
+        automatic logic [2:0] next;
+        tmp = a ^ b;
+        next = tmp[1] ? {1'b0, tmp[1:0]} : {tmp[2], 1'b1, b[0]};
+        y <= next;
+    end
+endmodule

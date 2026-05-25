@@ -236,9 +236,123 @@ int testGraphAssemblyMemory(const std::filesystem::path& sourcePath) {
     return 0;
 }
 
+int testGraphAssemblyPackedAggregateReg(const std::filesystem::path& sourcePath) {
+    auto bundle = compileInput(sourcePath, "graph_assembly_packed_aggregate_reg");
+    if (!bundle || !bundle->compilation) {
+        return fail("Failed to compile " + sourcePath.string());
+    }
+
+    wolvrix::lib::ingest::ConvertDriver driver;
+    wolvrix::lib::grh::Design design = driver.convert(bundle->compilation->getRoot());
+    const wolvrix::lib::grh::Graph* graph =
+        design.findGraph("graph_assembly_packed_aggregate_reg");
+    if (!graph) {
+        return fail("Missing graph_assembly_packed_aggregate_reg graph");
+    }
+
+    int memoryOps = 0;
+    int r0Regs = 0;
+    int r1Regs = 0;
+    bool sawWideR0Read = false;
+    bool sawWideR1Read = false;
+    for (wolvrix::lib::grh::OperationId opId : graph->operations()) {
+        wolvrix::lib::grh::Operation op = graph->getOperation(opId);
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kMemory) {
+            ++memoryOps;
+            continue;
+        }
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kRegister) {
+            auto width = getAttrInt(op, "width");
+            if (!width) {
+                return fail("Packed aggregate register missing width attribute");
+            }
+            if (op.symbolText() == std::string_view("r0")) {
+                ++r0Regs;
+                if (*width != 32) {
+                    return fail("Packed aggregate r0 register width should be flattened to 32");
+                }
+            }
+            if (op.symbolText() == std::string_view("r1")) {
+                ++r1Regs;
+                if (*width != 32) {
+                    return fail("Packed aggregate r1 register width should be flattened to 32");
+                }
+            }
+            continue;
+        }
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterReadPort) {
+            auto regSymbol = getAttrString(op, "regSymbol");
+            if (!regSymbol || op.results().empty()) {
+                continue;
+            }
+            wolvrix::lib::grh::Value value = graph->getValue(op.results().front());
+            if (*regSymbol == "r0" && value.width() == 32) {
+                sawWideR0Read = true;
+            }
+            if (*regSymbol == "r1" && value.width() == 32) {
+                sawWideR1Read = true;
+            }
+        }
+    }
+
+    if (memoryOps != 0) {
+        return fail("Whole packed aggregate registers should not create kMemory ops");
+    }
+    if (r0Regs != 1 || r1Regs != 1 || !sawWideR0Read || !sawWideR1Read) {
+        return fail("Expected flattened packed aggregate register/read ports for r0/r1");
+    }
+    return 0;
+}
+
+int testGraphAssemblyMemoryReadCoalesce(const std::filesystem::path& sourcePath) {
+    auto bundle = compileInput(sourcePath, "graph_assembly_memory_read_coalesce");
+    if (!bundle || !bundle->compilation) {
+        return fail("Failed to compile " + sourcePath.string());
+    }
+
+    wolvrix::lib::ingest::ConvertDriver driver;
+    wolvrix::lib::grh::Design design = driver.convert(bundle->compilation->getRoot());
+    const wolvrix::lib::grh::Graph* graph =
+        design.findGraph("graph_assembly_memory_read_coalesce");
+    if (!graph) {
+        return fail("Missing graph_assembly_memory_read_coalesce graph");
+    }
+
+    int readOps = 0;
+    int sliceOps = 0;
+    for (wolvrix::lib::grh::OperationId opId : graph->operations()) {
+        wolvrix::lib::grh::Operation op = graph->getOperation(opId);
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kMemoryReadPort) {
+            ++readOps;
+            auto memSymbol = getAttrString(op, "memSymbol");
+            if (!memSymbol || *memSymbol != "mem") {
+                return fail("Coalesced kMemoryReadPort missing memSymbol");
+            }
+        }
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kSliceStatic ||
+            op.kind() == wolvrix::lib::grh::OperationKind::kSliceDynamic) {
+            ++sliceOps;
+        }
+    }
+
+    if (readOps != 1) {
+        return fail("Expected same-address memory reads to coalesce into one read port");
+    }
+    if (sliceOps < 2) {
+        return fail("Expected bit outputs to be emitted as slices from coalesced read");
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
     const std::filesystem::path sourcePath = WOLF_SV_INGEST_GRAPH_ASSEMBLY_MEMORY_DATA_PATH;
-    return testGraphAssemblyMemory(sourcePath);
+    if (int result = testGraphAssemblyMemory(sourcePath); result != 0) {
+        return result;
+    }
+    if (int result = testGraphAssemblyPackedAggregateReg(sourcePath); result != 0) {
+        return result;
+    }
+    return testGraphAssemblyMemoryReadCoalesce(sourcePath);
 }

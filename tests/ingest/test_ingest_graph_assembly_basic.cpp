@@ -190,9 +190,48 @@ int testGraphAssemblyBasic(const std::filesystem::path& sourcePath) {
     return 0;
 }
 
+int testGraphAssemblyProceduralLocal(const std::filesystem::path& sourcePath) {
+    auto bundle = compileInput(sourcePath, "graph_assembly_procedural_local");
+    if (!bundle || !bundle->compilation) {
+        return fail("Failed to compile " + sourcePath.string());
+    }
+
+    wolvrix::lib::ingest::ConvertDriver driver;
+    wolvrix::lib::grh::Design design = driver.convert(bundle->compilation->getRoot());
+
+    const wolvrix::lib::grh::Graph* graph =
+        design.findGraph("graph_assembly_procedural_local");
+    if (!graph) {
+        return fail("Missing graph_assembly_procedural_local graph");
+    }
+
+    if (!hasPort(graph->inputPorts(), "clk") ||
+        !hasPort(graph->inputPorts(), "a") ||
+        !hasPort(graph->inputPorts(), "b") ||
+        !hasPort(graph->inputPorts(), "en") ||
+        !hasPort(graph->outputPorts(), "y")) {
+        return fail("Missing expected procedural local ports");
+    }
+
+    int regWrites = 0;
+    for (wolvrix::lib::grh::OperationId opId : graph->operations()) {
+        wolvrix::lib::grh::Operation op = graph->getOperation(opId);
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort) {
+            ++regWrites;
+        }
+    }
+    if (regWrites != 1) {
+        return fail("Expected exactly one register write for procedural local case");
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
     const std::filesystem::path sourcePath = WOLF_SV_INGEST_GRAPH_ASSEMBLY_DATA_PATH;
-    return testGraphAssemblyBasic(sourcePath);
+    if (int status = testGraphAssemblyBasic(sourcePath); status != 0) {
+        return status;
+    }
+    return testGraphAssemblyProceduralLocal(sourcePath);
 }

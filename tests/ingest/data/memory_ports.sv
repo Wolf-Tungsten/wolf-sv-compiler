@@ -51,6 +51,72 @@ module mem_read_seq_self_hold(
     end
 endmodule
 
+module mem_read_element_bit(
+    input logic [3:0] addr,
+    input logic sel,
+    output logic [2:0] q
+);
+    logic [2:0] mem [0:15];
+    assign q = {~sel, sel ? mem[addr][1] : mem[addr][0], mem[addr][0]};
+endmodule
+
+module mem_read_cast(
+    input logic [3:0] addr,
+    input logic sel,
+    output logic [15:0] q
+);
+    logic [7:0] mem [0:15];
+    logic [1:0][7:0] packed_state;
+    assign q = sel ? 16'(mem[addr]) : packed_state;
+endmodule
+
+module packed_aggregate_whole_reg(
+    input logic clk,
+    input logic [3:0][7:0] in,
+    output logic [3:0][7:0] out
+);
+    logic [3:0][7:0] r0;
+    logic [3:0][7:0] r1;
+    always_ff @(posedge clk) begin
+        r0 <= in;
+        r1 <= r0;
+    end
+    assign out = r1;
+endmodule
+
+module packed_aggregate_indexed_mem(
+    input logic clk,
+    input logic [1:0] addr,
+    input logic [7:0] data,
+    output logic [7:0] out
+);
+    logic [3:0][7:0] mem;
+    always_ff @(posedge clk) begin
+        mem[addr] <= data;
+    end
+    assign out = mem[addr];
+endmodule
+
+module packed_aggregate_priority_row_write(
+    input logic clk,
+    input logic a,
+    input logic b,
+    input logic [7:0] d0,
+    input logic [7:0] d1,
+    output logic [7:0] out
+);
+    logic [3:0][7:0] mem;
+    always_ff @(posedge clk) begin
+        if (a) begin
+            mem[2'h1] <= d0;
+        end
+        else if (b) begin
+            mem[2'h1] <= d1;
+        end
+    end
+    assign out = mem[2'h1];
+endmodule
+
 module mem_write_mask(
     input logic clk,
     input logic [3:0] addr,

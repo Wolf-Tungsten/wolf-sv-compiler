@@ -383,6 +383,7 @@ struct MemoryReadPort {
     SignalId signal = kInvalidPlanIndex;
     ExprNodeId address = kInvalidPlanIndex;
     ExprNodeId data = kInvalidPlanIndex;
+    ExprNodeId replacement = kInvalidPlanIndex;
     bool isSync = false;
     ExprNodeId updateCond = kInvalidPlanIndex;
     std::vector<EventEdge> eventEdges;
@@ -398,6 +399,16 @@ struct MemoryWritePort {
     ExprNodeId mask = kInvalidPlanIndex;
     ExprNodeId updateCond = kInvalidPlanIndex;
     bool isMasked = false;
+    std::vector<EventEdge> eventEdges;
+    std::vector<ExprNodeId> eventOperands;
+    slang::SourceLocation location{};
+};
+
+struct MemoryFillPort {
+    PlanSymbolId memory;
+    SignalId signal = kInvalidPlanIndex;
+    ExprNodeId data = kInvalidPlanIndex;
+    ExprNodeId updateCond = kInvalidPlanIndex;
     std::vector<EventEdge> eventEdges;
     std::vector<ExprNodeId> eventOperands;
     slang::SourceLocation location{};
@@ -427,6 +438,7 @@ struct LoweringPlan {
     std::vector<DpiImportInfo> dpiImports;
     std::vector<MemoryReadPort> memoryReads;
     std::vector<MemoryWritePort> memoryWrites;
+    std::vector<MemoryFillPort> memoryFills;
     std::vector<MemoryInit> memoryInits;
     std::vector<RegisterInit> registerInits;
 };

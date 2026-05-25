@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "slang/analysis/AnalysisManager.h"
@@ -168,6 +169,30 @@ bool matchesFormatLiteral(std::string_view literal, std::string_view expected) {
         normalized = normalized.substr(2, normalized.size() - 4);
     }
     return normalized == expected;
+}
+
+bool exprTreeContainsSymbol(const wolvrix::lib::ingest::ModulePlan& plan,
+                            const wolvrix::lib::ingest::LoweringPlan& lowering,
+                            wolvrix::lib::ingest::ExprNodeId id,
+                            std::string_view symbolName,
+                            std::unordered_set<std::size_t>& visited) {
+    if (id == wolvrix::lib::ingest::kInvalidPlanIndex || id >= lowering.values.size()) {
+        return false;
+    }
+    if (!visited.insert(id).second) {
+        return false;
+    }
+    const auto& node = lowering.values[id];
+    if (node.kind == wolvrix::lib::ingest::ExprNodeKind::Symbol &&
+        node.symbol.valid() && plan.symbolTable.text(node.symbol) == symbolName) {
+        return true;
+    }
+    for (const auto operand : node.operands) {
+        if (exprTreeContainsSymbol(plan, lowering, operand, symbolName, visited)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 constexpr std::size_t kLargeLoopCount = 5000;
@@ -1412,6 +1437,37 @@ int testDpiReturnLowering(const std::filesystem::path& sourcePath) {
     return 0;
 }
 
+int testProceduralLocalLowering(const std::filesystem::path& sourcePath) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    if (!buildLoweringPlan(sourcePath, "stmt_lowerer_procedural_local", diagnostics,
+                           plan, lowering)) {
+        return fail("Failed to build lowering plan for " + sourcePath.string());
+    }
+
+    if (diagnostics.hasError()) {
+        return fail("Unexpected Convert diagnostics errors in " + sourcePath.string());
+    }
+    if (lowering.writes.size() != 1) {
+        return fail("Expected one module write intent for procedural local case in " +
+                    sourcePath.string());
+    }
+    if (!lowering.writes.front().target.valid() ||
+        plan.symbolTable.text(lowering.writes.front().target) != std::string_view("y")) {
+        return fail("Expected procedural local case to write only y in " +
+                    sourcePath.string());
+    }
+    std::unordered_set<std::size_t> visitedA;
+    std::unordered_set<std::size_t> visitedB;
+    if (!exprTreeContainsSymbol(plan, lowering, lowering.writes.front().value, "a", visitedA) ||
+        !exprTreeContainsSymbol(plan, lowering, lowering.writes.front().value, "b", visitedB)) {
+        return fail("Expected procedural local write value to depend on assigned locals in " +
+                    sourcePath.string());
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -1545,5 +1601,8 @@ int main() {
     if (int status = testDpiCallLowering(sourcePath); status != 0) {
         return status;
     }
-    return testDpiReturnLowering(sourcePath);
+    if (int status = testDpiReturnLowering(sourcePath); status != 0) {
+        return status;
+    }
+    return testProceduralLocalLowering(sourcePath);
 }

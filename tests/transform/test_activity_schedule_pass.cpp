@@ -375,21 +375,28 @@ int main()
         {
             return rc;
         }
-        if ((*schedule.opToSupernode)[readOp.index - 1] == kInvalidActivitySupernodeId)
-        {
-            return fail("Expected memory read to be scheduled as compute op");
-        }
         std::size_t memoryReadCount = 0;
+        std::size_t scheduledMemoryReadCount = 0;
         for (const auto opId : graph.operations())
         {
             if (graph.opKind(opId) == wolvrix::lib::grh::OperationKind::kMemoryReadPort)
             {
                 ++memoryReadCount;
+                if (opId.index > 0 &&
+                    opId.index - 1 < schedule.opToSupernode->size() &&
+                    (*schedule.opToSupernode)[opId.index - 1] != kInvalidActivitySupernodeId)
+                {
+                    ++scheduledMemoryReadCount;
+                }
             }
         }
-        if (memoryReadCount != 1)
+        if (memoryReadCount != 2)
         {
-            return fail("Expected memory read not to be cloned as source");
+            return fail("Expected memory read to be cloned as source");
+        }
+        if (scheduledMemoryReadCount == 0)
+        {
+            return fail("Expected a memory read clone to be scheduled as compute op");
         }
         if (schedule.summaryStats->find("\"memory_read_activation_edges\":0") == std::string::npos)
         {
@@ -452,23 +459,23 @@ int main()
             return rc;
         }
         const uint32_t sharedSupernode = (*schedule.opToSupernode)[sharedOp.index - 1];
-        if (sharedSupernode == (*schedule.opToSupernode)[andOp.index - 1] ||
-            sharedSupernode == (*schedule.opToSupernode)[xorOp.index - 1])
+        const uint32_t andSupernode = (*schedule.opToSupernode)[andOp.index - 1];
+        const uint32_t xorSupernode = (*schedule.opToSupernode)[xorOp.index - 1];
+        if (sharedSupernode != andSupernode)
         {
-            return fail("Expected shared expression to remain an independent compute node");
+            return fail("Expected shared expression to be owned by its earliest consumer");
         }
-        if (!hasFanoutTo(*schedule.valueFanout, shared, (*schedule.opToSupernode)[andOp.index - 1]) ||
-            !hasFanoutTo(*schedule.valueFanout, shared, (*schedule.opToSupernode)[xorOp.index - 1]))
+        if (!hasFanoutTo(*schedule.valueFanout, shared, xorSupernode))
         {
-            return fail("Expected shared expression fanout to both consumers");
+            return fail("Expected shared expression fanout to later consumer");
         }
-        if (schedule.summaryStats->find("\"other_compute_activation_edges\":2") == std::string::npos)
+        if (schedule.summaryStats->find("\"other_compute_activation_edges\":1") == std::string::npos)
         {
-            return fail("Expected common_expr case to report two compute propagation edges");
+            return fail("Expected common_expr case to report one remaining compute propagation edge");
         }
-        if (schedule.summaryStats->find("\"other_compute_multi_target_values\":1") == std::string::npos)
+        if (schedule.summaryStats->find("\"other_compute_multi_target_values\":0") == std::string::npos)
         {
-            return fail("Expected common_expr case to report one multi-target compute value");
+            return fail("Expected common_expr case to avoid multi-target compute value after ownership selection");
         }
     }
 
