@@ -5780,10 +5780,29 @@ private:
             const int64_t strideVal = strides[i];
             if (strideVal != 1)
             {
+                int32_t strideWidthHint = 0;
+                for (int64_t temp = strideVal; temp > 0; temp >>= 1)
+                {
+                    ++strideWidthHint;
+                }
+                if (strideWidthHint <= 0)
+                {
+                    strideWidthHint = 1;
+                }
+                int64_t mulWidthHint =
+                    static_cast<int64_t>(indexWidth) + strideWidthHint;
+                if (mulWidthHint > std::numeric_limits<int32_t>::max())
+                {
+                    mulWidthHint = std::numeric_limits<int32_t>::max();
+                }
+                const int32_t mulWidth = static_cast<int32_t>(mulWidthHint);
+                indexExpr = resizeValueToWidth(indexExpr, mulWidth, false, location);
                 ExprNodeId strideExpr =
                     addConstantLiteral(std::to_string(strideVal), location);
-                indexExpr = makeOperation(wolvrix::lib::grh::OperationKind::kMul,
-                                          {indexExpr, strideExpr}, location);
+                strideExpr = resizeValueToWidth(strideExpr, mulWidth, false, location);
+                indexExpr = makeOperationWithWidth(wolvrix::lib::grh::OperationKind::kMul,
+                                                   {indexExpr, strideExpr}, mulWidth,
+                                                   location);
             }
             if (address == kInvalidPlanIndex)
             {
@@ -5803,10 +5822,38 @@ private:
         bitIndex = address;
         if (elementWidth > 1)
         {
+            int32_t elementWidthHint = 0;
+            for (int64_t temp = elementWidth; temp > 0; temp >>= 1)
+            {
+                ++elementWidthHint;
+            }
+            if (elementWidthHint <= 0)
+            {
+                elementWidthHint = 1;
+            }
+            int32_t addressWidthHint = 0;
+            if (address < lowering.values.size())
+            {
+                addressWidthHint = lowering.values[address].widthHint;
+            }
+            if (addressWidthHint <= 0)
+            {
+                addressWidthHint = 32;
+            }
+            int64_t mulWidthHint =
+                static_cast<int64_t>(addressWidthHint) + elementWidthHint;
+            if (mulWidthHint > std::numeric_limits<int32_t>::max())
+            {
+                mulWidthHint = std::numeric_limits<int32_t>::max();
+            }
+            const int32_t mulWidth = static_cast<int32_t>(mulWidthHint);
+            bitIndex = resizeValueToWidth(address, mulWidth, false, location);
             ExprNodeId widthExpr =
                 addConstantLiteral(std::to_string(elementWidth), location);
-            bitIndex = makeOperation(wolvrix::lib::grh::OperationKind::kMul,
-                                     {address, widthExpr}, location);
+            widthExpr = resizeValueToWidth(widthExpr, mulWidth, false, location);
+            bitIndex = makeOperationWithWidth(wolvrix::lib::grh::OperationKind::kMul,
+                                              {bitIndex, widthExpr}, mulWidth,
+                                              location);
         }
         return true;
     }
@@ -6039,6 +6086,24 @@ private:
         node.operands = std::move(operands);
         node.location = location;
         node.tempSymbol = makeTempSymbol();
+        return addNode(nullptr, std::move(node));
+    }
+
+    ExprNodeId makeOperationWithWidth(wolvrix::lib::grh::OperationKind op,
+                                      std::vector<ExprNodeId> operands,
+                                      int32_t widthHint,
+                                      slang::SourceLocation location)
+    {
+        ExprNode node;
+        node.kind = ExprNodeKind::Operation;
+        node.op = op;
+        node.operands = std::move(operands);
+        node.location = location;
+        node.tempSymbol = makeTempSymbol();
+        if (widthHint > 0)
+        {
+            node.widthHint = widthHint;
+        }
         return addNode(nullptr, std::move(node));
     }
 
@@ -7127,13 +7192,18 @@ private:
                 widthNode.location = location;
                 widthNode.widthHint = constWidthHint;
                 ExprNodeId widthId = addNode(nullptr, std::move(widthNode));
+                const int32_t mulWidth = static_cast<int32_t>(mulWidthHint);
+                adjustedId = resizeValueToWidth(adjustedId, mulWidth, false,
+                                                location);
+                widthId = resizeValueToWidth(widthId, mulWidth, false,
+                                             location);
                 ExprNode mulNode;
                 mulNode.kind = ExprNodeKind::Operation;
                 mulNode.op = wolvrix::lib::grh::OperationKind::kMul;
                 mulNode.operands = {adjustedId, widthId};
                 mulNode.location = location;
                 mulNode.tempSymbol = makeTempSymbol();
-                mulNode.widthHint = static_cast<int32_t>(mulWidthHint);
+                mulNode.widthHint = mulWidth;
                 adjustedId = addNode(nullptr, std::move(mulNode));
             }
             // Clamp packed-array bit indices to the addressing width of the bitstream.
@@ -7915,6 +7985,37 @@ private:
             {
                 reportUnsupported(expr, "Unsupported binary operator");
                 return kInvalidPlanIndex;
+            }
+            const bool isShift =
+                (*opKind == wolvrix::lib::grh::OperationKind::kShl ||
+                 *opKind == wolvrix::lib::grh::OperationKind::kLShr ||
+                 *opKind == wolvrix::lib::grh::OperationKind::kAShr);
+            if (isShift)
+            {
+                ExprNodeId lhs = kInvalidPlanIndex;
+                ExprNodeId rhs = kInvalidPlanIndex;
+                {
+                    WidthContextScope widthScope(*this, 0);
+                    lhs = lowerExpression(binary->left());
+                    rhs = lowerExpression(binary->right());
+                }
+                if (lhs == kInvalidPlanIndex || rhs == kInvalidPlanIndex)
+                {
+                    return kInvalidPlanIndex;
+                }
+                node.kind = ExprNodeKind::Operation;
+                node.op = *opKind;
+                node.operands = {lhs, rhs};
+                applyExprWidthHint(node);
+                node.tempSymbol = makeTempSymbol();
+                ExprNodeId shifted = addNodeForExpr(std::move(node));
+                if (widthContext > 0 && shifted != kInvalidPlanIndex)
+                {
+                    const bool signExtend = expr.type ? expr.type->isSigned() : false;
+                    return resizeValueToWidth(shifted, widthContext, signExtend,
+                                              expr.sourceRange.start());
+                }
+                return shifted;
             }
             ExprNodeId lhs = lowerExpression(binary->left());
             ExprNodeId rhs = lowerExpression(binary->right());
@@ -12534,6 +12635,22 @@ std::optional<int64_t> evalConstInt(const ModulePlan& plan, const LoweringPlan& 
         {
             return std::nullopt;
         }
+        auto widenBinaryOperands = [&]() {
+            if (node.widthHint <= 0)
+            {
+                return;
+            }
+            const slang::bitwidth_t width =
+                static_cast<slang::bitwidth_t>(node.widthHint);
+            if (lhs->getBitWidth() < width)
+            {
+                *lhs = lhs->resize(width);
+            }
+            if (rhs->getBitWidth() < width)
+            {
+                *rhs = rhs->resize(width);
+            }
+        };
         auto applyWidthHint = [&](slang::SVInt value) -> slang::SVInt {
             if (node.widthHint > 0 &&
                 static_cast<uint64_t>(node.widthHint) != value.getBitWidth())
@@ -12545,22 +12662,31 @@ std::optional<int64_t> evalConstInt(const ModulePlan& plan, const LoweringPlan& 
         switch (node.op)
         {
         case wolvrix::lib::grh::OperationKind::kAdd:
+            widenBinaryOperands();
             return applyWidthHint(*lhs + *rhs);
         case wolvrix::lib::grh::OperationKind::kSub:
+            widenBinaryOperands();
             return applyWidthHint(*lhs - *rhs);
         case wolvrix::lib::grh::OperationKind::kMul:
+            widenBinaryOperands();
             return applyWidthHint(*lhs * *rhs);
         case wolvrix::lib::grh::OperationKind::kDiv:
+            widenBinaryOperands();
             return applyWidthHint(*lhs / *rhs);
         case wolvrix::lib::grh::OperationKind::kMod:
+            widenBinaryOperands();
             return applyWidthHint(*lhs % *rhs);
         case wolvrix::lib::grh::OperationKind::kAnd:
+            widenBinaryOperands();
             return applyWidthHint(*lhs & *rhs);
         case wolvrix::lib::grh::OperationKind::kOr:
+            widenBinaryOperands();
             return applyWidthHint(*lhs | *rhs);
         case wolvrix::lib::grh::OperationKind::kXor:
+            widenBinaryOperands();
             return applyWidthHint(*lhs ^ *rhs);
         case wolvrix::lib::grh::OperationKind::kXnor:
+            widenBinaryOperands();
             return applyWidthHint(lhs->xnor(*rhs));
         case wolvrix::lib::grh::OperationKind::kShl:
             return applyWidthHint(lhs->shl(*rhs));
@@ -17587,12 +17713,17 @@ private:
                 widthNode.location = location;
                 widthNode.widthHint = constWidthHint;
                 ExprNodeId widthId = addSyntheticNode(std::move(widthNode));
+                const int32_t mulWidth = static_cast<int32_t>(mulWidthHint);
+                adjustedId = resizeValueToWidth(adjustedId, mulWidth, false,
+                                                location);
+                widthId = resizeValueToWidth(widthId, mulWidth, false,
+                                             location);
                 ExprNode mulNode;
                 mulNode.kind = ExprNodeKind::Operation;
                 mulNode.op = wolvrix::lib::grh::OperationKind::kMul;
                 mulNode.operands = {adjustedId, widthId};
                 mulNode.location = location;
-                mulNode.widthHint = static_cast<int32_t>(mulWidthHint);
+                mulNode.widthHint = mulWidth;
                 adjustedId = addSyntheticNode(std::move(mulNode));
             }
             uint64_t bitstreamWidth = canonical.getBitstreamWidth();
@@ -18096,6 +18227,96 @@ private:
             state_.lowering_.values.push_back(std::move(node));
             state_.registerExprNode();
             return id;
+        }
+
+        ExprNodeId makeSliceDynamic(ExprNodeId value, ExprNodeId index, int32_t width,
+                                    slang::SourceLocation location)
+        {
+            if (value == kInvalidPlanIndex || index == kInvalidPlanIndex)
+            {
+                return kInvalidPlanIndex;
+            }
+            ExprNode node;
+            node.kind = ExprNodeKind::Operation;
+            node.op = wolvrix::lib::grh::OperationKind::kSliceDynamic;
+            node.operands = {value, index};
+            node.location = location;
+            node.widthHint = width > 0 ? width : 1;
+            return addSyntheticNode(std::move(node));
+        }
+
+        ExprNodeId resizeValueToWidth(ExprNodeId value, int32_t targetWidth,
+                                      bool signExtend, slang::SourceLocation location)
+        {
+            if (value == kInvalidPlanIndex || targetWidth <= 0)
+            {
+                return value;
+            }
+            int32_t sourceWidth = 0;
+            if (value < state_.lowering_.values.size())
+            {
+                sourceWidth = state_.lowering_.values[value].widthHint;
+            }
+            if (sourceWidth <= 0 || sourceWidth == targetWidth)
+            {
+                return value;
+            }
+            if (targetWidth < sourceWidth)
+            {
+                ExprNode zeroNode;
+                zeroNode.kind = ExprNodeKind::Constant;
+                zeroNode.literal = "0";
+                zeroNode.location = location;
+                zeroNode.widthHint = targetWidth;
+                ExprNodeId zeroId = addSyntheticNode(std::move(zeroNode));
+                return makeSliceDynamic(value, zeroId, targetWidth, location);
+            }
+
+            const int32_t padWidth = targetWidth - sourceWidth;
+            ExprNodeId pad = kInvalidPlanIndex;
+            if (signExtend)
+            {
+                ExprNode signIndexNode;
+                signIndexNode.kind = ExprNodeKind::Constant;
+                signIndexNode.literal = std::to_string(sourceWidth - 1);
+                signIndexNode.location = location;
+                signIndexNode.widthHint = targetWidth;
+                ExprNodeId signIndex = addSyntheticNode(std::move(signIndexNode));
+                ExprNodeId signBit = makeSliceDynamic(value, signIndex, 1, location);
+                ExprNode countNode;
+                countNode.kind = ExprNodeKind::Constant;
+                countNode.literal = std::to_string(padWidth);
+                countNode.location = location;
+                countNode.widthHint = 32;
+                ExprNodeId countId = addSyntheticNode(std::move(countNode));
+                ExprNode repNode;
+                repNode.kind = ExprNodeKind::Operation;
+                repNode.op = wolvrix::lib::grh::OperationKind::kReplicate;
+                repNode.operands = {countId, signBit};
+                repNode.location = location;
+                repNode.widthHint = padWidth;
+                pad = addSyntheticNode(std::move(repNode));
+            }
+            else
+            {
+                ExprNode padNode;
+                padNode.kind = ExprNodeKind::Constant;
+                padNode.literal = std::to_string(padWidth) + "'b0";
+                padNode.location = location;
+                padNode.widthHint = padWidth;
+                pad = addSyntheticNode(std::move(padNode));
+            }
+            if (pad == kInvalidPlanIndex)
+            {
+                return value;
+            }
+            ExprNode concatNode;
+            concatNode.kind = ExprNodeKind::Operation;
+            concatNode.op = wolvrix::lib::grh::OperationKind::kConcat;
+            concatNode.operands = {pad, value};
+            concatNode.location = location;
+            concatNode.widthHint = targetWidth;
+            return addSyntheticNode(std::move(concatNode));
         }
 
         void reportUnsupported(const slang::ast::Expression& expr, std::string_view message)

@@ -23,6 +23,18 @@ struct CompilationBundle {
     std::unique_ptr<slang::ast::Compilation> compilation;
 };
 
+std::optional<int64_t> intAttr(const wolvrix::lib::grh::Operation& op,
+                               std::string_view key) {
+    auto attr = op.attr(key);
+    if (!attr) {
+        return std::nullopt;
+    }
+    if (const auto* value = std::get_if<int64_t>(&*attr)) {
+        return *value;
+    }
+    return std::nullopt;
+}
+
 std::unique_ptr<CompilationBundle> compileInput(const std::filesystem::path& sourcePath,
                                                 std::string_view topModule) {
     auto bundle = std::make_unique<CompilationBundle>();
@@ -85,6 +97,8 @@ int testGraphAssemblySlice(const std::filesystem::path& sourcePath) {
     bool hasConcat = false;
     bool hasSlice = false;
     bool hasConst = false;
+    bool hasPackedLane9Slice = false;
+    bool hasSixBitShiftOffset = false;
 
     for (wolvrix::lib::grh::OperationId opId : graph->operations()) {
         wolvrix::lib::grh::Operation op = graph->getOperation(opId);
@@ -92,8 +106,32 @@ int testGraphAssemblySlice(const std::filesystem::path& sourcePath) {
         case wolvrix::lib::grh::OperationKind::kConcat:
             hasConcat = true;
             break;
+        case wolvrix::lib::grh::OperationKind::kLShr:
+            if (op.operands().size() == 2) {
+                const wolvrix::lib::grh::Value shiftAmount =
+                    graph->getValue(op.operands()[1]);
+                const wolvrix::lib::grh::OperationId def = shiftAmount.definingOp();
+                if (def.valid()) {
+                    const wolvrix::lib::grh::Operation subOp = graph->getOperation(def);
+                    if (subOp.kind() == wolvrix::lib::grh::OperationKind::kSub &&
+                        shiftAmount.width() == 6) {
+                        hasSixBitShiftOffset = true;
+                    }
+                }
+            }
+            break;
         case wolvrix::lib::grh::OperationKind::kSliceStatic:
             hasSlice = true;
+            if (op.operands().size() == 1) {
+                const wolvrix::lib::grh::Value operand = graph->getValue(op.operands()[0]);
+                const auto sliceStart = intAttr(op, "sliceStart");
+                const auto sliceEnd = intAttr(op, "sliceEnd");
+                if (operand.symbolText() == "packed_data" &&
+                    sliceStart && sliceEnd &&
+                    *sliceStart == 72 && *sliceEnd == 79) {
+                    hasPackedLane9Slice = true;
+                }
+            }
             break;
         case wolvrix::lib::grh::OperationKind::kConstant:
             hasConst = true;
@@ -111,6 +149,12 @@ int testGraphAssemblySlice(const std::filesystem::path& sourcePath) {
     }
     if (!hasConst) {
         return fail("Missing kConstant op in graph");
+    }
+    if (!hasPackedLane9Slice) {
+        return fail("Missing packed_data[9] kSliceStatic [72:79]");
+    }
+    if (!hasSixBitShiftOffset) {
+        return fail("Missing 6-bit shift offset for first_rot >> (6'hB - start)");
     }
     return 0;
 }

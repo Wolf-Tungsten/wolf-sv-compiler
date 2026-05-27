@@ -15125,6 +15125,15 @@ inline std::array<std::uint64_t, N> grhsim_ashr_words(const std::array<std::uint
             *stream << "    return static_cast<std::uint8_t>(__builtin_popcount(static_cast<unsigned>(value)));\n";
             *stream << "}\n\n";
             *stream << "template <typename ActiveFlags>\n";
+            *stream << "inline bool grhsim_any_active_flags(const ActiveFlags &activeFlags)\n{\n";
+            *stream << "    for (const auto word : activeFlags) {\n";
+            *stream << "        if (word != UINT8_C(0)) {\n";
+            *stream << "            return true;\n";
+            *stream << "        }\n";
+            *stream << "    }\n";
+            *stream << "    return false;\n";
+            *stream << "}\n\n";
+            *stream << "template <typename ActiveFlags>\n";
             *stream << "inline std::size_t grhsim_count_active_supernodes(const ActiveFlags &activeFlags)\n{\n";
             *stream << "    std::size_t total = 0;\n";
             *stream << "    for (const auto word : activeFlags) {\n";
@@ -18707,7 +18716,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "                    std::chrono::steady_clock::now() - commit_begin_time)\n";
                 *stream << "                    .count());\n";
                 *stream << "        }\n";
-                *stream << "        pending_eval_round = commit_activated_readers_;\n";
+                *stream << "        pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);\n";
                 if (!model.allEventValues.empty())
                 {
                     *stream << "        // Event edges are per-fixed-point-round signals, so clear them before the next round.\n";
@@ -18729,7 +18738,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "            total_executed_batches += round_executed_batches;\n";
                 *stream << "            total_touched_state_shadows += round_touched_state_shadows;\n";
                 *stream << "            total_touched_writes += round_touched_writes;\n";
-                *stream << "            total_commit_activated_rounds += pending_eval_round ? 1u : 0u;\n";
+                *stream << "            total_commit_activated_rounds += commit_activated_readers_ ? 1u : 0u;\n";
                 *stream << "            total_batch_us += round_batch_us;\n";
                 *stream << "            total_commit_us += round_commit_us;\n";
                 *stream << "            total_event_clear_us += round_event_clear_us;\n";
@@ -18755,7 +18764,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "                         round_executed_batches,\n";
                 *stream << "                         round_touched_state_shadows,\n";
                 *stream << "                         round_touched_writes,\n";
-                *stream << "                         pending_eval_round ? 1 : 0,\n";
+                *stream << "                         commit_activated_readers_ ? 1 : 0,\n";
                 *stream << "                         static_cast<unsigned long long>(round_batch_us),\n";
                 *stream << "                         static_cast<unsigned long long>(round_commit_us),\n";
                 *stream << "                         static_cast<unsigned long long>(round_event_clear_us),\n";
@@ -18798,7 +18807,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "        commit_activated_readers_ = false;\n";
                 *stream << "        // Then commit sink supernodes in direct schedule order.\n";
                 emitDirectPhaseDispatch(commitScheduleBatches, "commit", "commitBatchExecCount", false);
-                *stream << "        pending_eval_round = commit_activated_readers_;\n";
+                *stream << "        pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);\n";
                 if (!model.allEventValues.empty())
                 {
                     *stream << "        // Event edges are per-fixed-point-round signals, so clear them before the next round.\n";
