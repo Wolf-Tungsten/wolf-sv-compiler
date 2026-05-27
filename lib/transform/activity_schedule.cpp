@@ -5093,51 +5093,131 @@ namespace wolvrix::lib::transform
                 return true;
             }
 
-            std::map<std::pair<uint32_t, uint32_t>, std::vector<wolvrix::lib::grh::ValueId>> edgeValues;
-            std::vector<uint32_t> topoPosByNode(rewrite.computeNodes.size(), 0);
-            std::size_t opCountTotal = 0;
-            std::size_t maxNodeWeight = 0;
-            for (uint32_t topoPos = 0; topoPos < rewrite.computeTopoOrder.size(); ++topoPos)
+            using wolvrix::lib::grh::OperationId;
+            using wolvrix::lib::grh::OperationIdHash;
+            using wolvrix::lib::grh::ValueId;
+
+            std::vector<OperationId> ops;
+            std::unordered_set<OperationId, OperationIdHash> seenOps;
+            for (const uint32_t computeNodeId : rewrite.computeTopoOrder)
             {
-                const uint32_t nodeId = rewrite.computeTopoOrder[topoPos];
-                if (nodeId < topoPosByNode.size())
+                if (computeNodeId >= rewrite.computeNodes.size())
                 {
-                    topoPosByNode[nodeId] = topoPos;
+                    continue;
+                }
+                for (const OperationId opId : rewrite.computeNodes[computeNodeId].ops)
+                {
+                    if (opId.valid() && seenOps.insert(opId).second)
+                    {
+                        ops.push_back(opId);
+                    }
                 }
             }
-            for (uint32_t dstNode = 0; dstNode < rewrite.computeNodes.size(); ++dstNode)
+
+            std::size_t maxOpIndex = 0;
+            for (const OperationId opId : ops)
             {
-                for (const auto boundary : rewrite.computeNodes[dstNode].boundaryInputs)
+                maxOpIndex = std::max<std::size_t>(maxOpIndex, opId.index);
+            }
+            std::vector<uint32_t> nodeOfOp(maxOpIndex + 1, kInvalidActivitySupernodeId);
+            for (uint32_t nodeId = 0; nodeId < ops.size(); ++nodeId)
+            {
+                if (ops[nodeId].index < nodeOfOp.size())
                 {
-                    const auto defOp = graph.valueDef(boundary);
-                    if (!defOp.valid() || defOp.index >= rewrite.computeNodeOfOp.size())
+                    nodeOfOp[ops[nodeId].index] = nodeId;
+                }
+            }
+
+            std::map<std::pair<uint32_t, uint32_t>, std::vector<ValueId>> edgeValues;
+            for (uint32_t dstNode = 0; dstNode < ops.size(); ++dstNode)
+            {
+                const OperationId dstOp = ops[dstNode];
+                for (const ValueId operand : graph.opOperands(dstOp))
+                {
+                    const OperationId srcOp = graph.valueDef(operand);
+                    if (!srcOp.valid() || srcOp.index >= nodeOfOp.size())
                     {
                         continue;
                     }
-                    const uint32_t srcNode = rewrite.computeNodeOfOp[defOp.index];
-                    if (srcNode == kInvalidActivitySupernodeId || srcNode == dstNode ||
-                        srcNode >= rewrite.computeNodes.size())
+                    const uint32_t srcNode = nodeOfOp[srcOp.index];
+                    if (srcNode == kInvalidActivitySupernodeId || srcNode == dstNode)
                     {
                         continue;
                     }
                     auto &values = edgeValues[{srcNode, dstNode}];
-                    if (std::find(values.begin(), values.end(), boundary) == values.end())
+                    if (std::find(values.begin(), values.end(), operand) == values.end())
                     {
-                        values.push_back(boundary);
+                        values.push_back(operand);
                     }
                 }
             }
+
+            std::vector<std::vector<uint32_t>> opDag(ops.size());
+            for (const auto &[pair, values] : edgeValues)
+            {
+                (void)values;
+                if (pair.first < opDag.size() && pair.second < opDag.size())
+                {
+                    opDag[pair.first].push_back(pair.second);
+                }
+            }
+            for (auto &succs : opDag)
+            {
+                std::sort(succs.begin(), succs.end());
+                succs.erase(std::unique(succs.begin(), succs.end()), succs.end());
+            }
+            std::vector<uint32_t> opTopoOrder;
+            try
+            {
+                opTopoOrder = topoOrderForDag(opDag);
+            }
+            catch (const std::exception &ex)
+            {
+                error = std::string("activity-schedule op-level compute DAG topo failed: ") + ex.what();
+                return false;
+            }
+            if (opTopoOrder.size() != ops.size())
+            {
+                error = "activity-schedule op-level compute DAG topo failed: missing ops";
+                return false;
+            }
+            std::vector<uint32_t> oldToNew(ops.size(), kInvalidActivitySupernodeId);
+            for (uint32_t newNode = 0; newNode < opTopoOrder.size(); ++newNode)
+            {
+                oldToNew[opTopoOrder[newNode]] = newNode;
+            }
+            std::map<std::pair<uint32_t, uint32_t>, std::vector<ValueId>> topoEdgeValues;
+            for (const auto &[pair, values] : edgeValues)
+            {
+                const uint32_t src = pair.first < oldToNew.size() ? oldToNew[pair.first]
+                                                                  : kInvalidActivitySupernodeId;
+                const uint32_t dst = pair.second < oldToNew.size() ? oldToNew[pair.second]
+                                                                   : kInvalidActivitySupernodeId;
+                if (src == kInvalidActivitySupernodeId || dst == kInvalidActivitySupernodeId)
+                {
+                    continue;
+                }
+                topoEdgeValues[{src, dst}] = values;
+            }
+            edgeValues = std::move(topoEdgeValues);
+
+            const auto valueBitWidth = [](int32_t width) -> std::size_t {
+                return width > 0 ? static_cast<std::size_t>(width) : std::size_t{1};
+            };
+            const auto edgeWeightForValues = [&](const std::vector<ValueId> &values) -> std::size_t {
+                std::size_t bits = 0;
+                for (const ValueId value : values)
+                {
+                    bits += valueBitWidth(graph.getValue(value).width());
+                }
+                return std::max<std::size_t>(std::size_t{1}, (bits + 63) / 64);
+            };
+
             std::size_t edgeWeightTotal = 0;
             for (const auto &[pair, values] : edgeValues)
             {
                 (void)pair;
-                edgeWeightTotal += values.size();
-            }
-            for (const auto &node : rewrite.computeNodes)
-            {
-                const std::size_t weight = std::max<std::size_t>(std::size_t{1}, node.ops.size());
-                opCountTotal += node.ops.size();
-                maxNodeWeight = std::max(maxNodeWeight, weight);
+                edgeWeightTotal += edgeWeightForValues(values);
             }
 
             std::ostringstream out;
@@ -5146,36 +5226,23 @@ namespace wolvrix::lib::transform
             out << "  \"graph_id\":\"" << escapeJsonString(std::string(graph.symbol()) + ".activity_compute") << "\",\n";
             out << "  \"source\":{\"pass\":\"activity-schedule\",\"path\":\""
                 << escapeJsonString(options.path) << "\"},\n";
-            out << "  \"options\":{\"edge_weight\":\"boundary_activation_edges\",\"node_weight\":\"op_count\"},\n";
-            out << "  \"stats\":{\"nodes\":" << rewrite.computeNodes.size()
+            out << "  \"options\":{\"node_granularity\":\"op\",\"edge_weight\":\"value_bitwidth_words\"},\n";
+            out << "  \"stats\":{\"nodes\":" << ops.size()
                 << ",\"edges\":" << edgeValues.size()
-                << ",\"node_weight_total\":" << opCountTotal
-                << ",\"max_node_weight\":" << maxNodeWeight
                 << ",\"edge_weight_total\":" << edgeWeightTotal << "},\n";
             out << "  \"nodes\":[\n";
-            for (uint32_t nodeId = 0; nodeId < rewrite.computeNodes.size(); ++nodeId)
+            for (uint32_t nodeId = 0; nodeId < ops.size(); ++nodeId)
             {
-                const auto &node = rewrite.computeNodes[nodeId];
-                std::string kind = "compute_node";
-                std::string symbol;
-                std::uint64_t opId = nodeId;
-                if (!node.ops.empty())
-                {
-                    const auto op = graph.getOperation(node.ops.front());
-                    kind = std::string(wolvrix::lib::grh::toString(op.kind()));
-                    symbol = std::string(op.symbolText());
-                    opId = node.ops.front().index;
-                }
+                const OperationId opId = ops[opTopoOrder[nodeId]];
+                const auto op = graph.getOperation(opId);
                 out << "    {\"id\":" << nodeId
-                    << ",\"op_id\":" << opId
-                    << ",\"kind\":\"" << escapeJsonString(kind)
-                    << "\",\"symbol\":\"" << escapeJsonString(symbol)
-                    << "\",\"weight\":" << std::max<std::size_t>(std::size_t{1}, node.ops.size())
-                    << ",\"topo_pos\":" << topoPosByNode[nodeId]
-                    << ",\"attrs\":{\"compute_node_id\":" << nodeId
-                    << ",\"op_count\":" << node.ops.size()
+                    << ",\"op_id\":" << opId.index
+                    << ",\"kind\":\"" << escapeJsonString(std::string(wolvrix::lib::grh::toString(op.kind())))
+                    << "\",\"symbol\":\"" << escapeJsonString(std::string(op.symbolText()))
+                    << "\",\"topo_pos\":" << nodeId
+                    << ",\"attrs\":{\"granularity\":\"op\""
                     << "}}";
-                if (nodeId + 1 != rewrite.computeNodes.size())
+                if (nodeId + 1 != ops.size())
                 {
                     out << ",";
                 }
@@ -5186,9 +5253,10 @@ namespace wolvrix::lib::transform
             std::size_t edgeIndex = 0;
             for (const auto &[pair, values] : edgeValues)
             {
+                const std::size_t edgeWeight = edgeWeightForValues(values);
                 out << "    {\"src\":" << pair.first
                     << ",\"dst\":" << pair.second
-                    << ",\"weight\":" << values.size()
+                    << ",\"weight\":" << edgeWeight
                     << ",\"values\":[";
                 for (std::size_t i = 0; i < values.size(); ++i)
                 {
@@ -5196,7 +5264,10 @@ namespace wolvrix::lib::transform
                     {
                         out << ",";
                     }
-                    out << values[i].index;
+                    const auto valueInfo = graph.getValue(values[i]);
+                    const std::size_t width = valueBitWidth(valueInfo.width());
+                    out << "{\"id\":" << values[i].index
+                        << ",\"width\":" << width << "}";
                 }
                 out << "]}";
                 if (++edgeIndex != edgeValues.size())

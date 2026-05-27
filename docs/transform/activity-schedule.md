@@ -36,18 +36,22 @@
 | `-path` | 无 | 目标 graph / 实例路径，必填 |
 | `-max-op-in-compute-supernode` | `128` | 连续 DP 分段时的目标 op 数上限；它不是 coarsen merge 上限，也不是最终 `supernode_to_ops[i].size()` 的硬上限 |
 | `-max-op-in-commit-supernode` | `4096` | 单个 `commitSupernode` 最多包含的 sink op 数 |
-| `-export-compute-dag` | 无 | 将 compute-node DAG 导出为 `topo-graph-partition-harness` 使用的 `wolvrix.compute-op-dag.v1` JSON |
+| `-export-compute-dag` | 无 | 将 compute op DAG 导出为 `topo-graph-partition-harness` 使用的 `wolvrix.compute-op-dag.v1` JSON |
 
 ### Compute DAG 导出
 
-`-export-compute-dag=<path>` 在 `buildComputeNodeRewrite(...)` 之后、最终 supernode materialize 之前导出 compute 侧 DAG。
+`-export-compute-dag=<path>` 在 `buildComputeNodeRewrite(...)` 之后、最终 supernode materialize 之前导出 compute 侧 DAG。导出文件是 harness 的输入协议，不暴露内部 compute-node/node-weight 模型。
 
 导出语义：
 
 - JSON `format` 固定为 `wolvrix.compute-op-dag.v1`
-- node 对应 activity-schedule compute node，`weight` 为该 compute node 内 op 数
-- edge 对应 compute node 之间的 boundary input value，`weight` 为 distinct boundary value 数
-- `topo_pos` 来自 compute-node DAG topo order
+- `options.node_granularity` 固定为 `op`
+- node 对应一个 compute op；顶点不带容量权重，禁止输出 `nodes[].weight`
+- `op_id` 记录原始 GRH operation id，`topo_pos` 是导出时重新排序后的 op-level topo 位置
+- edge 对应从 `src` op 结果 value 到 `dst` op operand 的依赖
+- `options.edge_weight` 固定为 `value_bitwidth_words`
+- `edges[].values[]` 记录该 op pair 上的 distinct value，每个 value 只带 `id` 和 `width`
+- value 不带独立权重；`edges[].weight = ceil(sum(edges[].values[].width) / 64)`，最小为 1
 - 不导出 commit node / sink op
 
 该文件可由仓库根目录下 `topo-graph-partition-harness` 的 `tgp_validate_graph` 验证。
