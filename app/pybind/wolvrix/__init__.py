@@ -598,10 +598,18 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
 
     string_options = [
         ("path", "-path"),
+        ("export_compute_dag", "-export-compute-dag"),
     ]
     size_options = [
         ("max_op_in_compute_supernode", "-max-op-in-compute-supernode"),
+        ("max_op_in_compute_node", "-max-op-in-compute-node"),
         ("max_op_in_commit_supernode", "-max-op-in-commit-supernode"),
+        ("split_oversize_compute_node_max_ops", "-split-oversize-compute-node-max-ops"),
+    ]
+    bool_options = [
+        ("enable_coarsen", "-enable-coarsen"),
+        ("enable_chain_merge", "-enable-chain-merge"),
+        ("split_oversize_compute_nodes", "-split-oversize-compute-nodes"),
     ]
 
     for key, arg in string_options:
@@ -614,6 +622,10 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
             if not isinstance(value, int) or value < 0:
                 raise ValueError(f"activity-schedule {key} must be a non-negative integer")
             out.extend([arg, str(value)])
+    for key, arg in bool_options:
+        value = _pop_named(local, key, None)
+        if value is not None:
+            out.extend([arg, "true" if value else "false"])
 
     _ensure_no_extra_named("activity-schedule", local)
     return out

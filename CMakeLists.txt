@@ -566,6 +566,11 @@ target_link_libraries(transform-activity-schedule
         wolvrix-lib
 )
 
+target_compile_definitions(transform-activity-schedule
+    PRIVATE
+        WOLF_SV_TEST_ARTIFACT_DIR="${WOLF_SV_TEST_ARTIFACT_DIR}"
+)
+
 register_test_exe(transform-activity-schedule)
 
 add_executable(transform-xmr-resolve-inout
@@ -866,6 +871,20 @@ target_compile_definitions(ingest-graph-assembly-slice
         WOLF_SV_INGEST_GRAPH_ASSEMBLY_SLICE_DATA_PATH="${WOLF_SV_INGEST_TEST_DATA_DIR}/graph_assembly_slice.sv"
 )
 register_test_exe(ingest-graph-assembly-slice)
+
+# ingest: graph assembly aggregate port slice
+add_executable(ingest-graph-assembly-aggregate-port-slice
+    tests/ingest/test_ingest_graph_assembly_aggregate_port_slice.cpp
+)
+target_link_libraries(ingest-graph-assembly-aggregate-port-slice
+    PRIVATE
+        wolvrix-lib
+)
+target_compile_definitions(ingest-graph-assembly-aggregate-port-slice
+    PRIVATE
+        WOLF_SV_INGEST_GRAPH_ASSEMBLY_AGGREGATE_PORT_SLICE_DATA_PATH="${WOLF_SV_INGEST_TEST_DATA_DIR}/graph_assembly_aggregate_port_slice.sv"
+)
+register_test_exe(ingest-graph-assembly-aggregate-port-slice)
 
 # ingest: graph assembly dpi/display
 add_executable(ingest-graph-assembly-dpi-display

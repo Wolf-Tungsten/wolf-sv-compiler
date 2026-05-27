@@ -36,6 +36,21 @@
 | `-path` | 无 | 目标 graph / 实例路径，必填 |
 | `-max-op-in-compute-supernode` | `128` | 连续 DP 分段时的目标 op 数上限；它不是 coarsen merge 上限，也不是最终 `supernode_to_ops[i].size()` 的硬上限 |
 | `-max-op-in-commit-supernode` | `4096` | 单个 `commitSupernode` 最多包含的 sink op 数 |
+| `-export-compute-dag` | 无 | 将 compute-node DAG 导出为 `topo-graph-partition-harness` 使用的 `wolvrix.compute-op-dag.v1` JSON |
+
+### Compute DAG 导出
+
+`-export-compute-dag=<path>` 在 `buildComputeNodeRewrite(...)` 之后、最终 supernode materialize 之前导出 compute 侧 DAG。
+
+导出语义：
+
+- JSON `format` 固定为 `wolvrix.compute-op-dag.v1`
+- node 对应 activity-schedule compute node，`weight` 为该 compute node 内 op 数
+- edge 对应 compute node 之间的 boundary input value，`weight` 为 distinct boundary value 数
+- `topo_pos` 来自 compute-node DAG topo order
+- 不导出 commit node / sink op
+
+该文件可由仓库根目录下 `topo-graph-partition-harness` 的 `tgp_validate_graph` 验证。
 
 ## Session 输出
 

@@ -15,11 +15,15 @@ module graph_assembly_aggregate_port_slice(
     logic [5:0] req3;
     logic [3:0][5:0] child_req;
     logic [3:0][5:0] child_out;
+    wire [3:0][5:0] packed_req_net;
+    logic [5:0] static_lane;
 
     assign req3 = req2 & ~feedback;
     assign child_req = {{req3}, {req2}, {req1}, {req0}};
-    assign feedback = child_out[2'h2];
-    assign y = feedback;
+    assign packed_req_net = {{req3}, {req2}, {req1}, {req0}};
+    assign static_lane = packed_req_net[2'h2];
+    assign feedback = static_lane;
+    assign y = feedback ^ child_out[2'h2];
 
     aggregate_lane_child u_child(
         .req(child_req),

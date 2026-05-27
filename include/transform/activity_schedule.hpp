@@ -42,6 +42,7 @@ namespace wolvrix::lib::transform
         bool enableLocalSharedCompute = false;
         bool splitOversizeComputeNodes = false;
         std::string costModel = "edge-cut";
+        std::string exportComputeDagPath;
     };
 
     struct ActivityScheduleSymbolIdHash

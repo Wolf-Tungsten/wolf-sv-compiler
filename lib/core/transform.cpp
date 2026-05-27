@@ -1170,6 +1170,18 @@ namespace wolvrix::lib::transform
                 {
                     options.costModel = std::string(arg.substr(std::string_view("-cost-model=").size()));
                 }
+                else if (arg == "-export-compute-dag")
+                {
+                    if (!parseStringArg("-export-compute-dag", options.exportComputeDagPath))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-export-compute-dag="))
+                {
+                    options.exportComputeDagPath =
+                        std::string(arg.substr(std::string_view("-export-compute-dag=").size()));
+                }
                 else
                 {
                     error = "unknown activity-schedule option";

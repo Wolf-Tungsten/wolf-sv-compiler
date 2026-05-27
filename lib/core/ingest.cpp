@@ -12474,6 +12474,30 @@ std::optional<int64_t> evalConstInt(const ModulePlan& plan, const LoweringPlan& 
             }
             return result;
         }
+        if (node.op == wolvrix::lib::grh::OperationKind::kSliceDynamic &&
+            node.operands.size() >= 2)
+        {
+            auto dataValue = self(self, node.operands[0]);
+            auto offsetValue = self(self, node.operands[1]);
+            if (!dataValue || !offsetValue)
+            {
+                return std::nullopt;
+            }
+            auto offset = offsetValue->template as<int64_t>();
+            if (!offset || *offset < 0)
+            {
+                return std::nullopt;
+            }
+            if (node.widthHint <= 0)
+            {
+                return std::nullopt;
+            }
+            const uint64_t width = static_cast<uint64_t>(node.widthHint);
+            slang::SVInt result =
+                dataValue->lshr(static_cast<slang::bitwidth_t>(*offset))
+                    .trunc(static_cast<slang::bitwidth_t>(width));
+            return result;
+        }
         if (node.operands.size() == 1)
         {
             auto operand = self(self, node.operands.front());
@@ -12679,7 +12703,8 @@ std::optional<int64_t> evalConstInt(const ModulePlan& plan, const LoweringPlan& 
             return self(self, branch);
         }
         if (node.op == wolvrix::lib::grh::OperationKind::kConcat ||
-            node.op == wolvrix::lib::grh::OperationKind::kReplicate)
+            node.op == wolvrix::lib::grh::OperationKind::kReplicate ||
+            node.op == wolvrix::lib::grh::OperationKind::kSliceDynamic)
         {
             auto value = evalConstSVInt(evalConstSVInt, nodeId);
             if (!value || value->hasUnknown())

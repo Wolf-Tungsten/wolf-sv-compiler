@@ -3,7 +3,10 @@
 #include "transform/activity_schedule.hpp"
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -124,6 +127,14 @@ namespace
         return 0;
     }
 
+    std::string readFile(const std::filesystem::path &path)
+    {
+        std::ifstream in(path);
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
+    }
+
 } // namespace
 
 int main()
@@ -181,8 +192,12 @@ int main()
         SessionStore session;
         PassManager manager;
         manager.options().session = &session;
+        const std::filesystem::path exportPath =
+            std::filesystem::path(WOLF_SV_TEST_ARTIFACT_DIR) / "activity_schedule_top_compute_dag.json";
         manager.addPass(std::make_unique<ActivitySchedulePass>(
-            ActivityScheduleOptions{.path = "top", .maxOpInComputeSupernode = 4}));
+            ActivityScheduleOptions{.path = "top",
+                                    .maxOpInComputeSupernode = 4,
+                                    .exportComputeDagPath = exportPath.string()}));
 
         PassDiagnostics diags;
         const PassManagerResult runResult = manager.run(design, diags);
@@ -194,6 +209,18 @@ int main()
         if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
         {
             return rc;
+        }
+        if (!std::filesystem::exists(exportPath))
+        {
+            return fail("Expected activity-schedule compute DAG export file to exist");
+        }
+        const std::string exportedDag = readFile(exportPath);
+        if (exportedDag.find("\"format\":\"wolvrix.compute-op-dag.v1\"") == std::string::npos ||
+            exportedDag.find("\"graph_id\":\"top.activity_compute\"") == std::string::npos ||
+            exportedDag.find("\"nodes\"") == std::string::npos ||
+            exportedDag.find("\"edges\"") == std::string::npos)
+        {
+            return fail("Expected compute DAG export to contain harness JSON fields");
         }
 
         const uint32_t addSupernode = (*schedule.opToSupernode)[addOp.index - 1];
@@ -463,7 +490,7 @@ int main()
         const uint32_t xorSupernode = (*schedule.opToSupernode)[xorOp.index - 1];
         if (sharedSupernode != andSupernode)
         {
-            return fail("Expected shared expression to be owned by its earliest consumer");
+            return fail("Expected safe shared expression to be owned by its earliest consumer");
         }
         if (!hasFanoutTo(*schedule.valueFanout, shared, xorSupernode))
         {
@@ -476,6 +503,141 @@ int main()
         if (schedule.summaryStats->find("\"other_compute_multi_target_values\":0") == std::string::npos)
         {
             return fail("Expected common_expr case to avoid multi-target compute value after ownership selection");
+        }
+    }
+
+    {
+        currentCase = "shared_condition_feedback_cycle";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("shared_condition_feedback_cycle");
+        design.markAsTop("shared_condition_feedback_cycle");
+
+        const auto clk = makeValue(graph, "clk", 1);
+        const auto en = makeValue(graph, "en", 1);
+        const auto req = makeValue(graph, "req", 2);
+        const auto flag = makeValue(graph, "flag", 1);
+        const auto a = makeValue(graph, "a", 27);
+        const auto b = makeValue(graph, "b", 27);
+        const auto c = makeValue(graph, "c", 27);
+        const auto fallback = makeValue(graph, "fallback", 27);
+        const auto idx = makeValue(graph, "idx", 2);
+        const auto dummy = makeValue(graph, "dummy", 27);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("en", en);
+        graph.bindInputPort("req", req);
+        graph.bindInputPort("flag", flag);
+        graph.bindInputPort("a", a);
+        graph.bindInputPort("b", b);
+        graph.bindInputPort("c", c);
+        graph.bindInputPort("fallback", fallback);
+        graph.bindInputPort("idx", idx);
+        graph.bindInputPort("dummy", dummy);
+
+        const auto regDecl = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
+                                                   graph.internSymbol("q"));
+        graph.setAttr(regDecl, "width", static_cast<int64_t>(27));
+        graph.setAttr(regDecl, "isSigned", false);
+
+        const auto two = makeValue(graph, "two", 2);
+        const auto twoOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kConstant,
+                                                 graph.internSymbol("two_const"));
+        graph.addResult(twoOp, two);
+        graph.setAttr(twoOp, "constValue", std::string("2'h2"));
+
+        const auto mask = makeValue(graph, "mask", 27);
+        const auto maskOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kConstant,
+                                                  graph.internSymbol("mask_const"));
+        graph.addResult(maskOp, mask);
+        graph.setAttr(maskOp, "constValue", std::string("27'h7ffffff"));
+
+        const auto onlyS2 = makeValue(graph, "only_s2", 1);
+        const auto onlyS2Op = graph.createOperation(wolvrix::lib::grh::OperationKind::kEq,
+                                                    graph.internSymbol("only_s2_eq"));
+        graph.addOperand(onlyS2Op, req);
+        graph.addOperand(onlyS2Op, two);
+        graph.addResult(onlyS2Op, onlyS2);
+
+        const auto cond = makeValue(graph, "write_cond", 1);
+        const auto condOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kOr,
+                                                  graph.internSymbol("write_cond_or"));
+        graph.addOperand(condOp, onlyS2);
+        graph.addOperand(condOp, flag);
+        graph.addResult(condOp, cond);
+
+        const auto gvpn = makeValue(graph, "gvpn", 27);
+        const auto gvpnOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kMux,
+                                                  graph.internSymbol("gvpn_mux"));
+        graph.addOperand(gvpnOp, onlyS2);
+        graph.addOperand(gvpnOp, a);
+        graph.addOperand(gvpnOp, b);
+        graph.addResult(gvpnOp, gvpn);
+
+        const auto earlyUse = makeValue(graph, "early_use", 27);
+        const auto earlyUseOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
+                                                      graph.internSymbol("early_gvpn_use"));
+        graph.addOperand(earlyUseOp, gvpn);
+        graph.addOperand(earlyUseOp, dummy);
+        graph.addResult(earlyUseOp, earlyUse);
+        graph.bindOutputPort("early_use", earlyUse);
+
+        const auto packed = makeValue(graph, "packed", 54);
+        const auto packedOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kConcat,
+                                                    graph.internSymbol("packed_concat"));
+        graph.addOperand(packedOp, c);
+        graph.addOperand(packedOp, gvpn);
+        graph.addResult(packedOp, packed);
+
+        const auto selected = makeValue(graph, "selected", 27);
+        const auto selectedOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kSliceDynamic,
+                                                      graph.internSymbol("selected_dynamic_slice"));
+        graph.addOperand(selectedOp, packed);
+        graph.addOperand(selectedOp, idx);
+        graph.addResult(selectedOp, selected);
+        graph.setAttr(selectedOp, "sliceWidth", static_cast<int64_t>(27));
+
+        const auto rhs = makeValue(graph, "rhs", 27);
+        const auto rhsOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kMux,
+                                                 graph.internSymbol("rhs_mux"));
+        graph.addOperand(rhsOp, cond);
+        graph.addOperand(rhsOp, selected);
+        graph.addOperand(rhsOp, fallback);
+        graph.addResult(rhsOp, rhs);
+
+        const auto writeOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                                                   graph.internSymbol("q_write"));
+        graph.addOperand(writeOp, en);
+        graph.addOperand(writeOp, rhs);
+        graph.addOperand(writeOp, mask);
+        graph.addOperand(writeOp, clk);
+        graph.setAttr(writeOp, "regSymbol", std::string("q"));
+        graph.setAttr(writeOp, "eventEdge", std::vector<std::string>{"posedge"});
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
+            .path = "shared_condition_feedback_cycle",
+            .maxOpInComputeSupernode = 1,
+            .enableCoarsen = false,
+        }));
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected shared-condition feedback case to schedule without compute-node cycle");
+        }
+        const auto schedule = loadSchedule(session, "shared_condition_feedback_cycle");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        if (!hasFanoutTo(*schedule.valueFanout, onlyS2, (*schedule.opToSupernode)[gvpnOp.index - 1]))
+        {
+            return fail("Expected shared condition to remain an explicit dependency of gvpn");
+        }
+        if (!hasFanoutTo(*schedule.valueFanout, gvpn, (*schedule.opToSupernode)[packedOp.index - 1]))
+        {
+            return fail("Expected gvpn to remain an explicit dependency of packed write path");
         }
     }
 
@@ -544,6 +706,74 @@ int main()
         if (schedule.summaryStats->find("\"compute_compute_value_pairs\":0") == std::string::npos)
         {
             return fail("Expected declared_value_local_compute case to report zero compute->compute value pairs");
+        }
+    }
+
+    {
+        currentCase = "coarsen_respects_compute_supernode_op_limit";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("coarsen_respects_compute_supernode_op_limit");
+        design.markAsTop("coarsen_respects_compute_supernode_op_limit");
+
+        const auto a = makeValue(graph, "a", 8);
+        const auto b = makeValue(graph, "b", 8);
+        graph.bindInputPort("a", a);
+        graph.bindInputPort("b", b);
+
+        std::vector<wolvrix::lib::grh::ValueId> leaves;
+        leaves.reserve(10);
+        for (int i = 0; i < 10; ++i)
+        {
+            const auto result = makeValue(graph, "leaf_" + std::to_string(i), 8);
+            const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
+                                                  graph.internSymbol("leaf_op_" + std::to_string(i)));
+            graph.addOperand(op, a);
+            graph.addOperand(op, b);
+            graph.addResult(op, result);
+            leaves.push_back(result);
+        }
+
+        wolvrix::lib::grh::ValueId cursor = leaves.front();
+        for (std::size_t i = 1; i < leaves.size(); ++i)
+        {
+            const auto result = makeValue(graph, "reduce_" + std::to_string(i), 8);
+            const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kOr,
+                                                  graph.internSymbol("reduce_op_" + std::to_string(i)));
+            graph.addOperand(op, cursor);
+            graph.addOperand(op, leaves[i]);
+            graph.addResult(op, result);
+            cursor = result;
+        }
+        graph.bindOutputPort("y", cursor);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
+            .path = "coarsen_respects_compute_supernode_op_limit",
+            .maxOpInComputeSupernode = 3,
+            .maxOpInComputeNode = 1,
+            .enableCoarsen = true,
+            .enableChainMerge = true,
+        }));
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected coarsen op-limit schedule to succeed");
+        }
+        const auto schedule = loadSchedule(session, "coarsen_respects_compute_supernode_op_limit");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps->size(); ++supernodeId)
+        {
+            if ((*schedule.supernodeKinds)[supernodeId] == ActivityScheduleSupernodeKind::Compute &&
+                (*schedule.supernodeToOps)[supernodeId].size() > 3)
+            {
+                return fail("Expected coarsened compute supernodes to obey maxOpInComputeSupernode");
+            }
         }
     }
 
