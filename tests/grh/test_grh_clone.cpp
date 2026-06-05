@@ -53,6 +53,11 @@ int main()
         SymbolId symB = src.internSymbol("b");
         SymbolId symSum = src.internSymbol("sum");
         SymbolId symOut = src.internSymbol("out");
+        SymbolId symLane1 = src.internSymbol("lane1");
+        SymbolId symLane0 = src.internSymbol("lane0");
+        SymbolId symPacked = src.internSymbol("packed_lanes");
+        SymbolId symPackedIndex = src.internSymbol("packed_index");
+        SymbolId symPackedOut = src.internSymbol("packed_out");
         SymbolId symAdd = src.internSymbol("add0");
         SymbolId symAssign = src.internSymbol("assign0");
 
@@ -60,13 +65,22 @@ int main()
         ValueId b = src.createValue(symB, 8, false);
         ValueId sum = src.createValue(symSum, 8, false);
         ValueId out = src.createValue(symOut, 8, false);
+        ValueId lane1 = src.createValue(symLane1, 3, false);
+        ValueId lane0 = src.createValue(symLane0, 3, false);
+        ValueId packed = src.createValue(symPacked, 6, false);
+        ValueId packedIndex = src.createValue(symPackedIndex, 1, false);
+        ValueId packedOut = src.createValue(symPackedOut, 3, false);
         ValueId ioIn = src.createValue(src.internSymbol("io__in"), 1, false);
         ValueId ioOut = src.createValue(src.internSymbol("io__out"), 1, false);
         ValueId ioOe = src.createValue(src.internSymbol("io__oe"), 1, false);
 
         src.bindInputPort("a", a);
         src.bindInputPort("b", b);
+        src.bindInputPort("lane1", lane1);
+        src.bindInputPort("lane0", lane0);
+        src.bindInputPort("packed_index", packedIndex);
         src.bindOutputPort("out", out);
+        src.bindOutputPort("packed_out", packedOut);
         src.bindInoutPort("io", ioIn, ioOut, ioOe);
 
         OperationId add = src.createOperation(OperationKind::kAdd, symAdd);
@@ -79,6 +93,26 @@ int main()
         OperationId assign = src.createOperation(OperationKind::kAssign, symAssign);
         src.addOperand(assign, sum);
         src.addResult(assign, out);
+
+        OperationId packedConcat = src.createOperation(OperationKind::kConcat, src.internSymbol("packed_concat"));
+        src.addOperand(packedConcat, lane1);
+        src.addOperand(packedConcat, lane0);
+        src.addResult(packedConcat, packed);
+        src.setAttr(packedConcat, "svPackedArray.version", AttributeValue(int64_t(1)));
+        src.setAttr(packedConcat, "svPackedArray.elementWidth", AttributeValue(int64_t(3)));
+        src.setAttr(packedConcat, "svPackedArray.elementCount", AttributeValue(int64_t(2)));
+        src.setAttr(packedConcat, "svPackedArray.indexLow", AttributeValue(int64_t(0)));
+        src.setAttr(packedConcat, "svPackedArray.indexHigh", AttributeValue(int64_t(1)));
+        src.setAttr(packedConcat, "svPackedArray.indexDirection", AttributeValue(std::string("downto")));
+        src.setAttr(packedConcat, "svPackedArray.laneOrder", AttributeValue(std::string("lsb_index_low")));
+        src.setAttr(packedConcat, "svPackedArray.concat.operand0Index", AttributeValue(int64_t(1)));
+        src.setAttr(packedConcat, "svPackedArray.concat.operandStride", AttributeValue(int64_t(-1)));
+
+        OperationId packedSlice = src.createOperation(OperationKind::kSliceArray, src.internSymbol("packed_slice"));
+        src.addOperand(packedSlice, packed);
+        src.addOperand(packedSlice, packedIndex);
+        src.addResult(packedSlice, packedOut);
+        src.setAttr(packedSlice, "sliceWidth", AttributeValue(int64_t(3)));
 
         SrcLoc opLoc;
         opLoc.file = "clone.sv";

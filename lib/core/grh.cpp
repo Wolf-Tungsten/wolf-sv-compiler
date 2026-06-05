@@ -1936,15 +1936,16 @@ namespace wolvrix::lib::grh
             throw std::runtime_error("OperationId refers to erased operation");
         }
         auto &attrs = operations_[opIdx].attrs;
-        for (auto &attr : attrs)
+        auto it = std::lower_bound(attrs.begin(), attrs.end(), key,
+                                   [](const AttrKV &attr, std::string_view attrKey) {
+                                       return attr.key < attrKey;
+                                   });
+        if (it != attrs.end() && it->key == key)
         {
-            if (attr.key == key)
-            {
-                attr.value = std::move(value);
-                return;
-            }
+            it->value = std::move(value);
+            return;
         }
-        attrs.push_back(AttrKV{std::string(key), std::move(value)});
+        attrs.insert(it, AttrKV{std::string(key), std::move(value)});
     }
 
     void GraphBuilder::setOpKind(OperationId op, OperationKind kind)

@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -30,6 +31,18 @@ std::optional<int64_t> intAttr(const wolvrix::lib::grh::Operation& op,
         return std::nullopt;
     }
     if (const auto* value = std::get_if<int64_t>(&*attr)) {
+        return *value;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> stringAttr(const wolvrix::lib::grh::Operation& op,
+                                      std::string_view key) {
+    auto attr = op.attr(key);
+    if (!attr) {
+        return std::nullopt;
+    }
+    if (const auto* value = std::get_if<std::string>(&*attr)) {
         return *value;
     }
     return std::nullopt;
@@ -98,6 +111,11 @@ int testGraphAssemblySlice(const std::filesystem::path& sourcePath) {
     bool hasSlice = false;
     bool hasConst = false;
     bool hasPackedLane9Slice = false;
+    bool hasPackedDynamicLaneSliceArray = false;
+    bool hasSmallDynamicLaneSliceArray = false;
+    bool hasUptoDynamicLaneSliceArray = false;
+    bool hasSmallPackedArrayConcatAttrs = false;
+    bool hasUptoPackedArrayConcatAttrs = false;
     bool hasSixBitShiftOffset = false;
 
     for (wolvrix::lib::grh::OperationId opId : graph->operations()) {
@@ -133,6 +151,104 @@ int testGraphAssemblySlice(const std::filesystem::path& sourcePath) {
                 }
             }
             break;
+        case wolvrix::lib::grh::OperationKind::kSliceArray:
+            if (op.operands().size() == 2) {
+                const wolvrix::lib::grh::Value operand = graph->getValue(op.operands()[0]);
+                const auto sliceWidth = intAttr(op, "sliceWidth");
+                if (operand.symbolText() == "packed_data" &&
+                    sliceWidth && *sliceWidth == 8) {
+                    hasPackedDynamicLaneSliceArray = true;
+                }
+                if (operand.symbolText() == "small_lanes" &&
+                    sliceWidth && *sliceWidth == 3) {
+                    hasSmallDynamicLaneSliceArray = true;
+                }
+                if (operand.symbolText() == "upto_lanes" &&
+                    sliceWidth && *sliceWidth == 3) {
+                    const wolvrix::lib::grh::Value index =
+                        graph->getValue(op.operands()[1]);
+                    const wolvrix::lib::grh::OperationId def = index.definingOp();
+                    if (def.valid()) {
+                        const wolvrix::lib::grh::Operation sub = graph->getOperation(def);
+                        hasUptoDynamicLaneSliceArray =
+                            sub.kind() == wolvrix::lib::grh::OperationKind::kSub;
+                    }
+                }
+            }
+            break;
+        case wolvrix::lib::grh::OperationKind::kAssign:
+            if (op.operands().size() == 1 && op.results().size() == 1) {
+                const wolvrix::lib::grh::Value result = graph->getValue(op.results()[0]);
+                if (result.symbolText() == "small_lanes") {
+                    const wolvrix::lib::grh::Value rhs = graph->getValue(op.operands()[0]);
+                    const wolvrix::lib::grh::OperationId def = rhs.definingOp();
+                    if (def.valid()) {
+                        const wolvrix::lib::grh::Operation concat = graph->getOperation(def);
+                        if (concat.kind() == wolvrix::lib::grh::OperationKind::kConcat) {
+                            const auto version = intAttr(concat, "svPackedArray.version");
+                            const auto elementWidth =
+                                intAttr(concat, "svPackedArray.elementWidth");
+                            const auto elementCount =
+                                intAttr(concat, "svPackedArray.elementCount");
+                            const auto indexLow = intAttr(concat, "svPackedArray.indexLow");
+                            const auto indexHigh = intAttr(concat, "svPackedArray.indexHigh");
+                            const auto direction =
+                                stringAttr(concat, "svPackedArray.indexDirection");
+                            const auto laneOrder =
+                                stringAttr(concat, "svPackedArray.laneOrder");
+                            const auto operand0Index =
+                                intAttr(concat, "svPackedArray.concat.operand0Index");
+                            const auto operandStride =
+                                intAttr(concat, "svPackedArray.concat.operandStride");
+                            hasSmallPackedArrayConcatAttrs =
+                                version && *version == 1 &&
+                                elementWidth && *elementWidth == 3 &&
+                                elementCount && *elementCount == 2 &&
+                                indexLow && *indexLow == 0 &&
+                                indexHigh && *indexHigh == 1 &&
+                                direction && *direction == "downto" &&
+                                laneOrder && *laneOrder == "lsb_index_low" &&
+                                operand0Index && *operand0Index == 1 &&
+                                operandStride && *operandStride == -1;
+                        }
+                    }
+                }
+                if (result.symbolText() == "upto_lanes") {
+                    const wolvrix::lib::grh::Value rhs = graph->getValue(op.operands()[0]);
+                    const wolvrix::lib::grh::OperationId def = rhs.definingOp();
+                    if (def.valid()) {
+                        const wolvrix::lib::grh::Operation concat = graph->getOperation(def);
+                        if (concat.kind() == wolvrix::lib::grh::OperationKind::kConcat) {
+                            const auto version = intAttr(concat, "svPackedArray.version");
+                            const auto elementWidth =
+                                intAttr(concat, "svPackedArray.elementWidth");
+                            const auto elementCount =
+                                intAttr(concat, "svPackedArray.elementCount");
+                            const auto indexLow = intAttr(concat, "svPackedArray.indexLow");
+                            const auto indexHigh = intAttr(concat, "svPackedArray.indexHigh");
+                            const auto direction =
+                                stringAttr(concat, "svPackedArray.indexDirection");
+                            const auto laneOrder =
+                                stringAttr(concat, "svPackedArray.laneOrder");
+                            const auto operand0Index =
+                                intAttr(concat, "svPackedArray.concat.operand0Index");
+                            const auto operandStride =
+                                intAttr(concat, "svPackedArray.concat.operandStride");
+                            hasUptoPackedArrayConcatAttrs =
+                                version && *version == 1 &&
+                                elementWidth && *elementWidth == 3 &&
+                                elementCount && *elementCount == 2 &&
+                                indexLow && *indexLow == 0 &&
+                                indexHigh && *indexHigh == 1 &&
+                                direction && *direction == "upto" &&
+                                laneOrder && *laneOrder == "lsb_index_high" &&
+                                operand0Index && *operand0Index == 0 &&
+                                operandStride && *operandStride == 1;
+                        }
+                    }
+                }
+            }
+            break;
         case wolvrix::lib::grh::OperationKind::kConstant:
             hasConst = true;
             break;
@@ -152,6 +268,21 @@ int testGraphAssemblySlice(const std::filesystem::path& sourcePath) {
     }
     if (!hasPackedLane9Slice) {
         return fail("Missing packed_data[9] kSliceStatic [72:79]");
+    }
+    if (!hasPackedDynamicLaneSliceArray) {
+        return fail("Missing packed_data[dyn_idx] kSliceArray with sliceWidth=8");
+    }
+    if (!hasSmallDynamicLaneSliceArray) {
+        return fail("Missing small_lanes[small_idx] kSliceArray with sliceWidth=3");
+    }
+    if (!hasUptoDynamicLaneSliceArray) {
+        return fail("Missing upto_lanes[upto_idx] kSliceArray with high-index lane adjustment");
+    }
+    if (!hasSmallPackedArrayConcatAttrs) {
+        return fail("Missing svPackedArray.* attrs on small_lanes kConcat defop");
+    }
+    if (!hasUptoPackedArrayConcatAttrs) {
+        return fail("Missing svPackedArray.* attrs on upto_lanes kConcat defop");
     }
     if (!hasSixBitShiftOffset) {
         return fail("Missing 6-bit shift offset for first_rot >> (6'hB - start)");

@@ -49,15 +49,29 @@ int main()
         SymbolId symB = graph.internSymbol("b");
         SymbolId symSum = graph.internSymbol("sum");
         SymbolId symSumCopy = graph.internSymbol("sum_copy");
+        SymbolId symLane1 = graph.internSymbol("lane1");
+        SymbolId symLane0 = graph.internSymbol("lane0");
+        SymbolId symPacked = graph.internSymbol("packed_lanes");
+        SymbolId symPackedIndex = graph.internSymbol("packed_index");
+        SymbolId symPackedOut = graph.internSymbol("packed_out");
         ValueId a = graph.createValue(symA, 8, false);
         ValueId b = graph.createValue(symB, 8, false);
         ValueId sum = graph.createValue(symSum, 8, false);
         ValueId sumCopy = graph.createValue(symSumCopy, 8, false);
+        ValueId lane1 = graph.createValue(symLane1, 3, false);
+        ValueId lane0 = graph.createValue(symLane0, 3, false);
+        ValueId packed = graph.createValue(symPacked, 6, false);
+        ValueId packedIndex = graph.createValue(symPackedIndex, 1, false);
+        ValueId packedOut = graph.createValue(symPackedOut, 3, false);
 
         graph.bindInputPort("a", a);
         graph.bindInputPort("b", b);
+        graph.bindInputPort("lane1", lane1);
+        graph.bindInputPort("lane0", lane0);
+        graph.bindInputPort("packed_index", packedIndex);
         graph.bindOutputPort("sum", sum);
         graph.bindOutputPort("sum_copy", sumCopy);
+        graph.bindOutputPort("packed_out", packedOut);
         graph.addDeclaredSymbol(symA);
         graph.addDeclaredSymbol(symSum);
         design.addDeclaredSymbol(design.internSymbol("demo"));
@@ -90,6 +104,26 @@ int main()
         {
             return fail("Assign result defining operation not set");
         }
+
+        OperationId packedConcat = graph.createOperation(OperationKind::kConcat, graph.internSymbol("packed_concat"));
+        graph.addOperand(packedConcat, lane1);
+        graph.addOperand(packedConcat, lane0);
+        graph.addResult(packedConcat, packed);
+        graph.setAttr(packedConcat, "svPackedArray.version", AttributeValue(int64_t(1)));
+        graph.setAttr(packedConcat, "svPackedArray.elementWidth", AttributeValue(int64_t(3)));
+        graph.setAttr(packedConcat, "svPackedArray.elementCount", AttributeValue(int64_t(2)));
+        graph.setAttr(packedConcat, "svPackedArray.indexLow", AttributeValue(int64_t(0)));
+        graph.setAttr(packedConcat, "svPackedArray.indexHigh", AttributeValue(int64_t(1)));
+        graph.setAttr(packedConcat, "svPackedArray.indexDirection", AttributeValue(std::string("downto")));
+        graph.setAttr(packedConcat, "svPackedArray.laneOrder", AttributeValue(std::string("lsb_index_low")));
+        graph.setAttr(packedConcat, "svPackedArray.concat.operand0Index", AttributeValue(int64_t(1)));
+        graph.setAttr(packedConcat, "svPackedArray.concat.operandStride", AttributeValue(int64_t(-1)));
+
+        OperationId packedSlice = graph.createOperation(OperationKind::kSliceArray, graph.internSymbol("packed_slice"));
+        graph.addOperand(packedSlice, packed);
+        graph.addOperand(packedSlice, packedIndex);
+        graph.addResult(packedSlice, packedOut);
+        graph.setAttr(packedSlice, "sliceWidth", AttributeValue(int64_t(3)));
 
         const Value aValue = graph.getValue(a);
         const auto aUsers = aValue.users();
@@ -271,6 +305,38 @@ int main()
         if (parsedAssign.operands().size() != 1 || parsedAssign.results().size() != 1)
         {
             return fail("Assign operation connectivity mismatch");
+        }
+
+        const OperationId parsedPackedConcatId = parsedGraph->findOperation("packed_concat");
+        if (!parsedPackedConcatId.valid())
+        {
+            return fail("Parsed packed concat operation missing");
+        }
+        const Operation parsedPackedConcat = parsedGraph->getOperation(parsedPackedConcatId);
+        auto parsedElementWidth = parsedPackedConcat.attr("svPackedArray.elementWidth");
+        auto parsedElementCount = parsedPackedConcat.attr("svPackedArray.elementCount");
+        auto parsedLaneOrder = parsedPackedConcat.attr("svPackedArray.laneOrder");
+        if (!parsedElementWidth || !parsedElementCount || !parsedLaneOrder ||
+            *parsedElementWidth != AttributeValue(int64_t(3)) ||
+            *parsedElementCount != AttributeValue(int64_t(2)) ||
+            *parsedLaneOrder != AttributeValue(std::string("lsb_index_low")))
+        {
+            return fail("Packed array producer attrs did not round-trip");
+        }
+        const OperationId parsedPackedSliceId = parsedGraph->findOperation("packed_slice");
+        if (!parsedPackedSliceId.valid())
+        {
+            return fail("Parsed packed slice operation missing");
+        }
+        const Operation parsedPackedSlice = parsedGraph->getOperation(parsedPackedSliceId);
+        auto parsedSliceWidth = parsedPackedSlice.attr("sliceWidth");
+        if (parsedPackedSlice.kind() != OperationKind::kSliceArray ||
+            parsedPackedSlice.operands().size() != 2 ||
+            parsedPackedSlice.results().size() != 1 ||
+            !parsedSliceWidth ||
+            *parsedSliceWidth != AttributeValue(int64_t(3)))
+        {
+            return fail("Packed kSliceArray did not round-trip");
         }
 
         auto parsedAssignKind = parseOperationKind("kAssign");

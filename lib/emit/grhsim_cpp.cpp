@@ -1578,6 +1578,7 @@ namespace wolvrix::lib::emit
                    name == prefixText + "_runtime.hpp" ||
                    name == prefixText + "_declared_value_index.txt" ||
                    name == prefixText + "_packed_value_index.txt" ||
+                   name == "grhsim_emit_stats.json" ||
                    name == prefixText + "_state.cpp" ||
                    name == prefixText + "_state.o" ||
                    name == prefixText + "_eval.cpp" ||
@@ -2472,6 +2473,29 @@ namespace wolvrix::lib::emit
             std::size_t slotIndex = 0;
         };
 
+        struct PackedArrayLaneView
+        {
+            ValueId value{};
+            ValueId sourceValue{};
+            OperationId concatOp{};
+            OperationId defOp{};
+            int32_t elementWidth = 0;
+            std::size_t elementCount = 0;
+            std::vector<std::size_t> laneByOperand;
+        };
+
+        struct PackedArrayLaneEmitStats
+        {
+            std::size_t svPackedArrayAttrDefops = 0;
+            std::size_t svPackedArrayAttrConcatDefops = 0;
+            std::size_t packedArraySliceArrayUsers = 0;
+            std::size_t packedArraySliceDynamicLegacyUsers = 0;
+            std::size_t packedArrayLaneEmitValues = 0;
+            std::size_t packedArrayLaneEmitSelects = 0;
+            std::size_t packedArrayLaneEmitFallbackMixedUser = 0;
+            std::size_t packedArrayLaneEmitFallbackInvalidShape = 0;
+        };
+
         struct WaveformSignalDecl
         {
             enum class SourceKind
@@ -2502,6 +2526,11 @@ namespace wolvrix::lib::emit
             std::unordered_map<ValueId, std::string, ValueIdHash> valueFieldByValue;
             std::unordered_map<ValueId, std::string, ValueIdHash> staticConstStringFieldByValue;
             std::unordered_map<ValueId, std::string, ValueIdHash> localValueNameByValue;
+            std::unordered_map<ValueId, PackedArrayLaneView, ValueIdHash> packedArrayLaneViewByValue;
+            std::unordered_map<ValueId, ValueId, ValueIdHash> packedArrayLaneTargetBySourceValue;
+            std::unordered_map<ValueId, std::string, ValueIdHash> packedArrayLaneFieldByValue;
+            std::unordered_map<ValueId, std::string, ValueIdHash> localPackedArrayLaneNameByValue;
+            PackedArrayLaneEmitStats packedArrayLaneEmitStats;
             std::unordered_map<ValueId, ValueScalarSlotRef, ValueIdHash> valueScalarSlotByValue;
             std::unordered_map<ValueId, ValueWideSlotRef, ValueIdHash> valueWideSlotByValue;
             std::unordered_map<ValueId, std::size_t, ValueIdHash> valueRealSlotByValue;
@@ -2785,6 +2814,392 @@ namespace wolvrix::lib::emit
         std::string stateScalarStorageRefExpr(ValueSlotScalarKind kind, std::string_view offsetExpr);
         std::string stateWideStorageRefExpr(std::size_t wordCount, std::string_view offsetExpr);
 
+        std::string packedArrayLaneCppType(const PackedArrayLaneView &view)
+        {
+            return logicCppType(view.elementWidth);
+        }
+
+        std::string packedArrayLaneStorageType(const PackedArrayLaneView &view)
+        {
+            return "std::array<" + packedArrayLaneCppType(view) + ", " +
+                   std::to_string(view.elementCount) + ">";
+        }
+
+        std::string packedArrayLaneFieldName(const Graph &graph, ValueId value)
+        {
+            return "packed_array_lanes_" + std::to_string(value.index) + "_" +
+                   std::to_string(value.generation) + "_" + valueDebugName(graph, value) + "_";
+        }
+
+        std::optional<std::string> writePackedArrayLaneEmitStatsJson(const std::filesystem::path &path,
+                                                                     const PackedArrayLaneEmitStats &stats,
+                                                                     std::uint64_t maxOutputFileBytes)
+        {
+            if (auto error = ensureOutputDirectory(path))
+            {
+                return error;
+            }
+            LimitedOutputStream stream(path, maxOutputFileBytes);
+            if (!stream.isOpen())
+            {
+                return "failed to open output file";
+            }
+            stream << "{\n";
+            stream << "  \"packed_array_lane_emit\": {\n";
+            stream << "    \"packed_array_lane_emit_fallback_invalid_shape\": "
+                   << stats.packedArrayLaneEmitFallbackInvalidShape << ",\n";
+            stream << "    \"packed_array_lane_emit_fallback_mixed_user\": "
+                   << stats.packedArrayLaneEmitFallbackMixedUser << ",\n";
+            stream << "    \"packed_array_lane_emit_selects\": "
+                   << stats.packedArrayLaneEmitSelects << ",\n";
+            stream << "    \"packed_array_lane_emit_values\": "
+                   << stats.packedArrayLaneEmitValues << ",\n";
+            stream << "    \"packed_array_slice_array_users\": "
+                   << stats.packedArraySliceArrayUsers << ",\n";
+            stream << "    \"packed_array_slice_dynamic_legacy_users\": "
+                   << stats.packedArraySliceDynamicLegacyUsers << ",\n";
+            stream << "    \"sv_packed_array_attr_concat_defops\": "
+                   << stats.svPackedArrayAttrConcatDefops << ",\n";
+            stream << "    \"sv_packed_array_attr_defops\": "
+                   << stats.svPackedArrayAttrDefops << "\n";
+            stream << "  }\n";
+            stream << "}\n";
+            return finalizeOutputFile(stream, path);
+        }
+
+        std::optional<OperationId> singleAssignWrapperConsumer(const Graph &graph, ValueId value)
+        {
+            std::optional<OperationId> assignOpId;
+            const Value valueInfo = graph.getValue(value);
+            for (const auto &user : valueInfo.users())
+            {
+                if (!user.operation.valid())
+                {
+                    return std::nullopt;
+                }
+                if (assignOpId && user.operation != *assignOpId)
+                {
+                    return std::nullopt;
+                }
+                assignOpId = user.operation;
+            }
+            if (!assignOpId)
+            {
+                return std::nullopt;
+            }
+            const Operation assignOp = graph.getOperation(*assignOpId);
+            if (assignOp.kind() != OperationKind::kAssign ||
+                assignOp.operands().size() != 1 ||
+                assignOp.results().size() != 1 ||
+                assignOp.operands().front() != value)
+            {
+                return std::nullopt;
+            }
+            return assignOpId;
+        }
+
+        std::optional<PackedArrayLaneView> buildPackedArrayLaneViewFromConcat(const Graph &graph,
+                                                                              ValueId value,
+                                                                              ValueId sourceValue,
+                                                                              OperationId defOpId,
+                                                                              OperationId concatOpId,
+                                                                              const Operation &concatOp)
+        {
+            if (!value.valid() || !sourceValue.valid() || concatOp.kind() != OperationKind::kConcat)
+            {
+                return std::nullopt;
+            }
+            const auto version = getAttribute<int64_t>(concatOp, "svPackedArray.version").value_or(0);
+            const auto elementWidth = getAttribute<int64_t>(concatOp, "svPackedArray.elementWidth");
+            const auto elementCount = getAttribute<int64_t>(concatOp, "svPackedArray.elementCount");
+            const auto operand0Index = getAttribute<int64_t>(concatOp, "svPackedArray.concat.operand0Index");
+            const auto operandStride = getAttribute<int64_t>(concatOp, "svPackedArray.concat.operandStride");
+            const auto indexLow = getAttribute<int64_t>(concatOp, "svPackedArray.indexLow");
+            const auto indexHigh = getAttribute<int64_t>(concatOp, "svPackedArray.indexHigh");
+            const auto laneOrder = getAttribute<std::string>(concatOp, "svPackedArray.laneOrder");
+            if (version != 1 || !elementWidth || !elementCount || !operand0Index || !operandStride ||
+                !indexLow || !indexHigh || !laneOrder)
+            {
+                return std::nullopt;
+            }
+            if (*elementWidth <= 0 || *elementWidth > 64 || *elementCount <= 1 ||
+                (*operandStride != 1 && *operandStride != -1) ||
+                *indexLow > *indexHigh || (*laneOrder != "lsb_index_low" && *laneOrder != "lsb_index_high"))
+            {
+                return std::nullopt;
+            }
+            if (static_cast<std::size_t>(*elementCount) != concatOp.operands().size())
+            {
+                return std::nullopt;
+            }
+            if ((*indexHigh - *indexLow + 1) != *elementCount)
+            {
+                return std::nullopt;
+            }
+            const int64_t expectedWidth = (*elementWidth) * (*elementCount);
+            if (expectedWidth <= 0 || graph.valueWidth(sourceValue) != expectedWidth || graph.valueWidth(value) != expectedWidth)
+            {
+                return std::nullopt;
+            }
+
+            PackedArrayLaneView view;
+            view.value = value;
+            view.sourceValue = sourceValue;
+            view.concatOp = concatOpId;
+            view.defOp = defOpId;
+            view.elementWidth = static_cast<int32_t>(*elementWidth);
+            view.elementCount = static_cast<std::size_t>(*elementCount);
+            view.laneByOperand.reserve(concatOp.operands().size());
+            for (std::size_t operandIndex = 0; operandIndex < concatOp.operands().size(); ++operandIndex)
+            {
+                const ValueId operand = concatOp.operands()[operandIndex];
+                if (!operand.valid() || graph.valueWidth(operand) != view.elementWidth)
+                {
+                    return std::nullopt;
+                }
+                const int64_t svIndex =
+                    *operand0Index + static_cast<int64_t>(operandIndex) * (*operandStride);
+                const int64_t lane = *laneOrder == "lsb_index_low"
+                                         ? svIndex - *indexLow
+                                         : *indexHigh - svIndex;
+                if (lane < 0 || lane >= *elementCount)
+                {
+                    return std::nullopt;
+                }
+                const int64_t expectedLane = *elementCount - 1 - static_cast<int64_t>(operandIndex);
+                if (lane != expectedLane)
+                {
+                    return std::nullopt;
+                }
+                view.laneByOperand.push_back(static_cast<std::size_t>(lane));
+            }
+            return view;
+        }
+
+        std::optional<PackedArrayLaneView> buildPackedArrayLaneViewForValue(const Graph &graph, ValueId value)
+        {
+            const OperationId defOpId = graph.valueDef(value);
+            if (!defOpId.valid() || graph.valueType(value) != ValueType::Logic || !isWideLogicValue(graph, value))
+            {
+                return std::nullopt;
+            }
+            const Operation defOp = graph.getOperation(defOpId);
+            if (defOp.kind() == OperationKind::kConcat)
+            {
+                return buildPackedArrayLaneViewFromConcat(graph, value, value, defOpId, defOpId, defOp);
+            }
+            if (defOp.kind() == OperationKind::kAssign &&
+                defOp.operands().size() == 1 &&
+                defOp.results().size() == 1)
+            {
+                const ValueId sourceValue = defOp.operands().front();
+                const auto wrapperOpId = singleAssignWrapperConsumer(graph, sourceValue);
+                if (!wrapperOpId || *wrapperOpId != defOpId)
+                {
+                    return std::nullopt;
+                }
+                const OperationId sourceOpId = graph.valueDef(sourceValue);
+                if (!sourceOpId.valid())
+                {
+                    return std::nullopt;
+                }
+                const Operation sourceOp = graph.getOperation(sourceOpId);
+                return buildPackedArrayLaneViewFromConcat(graph, value, sourceValue, defOpId, sourceOpId, sourceOp);
+            }
+            return std::nullopt;
+        }
+
+        bool sliceArrayUsesPackedArrayLaneView(const Graph &graph,
+                                               const PackedArrayLaneView &view,
+                                               const Operation &op)
+        {
+            if (op.kind() != OperationKind::kSliceArray || op.operands().size() != 2 || op.results().size() != 1)
+            {
+                return false;
+            }
+            if (op.operands().front() != view.value)
+            {
+                return false;
+            }
+            const ValueId indexValue = op.operands()[1];
+            if (graph.valueType(indexValue) != ValueType::Logic || graph.valueWidth(indexValue) > 64)
+            {
+                return false;
+            }
+            const auto sliceWidth = getAttribute<int64_t>(op, "sliceWidth");
+            return sliceWidth && *sliceWidth == view.elementWidth &&
+                   graph.valueWidth(op.results().front()) == view.elementWidth;
+        }
+
+        bool packedArrayLaneViewHasOnlySupportedConsumers(const Graph &graph,
+                                                          const PackedArrayLaneView &view)
+        {
+            const Value valueInfo = graph.getValue(view.value);
+            for (const auto &user : valueInfo.users())
+            {
+                if (!user.operation.valid())
+                {
+                    return false;
+                }
+                const Operation userOp = graph.getOperation(user.operation);
+                if (sliceArrayUsesPackedArrayLaneView(graph, view, userOp))
+                {
+                    continue;
+                }
+                return false;
+            }
+            return true;
+        }
+
+        std::size_t countPackedArrayLaneSliceUsers(const Graph &graph,
+                                                   const PackedArrayLaneView &view)
+        {
+            std::size_t count = 0;
+            const Value valueInfo = graph.getValue(view.value);
+            for (const auto &user : valueInfo.users())
+            {
+                if (!user.operation.valid())
+                {
+                    continue;
+                }
+                if (sliceArrayUsesPackedArrayLaneView(graph, view, graph.getOperation(user.operation)))
+                {
+                    ++count;
+                }
+            }
+            return count;
+        }
+
+        void discoverPackedArrayLaneViews(const Graph &graph,
+                                          const std::unordered_set<ValueId, ValueIdHash> &waveformValueIds,
+                                          EmitModel &model)
+        {
+            model.packedArrayLaneViewByValue.clear();
+            model.packedArrayLaneTargetBySourceValue.clear();
+            model.packedArrayLaneEmitStats = PackedArrayLaneEmitStats{};
+            std::unordered_set<ValueId, ValueIdHash> publicReadValues;
+            publicReadValues.reserve(graph.outputPorts().size() + graph.inoutPorts().size() * 2u);
+            for (const auto &port : graph.outputPorts())
+            {
+                publicReadValues.insert(port.value);
+            }
+            for (const auto &port : graph.inoutPorts())
+            {
+                publicReadValues.insert(port.out);
+                publicReadValues.insert(port.oe);
+            }
+            for (OperationId opId : graph.operations())
+            {
+                const Operation op = graph.getOperation(opId);
+                const auto version = getAttribute<int64_t>(op, "svPackedArray.version").value_or(0);
+                if (version != 1)
+                {
+                    continue;
+                }
+                ++model.packedArrayLaneEmitStats.svPackedArrayAttrDefops;
+                if (op.kind() == OperationKind::kConcat)
+                {
+                    ++model.packedArrayLaneEmitStats.svPackedArrayAttrConcatDefops;
+                }
+            }
+            for (ValueId valueId : graph.values())
+            {
+                if (waveformValueIds.contains(valueId) || publicReadValues.contains(valueId))
+                {
+                    continue;
+                }
+                auto view = buildPackedArrayLaneViewForValue(graph, valueId);
+                if (!view)
+                {
+                    const OperationId defOpId = graph.valueDef(valueId);
+                    if (defOpId.valid())
+                    {
+                        const Operation defOp = graph.getOperation(defOpId);
+                        const bool hasDirectPackedArrayAttr =
+                            getAttribute<int64_t>(defOp, "svPackedArray.version").value_or(0) == 1;
+                        const bool hasAssignWrappedPackedArrayAttr =
+                            defOp.kind() == OperationKind::kAssign && defOp.operands().size() == 1 &&
+                            [&]() {
+                                const OperationId sourceOpId = graph.valueDef(defOp.operands().front());
+                                if (!sourceOpId.valid())
+                                {
+                                    return false;
+                                }
+                                return getAttribute<int64_t>(graph.getOperation(sourceOpId), "svPackedArray.version")
+                                           .value_or(0) == 1;
+                            }();
+                        if (hasDirectPackedArrayAttr || hasAssignWrappedPackedArrayAttr)
+                        {
+                            ++model.packedArrayLaneEmitStats.packedArrayLaneEmitFallbackInvalidShape;
+                        }
+                    }
+                    continue;
+                }
+                if (view->value == view->sourceValue && singleAssignWrapperConsumer(graph, valueId))
+                {
+                    continue;
+                }
+                const Value valueInfo = graph.getValue(view->value);
+                for (const auto &user : valueInfo.users())
+                {
+                    if (!user.operation.valid())
+                    {
+                        continue;
+                    }
+                    const Operation userOp = graph.getOperation(user.operation);
+                    if (userOp.kind() == OperationKind::kSliceArray)
+                    {
+                        ++model.packedArrayLaneEmitStats.packedArraySliceArrayUsers;
+                    }
+                    else if (userOp.kind() == OperationKind::kSliceDynamic)
+                    {
+                        ++model.packedArrayLaneEmitStats.packedArraySliceDynamicLegacyUsers;
+                    }
+                }
+                if (!packedArrayLaneViewHasOnlySupportedConsumers(graph, *view))
+                {
+                    ++model.packedArrayLaneEmitStats.packedArrayLaneEmitFallbackMixedUser;
+                    continue;
+                }
+                if (view->sourceValue != valueId && model.boundaryFanoutByValue.contains(view->sourceValue))
+                {
+                    ++model.packedArrayLaneEmitStats.packedArrayLaneEmitFallbackInvalidShape;
+                    continue;
+                }
+                model.packedArrayLaneTargetBySourceValue.emplace(view->sourceValue, valueId);
+                model.packedArrayLaneEmitStats.packedArrayLaneEmitSelects +=
+                    countPackedArrayLaneSliceUsers(graph, *view);
+                model.packedArrayLaneViewByValue.emplace(valueId, std::move(*view));
+            }
+            model.packedArrayLaneEmitStats.packedArrayLaneEmitValues =
+                model.packedArrayLaneViewByValue.size();
+        }
+
+        bool isPackedArrayLaneValue(const EmitModel &model, ValueId value) noexcept
+        {
+            return model.packedArrayLaneViewByValue.find(value) != model.packedArrayLaneViewByValue.end();
+        }
+
+        const PackedArrayLaneView *packedArrayLaneViewForValue(const EmitModel &model, ValueId value) noexcept
+        {
+            const auto it = model.packedArrayLaneViewByValue.find(value);
+            if (it == model.packedArrayLaneViewByValue.end())
+            {
+                return nullptr;
+            }
+            return &it->second;
+        }
+
+        const PackedArrayLaneView *packedArrayLaneViewForSourceValue(const EmitModel &model, ValueId sourceValue) noexcept
+        {
+            const auto targetIt = model.packedArrayLaneTargetBySourceValue.find(sourceValue);
+            if (targetIt == model.packedArrayLaneTargetBySourceValue.end())
+            {
+                return nullptr;
+            }
+            return packedArrayLaneViewForValue(model, targetIt->second);
+        }
+
         struct LogicStorageReadOrder
         {
             std::size_t firstBatch = kInvalidIndex;
@@ -3003,6 +3418,7 @@ namespace wolvrix::lib::emit
         {
             model.valueFieldByValue.clear();
             model.staticConstStringFieldByValue.clear();
+            model.packedArrayLaneFieldByValue.clear();
             model.staticConstStringDecls.clear();
             model.staticConstStringDefs.clear();
             model.valueFieldDecls.clear();
@@ -3048,6 +3464,14 @@ namespace wolvrix::lib::emit
                 const ValueId valueId = entry.valueId;
                 if (!model.materializedValues.contains(valueId) || graph.valueType(valueId) != ValueType::Logic)
                 {
+                    continue;
+                }
+                if (const auto *view = packedArrayLaneViewForValue(model, valueId))
+                {
+                    const std::string fieldName = packedArrayLaneFieldName(graph, valueId);
+                    model.packedArrayLaneFieldByValue.emplace(valueId, fieldName);
+                    model.valueFieldDecls.push_back("    " + packedArrayLaneStorageType(*view) + " " +
+                                                    fieldName + "{};");
                     continue;
                 }
                 if (isWideLogicValue(graph, valueId))
@@ -3149,6 +3573,7 @@ namespace wolvrix::lib::emit
         {
             model.valueFieldByValue.clear();
             model.staticConstStringFieldByValue.clear();
+            model.packedArrayLaneFieldByValue.clear();
             model.staticConstStringDecls.clear();
             model.staticConstStringDefs.clear();
             model.valueFieldDecls.clear();
@@ -3170,6 +3595,14 @@ namespace wolvrix::lib::emit
                 if (const auto staticExpr = staticConstStringExpr(graph, valueId))
                 {
                     model.staticConstStringFieldByValue.emplace(valueId, *staticExpr);
+                    continue;
+                }
+                if (const auto *view = packedArrayLaneViewForValue(model, valueId))
+                {
+                    const std::string fieldName = packedArrayLaneFieldName(graph, valueId);
+                    model.packedArrayLaneFieldByValue.emplace(valueId, fieldName);
+                    model.valueFieldDecls.push_back("    " + packedArrayLaneStorageType(*view) + " " +
+                                                    fieldName + "{};");
                     continue;
                 }
                 switch (graph.valueType(valueId))
@@ -5572,6 +6005,17 @@ namespace wolvrix::lib::emit
             model.stateFieldDecls.clear();
             model.stateLogicScalarSlotCounts = {};
             model.stateLogicWideSlotCountsByWords.clear();
+            model.packedArrayLaneViewByValue.clear();
+            model.packedArrayLaneTargetBySourceValue.clear();
+            model.packedArrayLaneFieldByValue.clear();
+            model.localPackedArrayLaneNameByValue.clear();
+            model.boundaryFanoutByValue.clear();
+            model.inputHeadSupernodesByValue.clear();
+            model.localValueNameByValue.clear();
+            model.materializedValues.clear();
+            model.eventEdgeFieldByValue.clear();
+            model.allEventValues.clear();
+            model.inputEventValues.clear();
             std::size_t stateLogicStorageOffset = 0;
             auto registerInputEndpoint = [&](ValueId valueId, const std::string &fieldStem, const std::string &apiStem) {
                 if (model.inputFieldByValue.find(valueId) != model.inputFieldByValue.end())
@@ -6144,6 +6588,8 @@ namespace wolvrix::lib::emit
                 }
             }
 
+            discoverPackedArrayLaneViews(graph, waveformValueIds, model);
+
             std::unordered_set<ValueId, ValueIdHash> persistentValues;
             persistentValues.reserve(graph.values().size());
             enum PersistentValueReason : uint32_t
@@ -6307,7 +6753,17 @@ namespace wolvrix::lib::emit
                 }
                 if (!persistentValues.contains(valueId))
                 {
-                    model.localValueNameByValue.emplace(valueId, localValueName(graph, valueId));
+                    if (isPackedArrayLaneValue(model, valueId))
+                    {
+                        model.localPackedArrayLaneNameByValue.emplace(
+                            valueId,
+                            "packed_array_lanes_local_" + std::to_string(valueId.index) + "_" +
+                                std::to_string(valueId.generation));
+                    }
+                    else
+                    {
+                        model.localValueNameByValue.emplace(valueId, localValueName(graph, valueId));
+                    }
                     continue;
                 }
                 queueMaterializedValue(valueId);
@@ -6491,7 +6947,17 @@ namespace wolvrix::lib::emit
             {
                 return it->second;
             }
+            if (auto it = model.packedArrayLaneFieldByValue.find(value);
+                it != model.packedArrayLaneFieldByValue.end())
+            {
+                return it->second;
+            }
             if (auto it = model.localValueNameByValue.find(value); it != model.localValueNameByValue.end())
+            {
+                return it->second;
+            }
+            if (auto it = model.localPackedArrayLaneNameByValue.find(value);
+                it != model.localPackedArrayLaneNameByValue.end())
             {
                 return it->second;
             }
@@ -8836,6 +9302,147 @@ namespace wolvrix::lib::emit
             return true;
         }
 
+        std::string packedArrayLaneRefExpr(const EmitModel &model,
+                                           const PackedArrayLaneView &view,
+                                           const SupernodeLocalExprContext *context = nullptr)
+        {
+            return resolvedStoredValueRefExpr(model, view.value, context);
+        }
+
+        bool emitPackedArrayLaneConcatOperation(std::ostream &stream,
+                                                const Graph &graph,
+                                                const EmitModel &model,
+                                                const Operation &op,
+                                                SupernodeLocalExprContext *context = nullptr,
+                                                const ActivationEmitContext *activationContext = nullptr)
+        {
+            if (op.results().empty())
+            {
+                return false;
+            }
+            const ValueId sourceValue = op.results().front();
+            const PackedArrayLaneView *view = packedArrayLaneViewForSourceValue(model, sourceValue);
+            if (view == nullptr || view->concatOp != graph.valueDef(sourceValue) || op.kind() != OperationKind::kConcat)
+            {
+                return false;
+            }
+
+            const bool materialized = isMaterializedValue(model, view->value);
+            const std::string lanes = packedArrayLaneRefExpr(model, *view, context);
+            const std::string storageType = packedArrayLaneStorageType(*view);
+            const std::string laneType = packedArrayLaneCppType(*view);
+            emitValueAssignmentComment(stream, graph, model, view->value, "        ");
+            if (!materialized)
+            {
+                stream << "        " << storageType << " " << lanes << "{};\n";
+            }
+            else
+            {
+                stream << "        " << lanes << " = " << storageType << "{};\n";
+            }
+
+            const auto operands = op.operands();
+            for (std::size_t operandIndex = 0; operandIndex < operands.size(); ++operandIndex)
+            {
+                const ValueId operand = operands[operandIndex];
+                const std::string operandExpr = resolvedScheduleValueExpr(model, operand, context);
+                const std::size_t laneIndex = view->laneByOperand[operandIndex];
+                stream << "        " << lanes << "[" << laneIndex << "] = static_cast<" << laneType << ">("
+                       << scalarTruncExpr(scalarCastOperandExpr(operandExpr),
+                                          static_cast<std::size_t>(view->elementWidth))
+                       << ");\n";
+            }
+            if (materialized && view->sourceValue == view->value && valueNeedsChangeDetect(model, view->value))
+            {
+                emitChangedValuePropagation(stream, model, view->value, "        ", activationContext);
+            }
+            return true;
+        }
+
+        bool emitPackedArrayLaneAssignOperation(std::ostream &stream,
+                                                const Graph &graph,
+                                                const EmitModel &model,
+                                                const Operation &op,
+                                                SupernodeLocalExprContext *context = nullptr,
+                                                const ActivationEmitContext *activationContext = nullptr)
+        {
+            if (op.kind() != OperationKind::kAssign || op.results().empty())
+            {
+                return false;
+            }
+            const ValueId resultValue = op.results().front();
+            const PackedArrayLaneView *view = packedArrayLaneViewForValue(model, resultValue);
+            if (view == nullptr || view->defOp != graph.valueDef(resultValue))
+            {
+                return false;
+            }
+            (void)stream;
+            (void)context;
+            if (isMaterializedValue(model, resultValue) && valueNeedsChangeDetect(model, resultValue))
+            {
+                emitChangedValuePropagation(stream, model, resultValue, "        ", activationContext);
+            }
+            return true;
+        }
+
+        std::optional<std::string> packedArrayLaneSliceExpr(const Graph &graph,
+                                                            const EmitModel &model,
+                                                            const Operation &op,
+                                                            const PackedArrayLaneView &view,
+                                                            const std::string &indexExpr,
+                                                            const SupernodeLocalExprContext *context = nullptr)
+        {
+            if (!sliceArrayUsesPackedArrayLaneView(graph, view, op))
+            {
+                return std::nullopt;
+            }
+            const ValueId resultValue = op.results().front();
+            const std::string cppType = cppTypeForValue(graph, resultValue);
+            const std::string lanes = packedArrayLaneRefExpr(model, view, context);
+            const std::string rawIndex = indexExpr;
+            return "((" + rawIndex + " < " + std::to_string(view.elementCount) +
+                   "u) ? " + lanes + "[" + rawIndex + "] : " + cppType + "{})";
+        }
+
+        bool emitPackedArrayLaneSliceOperation(std::ostream &stream,
+                                               const Graph &graph,
+                                               const EmitModel &model,
+                                               const Operation &op,
+                                               SupernodeLocalExprContext *context = nullptr,
+                                               const ActivationEmitContext *activationContext = nullptr,
+                                               DeferredActivationEmitContext *deferredContext = nullptr)
+        {
+            if (op.kind() != OperationKind::kSliceArray || op.operands().size() != 2 || op.results().empty())
+            {
+                return false;
+            }
+            const ValueId baseValue = op.operands().front();
+            const PackedArrayLaneView *view = packedArrayLaneViewForValue(model, baseValue);
+            if (view == nullptr)
+            {
+                return false;
+            }
+            const ValueId resultValue = op.results().front();
+            const std::string indexName = "packed_array_idx_" + std::to_string(resultValue.index);
+            const std::string indexExpr = resolvedScheduleValueExpr(model, op.operands()[1], context);
+            const auto expr = packedArrayLaneSliceExpr(graph, model, op, *view, indexName, context);
+            if (!expr)
+            {
+                return false;
+            }
+            stream << "        const std::size_t " << indexName << " = static_cast<std::size_t>(" << indexExpr << ");\n";
+            emitLogicAssignFromScalarExpr(stream,
+                                          graph,
+                                          model,
+                                          resultValue,
+                                          *expr,
+                                          false,
+                                          context,
+                                          activationContext,
+                                          deferredContext);
+            return true;
+        }
+
         struct ScalarConcatPrefixCacheKey
         {
             ValueId lhs;
@@ -8972,6 +9579,18 @@ namespace wolvrix::lib::emit
                                     DeferredActivationEmitContext *deferredContext = nullptr)
         {
             if (op.results().empty())
+            {
+                return true;
+            }
+            if (emitPackedArrayLaneConcatOperation(stream, graph, model, op, context, activationContext))
+            {
+                return true;
+            }
+            if (emitPackedArrayLaneAssignOperation(stream, graph, model, op, context, activationContext))
+            {
+                return true;
+            }
+            if (emitPackedArrayLaneSliceOperation(stream, graph, model, op, context, activationContext, deferredContext))
             {
                 return true;
             }
@@ -11859,6 +12478,24 @@ namespace wolvrix::lib::emit
                                 break;
                             }
                         }
+                        if (emitPackedArrayLaneConcatOperation(stream, graph, model, op, &localExprContext, &activationContext))
+                        {
+                            break;
+                        }
+                        if (emitPackedArrayLaneAssignOperation(stream, graph, model, op, &localExprContext, &activationContext))
+                        {
+                            break;
+                        }
+                        if (emitPackedArrayLaneSliceOperation(stream,
+                                                             graph,
+                                                             model,
+                                                             op,
+                                                             &localExprContext,
+                                                             &activationContext,
+                                                             &deferredActivationContext))
+                        {
+                            break;
+                        }
                         if (opNeedsWordLogicEmit(graph, op))
                         {
                             std::string emitErrorText;
@@ -12527,6 +13164,7 @@ namespace wolvrix::lib::emit
             schedPaths.push_back(schedOutputPaths[batchIndex / schedBatchesPerCpp]);
         }
         const std::filesystem::path makefilePath = outDir / "Makefile";
+        const std::filesystem::path emitStatsPath = outDir / "grhsim_emit_stats.json";
         const std::uint64_t maxOutputFileBytes = effectiveMaxOutputFileBytes(options);
         const std::filesystem::path libfstSrcDir = std::filesystem::path(WOLVRIX_SOURCE_DIR) / "external/libfst/src";
 
@@ -12800,7 +13438,8 @@ namespace wolvrix::lib::emit
                         [](std::size_t count) { return count != 0; }) ||
             std::any_of(model.valueWideSlotCountsByWords.begin(),
                         model.valueWideSlotCountsByWords.end(),
-                        [](const auto &entry) { return entry.second != 0; });
+                        [](const auto &entry) { return entry.second != 0; }) ||
+            !model.packedArrayLaneFieldByValue.empty();
 
         if (hasValueLogicSlots)
         {
@@ -18260,6 +18899,12 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                             << wideLogicSlotFieldName("value_", wordCount) << ".end(), "
                             << fixedArrayType("std::uint64_t", wordCount) << "{});\n";
                 }
+                for (const auto &[valueId, fieldName] : model.packedArrayLaneFieldByValue)
+                {
+                    const PackedArrayLaneView &view = model.packedArrayLaneViewByValue.at(valueId);
+                    *stream << "    std::fill(" << fieldName << ".begin(), " << fieldName << ".end(), "
+                            << packedArrayLaneCppType(view) << "{});\n";
+                }
                 break;
             case InitChunkSpec::Kind::kValues:
                 *stream << "    // Initialize non-logic combinational value storage.\n";
@@ -19010,11 +19655,21 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             }
         }
 
+        if (auto error = writePackedArrayLaneEmitStatsJson(emitStatsPath,
+                                                           model.packedArrayLaneEmitStats,
+                                                           maxOutputFileBytes))
+        {
+            reportError(*error, emitStatsPath.string());
+            result.success = false;
+            return result;
+        }
+
         result.artifacts = {
             headerPath.string(),
             runtimePath.string(),
             statePath.string(),
             evalPath.string(),
+            emitStatsPath.string(),
         };
         for (const auto &stateInitPath : stateInitPaths)
         {

@@ -3241,6 +3241,11 @@ namespace wolvrix::lib::transform
             }
         }
 
+        bool opHasSideEffects(const wolvrix::lib::grh::Operation &op)
+        {
+            return getAttrValue<bool>(op, "hasSideEffects").value_or(false);
+        }
+
         std::size_t semanticConsumerCount(const wolvrix::lib::grh::Graph &graph,
                                           wolvrix::lib::grh::ValueId value,
                                           const std::vector<ActivityOpClass> &opClasses,
@@ -3671,6 +3676,14 @@ namespace wolvrix::lib::transform
                     }
                     if (!isLocalSharedComputeOpKind(graph_.opKind(defOp)))
                     {
+                        if (opHasSideEffects(graph_.getOperation(defOp)))
+                        {
+                            ensureComputeNodeForOp(defOp, true);
+                            if (!error_.empty())
+                            {
+                                return;
+                            }
+                        }
                         addBoundary(nodeId, operand);
                         ++build_.stats.computeNodeBoundaryInputsTotal;
                         ++build_.stats.computeNodeBoundaryInputUnsupported;

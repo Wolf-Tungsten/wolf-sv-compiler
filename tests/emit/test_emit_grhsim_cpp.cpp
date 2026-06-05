@@ -357,13 +357,28 @@ namespace
         graph.addResult(wildcardNe, wildcardNeY);
         graph.bindOutputPort("wildcard_ne_y", wildcardNeY);
 
-        ValueId sliceArrayIn = makeLogicValue(graph, "slice_array_in", 24);
+        ValueId sliceArrayIn = makeLogicValue(graph, "slice_array_in", 72);
         OperationId sliceArrayConcat = graph.createOperation(OperationKind::kConcat,
                                                              graph.internSymbol("slice_array_concat_op"));
         graph.addOperand(sliceArrayConcat, comb);
         graph.addOperand(sliceArrayConcat, b);
         graph.addOperand(sliceArrayConcat, a);
+        graph.addOperand(sliceArrayConcat, comb);
+        graph.addOperand(sliceArrayConcat, b);
+        graph.addOperand(sliceArrayConcat, a);
+        graph.addOperand(sliceArrayConcat, comb);
+        graph.addOperand(sliceArrayConcat, b);
+        graph.addOperand(sliceArrayConcat, a);
         graph.addResult(sliceArrayConcat, sliceArrayIn);
+        graph.setAttr(sliceArrayConcat, "svPackedArray.version", static_cast<int64_t>(1));
+        graph.setAttr(sliceArrayConcat, "svPackedArray.elementWidth", static_cast<int64_t>(8));
+        graph.setAttr(sliceArrayConcat, "svPackedArray.elementCount", static_cast<int64_t>(9));
+        graph.setAttr(sliceArrayConcat, "svPackedArray.indexLow", static_cast<int64_t>(0));
+        graph.setAttr(sliceArrayConcat, "svPackedArray.indexHigh", static_cast<int64_t>(8));
+        graph.setAttr(sliceArrayConcat, "svPackedArray.indexDirection", std::string("downto"));
+        graph.setAttr(sliceArrayConcat, "svPackedArray.laneOrder", std::string("lsb_index_low"));
+        graph.setAttr(sliceArrayConcat, "svPackedArray.concat.operand0Index", static_cast<int64_t>(8));
+        graph.setAttr(sliceArrayConcat, "svPackedArray.concat.operandStride", static_cast<int64_t>(-1));
 
         ValueId sliceArrayY = makeLogicValue(graph, "slice_array_y", 8);
         OperationId sliceArray = graph.createOperation(OperationKind::kSliceArray,
@@ -1848,13 +1863,20 @@ int main()
         const std::filesystem::path statePath = outDir / "grhsim_top_state.cpp";
         const std::filesystem::path evalPath = outDir / "grhsim_top_eval.cpp";
         const std::filesystem::path makefilePath = outDir / "Makefile";
+        const std::filesystem::path emitStatsPath = outDir / "grhsim_emit_stats.json";
         const std::vector<std::filesystem::path> stateFiles = collectSchedFiles(outDir, "grhsim_top_state");
         const std::vector<std::filesystem::path> schedFiles = collectSchedFiles(outDir, "grhsim_top_sched_");
         if (!std::filesystem::exists(headerPath) || !std::filesystem::exists(runtimePath) || !std::filesystem::exists(statePath) ||
-            !std::filesystem::exists(evalPath) || !std::filesystem::exists(makefilePath) || stateFiles.size() < 2 ||
+            !std::filesystem::exists(evalPath) || !std::filesystem::exists(makefilePath) ||
+            !std::filesystem::exists(emitStatsPath) || stateFiles.size() < 2 ||
             schedFiles.empty())
         {
             return fail("Expected generated grhsim split state/schedule artifacts to exist");
+        }
+        if (std::find(result.artifacts.begin(), result.artifacts.end(), emitStatsPath.string()) ==
+            result.artifacts.end())
+        {
+            return fail("EmitGrhSimCpp should report grhsim_emit_stats.json as an artifact");
         }
 
         const std::string header = readFile(headerPath);
@@ -1862,6 +1884,7 @@ int main()
         const std::string state = readFiles(stateFiles);
         const std::string eval = readFile(evalPath);
         const std::string makefile = readFile(makefilePath);
+        const std::string emitStats = readFile(emitStatsPath);
         const std::string sched = readFiles(schedFiles);
 
     if (header.find("class GrhSIM_top") == std::string::npos)
@@ -2037,6 +2060,23 @@ int main()
     {
         return fail("Missing emitted small-width combinational coverage");
     }
+    if (sched.find("std::array<std::uint8_t, 9> packed_array_lanes_local_") == std::string::npos ||
+        sched.find("packed_array_idx_") == std::string::npos ||
+        sched.find("? packed_array_lanes_local_") == std::string::npos ||
+        sched.find("slice_array_y = static_cast<std::uint8_t>(grhsim_trunc_u64(scalar_slice_array") != std::string::npos)
+    {
+        return fail("packed-array kSliceArray should emit lane storage and direct lane lookup");
+    }
+    if (emitStats.find("\"packed_array_lane_emit\"") == std::string::npos ||
+        emitStats.find("\"sv_packed_array_attr_defops\": 1") == std::string::npos ||
+        emitStats.find("\"sv_packed_array_attr_concat_defops\": 1") == std::string::npos ||
+        emitStats.find("\"packed_array_slice_array_users\": 1") == std::string::npos ||
+        emitStats.find("\"packed_array_slice_dynamic_legacy_users\": 0") == std::string::npos ||
+        emitStats.find("\"packed_array_lane_emit_values\": 1") == std::string::npos ||
+        emitStats.find("\"packed_array_lane_emit_selects\": 1") == std::string::npos)
+    {
+        return fail("packed-array lane emit stats should report the kSliceArray fast path");
+    }
     if (sched.find("grhsim_cast_u64") == std::string::npos ||
         sched.find("grhsim_compare_signed_u64") == std::string::npos ||
         sched.find("grhsim_compare_signed_words") == std::string::npos ||
@@ -2065,7 +2105,7 @@ int main()
         eval.find("Run compute-phase batches in direct schedule order") == std::string::npos ||
         eval.find("this->eval_compute_batch_0();") == std::string::npos ||
         eval.find("this->eval_commit_batch_") == std::string::npos ||
-        eval.find("pending_eval_round = commit_activated_readers_;") == std::string::npos)
+        eval.find("pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);") == std::string::npos)
     {
         return fail("Missing compute/commit fixed-point eval loop");
     }
@@ -3362,7 +3402,7 @@ int main()
             gatedEvalText.find("Run compute-phase batches in direct schedule order") == std::string::npos ||
             gatedEvalText.find("this->eval_compute_batch_0();") == std::string::npos ||
             gatedEvalText.find("this->eval_commit_batch_") == std::string::npos ||
-            gatedEvalText.find("pending_eval_round = commit_activated_readers_;") == std::string::npos)
+            gatedEvalText.find("pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);") == std::string::npos)
         {
             return fail("gated-clock eval should iterate until compute/commit reaches a fixed point");
         }

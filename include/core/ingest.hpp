@@ -281,6 +281,7 @@ struct ExprNode {
     std::string xmrPath;
     std::vector<ExprNodeId> operands;
     int32_t widthHint = 0;
+    int32_t sliceWidth = 0;
     bool isSigned = false;
     wolvrix::lib::grh::ValueType valueType = wolvrix::lib::grh::ValueType::Logic;
     bool hasSideEffects = false;
