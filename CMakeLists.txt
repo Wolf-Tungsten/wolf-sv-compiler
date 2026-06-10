@@ -502,6 +502,17 @@ target_link_libraries(transform-dead-code-elim
 
 register_test_exe(transform-dead-code-elim)
 
+add_executable(transform-redundant-elim
+    tests/transform/test_redundant_elim_pass.cpp
+)
+
+target_link_libraries(transform-redundant-elim
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-redundant-elim)
+
 add_executable(transform-simplify
     tests/transform/test_simplify_pass.cpp
 )
@@ -785,6 +796,8 @@ target_link_libraries(ingest-write-back-slice
 target_compile_definitions(ingest-write-back-slice
     PRIVATE
         WOLF_SV_INGEST_WRITE_BACK_SLICE_DATA_PATH="${WOLF_SV_INGEST_TEST_DATA_DIR}/write_back_slice.sv"
+        WOLF_SV_XS_BUGCASE_CASE009_DATA_PATH="${CMAKE_SOURCE_DIR}/../testcase/xs-bugcase/CASE_009/rtl/OldestArbiterResetCase009.sv"
+        WOLF_SV_XS_BUGCASE_CASE011_DATA_PATH="${CMAKE_SOURCE_DIR}/../testcase/xs-bugcase/CASE_011/rtl/PackedAggregateBitSelectCase011.sv"
 )
 register_test_exe(ingest-write-back-slice)
 

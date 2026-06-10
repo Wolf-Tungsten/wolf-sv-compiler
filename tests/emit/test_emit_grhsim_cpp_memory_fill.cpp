@@ -3,6 +3,7 @@
 #include "emit/grhsim_cpp.hpp"
 #include "transform/activity_schedule.hpp"
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -59,14 +60,30 @@ namespace
         const ValueId clk = makeLogicValue(graph, "clk", 1);
         const ValueId fillEn = makeLogicValue(graph, "fill_en", 1);
         const ValueId data = makeLogicValue(graph, "data", 8);
+        const ValueId packedData = makeLogicValue(graph, "packed_data", 8);
+        const ValueId widePackedData = makeLogicValue(graph, "wide_packed_data", 128);
         graph.bindInputPort("clk", clk);
         graph.bindInputPort("fill_en", fillEn);
         graph.bindInputPort("data", data);
+        graph.bindInputPort("packed_data", packedData);
+        graph.bindInputPort("wide_packed_data", widePackedData);
 
         const OperationId mem = graph.createOperation(OperationKind::kMemory, graph.internSymbol("mem"));
         graph.setAttr(mem, "width", static_cast<int64_t>(8));
         graph.setAttr(mem, "row", static_cast<int64_t>(4));
         graph.setAttr(mem, "isSigned", false);
+
+        const OperationId packedMem =
+            graph.createOperation(OperationKind::kMemory, graph.internSymbol("mem_packed"));
+        graph.setAttr(packedMem, "width", static_cast<int64_t>(2));
+        graph.setAttr(packedMem, "row", static_cast<int64_t>(4));
+        graph.setAttr(packedMem, "isSigned", false);
+
+        const OperationId widePackedMem =
+            graph.createOperation(OperationKind::kMemory, graph.internSymbol("mem_wide_packed"));
+        graph.setAttr(widePackedMem, "width", static_cast<int64_t>(32));
+        graph.setAttr(widePackedMem, "row", static_cast<int64_t>(4));
+        graph.setAttr(widePackedMem, "isSigned", false);
 
         const OperationId fill = graph.createOperation(OperationKind::kMemoryFillPort,
                                                        graph.internSymbol("mem_fill"));
@@ -77,6 +94,22 @@ namespace
         graph.addOperand(fill, clk);
 
         const ValueId addr0 = addConstant(graph, "addr0_op", "addr0", 2, "2'd0");
+        const OperationId packedFill = graph.createOperation(OperationKind::kMemoryFillPort,
+                                                             graph.internSymbol("mem_packed_fill"));
+        graph.setAttr(packedFill, "memSymbol", std::string("mem_packed"));
+        graph.setAttr(packedFill, "eventEdge", std::vector<std::string>{"posedge"});
+        graph.addOperand(packedFill, fillEn);
+        graph.addOperand(packedFill, packedData);
+        graph.addOperand(packedFill, clk);
+
+        const OperationId widePackedFill = graph.createOperation(OperationKind::kMemoryFillPort,
+                                                                 graph.internSymbol("mem_wide_packed_fill"));
+        graph.setAttr(widePackedFill, "memSymbol", std::string("mem_wide_packed"));
+        graph.setAttr(widePackedFill, "eventEdge", std::vector<std::string>{"posedge"});
+        graph.addOperand(widePackedFill, fillEn);
+        graph.addOperand(widePackedFill, widePackedData);
+        graph.addOperand(widePackedFill, clk);
+
         const ValueId out = makeLogicValue(graph, "out", 8);
         const OperationId read = graph.createOperation(OperationKind::kMemoryReadPort,
                                                        graph.internSymbol("mem_read"));
@@ -84,6 +117,22 @@ namespace
         graph.addOperand(read, addr0);
         graph.addResult(read, out);
         graph.bindOutputPort("out", out);
+
+        const ValueId packedOut = makeLogicValue(graph, "packed_out", 2);
+        const OperationId packedRead = graph.createOperation(OperationKind::kMemoryReadPort,
+                                                            graph.internSymbol("mem_packed_read"));
+        graph.setAttr(packedRead, "memSymbol", std::string("mem_packed"));
+        graph.addOperand(packedRead, addr0);
+        graph.addResult(packedRead, packedOut);
+        graph.bindOutputPort("packed_out", packedOut);
+
+        const ValueId widePackedOut = makeLogicValue(graph, "wide_packed_out", 32);
+        const OperationId widePackedRead = graph.createOperation(OperationKind::kMemoryReadPort,
+                                                                graph.internSymbol("mem_wide_packed_read"));
+        graph.setAttr(widePackedRead, "memSymbol", std::string("mem_wide_packed"));
+        graph.addOperand(widePackedRead, addr0);
+        graph.addResult(widePackedRead, widePackedOut);
+        graph.bindOutputPort("wide_packed_out", widePackedOut);
 
         return design;
     }
@@ -155,6 +204,28 @@ int main()
         sched.find("state_mem_mem_") == std::string::npos)
     {
         return fail("memory fill emit body is missing from generated schedule");
+    }
+    if (sched.find("grhsim_slice_dynamic_u64") == std::string::npos ||
+        sched.find("fill_row * 2u") == std::string::npos ||
+        sched.find("state_mem_mem_packed_") == std::string::npos)
+    {
+        return fail("packed memory fill emit body is missing row slice extraction");
+    }
+    if (sched.find("fill_row * 32u") == std::string::npos ||
+        sched.find("grhsim_slice_words<1>") == std::string::npos ||
+        sched.find("state_mem_mem_wide_packed_") == std::string::npos)
+    {
+        return fail("wide packed memory fill emit body is missing words row slice extraction");
+    }
+    if (sched.find("static_cast<std::uint64_t>(value_words_") != std::string::npos)
+    {
+        return fail("wide packed memory fill emitted invalid value_words scalar cast");
+    }
+
+    const std::string buildCmd = "make -C " + outDir.string() + " CXX=clang++ CXXFLAGS='-std=c++20 -O0'";
+    if (std::system(buildCmd.c_str()) != 0)
+    {
+        return fail("generated grhsim memory-fill model failed to compile");
     }
 
     return 0;

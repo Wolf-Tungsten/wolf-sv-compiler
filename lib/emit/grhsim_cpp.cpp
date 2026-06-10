@@ -4801,6 +4801,12 @@ namespace wolvrix::lib::emit
             return model.eventEdgeFieldByValue.find(value) != model.eventEdgeFieldByValue.end();
         }
 
+        std::string eventClassifyExpr(std::string_view oldExpr, std::string_view newExpr)
+        {
+            return "event_baseline_initialized_ ? grhsim_classify_edge(" + std::string(oldExpr) + ", " +
+                   std::string(newExpr) + ") : grhsim_event_edge_kind::none";
+        }
+
         bool valueNeedsTrackedChange(const EmitModel &model, ValueId resultValue)
         {
             return valueNeedsChangeDetect(model, resultValue) || isEventValue(model, resultValue);
@@ -4823,7 +4829,7 @@ namespace wolvrix::lib::emit
             if (const auto eventIt = model.eventEdgeFieldByValue.find(resultValue);
                 eventIt != model.eventEdgeFieldByValue.end())
             {
-                stream << indent << eventIt->second << " = grhsim_classify_edge(" << oldExpr << ", " << newExpr << ");\n";
+                stream << indent << eventIt->second << " = " << eventClassifyExpr(oldExpr, newExpr) << ";\n";
             }
             emitChangedValuePropagation(stream, model, resultValue, indent, context);
         }
@@ -4841,7 +4847,7 @@ namespace wolvrix::lib::emit
             if (const auto eventIt = model.eventEdgeFieldByValue.find(resultValue);
                 eventIt != model.eventEdgeFieldByValue.end())
             {
-                stream << indent << eventIt->second << " = grhsim_classify_edge(" << oldExpr << ", " << newExpr << ");\n";
+                stream << indent << eventIt->second << " = " << eventClassifyExpr(oldExpr, newExpr) << ";\n";
                 deferredContext = nullptr;
             }
             const auto fanoutIt = model.boundaryFanoutByValue.find(resultValue);
@@ -5289,7 +5295,11 @@ namespace wolvrix::lib::emit
                 error = "kMemoryFillPort updateCond must be logic: " + opName;
                 return false;
             }
-            if (graph.valueType(operands[1]) != ValueType::Logic || graph.valueWidth(operands[1]) != state.width)
+            const int32_t dataWidth = graph.valueWidth(operands[1]);
+            const int64_t packedWidth =
+                state.rowCount > 0 ? static_cast<int64_t>(state.width) * state.rowCount : 0;
+            if (graph.valueType(operands[1]) != ValueType::Logic ||
+                (dataWidth != state.width && dataWidth != packedWidth))
             {
                 error = "kMemoryFillPort data width/type mismatch: " + opName;
                 return false;
@@ -11465,23 +11475,67 @@ namespace wolvrix::lib::emit
                 if (write.isMemoryFill)
                 {
                     const std::string stateRef = resolvedStateRefExpr(state, context);
+                    const ValueId dataValue = operands[1];
+                    const int32_t dataWidth = graph.valueWidth(dataValue);
+                    const int64_t packedWidth =
+                        state.rowCount > 0 ? static_cast<int64_t>(state.width) * state.rowCount : 0;
+                    const bool isPackedFill = dataWidth == packedWidth && dataWidth != state.width;
                     stream << innerIndent << "bool any_row_changed = false;\n";
                     stream << innerIndent << "for (std::size_t fill_row = 0; fill_row < " << state.rowCount
                            << "u; ++fill_row) {\n";
                     if (isWideLogicWidth(state.width))
                     {
+                        std::string rowWordsExpr;
+                        if (isPackedFill)
+                        {
+                            rowWordsExpr = sliceWordsExpr(
+                                wordsExprForValue(graph, model, dataValue, dataWidth, context),
+                                dataWidth,
+                                "fill_row * " + std::to_string(state.width) + "u",
+                                state.width);
+                        }
+                        else
+                        {
+                            rowWordsExpr = wordsExprForValue(graph, model, dataValue, state.width, context);
+                        }
                         stream << innerIndent << "    if ("
                                << assignWordsInlineExpr(
                                       stateRef + "[fill_row]",
-                                      wordsExprForValue(graph, model, operands[1], state.width, context),
+                                      rowWordsExpr,
                                       state.width)
                                << ") {\n";
                     }
                     else
                     {
+                        std::string fillExpr;
+                        if (isPackedFill)
+                        {
+                            const std::string startExpr = "fill_row * " + std::to_string(state.width) + "u";
+                            if (isWideLogicWidth(dataWidth))
+                            {
+                                fillExpr = "(" +
+                                           sliceWordsExpr(
+                                               wordsExprForValue(graph, model, dataValue, dataWidth, context),
+                                               dataWidth,
+                                               startExpr,
+                                               state.width) +
+                                           ")[0]";
+                            }
+                            else
+                            {
+                                fillExpr = "grhsim_slice_dynamic_u64(static_cast<std::uint64_t>(" +
+                                           resolvedScheduleValueExpr(model, dataValue, context) + "), "
+                                           "static_cast<std::uint64_t>(" + startExpr + "), " +
+                                           std::to_string(state.width) + ")";
+                            }
+                        }
+                        else
+                        {
+                            fillExpr = "static_cast<std::uint64_t>(" +
+                                       resolvedScheduleValueExpr(model, dataValue, context) + ")";
+                        }
                         stream << innerIndent << "    const auto fill_value = static_cast<" << logicCppType(state.width)
-                               << ">(grhsim_trunc_u64(static_cast<std::uint64_t>("
-                               << resolvedScheduleValueExpr(model, operands[1], context) << "), "
+                               << ">(grhsim_trunc_u64(" << fillExpr << ", "
                                << state.width << "));\n";
                         stream << innerIndent << "    if (" << stateRef << "[fill_row] != fill_value) {\n";
                         stream << innerIndent << "        " << stateRef << "[fill_row] = fill_value;\n";
@@ -16822,6 +16876,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "                               bool deferred);\n\n";
             }
             *stream << "    bool first_eval_ = true;\n";
+            *stream << "    bool event_baseline_initialized_ = false;\n";
             if (model.needsSystemTaskRuntime)
             {
                 *stream << "    bool finalized_ = false;\n";
@@ -19062,6 +19117,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 }
                 emitPerfCounterReset(*stream, model, "    ");
                 *stream << "    first_eval_ = true;\n";
+                *stream << "    event_baseline_initialized_ = false;\n";
                 *stream << "    register_write_conflict_ = false;\n";
                 break;
             case InitChunkSpec::Kind::kRuntimeState:
@@ -19287,8 +19343,10 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "    // Update shared event edges for direct input event values.\n";
                 for (ValueId value : model.inputEventValues)
                 {
-                    *stream << "    " << model.eventEdgeFieldByValue.at(value) << " = grhsim_classify_edge("
-                            << model.prevInputFieldByValue.at(value) << ", " << model.inputFieldByValue.at(value) << ");\n";
+                    *stream << "    " << model.eventEdgeFieldByValue.at(value) << " = "
+                            << eventClassifyExpr(model.prevInputFieldByValue.at(value),
+                                                 model.inputFieldByValue.at(value))
+                            << ";\n";
                 }
             }
             *stream << '\n';
@@ -19479,6 +19537,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             {
                 *stream << "    " << model.prevInputFieldByValue.at(port.in) << " = " << sanitizeIdentifier(port.name) << ".in;\n";
             }
+            *stream << "    event_baseline_initialized_ = true;\n";
             *stream << "    first_eval_ = false;\n";
             *stream << "}\n";
             if (auto error = finalizeOutputFile(*stream, evalPath))

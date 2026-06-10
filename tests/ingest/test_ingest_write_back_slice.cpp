@@ -2,15 +2,20 @@
 
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include "slang/analysis/AnalysisManager.h"
 #include "slang/ast/symbols/CompilationUnitSymbols.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
 #include "slang/driver/Driver.h"
+#include "slang/numeric/SVInt.h"
 
 namespace {
 
@@ -99,7 +104,8 @@ bool buildWriteBackPlan(const std::filesystem::path& sourcePath, std::string_vie
                         wolvrix::lib::ingest::ConvertDiagnostics& diagnostics,
                         wolvrix::lib::ingest::ModulePlan& outPlan,
                         wolvrix::lib::ingest::LoweringPlan& outLowering,
-                        wolvrix::lib::ingest::WriteBackPlan& outWriteBack) {
+                        wolvrix::lib::ingest::WriteBackPlan& outWriteBack,
+                        bool lowerMemoryPorts = false) {
     auto bundle = compileInput(sourcePath, topModule);
     if (!bundle || !bundle->compilation) {
         return false;
@@ -127,18 +133,199 @@ bool buildWriteBackPlan(const std::filesystem::path& sourcePath, std::string_vie
     wolvrix::lib::ingest::ModulePlanner planner(context);
     wolvrix::lib::ingest::StmtLowererPass stmtLowerer(context);
     wolvrix::lib::ingest::WriteBackPass writeBack(context);
+    wolvrix::lib::ingest::MemoryPortLowererPass memoryPortLowerer(context);
 
     outPlan = planner.plan(top->body);
     outLowering = {};
     stmtLowerer.lower(outPlan, outLowering);
+    if (lowerMemoryPorts) {
+        memoryPortLowerer.lower(outPlan, outLowering);
+    }
     outWriteBack = writeBack.lower(outPlan, outLowering);
     return true;
+}
+
+const wolvrix::lib::grh::Port* findOutputPort(const wolvrix::lib::grh::Graph& graph,
+                                              std::string_view name) {
+    for (const auto& port : graph.outputPorts()) {
+        if (port.name == name) {
+            return &port;
+        }
+    }
+    return nullptr;
+}
+
+const wolvrix::lib::grh::Port* findInputPort(const wolvrix::lib::grh::Graph& graph,
+                                             std::string_view name) {
+    for (const auto& port : graph.inputPorts()) {
+        if (port.name == name) {
+            return &port;
+        }
+    }
+    return nullptr;
+}
+
+std::optional<int64_t> constLogicInt(const wolvrix::lib::grh::Graph& graph,
+                                     wolvrix::lib::grh::ValueId value) {
+    if (!value.valid()) {
+        return std::nullopt;
+    }
+    const wolvrix::lib::grh::OperationId defId = graph.getValue(value).definingOp();
+    if (!defId.valid()) {
+        return std::nullopt;
+    }
+    const wolvrix::lib::grh::Operation op = graph.getOperation(defId);
+    if (op.kind() != wolvrix::lib::grh::OperationKind::kConstant) {
+        return std::nullopt;
+    }
+    const auto attr = op.attr("constValue");
+    if (!attr) {
+        return std::nullopt;
+    }
+    const auto* text = std::get_if<std::string>(&*attr);
+    if (!text) {
+        return std::nullopt;
+    }
+    try {
+        slang::SVInt parsed = slang::SVInt::fromString(*text);
+        if (parsed.hasUnknown()) {
+            return std::nullopt;
+        }
+        if (auto valueInt = parsed.as<int64_t>()) {
+            return *valueInt;
+        }
+    }
+    catch (const std::exception&) {
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::vector<std::string>> getAttrStrings(const wolvrix::lib::grh::Operation& op,
+                                                       std::string_view key) {
+    auto attr = op.attr(key);
+    if (!attr) {
+        return std::nullopt;
+    }
+    if (const auto* value = std::get_if<std::vector<std::string>>(&*attr)) {
+        return *value;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::vector<int64_t>> getAttrInts(const wolvrix::lib::grh::Operation& op,
+                                                std::string_view key) {
+    auto attr = op.attr(key);
+    if (!attr) {
+        return std::nullopt;
+    }
+    if (const auto* value = std::get_if<std::vector<int64_t>>(&*attr)) {
+        return *value;
+    }
+    return std::nullopt;
+}
+
+std::optional<int64_t> parseLogicLiteralInt(const std::string& text) {
+    try {
+        slang::SVInt parsed = slang::SVInt::fromString(text);
+        if (parsed.hasUnknown()) {
+            return std::nullopt;
+        }
+        if (auto value = parsed.as<int64_t>()) {
+            return *value;
+        }
+    }
+    catch (const std::exception&) {
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+void collectMemoryReadAddresses(const wolvrix::lib::grh::Graph& graph,
+                                wolvrix::lib::grh::ValueId value,
+                                std::vector<std::optional<int64_t>>& addresses,
+                                std::unordered_set<wolvrix::lib::grh::ValueId,
+                                                   wolvrix::lib::grh::ValueIdHash>& seen) {
+    if (!value.valid() || !seen.insert(value).second) {
+        return;
+    }
+    const wolvrix::lib::grh::OperationId defId = graph.getValue(value).definingOp();
+    if (!defId.valid()) {
+        return;
+    }
+    const wolvrix::lib::grh::Operation op = graph.getOperation(defId);
+    if (op.kind() == wolvrix::lib::grh::OperationKind::kMemoryReadPort) {
+        if (op.operands().empty()) {
+            addresses.push_back(std::nullopt);
+        }
+        else {
+            addresses.push_back(constLogicInt(graph, op.operands().front()));
+        }
+        return;
+    }
+    for (wolvrix::lib::grh::ValueId operand : op.operands()) {
+        collectMemoryReadAddresses(graph, operand, addresses, seen);
+    }
+}
+
+int expectSingleMemoryReadAddress(const wolvrix::lib::grh::Graph& graph,
+                                  std::string_view outputName,
+                                  int64_t expectedAddress) {
+    const wolvrix::lib::grh::Port* port = findOutputPort(graph, outputName);
+    if (!port || !port->value.valid()) {
+        return fail("Missing output port " + std::string(outputName));
+    }
+    std::vector<std::optional<int64_t>> addresses;
+    std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash> seen;
+    collectMemoryReadAddresses(graph, port->value, addresses, seen);
+    if (addresses.size() != 1) {
+        return fail(std::string(outputName) + " should depend on exactly one memory row read, saw " +
+                    std::to_string(addresses.size()));
+    }
+    if (!addresses.front() || *addresses.front() != expectedAddress) {
+        return fail(std::string(outputName) + " should read packed aggregate row " +
+                    std::to_string(expectedAddress));
+    }
+    return 0;
 }
 
 bool hasOp(const wolvrix::lib::ingest::LoweringPlan& lowering, wolvrix::lib::grh::OperationKind kind) {
     for (const auto& node : lowering.values) {
         if (node.kind == wolvrix::lib::ingest::ExprNodeKind::Operation && node.op == kind) {
             return true;
+        }
+    }
+    return false;
+}
+
+bool exprHasOpWidth(const wolvrix::lib::ingest::LoweringPlan& lowering,
+                    wolvrix::lib::ingest::ExprNodeId root,
+                    wolvrix::lib::grh::OperationKind kind,
+                    int32_t widthHint) {
+    if (root == wolvrix::lib::ingest::kInvalidPlanIndex) {
+        return false;
+    }
+    std::unordered_set<wolvrix::lib::ingest::ExprNodeId> seen;
+    std::vector<wolvrix::lib::ingest::ExprNodeId> stack;
+    stack.push_back(root);
+    while (!stack.empty()) {
+        const wolvrix::lib::ingest::ExprNodeId current = stack.back();
+        stack.pop_back();
+        if (current == wolvrix::lib::ingest::kInvalidPlanIndex ||
+            current >= static_cast<wolvrix::lib::ingest::ExprNodeId>(lowering.values.size())) {
+            continue;
+        }
+        if (!seen.insert(current).second) {
+            continue;
+        }
+        const auto& node = lowering.values[current];
+        if (node.kind == wolvrix::lib::ingest::ExprNodeKind::Operation) {
+            if (node.op == kind && node.widthHint == widthHint) {
+                return true;
+            }
+            for (wolvrix::lib::ingest::ExprNodeId operand : node.operands) {
+                stack.push_back(operand);
+            }
         }
     }
     return false;
@@ -153,6 +340,55 @@ bool hasWarningMessage(const wolvrix::lib::ingest::ConvertDiagnostics& diagnosti
         }
     }
     return false;
+}
+
+bool exprUsesSymbol(const wolvrix::lib::ingest::LoweringPlan& lowering,
+                    wolvrix::lib::ingest::ExprNodeId root,
+                    wolvrix::lib::ingest::PlanSymbolId target) {
+    if (root == wolvrix::lib::ingest::kInvalidPlanIndex || !target.valid()) {
+        return false;
+    }
+    std::unordered_set<wolvrix::lib::ingest::ExprNodeId> seen;
+    std::vector<wolvrix::lib::ingest::ExprNodeId> stack;
+    stack.push_back(root);
+    while (!stack.empty()) {
+        const wolvrix::lib::ingest::ExprNodeId current = stack.back();
+        stack.pop_back();
+        if (current == wolvrix::lib::ingest::kInvalidPlanIndex ||
+            current >= static_cast<wolvrix::lib::ingest::ExprNodeId>(lowering.values.size())) {
+            continue;
+        }
+        if (!seen.insert(current).second) {
+            continue;
+        }
+        const auto& node = lowering.values[current];
+        if (node.kind == wolvrix::lib::ingest::ExprNodeKind::Symbol &&
+            node.symbol.index == target.index) {
+            return true;
+        }
+        if (node.kind != wolvrix::lib::ingest::ExprNodeKind::Operation) {
+            continue;
+        }
+        for (wolvrix::lib::ingest::ExprNodeId operand : node.operands) {
+            stack.push_back(operand);
+        }
+    }
+    return false;
+}
+
+const wolvrix::lib::ingest::WriteBackPlan::Entry* findEntryForSymbol(
+    const wolvrix::lib::ingest::ModulePlan& plan,
+    const wolvrix::lib::ingest::WriteBackPlan& writeBack,
+    std::string_view name) {
+    for (const auto& entry : writeBack.entries) {
+        if (!entry.target.valid()) {
+            continue;
+        }
+        if (plan.symbolTable.text(entry.target) == name) {
+            return &entry;
+        }
+    }
+    return nullptr;
 }
 
 int testWriteBackSliceStatic(const std::filesystem::path& sourcePath) {
@@ -221,7 +457,381 @@ int testWriteBackSliceMember(const std::filesystem::path& sourcePath) {
     return 0;
 }
 
+int testWriteBackWholeSelfSliceAcyclic(const std::filesystem::path& sourcePath) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    wolvrix::lib::ingest::WriteBackPlan writeBack;
+    if (!buildWriteBackPlan(sourcePath, "write_back_whole_self_slice_acyclic", diagnostics,
+                            plan, lowering, writeBack)) {
+        return fail("Failed to build write-back whole self-slice acyclic plan for " +
+                    sourcePath.string());
+    }
+
+    const auto* entry = findEntryForSymbol(plan, writeBack, "y");
+    if (!entry) {
+        return fail("Missing y write-back entry for whole self-slice acyclic");
+    }
+    if (exprUsesSymbol(lowering, entry->nextValue, entry->target)) {
+        return fail("Acyclic whole self-slice write-back still depends on its target");
+    }
+    if (diagnostics.hasError()) {
+        return fail("Unexpected Convert diagnostics errors in whole self-slice acyclic");
+    }
+    return 0;
+}
+
+int testWriteBackWholeSelfSliceTrueLoop(const std::filesystem::path& sourcePath) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    wolvrix::lib::ingest::WriteBackPlan writeBack;
+    if (!buildWriteBackPlan(sourcePath, "write_back_whole_self_slice_true_loop", diagnostics,
+                            plan, lowering, writeBack)) {
+        return fail("Failed to build write-back whole self-slice true-loop plan for " +
+                    sourcePath.string());
+    }
+
+    const auto* entry = findEntryForSymbol(plan, writeBack, "y");
+    if (!entry) {
+        return fail("Missing y write-back entry for whole self-slice true loop");
+    }
+    if (!exprUsesSymbol(lowering, entry->nextValue, entry->target)) {
+        return fail("True whole self-slice loop was incorrectly removed");
+    }
+    if (diagnostics.hasError()) {
+        return fail("Unexpected Convert diagnostics errors in whole self-slice true loop");
+    }
+    return 0;
+}
+
+int testWriteBackPackedArraySelfSliceAcyclic(const std::filesystem::path& sourcePath) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    wolvrix::lib::ingest::WriteBackPlan writeBack;
+    if (!buildWriteBackPlan(sourcePath, "write_back_packed_array_self_slice_acyclic",
+                            diagnostics, plan, lowering, writeBack)) {
+        return fail("Failed to build write-back packed array self-slice acyclic plan for " +
+                    sourcePath.string());
+    }
+
+    const auto* entry = findEntryForSymbol(plan, writeBack, "y");
+    if (!entry) {
+        return fail("Missing y write-back entry for packed array self-slice acyclic");
+    }
+    if (exprUsesSymbol(lowering, entry->nextValue, entry->target)) {
+        return fail("Acyclic packed array self-slice write-back still depends on its target");
+    }
+    if (diagnostics.hasError()) {
+        return fail("Unexpected Convert diagnostics errors in packed array self-slice acyclic");
+    }
+    return 0;
+}
+
+int testWriteBackMutualSelfSliceAcyclic(const std::filesystem::path& sourcePath) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    wolvrix::lib::ingest::WriteBackPlan writeBack;
+    if (!buildWriteBackPlan(sourcePath, "write_back_mutual_self_slice_acyclic",
+                            diagnostics, plan, lowering, writeBack)) {
+        return fail("Failed to build write-back mutual self-slice acyclic plan for " +
+                    sourcePath.string());
+    }
+
+    const auto* aEntry = findEntryForSymbol(plan, writeBack, "a");
+    const auto* bEntry = findEntryForSymbol(plan, writeBack, "b");
+    if (!aEntry || !bEntry) {
+        return fail("Missing a/b write-back entries for mutual self-slice acyclic");
+    }
+    if (exprUsesSymbol(lowering, aEntry->nextValue, aEntry->target) ||
+        exprUsesSymbol(lowering, aEntry->nextValue, bEntry->target) ||
+        exprUsesSymbol(lowering, bEntry->nextValue, aEntry->target) ||
+        exprUsesSymbol(lowering, bEntry->nextValue, bEntry->target)) {
+        return fail("Acyclic mutual self-slice write-back still depends on its SCC");
+    }
+    if (diagnostics.hasError()) {
+        return fail("Unexpected Convert diagnostics errors in mutual self-slice acyclic");
+    }
+    return 0;
+}
+
+int testWriteBackIndirectMutualSelfSliceAcyclic(const std::filesystem::path& sourcePath) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    wolvrix::lib::ingest::WriteBackPlan writeBack;
+    if (!buildWriteBackPlan(sourcePath, "write_back_indirect_mutual_self_slice_acyclic",
+                            diagnostics, plan, lowering, writeBack)) {
+        return fail("Failed to build write-back indirect mutual self-slice acyclic plan for " +
+                    sourcePath.string());
+    }
+
+    const auto* aEntry = findEntryForSymbol(plan, writeBack, "a");
+    const auto* bEntry = findEntryForSymbol(plan, writeBack, "b");
+    if (!aEntry || !bEntry) {
+        return fail("Missing a/b write-back entries for indirect mutual self-slice acyclic");
+    }
+    if (exprUsesSymbol(lowering, aEntry->nextValue, aEntry->target) ||
+        exprUsesSymbol(lowering, aEntry->nextValue, bEntry->target) ||
+        exprUsesSymbol(lowering, bEntry->nextValue, aEntry->target) ||
+        exprUsesSymbol(lowering, bEntry->nextValue, bEntry->target)) {
+        return fail("Acyclic indirect mutual self-slice write-back still depends on its SCC");
+    }
+    if (diagnostics.hasError()) {
+        return fail("Unexpected Convert diagnostics errors in indirect mutual self-slice acyclic");
+    }
+    return 0;
+}
+
+int testOldestArbiterResetPackedArray(const std::filesystem::path& sourcePath,
+                                      std::string_view moduleName,
+                                      int32_t priorityWidth) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    wolvrix::lib::ingest::WriteBackPlan writeBack;
+    if (!buildWriteBackPlan(sourcePath, moduleName, diagnostics, plan, lowering, writeBack,
+                            /*lowerMemoryPorts=*/true)) {
+        return fail("Failed to build OldestArbiter reset write-back plan for " +
+                    sourcePath.string());
+    }
+
+    const wolvrix::lib::ingest::PlanSymbolId prioritySymbol =
+        plan.symbolTable.lookup("priorityVecReg");
+    if (!prioritySymbol.valid()) {
+        return fail("Missing priorityVecReg symbol for " + std::string(moduleName));
+    }
+
+    const wolvrix::lib::ingest::MemoryFillPort* priorityFill = nullptr;
+    for (const auto& fill : lowering.memoryFills) {
+        if (fill.memory.index == prioritySymbol.index) {
+            priorityFill = &fill;
+            break;
+        }
+    }
+    if (!priorityFill) {
+        return fail("Missing priorityVecReg whole-array memory fill for " + std::string(moduleName));
+    }
+    if (priorityFill->eventEdges.size() != 2 || priorityFill->eventOperands.size() != 2) {
+        return fail("priorityVecReg fill should preserve clock/reset edge events for " +
+                    std::string(moduleName));
+    }
+    if (exprUsesSymbol(lowering, priorityFill->data, prioritySymbol)) {
+        return fail("priorityVecReg reset fill still depends on itself for " +
+                    std::string(moduleName));
+    }
+    if (!exprHasOpWidth(lowering, priorityFill->data, wolvrix::lib::grh::OperationKind::kConcat,
+                        priorityWidth)) {
+        return fail("priorityVecReg fill is missing packed-array concat width " +
+                    std::to_string(priorityWidth) + " for " + std::string(moduleName));
+    }
+
+    std::size_t priorityWrites = 0;
+    for (const auto& write : lowering.memoryWrites) {
+        if (write.memory.index != prioritySymbol.index) {
+            continue;
+        }
+        ++priorityWrites;
+        if (write.eventEdges.size() != 2 || write.eventOperands.size() != 2) {
+            return fail("priorityVecReg element write should preserve clock/reset edge events for " +
+                        std::string(moduleName));
+        }
+    }
+    if (priorityWrites == 0) {
+        return fail("Missing priorityVecReg element memory writes for " + std::string(moduleName));
+    }
+    if (diagnostics.hasError()) {
+        return fail("Unexpected Convert diagnostics errors in OldestArbiter reset case");
+    }
+    return 0;
+}
+
+int testOldestArbiterResetGraphWholeRead(const std::filesystem::path& sourcePath,
+                                         std::string_view moduleName,
+                                         int32_t expectedRows) {
+    auto bundle = compileInput(sourcePath, moduleName);
+    if (!bundle || !bundle->compilation) {
+        return fail("Failed to compile OldestArbiter reset graph case for " +
+                    std::string(moduleName));
+    }
+
+    wolvrix::lib::ingest::ConvertDriver driver;
+    wolvrix::lib::grh::Design design = driver.convert(bundle->compilation->getRoot());
+    const wolvrix::lib::grh::Graph* graph = design.findGraph(moduleName);
+    if (!graph) {
+        return fail("Missing graph for " + std::string(moduleName));
+    }
+
+    const wolvrix::lib::grh::Port* priorityPort = findOutputPort(*graph, "priority_flat");
+    if (!priorityPort || !priorityPort->value.valid()) {
+        return fail("Missing priority_flat output port for " + std::string(moduleName));
+    }
+    const wolvrix::lib::grh::OperationId assignId =
+        graph->getValue(priorityPort->value).definingOp();
+    if (!assignId.valid()) {
+        return fail("priority_flat output has no defining op for " + std::string(moduleName));
+    }
+    const wolvrix::lib::grh::Operation assignOp = graph->getOperation(assignId);
+    if (assignOp.kind() != wolvrix::lib::grh::OperationKind::kAssign ||
+        assignOp.operands().size() != 1) {
+        return fail("priority_flat output should be assigned from aggregate whole read for " +
+                    std::string(moduleName));
+    }
+    const wolvrix::lib::grh::ValueId aggregateValue = assignOp.operands().front();
+    const wolvrix::lib::grh::OperationId concatId =
+        graph->getValue(aggregateValue).definingOp();
+    if (!concatId.valid()) {
+        return fail("priority_flat aggregate whole read has no defining op for " +
+                    std::string(moduleName));
+    }
+    const wolvrix::lib::grh::Operation concatOp = graph->getOperation(concatId);
+    if (concatOp.kind() != wolvrix::lib::grh::OperationKind::kConcat ||
+        concatOp.operands().size() != static_cast<std::size_t>(expectedRows)) {
+        return fail("priority_flat aggregate whole read should concat memory rows for " +
+                    std::string(moduleName));
+    }
+    for (wolvrix::lib::grh::ValueId operand : concatOp.operands()) {
+        const wolvrix::lib::grh::OperationId readId = graph->getValue(operand).definingOp();
+        if (!readId.valid() ||
+            graph->getOperation(readId).kind() !=
+                wolvrix::lib::grh::OperationKind::kMemoryReadPort) {
+            return fail("priority_flat aggregate concat operand is not a memory read for " +
+                        std::string(moduleName));
+        }
+    }
+    return 0;
+}
+
+int testOldestArbiterInitialResetMemoryInit(const std::filesystem::path& sourcePath,
+                                            std::string_view moduleName,
+                                            const std::vector<int64_t>& expectedRows) {
+    auto bundle = compileInput(sourcePath, moduleName);
+    if (!bundle || !bundle->compilation) {
+        return fail("Failed to compile OldestArbiter initial reset graph case for " +
+                    std::string(moduleName));
+    }
+
+    wolvrix::lib::ingest::ConvertDriver driver;
+    wolvrix::lib::grh::Design design = driver.convert(bundle->compilation->getRoot());
+    const wolvrix::lib::grh::Graph* graph = design.findGraph(moduleName);
+    if (!graph) {
+        return fail("Missing graph for " + std::string(moduleName));
+    }
+
+    const wolvrix::lib::grh::Port* resetPort = findInputPort(*graph, "reset");
+    if (!resetPort || !resetPort->value.valid()) {
+        return fail("reset input port should be preserved for " + std::string(moduleName));
+    }
+
+    std::optional<wolvrix::lib::grh::Operation> priorityMemory;
+    for (wolvrix::lib::grh::OperationId opId : graph->operations()) {
+        const wolvrix::lib::grh::Operation op = graph->getOperation(opId);
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kRegister &&
+            op.symbolText() == std::string_view("reset")) {
+            return fail("reset input should not be converted to kRegister for " +
+                        std::string(moduleName));
+        }
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kMemory &&
+            op.symbolText() == std::string_view("priorityVecReg")) {
+            priorityMemory = op;
+        }
+    }
+    if (!priorityMemory) {
+        return fail("Missing priorityVecReg kMemory for " + std::string(moduleName));
+    }
+
+    auto kinds = getAttrStrings(*priorityMemory, "initKind");
+    auto values = getAttrStrings(*priorityMemory, "initValue");
+    auto starts = getAttrInts(*priorityMemory, "initStart");
+    auto lens = getAttrInts(*priorityMemory, "initLen");
+    if (!kinds || !values || !starts || !lens) {
+        return fail("priorityVecReg missing memory init attrs for " + std::string(moduleName));
+    }
+    if (kinds->size() != values->size() || values->size() != starts->size() ||
+        starts->size() != lens->size()) {
+        return fail("priorityVecReg memory init attr size mismatch for " +
+                    std::string(moduleName));
+    }
+
+    std::map<int64_t, int64_t> rows;
+    for (std::size_t i = 0; i < values->size(); ++i) {
+        if ((*kinds)[i] != "literal") {
+            return fail("priorityVecReg init should be literal for " + std::string(moduleName));
+        }
+        auto parsed = parseLogicLiteralInt((*values)[i]);
+        if (!parsed) {
+            return fail("priorityVecReg init literal did not parse for " +
+                        std::string(moduleName));
+        }
+        if ((*starts)[i] < 0) {
+            for (std::size_t row = 0; row < expectedRows.size(); ++row) {
+                rows[static_cast<int64_t>(row)] = *parsed;
+            }
+            continue;
+        }
+        if ((*lens)[i] != 1) {
+            return fail("priorityVecReg per-row init should have len=1 for " +
+                        std::string(moduleName));
+        }
+        rows[(*starts)[i]] = *parsed;
+    }
+
+    if (rows.size() != expectedRows.size()) {
+        return fail("priorityVecReg memory init row count mismatch for " +
+                    std::string(moduleName));
+    }
+    for (std::size_t row = 0; row < expectedRows.size(); ++row) {
+        auto it = rows.find(static_cast<int64_t>(row));
+        if (it == rows.end() || it->second != expectedRows[row]) {
+            return fail("priorityVecReg memory init row mismatch for " +
+                        std::string(moduleName));
+        }
+    }
+    return 0;
+}
+
+int testPackedAggregateBitSelectGraph(const std::filesystem::path& sourcePath) {
+    auto bundle = compileInput(sourcePath, "PackedAggregateBitSelectCase011");
+    if (!bundle || !bundle->compilation) {
+        return fail("Failed to compile packed aggregate bit-select graph case");
+    }
+
+    wolvrix::lib::ingest::ConvertDriver driver;
+    wolvrix::lib::grh::Design design = driver.convert(bundle->compilation->getRoot());
+    const wolvrix::lib::grh::Graph* graph = design.findGraph("PackedAggregateBitSelectCase011");
+    if (!graph) {
+        return fail("Missing graph for PackedAggregateBitSelectCase011");
+    }
+
+    if (int status = expectSingleMemoryReadAddress(*graph, "row0", 0); status != 0) {
+        return status;
+    }
+    if (int status = expectSingleMemoryReadAddress(*graph, "bit00", 0); status != 0) {
+        return status;
+    }
+    if (int status = expectSingleMemoryReadAddress(*graph, "bit01", 0); status != 0) {
+        return status;
+    }
+    if (int status = expectSingleMemoryReadAddress(*graph, "row1", 1); status != 0) {
+        return status;
+    }
+    if (int status = expectSingleMemoryReadAddress(*graph, "bit10", 1); status != 0) {
+        return status;
+    }
+    return expectSingleMemoryReadAddress(*graph, "bit11", 1);
+}
+
 } // namespace
+
+#ifndef WOLF_SV_XS_BUGCASE_CASE009_DATA_PATH
+#error "WOLF_SV_XS_BUGCASE_CASE009_DATA_PATH must be defined"
+#endif
+
+#ifndef WOLF_SV_XS_BUGCASE_CASE011_DATA_PATH
+#error "WOLF_SV_XS_BUGCASE_CASE011_DATA_PATH must be defined"
+#endif
 
 int main() {
     const std::filesystem::path sourcePath = WOLF_SV_INGEST_WRITE_BACK_SLICE_DATA_PATH;
@@ -231,5 +841,54 @@ int main() {
     if (int status = testWriteBackSliceDynamic(sourcePath); status != 0) {
         return status;
     }
-    return testWriteBackSliceMember(sourcePath);
+    if (int status = testWriteBackSliceMember(sourcePath); status != 0) {
+        return status;
+    }
+    if (int status = testWriteBackWholeSelfSliceAcyclic(sourcePath); status != 0) {
+        return status;
+    }
+    if (int status = testWriteBackWholeSelfSliceTrueLoop(sourcePath); status != 0) {
+        return status;
+    }
+    if (int status = testWriteBackPackedArraySelfSliceAcyclic(sourcePath); status != 0) {
+        return status;
+    }
+    if (int status = testWriteBackMutualSelfSliceAcyclic(sourcePath); status != 0) {
+        return status;
+    }
+    if (int status = testWriteBackIndirectMutualSelfSliceAcyclic(sourcePath); status != 0) {
+        return status;
+    }
+    const std::filesystem::path oldestArbiterResetPath = WOLF_SV_XS_BUGCASE_CASE009_DATA_PATH;
+    if (int status = testOldestArbiterResetPackedArray(
+            oldestArbiterResetPath, "OldestArbiterReset2Case009", 4);
+        status != 0) {
+        return status;
+    }
+    if (int status = testOldestArbiterResetPackedArray(
+            oldestArbiterResetPath, "OldestArbiterReset3Case009", 9);
+        status != 0) {
+        return status;
+    }
+    if (int status = testOldestArbiterResetGraphWholeRead(
+            oldestArbiterResetPath, "OldestArbiterReset2Case009", 2);
+        status != 0) {
+        return status;
+    }
+    if (int status = testOldestArbiterResetGraphWholeRead(
+            oldestArbiterResetPath, "OldestArbiterReset3Case009", 3);
+        status != 0) {
+        return status;
+    }
+    if (int status = testOldestArbiterInitialResetMemoryInit(
+            oldestArbiterResetPath, "OldestArbiterInitialReset2Case009", {1, 2});
+        status != 0) {
+        return status;
+    }
+    if (int status = testOldestArbiterInitialResetMemoryInit(
+            oldestArbiterResetPath, "OldestArbiterInitialReset3Case009", {1, 2, 4});
+        status != 0) {
+        return status;
+    }
+    return testPackedAggregateBitSelectGraph(WOLF_SV_XS_BUGCASE_CASE011_DATA_PATH);
 }

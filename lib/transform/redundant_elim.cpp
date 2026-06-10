@@ -181,6 +181,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kMemory:
             case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
             case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
+            case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
             case wolvrix::lib::grh::OperationKind::kRegister:
             case wolvrix::lib::grh::OperationKind::kRegisterReadPort:
             case wolvrix::lib::grh::OperationKind::kRegisterWritePort:

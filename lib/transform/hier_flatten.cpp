@@ -289,7 +289,27 @@ namespace wolvrix::lib::transform
                 child->outputPorts().size() != outputCount ||
                 child->inoutPorts().size() != inoutCount)
             {
-                state.graphError(sourceGraph, "Instance port list does not match module ports");
+                std::string message = "Instance port list does not match module ports";
+                message.append(" module=");
+                message.append(info.moduleName);
+                if (!info.instanceName.empty())
+                {
+                    message.append(" instance=");
+                    message.append(info.instanceName);
+                }
+                message.append(" child_in=");
+                message.append(std::to_string(child->inputPorts().size()));
+                message.append(" attr_in=");
+                message.append(std::to_string(inputCount));
+                message.append(" child_out=");
+                message.append(std::to_string(child->outputPorts().size()));
+                message.append(" attr_out=");
+                message.append(std::to_string(outputCount));
+                message.append(" child_inout=");
+                message.append(std::to_string(child->inoutPorts().size()));
+                message.append(" attr_inout=");
+                message.append(std::to_string(inoutCount));
+                state.graphError(sourceGraph, std::move(message));
                 return false;
             }
 

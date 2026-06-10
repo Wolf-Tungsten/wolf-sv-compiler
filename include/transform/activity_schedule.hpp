@@ -86,6 +86,7 @@ namespace wolvrix::lib::transform
         std::size_t otherComputeDuplicateActivationEdges = 0;
         std::size_t computeNodes = 0;
         std::size_t computeNodeOpsTotal = 0;
+        std::size_t computeNodeCycleSplitIters = 0;
         std::size_t initialComputeSupernodes = 0;
         std::size_t initialComputeSupernodeOpsTotal = 0;
         std::size_t initialComputeSupernodeDagEdges = 0;

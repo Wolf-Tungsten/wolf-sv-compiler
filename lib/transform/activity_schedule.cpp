@@ -375,6 +375,7 @@ namespace wolvrix::lib::transform
             out << ",\"other_compute_duplicate_activation_edges\":" << stats.otherComputeDuplicateActivationEdges;
             out << ",\"compute_nodes\":" << stats.computeNodes;
             out << ",\"compute_node_ops_total\":" << stats.computeNodeOpsTotal;
+            out << ",\"compute_node_cycle_split_iters\":" << stats.computeNodeCycleSplitIters;
             out << ",\"initial_compute_supernodes\":" << stats.initialComputeSupernodes;
             out << ",\"initial_compute_supernode_ops_total\":"
                 << stats.initialComputeSupernodeOpsTotal;
@@ -438,6 +439,7 @@ namespace wolvrix::lib::transform
             stats.supernodes = build.supernodeToOps.size();
             stats.computeNodes = rewrite.stats.computeNodes;
             stats.computeNodeOpsTotal = rewrite.stats.computeNodeOpsTotal;
+            stats.computeNodeCycleSplitIters = rewrite.stats.computeNodeCycleSplitIters;
             stats.initialComputeSupernodes = rewrite.stats.initialComputeSupernodes;
             stats.initialComputeSupernodeOpsTotal =
                 rewrite.stats.initialComputeSupernodeOpsTotal;
@@ -2717,6 +2719,7 @@ namespace wolvrix::lib::transform
 
             std::size_t computeNodes = 0;
             std::size_t computeNodeOpsTotal = 0;
+            std::size_t computeNodeCycleSplitIters = 0;
             std::size_t initialComputeSupernodes = 0;
             std::size_t initialComputeSupernodeOpsTotal = 0;
             std::size_t initialComputeSupernodeDagEdges = 0;
@@ -3500,7 +3503,7 @@ namespace wolvrix::lib::transform
                 }
                 owner = newNode(false);
                 build_.computeNodes[owner].ops.push_back(opId);
-                processOperands(owner, opId);
+                processOperandsBounded(owner, opId);
                 return owner;
             }
 
@@ -3594,7 +3597,7 @@ namespace wolvrix::lib::transform
                     ensureOpCapacity(opId);
                     build_.computeNodeOfOp[opId.index] = nodeId;
                 }
-                processOperands(nodeId, opId);
+                processOperandsBounded(nodeId, opId);
             }
 
             bool absorbSourceOp(uint32_t nodeId, wolvrix::lib::grh::OperationId opId)
@@ -3617,8 +3620,44 @@ namespace wolvrix::lib::transform
                 }
                 node.ops.push_back(opId);
                 build_.computeNodeOfOp[opId.index] = nodeId;
-                processOperands(nodeId, opId);
+                processOperandsBounded(nodeId, opId);
                 return true;
+            }
+
+            void processOperandsBounded(uint32_t nodeId, wolvrix::lib::grh::OperationId opId)
+            {
+                if (nodeId >= build_.computeNodes.size() || !opId.valid() || !error_.empty())
+                {
+                    return;
+                }
+                if (operandProcessDepth_ >= kMaxOperandProcessRecursion)
+                {
+                    pendingOperandProcesses_.push_back({nodeId, opId});
+                    return;
+                }
+                ++operandProcessDepth_;
+                processOperands(nodeId, opId);
+                --operandProcessDepth_;
+                if (operandProcessDepth_ == 0 && !drainingPendingOperands_)
+                {
+                    drainPendingOperandProcesses();
+                }
+            }
+
+            void drainPendingOperandProcesses()
+            {
+                if (drainingPendingOperands_)
+                {
+                    return;
+                }
+                drainingPendingOperands_ = true;
+                while (!pendingOperandProcesses_.empty() && error_.empty())
+                {
+                    const auto [nodeId, opId] = pendingOperandProcesses_.back();
+                    pendingOperandProcesses_.pop_back();
+                    processOperandsBounded(nodeId, opId);
+                }
+                drainingPendingOperands_ = false;
             }
 
             void processOperands(uint32_t nodeId, wolvrix::lib::grh::OperationId opId)
@@ -3758,6 +3797,10 @@ namespace wolvrix::lib::transform
             std::vector<ActivityOpClass> &opClasses_;
             ComputeRewriteBuild &build_;
             std::string &error_;
+            static constexpr std::size_t kMaxOperandProcessRecursion = 256;
+            std::size_t operandProcessDepth_ = 0;
+            bool drainingPendingOperands_ = false;
+            std::vector<std::pair<uint32_t, wolvrix::lib::grh::OperationId>> pendingOperandProcesses_;
         };
 
         struct ClusterValueEdges
@@ -3918,6 +3961,7 @@ namespace wolvrix::lib::transform
                              const wolvrix::lib::grh::Graph &graph)
         {
             build.computeDag.assign(build.computeNodes.size(), {});
+            build.stats.computeNodeBoundaryValues = 0;
             std::unordered_set<uint64_t> seen;
             for (uint32_t nodeId = 0; nodeId < build.computeNodes.size(); ++nodeId)
             {
@@ -3944,6 +3988,285 @@ namespace wolvrix::lib::transform
             for (auto &succs : build.computeDag)
             {
                 std::sort(succs.begin(), succs.end());
+            }
+        }
+
+        uint32_t topoPosForOp(const ActivityOpData &opData, wolvrix::lib::grh::OperationId opId)
+        {
+            if (!opId.valid() || opId.index >= opData.topoPosByOpIndex.size())
+            {
+                return kInvalidActivitySupernodeId;
+            }
+            return opData.topoPosByOpIndex[opId.index];
+        }
+
+        bool topoLessOp(const ActivityOpData &opData,
+                        wolvrix::lib::grh::OperationId lhs,
+                        wolvrix::lib::grh::OperationId rhs)
+        {
+            const uint32_t lhsPos = topoPosForOp(opData, lhs);
+            const uint32_t rhsPos = topoPosForOp(opData, rhs);
+            if (lhsPos != rhsPos)
+            {
+                if (lhsPos == kInvalidActivitySupernodeId)
+                {
+                    return false;
+                }
+                if (rhsPos == kInvalidActivitySupernodeId)
+                {
+                    return true;
+                }
+                return lhsPos < rhsPos;
+            }
+            return lhs.index < rhs.index;
+        }
+
+        void recomputeComputeNodeOwnersAndBoundaries(ComputeRewriteBuild &build,
+                                                     const wolvrix::lib::grh::Graph &graph)
+        {
+            std::size_t mapSize = build.computeNodeOfOp.size();
+            for (const auto &node : build.computeNodes)
+            {
+                for (const auto opId : node.ops)
+                {
+                    mapSize = std::max<std::size_t>(mapSize, opId.index + 1);
+                }
+            }
+            build.computeNodeOfOp.assign(mapSize, kInvalidActivitySupernodeId);
+            for (uint32_t nodeId = 0; nodeId < build.computeNodes.size(); ++nodeId)
+            {
+                auto &node = build.computeNodes[nodeId];
+                node.boundaryInputs.clear();
+                for (const auto opId : node.ops)
+                {
+                    if (opId.index >= build.computeNodeOfOp.size())
+                    {
+                        build.computeNodeOfOp.resize(opId.index + 1, kInvalidActivitySupernodeId);
+                    }
+                    build.computeNodeOfOp[opId.index] = nodeId;
+                }
+            }
+            for (uint32_t nodeId = 0; nodeId < build.computeNodes.size(); ++nodeId)
+            {
+                auto &node = build.computeNodes[nodeId];
+                for (const auto opId : node.ops)
+                {
+                    for (const auto operand : graph.opOperands(opId))
+                    {
+                        const auto defOp = graph.valueDef(operand);
+                        if (!defOp.valid() || defOp.index >= build.computeNodeOfOp.size() ||
+                            build.computeNodeOfOp[defOp.index] != nodeId)
+                        {
+                            if (!vectorContainsValue(node.boundaryInputs, operand))
+                            {
+                                node.boundaryInputs.push_back(operand);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        bool splitCycleComputeNodesToSingletons(ComputeRewriteBuild &build,
+                                                const wolvrix::lib::grh::Graph &graph,
+                                                const ActivityOpData &opData,
+                                                const std::vector<uint32_t> &cycle)
+        {
+            if (cycle.empty())
+            {
+                return false;
+            }
+            std::vector<uint8_t> splitNode(build.computeNodes.size(), 0U);
+            bool anySplit = false;
+            std::size_t extraNodes = 0;
+            for (const uint32_t nodeId : cycle)
+            {
+                if (nodeId >= build.computeNodes.size())
+                {
+                    continue;
+                }
+                if (build.computeNodes[nodeId].ops.size() <= 1)
+                {
+                    continue;
+                }
+                if (splitNode[nodeId] == 0U)
+                {
+                    splitNode[nodeId] = 1U;
+                    anySplit = true;
+                    extraNodes += build.computeNodes[nodeId].ops.size() - 1;
+                }
+            }
+            if (!anySplit)
+            {
+                return false;
+            }
+
+            std::vector<ComputeNode> nextNodes;
+            nextNodes.reserve(build.computeNodes.size() + extraNodes);
+            for (uint32_t nodeId = 0; nodeId < build.computeNodes.size(); ++nodeId)
+            {
+                const auto &node = build.computeNodes[nodeId];
+                if (splitNode[nodeId] == 0U)
+                {
+                    ComputeNode copy;
+                    copy.ops = node.ops;
+                    copy.commonExpr = node.commonExpr;
+                    nextNodes.push_back(std::move(copy));
+                    continue;
+                }
+                std::vector<wolvrix::lib::grh::OperationId> orderedOps = node.ops;
+                std::sort(orderedOps.begin(), orderedOps.end(), [&](const auto lhs, const auto rhs) {
+                    return topoLessOp(opData, lhs, rhs);
+                });
+                for (const auto opId : orderedOps)
+                {
+                    ComputeNode split;
+                    split.ops.push_back(opId);
+                    split.commonExpr = node.commonExpr;
+                    nextNodes.push_back(std::move(split));
+                }
+            }
+            build.computeNodes = std::move(nextNodes);
+            recomputeComputeNodeOwnersAndBoundaries(build, graph);
+            return true;
+        }
+
+        void appendComputeNodeSummary(std::ostringstream &oss,
+                                      const wolvrix::lib::grh::Graph &graph,
+                                      const ComputeRewriteBuild &build,
+                                      const ActivityOpData &opData,
+                                      uint32_t nodeId)
+        {
+            oss << "node=" << nodeId;
+            if (nodeId >= build.computeNodes.size())
+            {
+                return;
+            }
+            const auto &node = build.computeNodes[nodeId];
+            oss << ":ops=" << node.ops.size()
+                << ":boundaries=" << node.boundaryInputs.size();
+            if (node.commonExpr)
+            {
+                oss << ":common";
+            }
+            uint32_t minTopo = kInvalidActivitySupernodeId;
+            uint32_t maxTopo = 0;
+            for (const auto opId : node.ops)
+            {
+                if (!opId.valid() || opId.index >= opData.topoPosByOpIndex.size())
+                {
+                    continue;
+                }
+                const uint32_t pos = opData.topoPosByOpIndex[opId.index];
+                if (pos == kInvalidActivitySupernodeId)
+                {
+                    continue;
+                }
+                minTopo = std::min(minTopo, pos);
+                maxTopo = std::max(maxTopo, pos);
+            }
+            if (minTopo != kInvalidActivitySupernodeId)
+            {
+                oss << ":topo=[" << minTopo << "," << maxTopo << "]";
+            }
+            oss << "[";
+            const std::size_t opLimit = std::min<std::size_t>(node.ops.size(), 6);
+            for (std::size_t opIndex = 0; opIndex < opLimit; ++opIndex)
+            {
+                if (opIndex != 0)
+                {
+                    oss << ",";
+                }
+                const auto opId = node.ops[opIndex];
+                oss << describeOp(graph, opId);
+                if (opId.valid() && opId.index < opData.topoPosByOpIndex.size())
+                {
+                    const uint32_t pos = opData.topoPosByOpIndex[opId.index];
+                    if (pos != kInvalidActivitySupernodeId)
+                    {
+                        oss << "@topo" << pos;
+                    }
+                }
+            }
+            if (node.ops.size() > opLimit)
+            {
+                oss << ",...";
+            }
+            oss << "]";
+        }
+
+        void appendComputeNodeEdgeReasons(std::ostringstream &oss,
+                                          const wolvrix::lib::grh::Graph &graph,
+                                          const ComputeRewriteBuild &build,
+                                          const ActivityOpData &opData,
+                                          uint32_t from,
+                                          uint32_t to)
+        {
+            oss << " edge " << from << " -> " << to << " via";
+            if (to >= build.computeNodes.size())
+            {
+                oss << " <invalid-target>";
+                return;
+            }
+            std::size_t printed = 0;
+            for (const auto boundary : build.computeNodes[to].boundaryInputs)
+            {
+                const auto defOp = graph.valueDef(boundary);
+                if (!defOp.valid() || defOp.index >= build.computeNodeOfOp.size() ||
+                    build.computeNodeOfOp[defOp.index] != from)
+                {
+                    continue;
+                }
+                for (const auto useOp : build.computeNodes[to].ops)
+                {
+                    const auto operands = graph.opOperands(useOp);
+                    for (std::size_t operandIndex = 0; operandIndex < operands.size(); ++operandIndex)
+                    {
+                        if (operands[operandIndex] != boundary)
+                        {
+                            continue;
+                        }
+                        if (printed == 0)
+                        {
+                            oss << " ";
+                        }
+                        else
+                        {
+                            oss << "; ";
+                        }
+                        oss << describeValue(graph, boundary)
+                            << " def=" << describeOp(graph, defOp);
+                        if (defOp.index < opData.topoPosByOpIndex.size())
+                        {
+                            const uint32_t pos = opData.topoPosByOpIndex[defOp.index];
+                            if (pos != kInvalidActivitySupernodeId)
+                            {
+                                oss << "@topo" << pos;
+                            }
+                        }
+                        oss << " use=" << describeOp(graph, useOp)
+                            << "(operand=" << operandIndex;
+                        if (useOp.index < opData.topoPosByOpIndex.size())
+                        {
+                            const uint32_t pos = opData.topoPosByOpIndex[useOp.index];
+                            if (pos != kInvalidActivitySupernodeId)
+                            {
+                                oss << ",topo=" << pos;
+                            }
+                        }
+                        oss << ")";
+                        ++printed;
+                        if (printed >= 6)
+                        {
+                            oss << "; ...";
+                            return;
+                        }
+                    }
+                }
+            }
+            if (printed == 0)
+            {
+                oss << " <no matching boundary found>";
             }
         }
 
@@ -5022,72 +5345,81 @@ namespace wolvrix::lib::transform
                 }
             }
 
-            buildComputeDag(out, out.computeNodeOfOp, graph);
-            try
+            constexpr std::size_t kMaxComputeNodeCycleSplitIters = 1024;
+            std::size_t cycleSplitIters = 0;
+            while (true)
             {
-                out.computeTopoOrder = topoOrderForDag(out.computeDag);
-            }
-            catch (const std::exception &ex)
-            {
-                std::ostringstream oss;
-                oss << "activity-schedule compute-node topo failed: " << ex.what();
-                const auto cycle = findCyclePath(out.computeDag);
-                if (!cycle.empty())
+                buildComputeDag(out, out.computeNodeOfOp, graph);
+                try
                 {
-                    oss << " cycle_path=";
-                    const std::size_t nodeLimit = std::min<std::size_t>(cycle.size(), 12);
-                    for (std::size_t i = 0; i < nodeLimit; ++i)
-                    {
-                        if (i != 0)
-                        {
-                            oss << " -> ";
-                        }
-                        oss << cycle[i];
-                    }
-                    if (cycle.size() > nodeLimit)
-                    {
-                        oss << " -> ...";
-                    }
-                    oss << " cycle_nodes={";
-                    for (std::size_t i = 0; i < nodeLimit; ++i)
-                    {
-                        if (i != 0)
-                        {
-                            oss << " | ";
-                        }
-                        const uint32_t nodeId = cycle[i];
-                        oss << "node=" << nodeId;
-                        if (nodeId < out.computeNodes.size())
-                        {
-                            const auto &node = out.computeNodes[nodeId];
-                            oss << ":ops=" << node.ops.size();
-                            if (node.commonExpr)
-                            {
-                                oss << ":common";
-                            }
-                            oss << "[";
-                            const std::size_t opLimit = std::min<std::size_t>(node.ops.size(), 6);
-                            for (std::size_t opIndex = 0; opIndex < opLimit; ++opIndex)
-                            {
-                                if (opIndex != 0)
-                                {
-                                    oss << ",";
-                                }
-                                oss << describeOp(graph, node.ops[opIndex]);
-                            }
-                            if (node.ops.size() > opLimit)
-                            {
-                                oss << ",...";
-                            }
-                            oss << "]";
-                        }
-                    }
-                    oss << "}";
+                    out.computeTopoOrder = topoOrderForDag(out.computeDag);
+                    break;
                 }
-                error = oss.str();
-                return false;
+                catch (const std::exception &ex)
+                {
+                    const auto cycle = findCyclePath(out.computeDag);
+                    if (cycleSplitIters < kMaxComputeNodeCycleSplitIters &&
+                        splitCycleComputeNodesToSingletons(out, graph, opData, cycle))
+                    {
+                        ++cycleSplitIters;
+                        continue;
+                    }
+
+                    std::ostringstream oss;
+                    oss << "activity-schedule compute-node topo failed: " << ex.what();
+                    if (!cycle.empty())
+                    {
+                        oss << " cycle_path=";
+                        const std::size_t nodeLimit = std::min<std::size_t>(cycle.size(), 12);
+                        for (std::size_t i = 0; i < nodeLimit; ++i)
+                        {
+                            if (i != 0)
+                            {
+                                oss << " -> ";
+                            }
+                            oss << cycle[i];
+                        }
+                        if (cycle.size() > nodeLimit)
+                        {
+                            oss << " -> ...";
+                        }
+                        oss << " cycle_nodes={";
+                        for (std::size_t i = 0; i < nodeLimit; ++i)
+                        {
+                            if (i != 0)
+                            {
+                                oss << " | ";
+                            }
+                            appendComputeNodeSummary(oss, graph, out, opData, cycle[i]);
+                        }
+                        oss << "}";
+                        oss << " cycle_edges={";
+                        const std::size_t edgeLimit =
+                            cycle.empty() ? std::size_t{0} : std::min<std::size_t>(cycle.size() - 1, 12);
+                        for (std::size_t i = 0; i < edgeLimit; ++i)
+                        {
+                            if (i != 0)
+                            {
+                                oss << " | ";
+                            }
+                            appendComputeNodeEdgeReasons(oss, graph, out, opData, cycle[i], cycle[i + 1]);
+                        }
+                        if (!cycle.empty() && cycle.size() - 1 > edgeLimit)
+                        {
+                            oss << " | ...";
+                        }
+                        oss << "}";
+                    }
+                    if (cycleSplitIters >= kMaxComputeNodeCycleSplitIters)
+                    {
+                        oss << " cycle_split_iters=" << cycleSplitIters;
+                    }
+                    error = oss.str();
+                    return false;
+                }
             }
             out.stats.computeNodes = out.computeNodes.size();
+            out.stats.computeNodeCycleSplitIters = cycleSplitIters;
             out.stats.computeNodeOpsTotal = 0;
             for (const auto &node : out.computeNodes)
             {
@@ -5992,6 +6324,7 @@ namespace wolvrix::lib::transform
         logInfo("activity-schedule progress: compute_node_build done compute_nodes=" +
                 std::to_string(rewrite.computeNodes.size()) +
                 " commit_nodes=" + std::to_string(rewrite.commitNodes.size()) +
+                " cycle_split_iters=" + std::to_string(rewrite.stats.computeNodeCycleSplitIters) +
                 " elapsed_ms=" + std::to_string(computeNodeMs));
         if (!exportComputeDagJson(*graph, options_, rewrite, buildError))
         {
@@ -6120,6 +6453,8 @@ namespace wolvrix::lib::transform
         logInfo("activity-schedule timing detail: compute_nodes=" +
                 std::to_string(rewrite.stats.computeNodes) +
                 " compute_node_ops_total=" + std::to_string(rewrite.stats.computeNodeOpsTotal) +
+                " compute_node_cycle_split_iters=" +
+                std::to_string(rewrite.stats.computeNodeCycleSplitIters) +
                 " initial_compute_supernodes=" +
                 std::to_string(rewrite.stats.initialComputeSupernodes) +
                 " initial_compute_supernode_ops_total=" +

@@ -108,5 +108,55 @@ int main()
         return fail("Expected constValue to be 1'b1");
     }
 
+    {
+        wolvrix::lib::grh::Design fillDesign;
+        wolvrix::lib::grh::Graph &fillGraph = fillDesign.createGraph("fill");
+
+        wolvrix::lib::grh::OperationId mem =
+            fillGraph.createOperation(wolvrix::lib::grh::OperationKind::kMemory,
+                                      fillGraph.internSymbol("mem"));
+        fillGraph.setAttr(mem, "width", static_cast<int64_t>(8));
+        fillGraph.setAttr(mem, "row", static_cast<int64_t>(4));
+        fillGraph.setAttr(mem, "isSigned", false);
+
+        wolvrix::lib::grh::ValueId cond = fillGraph.createValue(fillGraph.internSymbol("cond"), 1, false);
+        wolvrix::lib::grh::ValueId data = fillGraph.createValue(fillGraph.internSymbol("data"), 8, false);
+        wolvrix::lib::grh::ValueId clk = fillGraph.createValue(fillGraph.internSymbol("clk"), 1, false);
+        fillGraph.bindInputPort("cond", cond);
+        fillGraph.bindInputPort("data", data);
+        fillGraph.bindInputPort("clk", clk);
+
+        wolvrix::lib::grh::OperationId fill =
+            fillGraph.createOperation(wolvrix::lib::grh::OperationKind::kMemoryFillPort,
+                                      fillGraph.internSymbol("fill"));
+        fillGraph.addOperand(fill, cond);
+        fillGraph.addOperand(fill, data);
+        fillGraph.addOperand(fill, clk);
+        fillGraph.setAttr(fill, "memSymbol", std::string("mem"));
+        fillGraph.setAttr(fill, "eventEdge", std::vector<std::string>{"posedge"});
+
+        PassManager fillManager;
+        fillManager.addPass(std::make_unique<RedundantElimPass>());
+
+        PassDiagnostics fillDiags;
+        PassManagerResult fillRes{};
+        try
+        {
+            fillRes = fillManager.run(fillDesign, fillDiags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during fill run: ") + ex.what());
+        }
+        if (!fillRes.success || fillDiags.hasError())
+        {
+            return fail("Expected redundant elimination fill run to succeed");
+        }
+        if (!fillGraph.findOperation("fill").valid())
+        {
+            return fail("kMemoryFillPort must not be removed as redundant");
+        }
+    }
+
     return 0;
 }

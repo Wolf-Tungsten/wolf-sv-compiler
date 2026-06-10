@@ -344,6 +344,90 @@ int testGraphAssemblyMemoryReadCoalesce(const std::filesystem::path& sourcePath)
     return 0;
 }
 
+int testGraphAssemblyPackedAggregateInstanceSink(const std::filesystem::path& sourcePath) {
+    auto bundle = compileInput(sourcePath, "graph_assembly_packed_aggregate_instance_sink");
+    if (!bundle || !bundle->compilation) {
+        return fail("Failed to compile " + sourcePath.string());
+    }
+
+    wolvrix::lib::ingest::ConvertDriver driver;
+    wolvrix::lib::grh::Design design = driver.convert(bundle->compilation->getRoot());
+    const wolvrix::lib::grh::Graph* graph =
+        design.findGraph("graph_assembly_packed_aggregate_instance_sink");
+    if (!graph) {
+        return fail("Missing graph_assembly_packed_aggregate_instance_sink graph");
+    }
+
+    int memoryOps = 0;
+    int t1Regs = 0;
+    int t2Regs = 0;
+    bool sawT1Write = false;
+    bool sawT2Write = false;
+    bool sawInstanceSink = false;
+    int laneSliceOps = 0;
+    for (wolvrix::lib::grh::OperationId opId : graph->operations()) {
+        wolvrix::lib::grh::Operation op = graph->getOperation(opId);
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kMemory) {
+            ++memoryOps;
+            continue;
+        }
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kRegister) {
+            auto width = getAttrInt(op, "width");
+            if (!width) {
+                return fail("Packed aggregate instance-sink register missing width");
+            }
+            if (op.symbolText() == std::string_view("t1")) {
+                ++t1Regs;
+                if (*width != 72) {
+                    return fail("t1 packed aggregate register should be flattened to 72 bits");
+                }
+            }
+            if (op.symbolText() == std::string_view("t2")) {
+                ++t2Regs;
+                if (*width != 72) {
+                    return fail("t2 packed aggregate register should be flattened to 72 bits");
+                }
+            }
+            continue;
+        }
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort) {
+            auto regSymbol = getAttrString(op, "regSymbol");
+            if (regSymbol && *regSymbol == "t1") {
+                sawT1Write = true;
+            }
+            if (regSymbol && *regSymbol == "t2") {
+                sawT2Write = true;
+            }
+            continue;
+        }
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kSliceStatic ||
+            op.kind() == wolvrix::lib::grh::OperationKind::kSliceArray) {
+            const auto& results = op.results();
+            if (!results.empty() && graph->getValue(results.front()).width() == 9) {
+                ++laneSliceOps;
+            }
+            continue;
+        }
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kInstance) {
+            auto moduleName = getAttrString(op, "moduleName");
+            if (moduleName && *moduleName == "graph_assembly_packed_aggregate_sink") {
+                sawInstanceSink = true;
+            }
+        }
+    }
+
+    if (memoryOps != 0) {
+        return fail("Packed aggregate instance input slices should not create anonymous memory");
+    }
+    if (t1Regs != 1 || t2Regs != 1 || !sawT1Write || !sawT2Write) {
+        return fail("Expected flattened packed aggregate t1/t2 registers and writes");
+    }
+    if (!sawInstanceSink || laneSliceOps < 2) {
+        return fail("Expected instance sinks driven by packed aggregate lane slices");
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -354,5 +438,8 @@ int main() {
     if (int result = testGraphAssemblyPackedAggregateReg(sourcePath); result != 0) {
         return result;
     }
-    return testGraphAssemblyMemoryReadCoalesce(sourcePath);
+    if (int result = testGraphAssemblyMemoryReadCoalesce(sourcePath); result != 0) {
+        return result;
+    }
+    return testGraphAssemblyPackedAggregateInstanceSink(sourcePath);
 }

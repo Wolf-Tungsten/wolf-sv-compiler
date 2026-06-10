@@ -380,6 +380,277 @@ namespace
         return 0;
     }
 
+    int test_false_loop_bitwise_partition_propagation()
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g_bitwise_false");
+
+        const auto mask = makeValue(graph, "mask", 6);
+        const auto ext = makeValue(graph, "ext", 4);
+        graph.bindInputPort("mask", mask);
+        graph.bindInputPort("ext", ext);
+
+        const auto y = makeValue(graph, "y", 6);
+        const auto x = makeValue(graph, "x", 6);
+        const auto mid = makeValue(graph, "mid", 2);
+
+        const auto xorOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
+                                                 graph.internSymbol("xor_y_mask"));
+        graph.addOperand(xorOp, y);
+        graph.addOperand(xorOp, mask);
+        graph.addResult(xorOp, x);
+
+        makeSliceStatic(graph, x, mid, 1, 2, "slice_x_mid");
+        makeConcat(graph, "concat_y", {mid, ext}, y);
+
+        PassManager manager;
+        manager.addPass(std::make_unique<CombLoopElimPass>());
+
+        PassDiagnostics diags;
+        PassManagerResult res{};
+        try
+        {
+            res = manager.run(design, diags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during bitwise false-loop run: ") + ex.what());
+        }
+        if (!res.success || diags.hasError())
+        {
+            return fail("Expected bitwise false-loop case to succeed");
+        }
+        if (!res.changed)
+        {
+            return fail("Expected bitwise false-loop case to report changes");
+        }
+
+        bool foundSplitInfo = false;
+        for (const auto &msg : diags.messages())
+        {
+            if (msg.passName != "comb-loop-elim")
+            {
+                continue;
+            }
+            if (msg.kind == PassDiagnosticKind::Warning)
+            {
+                return fail("Expected bitwise false-loop case to avoid warning diagnostics");
+            }
+            if (msg.kind == PassDiagnosticKind::Info &&
+                msg.message.find("resolved false loops") != std::string::npos &&
+                msg.message.find("split-values=0") == std::string::npos)
+            {
+                foundSplitInfo = true;
+            }
+        }
+        if (!foundSplitInfo)
+        {
+            return fail("Expected bitwise false-loop case to use value splitting");
+        }
+
+        CombLoopElimOptions verifyOptions;
+        verifyOptions.fixFalseLoops = false;
+        PassManager verifyManager;
+        verifyManager.addPass(std::make_unique<CombLoopElimPass>(verifyOptions));
+
+        PassDiagnostics verifyDiags;
+        PassManagerResult verifyRes{};
+        try
+        {
+            verifyRes = verifyManager.run(design, verifyDiags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during bitwise verify run: ") + ex.what());
+        }
+        if (!verifyRes.success || verifyDiags.hasError())
+        {
+            return fail("Expected bitwise verify run to succeed");
+        }
+        for (const auto &msg : verifyDiags.messages())
+        {
+            if (msg.passName == "comb-loop-elim" &&
+                msg.message.find("comb loop detected") != std::string::npos)
+            {
+                return fail("Expected no comb-loop warnings after bitwise split");
+            }
+        }
+
+        return 0;
+    }
+
+    int test_false_loop_compare_split()
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g_compare_false");
+
+        const auto mask = makeValue(graph, "mask", 4);
+        const auto ext = makeValue(graph, "ext", 3);
+        const auto rhs = makeConst(graph, "rhs", 3, "3'h3");
+        graph.bindInputPort("mask", mask);
+        graph.bindInputPort("ext", ext);
+
+        const auto y = makeValue(graph, "y", 4);
+        const auto x = makeValue(graph, "x", 4);
+        const auto low = makeValue(graph, "low", 3);
+        const auto bit = makeValue(graph, "bit", 1);
+
+        const auto xorOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
+                                                 graph.internSymbol("xor_y_mask"));
+        graph.addOperand(xorOp, y);
+        graph.addOperand(xorOp, mask);
+        graph.addResult(xorOp, x);
+
+        makeSliceStatic(graph, x, low, 0, 2, "slice_x_low");
+
+        const auto eqOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kEq,
+                                                graph.internSymbol("eq_x_rhs"));
+        graph.addOperand(eqOp, low);
+        graph.addOperand(eqOp, rhs);
+        graph.addResult(eqOp, bit);
+
+        makeConcat(graph, "concat_y", {bit, ext}, y);
+
+        PassManager manager;
+        manager.addPass(std::make_unique<CombLoopElimPass>());
+
+        PassDiagnostics diags;
+        PassManagerResult res{};
+        try
+        {
+            res = manager.run(design, diags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during compare false-loop run: ") + ex.what());
+        }
+        if (!res.success || diags.hasError())
+        {
+            return fail("Expected compare false-loop case to succeed");
+        }
+        if (!res.changed)
+        {
+            return fail("Expected compare false-loop case to report changes");
+        }
+        for (const auto &msg : diags.messages())
+        {
+            if (msg.passName == "comb-loop-elim" && msg.kind == PassDiagnosticKind::Warning)
+            {
+                return fail("Expected compare false-loop case to avoid warning diagnostics");
+            }
+        }
+        return 0;
+    }
+
+    int test_false_loop_replicate_split()
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g_replicate_false");
+
+        const auto ext = makeValue(graph, "ext", 2);
+        graph.bindInputPort("ext", ext);
+
+        const auto y = makeValue(graph, "y", 4);
+        const auto low = makeValue(graph, "low", 1);
+        const auto repeated = makeValue(graph, "repeated", 2);
+
+        makeSliceStatic(graph, y, low, 0, 0, "slice_y_low");
+
+        const auto repOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kReplicate,
+                                                 graph.internSymbol("rep_low"));
+        graph.addOperand(repOp, low);
+        graph.addResult(repOp, repeated);
+        graph.setAttr(repOp, "rep", int64_t{2});
+
+        makeConcat(graph, "concat_y", {repeated, ext}, y);
+
+        PassManager manager;
+        manager.addPass(std::make_unique<CombLoopElimPass>());
+
+        PassDiagnostics diags;
+        PassManagerResult res{};
+        try
+        {
+            res = manager.run(design, diags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during replicate false-loop run: ") + ex.what());
+        }
+        if (!res.success || diags.hasError())
+        {
+            return fail("Expected replicate false-loop case to succeed");
+        }
+        if (!res.changed)
+        {
+            return fail("Expected replicate false-loop case to report changes");
+        }
+        for (const auto &msg : diags.messages())
+        {
+            if (msg.passName == "comb-loop-elim" && msg.kind == PassDiagnosticKind::Warning)
+            {
+                return fail("Expected replicate false-loop case to avoid warning diagnostics");
+            }
+        }
+        return 0;
+    }
+
+    int test_false_loop_reduce_split()
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g_reduce_false");
+
+        const auto ext = makeValue(graph, "ext", 2);
+        graph.bindInputPort("ext", ext);
+
+        const auto y = makeValue(graph, "y", 4);
+        const auto low = makeValue(graph, "low", 1);
+        const auto high = makeValue(graph, "high", 1);
+        const auto pair = makeValue(graph, "pair", 2);
+        const auto bit = makeValue(graph, "bit", 1);
+
+        makeSliceStatic(graph, y, low, 0, 0, "slice_y_low");
+        makeSliceStatic(graph, y, high, 1, 1, "slice_y_high");
+        makeConcat(graph, "concat_pair", {high, low}, pair);
+
+        const auto reduceOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kReduceAnd,
+                                                    graph.internSymbol("reduce_pair"));
+        graph.addOperand(reduceOp, pair);
+        graph.addResult(reduceOp, bit);
+
+        makeConcat(graph, "concat_y", {bit, ext, high}, y);
+
+        PassManager manager;
+        manager.addPass(std::make_unique<CombLoopElimPass>());
+
+        PassDiagnostics diags;
+        PassManagerResult res{};
+        try
+        {
+            res = manager.run(design, diags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during reduce false-loop run: ") + ex.what());
+        }
+        if (!res.success || diags.hasError())
+        {
+            return fail("Expected reduce false-loop case to succeed");
+        }
+        if (!res.changed)
+        {
+            return fail("Expected reduce false-loop case to report changes");
+        }
+        for (const auto &msg : diags.messages())
+        {
+            if (msg.passName == "comb-loop-elim" && msg.kind == PassDiagnosticKind::Warning)
+            {
+                return fail("Expected reduce false-loop case to avoid warning diagnostics");
+            }
+        }
+        return 0;
+    }
+
 } // namespace
 
 int main()
@@ -393,6 +664,22 @@ int main()
         return rc;
     }
     if (int rc = test_false_loop_dynamic_slice_retargeted(); rc != 0)
+    {
+        return rc;
+    }
+    if (int rc = test_false_loop_bitwise_partition_propagation(); rc != 0)
+    {
+        return rc;
+    }
+    if (int rc = test_false_loop_compare_split(); rc != 0)
+    {
+        return rc;
+    }
+    if (int rc = test_false_loop_replicate_split(); rc != 0)
+    {
+        return rc;
+    }
+    if (int rc = test_false_loop_reduce_split(); rc != 0)
     {
         return rc;
     }

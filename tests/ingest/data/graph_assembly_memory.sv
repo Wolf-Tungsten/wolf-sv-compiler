@@ -45,3 +45,54 @@ module graph_assembly_memory_read_coalesce(
     assign bit0 = mem[addr][0];
     assign bit1 = mem[addr][1];
 endmodule
+
+module graph_assembly_packed_aggregate_sink(
+    input logic [8:0] in,
+    output logic [8:0] out
+);
+    assign out = in;
+endmodule
+
+module graph_assembly_packed_aggregate_instance_sink(
+    input logic clk,
+    input logic reset,
+    input logic [8:0] start_idx,
+    output logic [8:0] out0,
+    output logic [8:0] out1
+);
+    logic [7:0][8:0] t0;
+    logic [7:0][8:0] t1;
+    logic [7:0][8:0] t2;
+
+    assign t0 = {
+        start_idx + 9'h7,
+        start_idx + 9'h6,
+        start_idx + 9'h5,
+        start_idx + 9'h4,
+        start_idx + 9'h3,
+        start_idx + 9'h2,
+        start_idx + 9'h1,
+        start_idx
+    };
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            t1 <= '0;
+            t2 <= '0;
+        end
+        else begin
+            t1 <= t0;
+            t2 <= t1;
+        end
+    end
+
+    graph_assembly_packed_aggregate_sink u0 (
+        .in(t2[3'h0]),
+        .out(out0)
+    );
+
+    graph_assembly_packed_aggregate_sink u1 (
+        .in(t2[3'h1]),
+        .out(out1)
+    );
+endmodule

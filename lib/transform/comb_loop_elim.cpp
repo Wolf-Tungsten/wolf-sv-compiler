@@ -1597,6 +1597,26 @@ namespace wolvrix::lib::transform
             int64_t width = 0;
         };
 
+        bool isCompareOp(OperationKind kind)
+        {
+            switch (kind)
+            {
+            case OperationKind::kEq:
+            case OperationKind::kNe:
+            case OperationKind::kCaseEq:
+            case OperationKind::kCaseNe:
+            case OperationKind::kWildcardEq:
+            case OperationKind::kWildcardNe:
+            case OperationKind::kLt:
+            case OperationKind::kLe:
+            case OperationKind::kGt:
+            case OperationKind::kGe:
+                return true;
+            default:
+                return false;
+            }
+        }
+
         bool collectCopyEdges(const Graph &graph,
                               const std::vector<OperationId> &loopOps,
                               std::vector<MappingEdge> &edges)
@@ -1734,6 +1754,92 @@ namespace wolvrix::lib::transform
                         cursor = lo;
                         edges.push_back(MappingEdge{operands[i], resultId, 0, lo, width});
                     }
+                    break;
+                }
+                case OperationKind::kReplicate:
+                {
+                    if (operands.size() != 1 || !operands[0].valid())
+                    {
+                        return false;
+                    }
+                    auto repOpt = getIntAttr(op, "rep");
+                    if (!repOpt || *repOpt <= 0)
+                    {
+                        return false;
+                    }
+                    const int64_t operandWidth = graph.getValue(operands[0]).width();
+                    if (operandWidth <= 0 ||
+                        operandWidth > std::numeric_limits<int64_t>::max() / *repOpt ||
+                        operandWidth * *repOpt != resultWidth)
+                    {
+                        return false;
+                    }
+                    for (int64_t i = 0; i < *repOpt; ++i)
+                    {
+                        edges.push_back(MappingEdge{operands[0], resultId, 0, i * operandWidth, operandWidth});
+                    }
+                    break;
+                }
+                case OperationKind::kAnd:
+                case OperationKind::kOr:
+                case OperationKind::kXor:
+                case OperationKind::kXnor:
+                case OperationKind::kLogicAnd:
+                case OperationKind::kLogicOr:
+                {
+                    if (operands.size() < 2)
+                    {
+                        return false;
+                    }
+                    for (ValueId operand : operands)
+                    {
+                        if (!operand.valid())
+                        {
+                            return false;
+                        }
+                        const int64_t operandWidth = graph.getValue(operand).width();
+                        if (operandWidth != resultWidth)
+                        {
+                            return false;
+                        }
+                        edges.push_back(MappingEdge{operand, resultId, 0, 0, resultWidth});
+                    }
+                    break;
+                }
+                case OperationKind::kNot:
+                case OperationKind::kLogicNot:
+                {
+                    if (operands.size() != 1 || !operands[0].valid())
+                    {
+                        return false;
+                    }
+                    const int64_t operandWidth = graph.getValue(operands[0]).width();
+                    if (operandWidth != resultWidth)
+                    {
+                        return false;
+                    }
+                    edges.push_back(MappingEdge{operands[0], resultId, 0, 0, resultWidth});
+                    break;
+                }
+                case OperationKind::kMux:
+                {
+                    if (operands.size() != 3 ||
+                        !operands[0].valid() || !operands[1].valid() || !operands[2].valid())
+                    {
+                        return false;
+                    }
+                    if (graph.getValue(operands[0]).width() != 1)
+                    {
+                        return false;
+                    }
+                    const int64_t trueWidth = graph.getValue(operands[1]).width();
+                    const int64_t falseWidth = graph.getValue(operands[2]).width();
+                    if (trueWidth != resultWidth || falseWidth != resultWidth)
+                    {
+                        return false;
+                    }
+                    edges.push_back(MappingEdge{operands[1], resultId, 0, 0, resultWidth});
+                    edges.push_back(MappingEdge{operands[2], resultId, 0, 0, resultWidth});
                     break;
                 }
                 default:
@@ -2319,6 +2425,48 @@ namespace wolvrix::lib::transform
                     }
                     break;
                 }
+                case OperationKind::kReplicate:
+                {
+                    if (operands.size() != 1 || !operands[0].valid())
+                    {
+                        return false;
+                    }
+                    auto repOpt = getIntAttr(op, "rep");
+                    if (!repOpt || *repOpt <= 0)
+                    {
+                        return false;
+                    }
+                    const ValueId operandId = operands[0];
+                    const int64_t operandWidth = graph.getValue(operandId).width();
+                    const int64_t resultWidth = graph.getValue(resultId).width();
+                    if (operandWidth <= 0 ||
+                        operandWidth > std::numeric_limits<int64_t>::max() / *repOpt ||
+                        operandWidth * *repOpt != resultWidth)
+                    {
+                        return false;
+                    }
+                    for (const auto &seg : resultSegments)
+                    {
+                        if (seg.low < 0 || seg.high < seg.low || seg.high >= resultWidth)
+                        {
+                            return false;
+                        }
+                        const int64_t copyLow = (seg.low / operandWidth) * operandWidth;
+                        const int64_t copyHigh = copyLow + operandWidth - 1;
+                        if (seg.high > copyHigh)
+                        {
+                            return false;
+                        }
+                        BitRange srcRange{seg.low - copyLow, seg.high - copyLow};
+                        auto srcFrag = getFragment(operandId, srcRange);
+                        auto dstFrag = getFragment(resultId, seg);
+                        if (!srcFrag || !dstFrag || !addPair(opId, *srcFrag, *dstFrag))
+                        {
+                            return false;
+                        }
+                    }
+                    break;
+                }
                 case OperationKind::kAnd:
                 case OperationKind::kOr:
                 case OperationKind::kXor:
@@ -2503,25 +2651,7 @@ namespace wolvrix::lib::transform
                     {
                         return false;
                     }
-                    const BitRange opRange{0, operandWidth - 1};
-                    if (loopSet.find(operandId) != loopSet.end())
-                    {
-                        const auto segIt = segments.find(operandId);
-                        if (segIt == segments.end())
-                        {
-                            return false;
-                        }
-                        if (segIt->second.size() != 1)
-                        {
-                            return false;
-                        }
-                        const auto &seg = segIt->second.front();
-                        if (seg.low != opRange.low || seg.high != opRange.high)
-                        {
-                            return false;
-                        }
-                    }
-                    auto srcFrag = getFragment(operandId, opRange);
+                    auto srcFrag = getFullView(operandId);
                     if (!srcFrag)
                     {
                         return false;
@@ -2613,6 +2743,15 @@ namespace wolvrix::lib::transform
                     }
                     break;
                 }
+                case OperationKind::kEq:
+                case OperationKind::kNe:
+                case OperationKind::kCaseEq:
+                case OperationKind::kCaseNe:
+                case OperationKind::kWildcardEq:
+                case OperationKind::kWildcardNe:
+                case OperationKind::kLt:
+                case OperationKind::kLe:
+                case OperationKind::kGe:
                 case OperationKind::kGt:
                 {
                     if (operands.size() != 2 || !operands[0].valid() || !operands[1].valid())
@@ -2796,14 +2935,14 @@ namespace wolvrix::lib::transform
             {
                 const OperationId opId = entry.first;
                 const auto &custom = entry.second;
-                if (custom.kind == OperationKind::kGt)
+                if (isCompareOp(custom.kind))
                 {
                     auto dstFrag = getFragment(custom.result, custom.resultSegments.front());
                     if (!dstFrag)
                     {
                         return false;
                     }
-                    if (!rewriteOp(opId, OperationKind::kGt, custom.operands, *dstFrag))
+                    if (!rewriteOp(opId, custom.kind, custom.operands, *dstFrag))
                     {
                         return false;
                     }

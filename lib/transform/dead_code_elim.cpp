@@ -478,7 +478,8 @@ namespace wolvrix::lib::transform
                     break;
                 case OperationKind::kRegisterWritePort:
                 case OperationKind::kLatchWritePort:
-                case OperationKind::kMemoryWritePort: {
+                case OperationKind::kMemoryWritePort:
+                case OperationKind::kMemoryFillPort: {
                     auto sym = getStorageSymbol(op);
                     auto *map = storageMapForKind(info.kind, regInfos, latchInfos, memInfos);
                     if (sym && map)
