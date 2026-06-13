@@ -2559,10 +2559,11 @@ namespace wolvrix::lib::emit
             std::vector<uint8_t> supernodeHasComputePart;
             std::vector<uint8_t> supernodeHasCommitPart;
             bool emitRuntimeProfile = false;
-            std::vector<std::size_t> runtimeProfileComputeNodesBySupernode;
             std::vector<std::size_t> runtimeProfileSourceOpsBySupernode;
             std::vector<std::size_t> runtimeProfileComputeOpsBySupernode;
             std::vector<std::size_t> runtimeProfileSinkOpsBySupernode;
+            std::vector<std::size_t> runtimeProfileConstOpsBySupernode;
+            std::vector<std::size_t> runtimeProfileASuccBySupernode;
             std::vector<std::string> staticConstStringDecls;
             std::vector<std::string> staticConstStringDefs;
             std::vector<std::string> valueFieldDecls;
@@ -2688,6 +2689,7 @@ namespace wolvrix::lib::emit
         enum class RuntimeProfileOpClass
         {
             Source,
+            Const,
             Compute,
             Sink,
             Ignored,
@@ -2698,8 +2700,10 @@ namespace wolvrix::lib::emit
             switch (kind)
             {
             case OperationKind::kConstant:
+                return RuntimeProfileOpClass::Const;
             case OperationKind::kRegisterReadPort:
             case OperationKind::kLatchReadPort:
+            case OperationKind::kMemoryReadPort:
                 return RuntimeProfileOpClass::Source;
             case OperationKind::kRegisterWritePort:
             case OperationKind::kLatchWritePort:
@@ -2712,6 +2716,8 @@ namespace wolvrix::lib::emit
             case OperationKind::kDpicImport:
             case OperationKind::kInstance:
             case OperationKind::kBlackbox:
+            case OperationKind::kXMRRead:
+            case OperationKind::kXMRWrite:
                 return RuntimeProfileOpClass::Ignored;
             default:
                 return RuntimeProfileOpClass::Compute;
@@ -2723,31 +2729,24 @@ namespace wolvrix::lib::emit
                                         EmitModel &model)
         {
             const std::size_t supernodeCount = schedule.supernodeToOps.size();
-            model.runtimeProfileComputeNodesBySupernode.assign(supernodeCount, 0);
             model.runtimeProfileSourceOpsBySupernode.assign(supernodeCount, 0);
             model.runtimeProfileComputeOpsBySupernode.assign(supernodeCount, 0);
             model.runtimeProfileSinkOpsBySupernode.assign(supernodeCount, 0);
+            model.runtimeProfileConstOpsBySupernode.assign(supernodeCount, 0);
+            model.runtimeProfileASuccBySupernode.assign(supernodeCount, 0);
             for (std::size_t supernodeId = 0; supernodeId < supernodeCount; ++supernodeId)
             {
-                if (schedule.computeNodesBySupernode != nullptr &&
-                    supernodeId < schedule.computeNodesBySupernode->size())
-                {
-                    model.runtimeProfileComputeNodesBySupernode[supernodeId] =
-                        (*schedule.computeNodesBySupernode)[supernodeId].size();
-                }
-                else if (schedule.supernodeKinds != nullptr &&
-                         supernodeId < schedule.supernodeKinds->size() &&
-                         (*schedule.supernodeKinds)[supernodeId] == ActivityScheduleSupernodeKind::Compute)
-                {
-                    model.runtimeProfileComputeNodesBySupernode[supernodeId] = 1;
-                }
                 for (OperationId opId : schedule.supernodeToOps[supernodeId])
                 {
-                    const OperationKind kind = graph.opKind(opId);
+                    const Operation op = graph.getOperation(opId);
+                    const OperationKind kind = op.kind();
                     switch (classifyRuntimeProfileOp(kind))
                     {
                     case RuntimeProfileOpClass::Source:
                         ++model.runtimeProfileSourceOpsBySupernode[supernodeId];
+                        break;
+                    case RuntimeProfileOpClass::Const:
+                        ++model.runtimeProfileConstOpsBySupernode[supernodeId];
                         break;
                     case RuntimeProfileOpClass::Compute:
                         ++model.runtimeProfileComputeOpsBySupernode[supernodeId];
@@ -2757,6 +2756,26 @@ namespace wolvrix::lib::emit
                         break;
                     case RuntimeProfileOpClass::Ignored:
                         break;
+                    }
+                    for (ValueId result : op.results())
+                    {
+                        const auto fanoutIt = model.boundaryFanoutByValue.find(result);
+                        if (fanoutIt != model.boundaryFanoutByValue.end() && !fanoutIt->second.empty())
+                        {
+                            ++model.runtimeProfileASuccBySupernode[supernodeId];
+                        }
+                    }
+                    if (isWritePortKind(kind))
+                    {
+                        const auto writeIt = model.writeByOp.find(opId);
+                        if (writeIt != model.writeByOp.end())
+                        {
+                            const auto headIt = model.stateHeadSupernodesBySymbol.find(writeIt->second.symbol);
+                            if (headIt != model.stateHeadSupernodesBySymbol.end() && !headIt->second.empty())
+                            {
+                                ++model.runtimeProfileASuccBySupernode[supernodeId];
+                            }
+                        }
                     }
                 }
             }
@@ -11758,23 +11777,14 @@ namespace wolvrix::lib::emit
                     if (model.emitRuntimeProfile)
                     {
                         stream << "        if (runtime_profile_enabled_) {\n";
-                        stream << "            ++runtime_profile_active_supernodes_;\n";
                         if (batch.phase == ScheduleBatch::Phase::kCompute)
                         {
-                            stream << "            ++runtime_profile_compute_supernodes_;\n";
+                            stream << "            ++runtime_profile_fire_compute_[" << supernodeId << "u];\n";
                         }
                         else
                         {
-                            stream << "            ++runtime_profile_commit_supernodes_;\n";
+                            stream << "            ++runtime_profile_fire_commit_[" << supernodeId << "u];\n";
                         }
-                        stream << "            runtime_profile_compute_nodes_ += UINT64_C("
-                               << model.runtimeProfileComputeNodesBySupernode[supernodeId] << ");\n";
-                        stream << "            runtime_profile_source_ops_ += UINT64_C("
-                               << model.runtimeProfileSourceOpsBySupernode[supernodeId] << ");\n";
-                        stream << "            runtime_profile_compute_ops_ += UINT64_C("
-                               << model.runtimeProfileComputeOpsBySupernode[supernodeId] << ");\n";
-                        stream << "            runtime_profile_sink_ops_ += UINT64_C("
-                               << model.runtimeProfileSinkOpsBySupernode[supernodeId] << ");\n";
                         stream << "        }\n";
                     }
                     stream << "        {\n";
@@ -13220,6 +13230,36 @@ namespace wolvrix::lib::emit
         const std::filesystem::path makefilePath = outDir / "Makefile";
         const std::filesystem::path emitStatsPath = outDir / "grhsim_emit_stats.json";
         const std::uint64_t maxOutputFileBytes = effectiveMaxOutputFileBytes(options);
+
+        // NO0190 §10.1: EMIT-time output — STATIC per-supernode cost columns, written host-side
+        // (not baked into generated code). Kept separate from the runtime fire-count output
+        // (emit-time structural data vs runtime dynamic data; aligned with gsim §10.2).
+        if (model.emitRuntimeProfile)
+        {
+            const std::filesystem::path staticTsvPath = outDir / "grhsim_supernode_static.tsv";
+            if (std::FILE *fp = std::fopen(staticTsvPath.string().c_str(), "w"))
+            {
+                std::fprintf(fp, "supernode_id\tphase\tn_comp\tn_src\tn_sink\tn_const\ta_succ\n");
+                const auto writeStaticRow = [&](uint32_t sid, const char *phase) {
+                    std::fprintf(fp, "%u\t%s\t%zu\t%zu\t%zu\t%zu\t%zu\n",
+                                 static_cast<unsigned>(sid), phase,
+                                 model.runtimeProfileComputeOpsBySupernode[sid],
+                                 model.runtimeProfileSourceOpsBySupernode[sid],
+                                 model.runtimeProfileSinkOpsBySupernode[sid],
+                                 model.runtimeProfileConstOpsBySupernode[sid],
+                                 model.runtimeProfileASuccBySupernode[sid]);
+                };
+                for (const uint32_t sid : model.computeSupernodeIds) writeStaticRow(sid, "compute");
+                for (const uint32_t sid : model.commitSupernodeIds) writeStaticRow(sid, "commit");
+                std::fclose(fp);
+            }
+            else
+            {
+                std::fprintf(stderr,
+                             "[GRHSIM_RUNTIME_PROFILE] failed to open supernode static TSV %s\n",
+                             staticTsvPath.string().c_str());
+            }
+        }
         const std::filesystem::path libfstSrcDir = std::filesystem::path(WOLVRIX_SOURCE_DIR) / "external/libfst/src";
 
         struct InitChunkSpec
@@ -16897,13 +16937,8 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             if (model.emitRuntimeProfile)
             {
                 *stream << "    bool runtime_profile_enabled_ = false;\n";
-                *stream << "    std::uint64_t runtime_profile_active_supernodes_ = UINT64_C(0);\n";
-                *stream << "    std::uint64_t runtime_profile_compute_supernodes_ = UINT64_C(0);\n";
-                *stream << "    std::uint64_t runtime_profile_commit_supernodes_ = UINT64_C(0);\n";
-                *stream << "    std::uint64_t runtime_profile_compute_nodes_ = UINT64_C(0);\n";
-                *stream << "    std::uint64_t runtime_profile_source_ops_ = UINT64_C(0);\n";
-                *stream << "    std::uint64_t runtime_profile_compute_ops_ = UINT64_C(0);\n";
-                *stream << "    std::uint64_t runtime_profile_sink_ops_ = UINT64_C(0);\n";
+                *stream << "    std::array<std::uint64_t, kSupernodeCount> runtime_profile_fire_compute_{};\n";
+                *stream << "    std::array<std::uint64_t, kSupernodeCount> runtime_profile_fire_commit_{};\n";
             }
             *stream << "    bool register_write_conflict_ = false;\n";
             *stream << "    std::uint64_t random_seed_ = UINT64_C(0);\n";
@@ -17343,6 +17378,11 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             *stream << "#include \"" << headerPath.filename().string() << "\"\n";
             *stream << "#include <cstdlib>\n";
             *stream << "#include <cstdio>\n\n";
+            if (model.emitRuntimeProfile)
+            {
+                *stream << "#include <filesystem>\n";
+                *stream << "#include <system_error>\n\n";
+            }
             *stream << className << "::" << className << "()\n";
             *stream << "{\n";
             if (model.emitPerf)
@@ -17516,15 +17556,72 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "    if (!runtime_profile_enabled_) {\n";
                 *stream << "        return;\n";
                 *stream << "    }\n";
-                *stream << "    std::printf(\"[GRHSIM_RUNTIME_PROFILE] active_supernodes=%llu compute_supernodes=%llu commit_supernodes=%llu compute_nodes=%llu source_ops=%llu compute_ops=%llu sink_ops=%llu total_ops=%llu\\n\",\n";
-                *stream << "                static_cast<unsigned long long>(runtime_profile_active_supernodes_),\n";
-                *stream << "                static_cast<unsigned long long>(runtime_profile_compute_supernodes_),\n";
-                *stream << "                static_cast<unsigned long long>(runtime_profile_commit_supernodes_),\n";
-                *stream << "                static_cast<unsigned long long>(runtime_profile_compute_nodes_),\n";
-                *stream << "                static_cast<unsigned long long>(runtime_profile_source_ops_),\n";
-                *stream << "                static_cast<unsigned long long>(runtime_profile_compute_ops_),\n";
-                *stream << "                static_cast<unsigned long long>(runtime_profile_sink_ops_),\n";
-                *stream << "                static_cast<unsigned long long>(runtime_profile_source_ops_ + runtime_profile_compute_ops_ + runtime_profile_sink_ops_));\n";
+                // NO0190 §10.1: RUNTIME output = per-(supernode,phase) fire counts only. Static
+                // columns are an EMIT-time artifact (grhsim_supernode_static.tsv); join on
+                // (supernode_id, phase). Only a minimal (id, phase) row table is baked here so the
+                // runtime can pick the right fire counter and label the phase.
+                *stream << "    struct RuntimeProfileFireRow {\n";
+                *stream << "        std::uint32_t supernodeId = 0;\n";
+                *stream << "        bool computePhase = true;\n";
+                *stream << "    };\n";
+                const std::size_t runtimeProfileRowCount =
+                    model.computeSupernodeIds.size() + model.commitSupernodeIds.size();
+                if (runtimeProfileRowCount == 0)
+                {
+                    *stream << "    static constexpr std::array<RuntimeProfileFireRow, 0> kRows{};\n";
+                }
+                else
+                {
+                    *stream << "    static constexpr std::array<RuntimeProfileFireRow, "
+                            << runtimeProfileRowCount << "> kRows = {{\n";
+                    for (const uint32_t supernodeId : model.computeSupernodeIds)
+                    {
+                        *stream << "        RuntimeProfileFireRow{" << supernodeId << "u, true},\n";
+                    }
+                    for (const uint32_t supernodeId : model.commitSupernodeIds)
+                    {
+                        *stream << "        RuntimeProfileFireRow{" << supernodeId << "u, false},\n";
+                    }
+                    *stream << "    }};\n";
+                }
+                *stream << "    const char *envPath = std::getenv(\"WOLVRIX_GRHSIM_SUPERNODE_TSV\");\n";
+                *stream << "    const char *path = (envPath != nullptr && envPath[0] != '\\0')\n";
+                *stream << "        ? envPath\n";
+                *stream << "        : \"" << escapeCppString((outDir / "grhsim_supernode_fire.tsv").string()) << "\";\n";
+                *stream << "    const std::filesystem::path outputPath(path);\n";
+                *stream << "    if (outputPath.has_parent_path()) {\n";
+                *stream << "        std::error_code ec;\n";
+                *stream << "        std::filesystem::create_directories(outputPath.parent_path(), ec);\n";
+                *stream << "        if (ec) {\n";
+                *stream << "            std::fprintf(stderr,\n";
+                *stream << "                         \"[GRHSIM_RUNTIME_PROFILE] failed to create supernode TSV directory %s: %s\\n\",\n";
+                *stream << "                         outputPath.parent_path().string().c_str(),\n";
+                *stream << "                         ec.message().c_str());\n";
+                *stream << "            return;\n";
+                *stream << "        }\n";
+                *stream << "    }\n";
+                *stream << "    std::FILE *fp = std::fopen(path, \"w\");\n";
+                *stream << "    if (fp == nullptr) {\n";
+                *stream << "        std::fprintf(stderr,\n";
+                *stream << "                     \"[GRHSIM_RUNTIME_PROFILE] failed to open supernode TSV %s\\n\",\n";
+                *stream << "                     path);\n";
+                *stream << "        return;\n";
+                *stream << "    }\n";
+                *stream << "    std::fprintf(fp, \"supernode_id\\tphase\\tf\\n\");\n";
+                *stream << "    for (const auto &row : kRows) {\n";
+                *stream << "        const std::uint64_t fireCount = row.computePhase\n";
+                *stream << "            ? runtime_profile_fire_compute_[row.supernodeId]\n";
+                *stream << "            : runtime_profile_fire_commit_[row.supernodeId];\n";
+                *stream << "        std::fprintf(fp,\n";
+                *stream << "                     \"%u\\t%s\\t%llu\\n\",\n";
+                *stream << "                     static_cast<unsigned>(row.supernodeId),\n";
+                *stream << "                     row.computePhase ? \"compute\" : \"commit\",\n";
+                *stream << "                     static_cast<unsigned long long>(fireCount));\n";
+                *stream << "    }\n";
+                *stream << "    std::fclose(fp);\n";
+                *stream << "    std::printf(\"[GRHSIM_RUNTIME_PROFILE] supernode_fire_tsv=%s rows=%zu\\n\",\n";
+                *stream << "                path,\n";
+                *stream << "                kRows.size());\n";
             }
             *stream << "}\n\n";
             const bool useCommitBoolRange = modelUsesCommitScalarStateWriteKind(model, ValueSlotScalarKind::kBool);
@@ -19116,6 +19213,11 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                     *stream << "    touched_state_shadow_count_ = 0;\n";
                 }
                 emitPerfCounterReset(*stream, model, "    ");
+                if (model.emitRuntimeProfile)
+                {
+                    *stream << "    runtime_profile_fire_compute_.fill(UINT64_C(0));\n";
+                    *stream << "    runtime_profile_fire_commit_.fill(UINT64_C(0));\n";
+                }
                 *stream << "    first_eval_ = true;\n";
                 *stream << "    event_baseline_initialized_ = false;\n";
                 *stream << "    register_write_conflict_ = false;\n";
