@@ -2538,6 +2538,7 @@ namespace wolvrix::lib::emit
             std::unordered_set<ValueId, ValueIdHash> materializedValues;
             std::unordered_map<ValueId, std::vector<uint32_t>, ValueIdHash> inputHeadSupernodesByValue;
             std::unordered_map<ValueId, std::vector<uint32_t>, ValueIdHash> boundaryFanoutByValue;
+            std::vector<ValueId> commitInputValues;
             std::vector<std::size_t> activeIdBySupernode;
             std::unordered_map<std::string, StateDecl> stateBySymbol;
             std::unordered_map<std::string, std::vector<uint32_t>> stateHeadSupernodesBySymbol;
@@ -2617,6 +2618,39 @@ namespace wolvrix::lib::emit
         {
             return model.inputFieldByValue.find(value) != model.inputFieldByValue.end() ||
                    model.materializedValues.find(value) != model.materializedValues.end();
+        }
+
+        bool isComputeSupernode(const EmitModel &model, uint32_t supernodeId) noexcept
+        {
+            return supernodeId < model.supernodeHasComputePart.size() &&
+                   model.supernodeHasComputePart[supernodeId] != 0U;
+        }
+
+        bool isCommitSupernode(const EmitModel &model, uint32_t supernodeId) noexcept
+        {
+            return supernodeId < model.supernodeHasCommitPart.size() &&
+                   model.supernodeHasCommitPart[supernodeId] != 0U;
+        }
+
+        std::vector<ActiveMaskEntry> buildComputeSupernodeActiveMaskEntries(const EmitModel &model)
+        {
+            std::vector<uint32_t> activeIds;
+            activeIds.reserve(model.computeSupernodeIds.size());
+            for (uint32_t supernodeId : model.computeSupernodeIds)
+            {
+                if (supernodeId >= model.activeIdBySupernode.size())
+                {
+                    continue;
+                }
+                const std::size_t activeId = model.activeIdBySupernode[supernodeId];
+                if (activeId == kInvalidIndex)
+                {
+                    continue;
+                }
+                activeIds.push_back(static_cast<uint32_t>(activeId));
+            }
+            sortUniqueVector(activeIds);
+            return buildActiveMaskEntries(activeIds);
         }
 
         std::uint8_t scheduleBatchWordDispatchMask(const EmitModel &model,
@@ -6040,6 +6074,7 @@ namespace wolvrix::lib::emit
             model.localPackedArrayLaneNameByValue.clear();
             model.boundaryFanoutByValue.clear();
             model.inputHeadSupernodesByValue.clear();
+            model.commitInputValues.clear();
             model.localValueNameByValue.clear();
             model.materializedValues.clear();
             model.eventEdgeFieldByValue.clear();
@@ -6603,6 +6638,10 @@ namespace wolvrix::lib::emit
                     activeIds.reserve(succs.size());
                     for (uint32_t supernodeId : succs)
                     {
+                        if (isCommitSupernode(model, supernodeId))
+                        {
+                            continue;
+                        }
                         if (supernodeId < model.activeIdBySupernode.size() &&
                             model.activeIdBySupernode[supernodeId] != kInvalidIndex)
                         {
@@ -6899,6 +6938,10 @@ namespace wolvrix::lib::emit
                 auto &dst = model.stateHeadSupernodesBySymbol[stateSymbol];
                 for (uint32_t supernodeId : supernodes)
                 {
+                    if (!isComputeSupernode(model, supernodeId))
+                    {
+                        continue;
+                    }
                     if (supernodeId < model.activeIdBySupernode.size() &&
                         model.activeIdBySupernode[supernodeId] != kInvalidIndex)
                     {
@@ -6911,6 +6954,22 @@ namespace wolvrix::lib::emit
             {
                 for (const auto opId : schedule.supernodeToOps[supernodeId])
                 {
+                    if (isCommitSupernode(model, supernodeId))
+                    {
+                        const Operation op = graph.getOperation(opId);
+                        for (const ValueId operand : op.operands())
+                        {
+                            if (model.inputFieldByValue.find(operand) != model.inputFieldByValue.end())
+                            {
+                                model.commitInputValues.push_back(operand);
+                            }
+                        }
+                        continue;
+                    }
+                    if (!isComputeSupernode(model, supernodeId))
+                    {
+                        continue;
+                    }
                     const Operation op = graph.getOperation(opId);
                     for (const ValueId operand : op.operands())
                     {
@@ -6937,6 +6996,7 @@ namespace wolvrix::lib::emit
                 (void)symbol;
                 sortUniqueVector(supernodes);
             }
+            sortUniqueValueIds(model.commitInputValues);
 
             for (const auto &decl : model.dpiImports)
             {
@@ -10978,6 +11038,8 @@ namespace wolvrix::lib::emit
         {
             bool homogeneous = false;
             std::string eventExpr = "true";
+            std::string dispatchExpr = "true";
+            std::vector<std::string> eventExprs;
         };
 
         std::optional<CommitEventClusterInfo> analyzeCommitSupernodeEvent(const Graph &graph,
@@ -10989,9 +11051,11 @@ namespace wolvrix::lib::emit
             if (supernodeId >= supernodeToOps.size())
             {
                 info.homogeneous = true;
+                info.eventExprs.push_back(info.eventExpr);
                 return info;
             }
 
+            info.homogeneous = true;
             bool sawCommitOp = false;
             for (const OperationId opId : supernodeToOps[supernodeId])
             {
@@ -11005,6 +11069,11 @@ namespace wolvrix::lib::emit
                 {
                     return std::nullopt;
                 }
+                if (std::find(info.eventExprs.begin(), info.eventExprs.end(), *eventExpr) ==
+                    info.eventExprs.end())
+                {
+                    info.eventExprs.push_back(*eventExpr);
+                }
                 if (!sawCommitOp)
                 {
                     info.eventExpr = *eventExpr;
@@ -11014,14 +11083,35 @@ namespace wolvrix::lib::emit
                 if (info.eventExpr != *eventExpr)
                 {
                     info.homogeneous = false;
-                    return info;
                 }
             }
 
-            info.homogeneous = true;
             if (!sawCommitOp)
             {
                 info.eventExpr = "true";
+                info.eventExprs.push_back(info.eventExpr);
+            }
+            if (std::find(info.eventExprs.begin(), info.eventExprs.end(), std::string("true")) !=
+                info.eventExprs.end())
+            {
+                info.dispatchExpr = "true";
+            }
+            else
+            {
+                if (info.eventExprs.size() == 1u)
+                {
+                    info.dispatchExpr = info.eventExprs.front();
+                }
+                else
+                {
+                    std::vector<std::string> parts;
+                    parts.reserve(info.eventExprs.size());
+                    for (const auto &expr : info.eventExprs)
+                    {
+                        parts.push_back("(" + expr + ")");
+                    }
+                    info.dispatchExpr = parts.empty() ? std::string("true") : joinStrings(parts, " || ");
+                }
             }
             return info;
         }
@@ -11746,14 +11836,94 @@ namespace wolvrix::lib::emit
             {
                 const std::uint8_t dispatchMask = scheduleBatchWordDispatchMask(model, word);
                 const std::uint8_t clearMask = scheduleBatchWordClearMask(model, batch, word);
+                struct CommitEventWordCluster
+                {
+                    std::string eventExpr;
+                    std::uint8_t mask = UINT8_C(0);
+                };
+                auto buildCommitEventWordClusters = [&]() -> std::optional<std::vector<CommitEventWordCluster>>
+                {
+                    std::vector<CommitEventWordCluster> clusters;
+                    if (batch.phase != ScheduleBatch::Phase::kCommit)
+                    {
+                        return clusters;
+                    }
+                    for (uint32_t supernodeId : word.supernodeIds)
+                    {
+                        const std::size_t activeId =
+                            supernodeId < model.activeIdBySupernode.size() ? model.activeIdBySupernode[supernodeId]
+                                                                           : kInvalidIndex;
+                        if (activeId == kInvalidIndex)
+                        {
+                            continue;
+                        }
+                        const auto commitEventInfo =
+                            analyzeCommitSupernodeEvent(graph, model, schedule.supernodeToOps, supernodeId);
+                        if (!commitEventInfo)
+                        {
+                            return std::nullopt;
+                        }
+                        const std::string &eventExpr = commitEventInfo->dispatchExpr;
+                        const std::uint8_t bit = static_cast<std::uint8_t>(
+                            UINT8_C(1) << (activeId % kActiveFlagBitsPerWord));
+                        auto clusterIt =
+                            std::find_if(clusters.begin(),
+                                         clusters.end(),
+                                         [&](const CommitEventWordCluster &cluster)
+                                         {
+                                             return cluster.eventExpr == eventExpr;
+                                         });
+                        if (clusterIt == clusters.end())
+                        {
+                            clusters.push_back(CommitEventWordCluster{.eventExpr = eventExpr, .mask = bit});
+                        }
+                        else
+                        {
+                            clusterIt->mask = static_cast<std::uint8_t>(clusterIt->mask | bit);
+                        }
+                    }
+                    return clusters;
+                };
                 stream << "    \n";
                 stream << "        {\n";
                 stream << "            constexpr std::uint8_t dispatchMask = UINT8_C("
                        << static_cast<unsigned>(dispatchMask) << ");\n";
                 stream << "            constexpr std::uint8_t clearMask = UINT8_C("
                        << static_cast<unsigned>(clearMask) << ");\n";
-                stream << "            std::uint8_t activeWordFlags = static_cast<std::uint8_t>(supernode_active_curr_["
-                       << word.activeFlagWordIndex << "u] & dispatchMask);\n";
+                if (batch.phase == ScheduleBatch::Phase::kCommit)
+                {
+                    const auto commitEventClusters = buildCommitEventWordClusters();
+                    if (!commitEventClusters)
+                    {
+                        return emitError("unsupported exact event expression emit for commit word",
+                                         scheduleBatchMethodName(batch));
+                    }
+                    stream << "            std::uint8_t activeWordFlags = UINT8_C(0);\n";
+                    for (const auto &cluster : *commitEventClusters)
+                    {
+                        if (cluster.mask == UINT8_C(0))
+                        {
+                            continue;
+                        }
+                        if (cluster.eventExpr == "true")
+                        {
+                            stream << "            activeWordFlags = static_cast<std::uint8_t>(activeWordFlags | UINT8_C("
+                                   << static_cast<unsigned>(cluster.mask) << "));\n";
+                        }
+                        else
+                        {
+                            stream << "            if (" << cluster.eventExpr << ") {\n";
+                            stream << "                activeWordFlags = static_cast<std::uint8_t>(activeWordFlags | UINT8_C("
+                                   << static_cast<unsigned>(cluster.mask) << "));\n";
+                            stream << "            }\n";
+                        }
+                    }
+                }
+                else
+                {
+                    stream << "            std::uint8_t activeWordFlags = static_cast<std::uint8_t>(supernode_active_curr_["
+                           << word.activeFlagWordIndex << "u] & dispatchMask);\n";
+                }
                 stream << "            if (unlikely(activeWordFlags != UINT8_C(0))) {\n";
                 stream << "                supernode_active_curr_[" << word.activeFlagWordIndex
                         << "u] = static_cast<std::uint8_t>(supernode_active_curr_["
@@ -11834,6 +12004,7 @@ namespace wolvrix::lib::emit
                     }
                 }
                 std::optional<std::string> outerCommitEventExpr;
+                bool commitEventHandledByDispatch = false;
                 if (batch.phase == ScheduleBatch::Phase::kCommit)
                 {
                     const auto commitEventInfo =
@@ -11843,11 +12014,7 @@ namespace wolvrix::lib::emit
                         return emitError("unsupported exact event expression emit for commit supernode",
                                          std::to_string(supernodeId));
                     }
-                    if (commitEventInfo->homogeneous && commitEventInfo->eventExpr != "true")
-                    {
-                        outerCommitEventExpr = commitEventInfo->eventExpr;
-                        stream << "            if (" << *outerCommitEventExpr << ") {\n";
-                    }
+                    commitEventHandledByDispatch = commitEventInfo->homogeneous;
                 }
                 while (opIndex < supernodeOps.size())
                 {
@@ -11877,9 +12044,10 @@ namespace wolvrix::lib::emit
                         {
                             return emitError("unsupported exact event expression emit", std::string(op.symbolText()));
                         }
-                        const bool eventHandledByOuterGuard =
-                            batch.phase == ScheduleBatch::Phase::kCommit && outerCommitEventExpr.has_value();
-                        const std::string effectiveEventExpr = eventHandledByOuterGuard ? "true" : *eventExpr;
+                        const bool eventAlreadyHandled =
+                            batch.phase == ScheduleBatch::Phase::kCommit &&
+                            (commitEventHandledByDispatch || outerCommitEventExpr.has_value());
+                        const std::string effectiveEventExpr = eventAlreadyHandled ? "true" : *eventExpr;
                         if (isCompressibleScalarStateWrite(model, opId))
                         {
                             std::vector<TableCompressibleScalarStateWriteDesc> tableRunDescs;
@@ -12618,8 +12786,9 @@ namespace wolvrix::lib::emit
                         {
                             return emitError("unsupported exact event expression emit", std::string(op.symbolText()));
                         }
-                        const bool eventHandledByOuterGuard =
-                            batch.phase == ScheduleBatch::Phase::kCommit && outerCommitEventExpr.has_value();
+                        const bool eventAlreadyHandled =
+                            batch.phase == ScheduleBatch::Phase::kCommit &&
+                            (commitEventHandledByDispatch || outerCommitEventExpr.has_value());
                         stream << "            // System tasks are side effects. They execute in schedule order when condition and exact event both hit.\n";
                         std::string procGuard = "true";
                         if (systemTaskRunsOnlyOnInitialEval(op))
@@ -12632,7 +12801,7 @@ namespace wolvrix::lib::emit
                             procGuard = "(" + procGuard + ") && (!" + sampleIt->second.completedFieldName + ")";
                         }
                         stream << "            if ((" << condExpr << ") && ";
-                        if (!eventHandledByOuterGuard)
+                        if (!eventAlreadyHandled)
                         {
                             stream << "(" << *eventExpr << ") && ";
                         }
@@ -12705,11 +12874,12 @@ namespace wolvrix::lib::emit
                         {
                             return emitError("unsupported exact event expression emit", std::string(op.symbolText()));
                         }
-                        const bool eventHandledByOuterGuard =
-                            batch.phase == ScheduleBatch::Phase::kCommit && outerCommitEventExpr.has_value();
+                        const bool eventAlreadyHandled =
+                            batch.phase == ScheduleBatch::Phase::kCommit &&
+                            (commitEventHandledByDispatch || outerCommitEventExpr.has_value());
                         stream << "            // DPIC calls may produce side effects and output values, so they stay as explicit schedule boundaries.\n";
                         stream << "            if ((" << condExpr << ")";
-                        if (!eventHandledByOuterGuard)
+                        if (!eventAlreadyHandled)
                         {
                             stream << " && (" << *eventExpr << ")";
                         }
@@ -12877,6 +13047,10 @@ namespace wolvrix::lib::emit
             const auto emitSplitWordBody = [&](const ScheduleBatch::Word &word,
                                                std::size_t wordChunkIndex) -> std::optional<std::string>
             {
+                if (batch.phase == ScheduleBatch::Phase::kCommit)
+                {
+                    return emitWordBody(word);
+                }
                 std::uint8_t dispatchMask = UINT8_C(0);
                 std::uint8_t clearMask = UINT8_C(0);
                 for (uint32_t supernodeId : word.supernodeIds)
@@ -12995,8 +13169,16 @@ namespace wolvrix::lib::emit
             }
 
                  stream << "void " << className << "::" << scheduleBatchMethodName(batch) << "()\n{\n";
-                 stream << "        // " << scheduleBatchPhaseName(batch.phase) << " batch " << batch.index
-                   << ": evaluate active supernodes selected from a group of activity-flag words.\n";
+                if (batch.phase == ScheduleBatch::Phase::kCommit)
+                {
+                    stream << "        // commit batch " << batch.index
+                           << ": scan fixed event-driven commit supernodes; compute does not activate them.\n";
+                }
+                else
+                {
+                    stream << "        // compute batch " << batch.index
+                           << ": evaluate active supernodes selected from activity-flag words.\n";
+                }
             for (std::size_t wordChunkIndex = 0; wordChunkIndex < batch.words.size(); ++wordChunkIndex)
             {
                 const auto &word = batch.words[wordChunkIndex];
@@ -19386,7 +19568,9 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                     }
                 }
             };
-            *stream << "    // Seed this eval from first-eval full activation and changed external inputs.\n";
+            const std::vector<ActiveMaskEntry> initialComputeActiveMasks =
+                buildComputeSupernodeActiveMaskEntries(model);
+            *stream << "    // Seed this eval from first-eval compute activation and changed external inputs.\n";
             *stream << "    const bool initial_eval = first_eval_;\n";
             emitPerfCounterIncrement(*stream, model, "    ", "evalCount");
             if (model.emitPerf || model.emitWaveform)
@@ -19397,14 +19581,28 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             *stream << "    bool pending_eval_round = initial_eval;\n";
             *stream << "    register_write_conflict_ = false;\n";
             *stream << "    if (initial_eval) {\n";
-                *stream << "        supernode_active_curr_.fill(UINT8_C(0xFF));\n";
-                if ((schedule.supernodeToOps.size() % kActiveFlagBitsPerWord) != 0u)
+            if (!initialComputeActiveMasks.empty())
+            {
+                *stream << "        static constexpr grhsim_active_mask_entry kInitialComputeActiveMasks[] = {";
+                for (std::size_t i = 0; i < initialComputeActiveMasks.size(); ++i)
                 {
-                    const std::uint8_t lastMask = static_cast<std::uint8_t>(
-                        (UINT8_C(1) << (schedule.supernodeToOps.size() % kActiveFlagBitsPerWord)) - UINT8_C(1));
-                    *stream << "        supernode_active_curr_[kActiveFlagWordCount - 1] = UINT8_C("
-                            << static_cast<unsigned>(lastMask) << ");\n";
+                    if ((i % 8u) == 0u)
+                    {
+                        *stream << "\n            ";
+                    }
+                    *stream << "{"
+                            << initialComputeActiveMasks[i].wordIndex << "u, UINT8_C("
+                            << static_cast<unsigned>(initialComputeActiveMasks[i].mask) << ")}";
+                    if (i + 1u != initialComputeActiveMasks.size())
+                    {
+                        *stream << ", ";
+                    }
                 }
+                *stream << "\n        };\n";
+                *stream << "        for (const auto &entry : kInitialComputeActiveMasks) {\n";
+                *stream << "            supernode_active_curr_[entry.word_index] |= entry.mask;\n";
+                *stream << "        }\n";
+            }
             *stream << "    }\n";
             std::map<std::vector<uint32_t>, std::vector<std::string>> inputSeedGroups;
             for (const auto &port : graph.inputPorts())
@@ -19436,6 +19634,19 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                     "active_count_",
                     supernodes,
                     "        ");
+                *stream << "        pending_eval_round = true;\n";
+                *stream << "    }\n";
+            }
+            if (!model.commitInputValues.empty())
+            {
+                std::vector<std::string> commitInputConditions;
+                commitInputConditions.reserve(model.commitInputValues.size());
+                for (ValueId value : model.commitInputValues)
+                {
+                    commitInputConditions.push_back("(" + model.inputFieldByValue.at(value) + " != " +
+                                                   model.prevInputFieldByValue.at(value) + ")");
+                }
+                *stream << "    if (!initial_eval && (" << joinStrings(commitInputConditions, " || ") << ")) {\n";
                 *stream << "        pending_eval_round = true;\n";
                 *stream << "    }\n";
             }
