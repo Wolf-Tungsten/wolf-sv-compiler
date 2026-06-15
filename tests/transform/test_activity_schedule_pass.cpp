@@ -918,6 +918,7 @@ int main()
             .maxOpInComputeSupernode = 1,
             .maxOpInCommitSupernode = 1,
             .enableCoarsen = false,
+            .commitGuardEventBuckets = false,
         }));
         PassDiagnostics diags;
         const PassManagerResult runResult = manager.run(design, diags);
@@ -933,6 +934,213 @@ int main()
         if ((*schedule.opToSupernode)[write0.index - 1] == (*schedule.opToSupernode)[write1.index - 1])
         {
             return fail("Expected maxOpInCommitSupernode to split commit supernodes");
+        }
+    }
+
+    {
+        currentCase = "commit_guard_event_bucket";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("commit_guard_event_bucket");
+        design.markAsTop("commit_guard_event_bucket");
+
+        const auto clk = makeValue(graph, "clk", 1);
+        const auto en = makeValue(graph, "en", 1);
+        const auto otherEn = makeValue(graph, "other_en", 1);
+        const auto thirdEn = makeValue(graph, "third_en", 1);
+        const auto mask = makeValue(graph, "mask", 8);
+        const auto d0 = makeValue(graph, "d0", 8);
+        const auto d1 = makeValue(graph, "d1", 8);
+        const auto d2 = makeValue(graph, "d2", 8);
+        const auto d3 = makeValue(graph, "d3", 8);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("en", en);
+        graph.bindInputPort("other_en", otherEn);
+        graph.bindInputPort("third_en", thirdEn);
+        graph.bindInputPort("mask", mask);
+        graph.bindInputPort("d0", d0);
+        graph.bindInputPort("d1", d1);
+        graph.bindInputPort("d2", d2);
+        graph.bindInputPort("d3", d3);
+        for (const char *name : {"q0", "q1", "q2", "q3"})
+        {
+            const auto reg = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
+                                                   graph.internSymbol(name));
+            graph.setAttr(reg, "width", static_cast<int64_t>(8));
+            graph.setAttr(reg, "isSigned", false);
+        }
+
+        const auto write0 = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                                                  graph.internSymbol("w0"));
+        graph.addOperand(write0, en);
+        graph.addOperand(write0, d0);
+        graph.addOperand(write0, mask);
+        graph.addOperand(write0, clk);
+        graph.setAttr(write0, "regSymbol", std::string("q0"));
+        graph.setAttr(write0, "eventEdge", std::vector<std::string>{"posedge"});
+        const auto write1 = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                                                  graph.internSymbol("w1"));
+        graph.addOperand(write1, otherEn);
+        graph.addOperand(write1, d1);
+        graph.addOperand(write1, mask);
+        graph.addOperand(write1, clk);
+        graph.setAttr(write1, "regSymbol", std::string("q1"));
+        graph.setAttr(write1, "eventEdge", std::vector<std::string>{"posedge"});
+        const auto write2 = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                                                  graph.internSymbol("w2"));
+        graph.addOperand(write2, en);
+        graph.addOperand(write2, d2);
+        graph.addOperand(write2, mask);
+        graph.addOperand(write2, clk);
+        graph.setAttr(write2, "regSymbol", std::string("q2"));
+        graph.setAttr(write2, "eventEdge", std::vector<std::string>{"posedge"});
+        const auto write3 = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                                                  graph.internSymbol("w3"));
+        graph.addOperand(write3, thirdEn);
+        graph.addOperand(write3, d3);
+        graph.addOperand(write3, mask);
+        graph.addOperand(write3, clk);
+        graph.setAttr(write3, "regSymbol", std::string("q3"));
+        graph.setAttr(write3, "eventEdge", std::vector<std::string>{"posedge"});
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
+            .path = "commit_guard_event_bucket",
+            .maxOpInComputeSupernode = 1,
+            .maxOpInCommitSupernode = 3,
+            .enableCoarsen = false,
+        }));
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected commit guard event bucket schedule to succeed");
+        }
+        const auto schedule = loadSchedule(session, "commit_guard_event_bucket");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        const uint32_t write0Supernode = (*schedule.opToSupernode)[write0.index - 1];
+        const uint32_t write1Supernode = (*schedule.opToSupernode)[write1.index - 1];
+        const uint32_t write2Supernode = (*schedule.opToSupernode)[write2.index - 1];
+        const uint32_t write3Supernode = (*schedule.opToSupernode)[write3.index - 1];
+        if (write0Supernode != write1Supernode || write0Supernode != write2Supernode)
+        {
+            return fail("Expected guard buckets to merge while total commit ops stay under cap");
+        }
+        if (write0Supernode == write3Supernode)
+        {
+            return fail("Expected guard bucket packing to split before exceeding commit op cap");
+        }
+        const auto &commitOps = (*schedule.supernodeToOps)[write0Supernode];
+        const auto write0It = std::find(commitOps.begin(), commitOps.end(), write0);
+        const auto write1It = std::find(commitOps.begin(), commitOps.end(), write1);
+        const auto write2It = std::find(commitOps.begin(), commitOps.end(), write2);
+        if (write0It == commitOps.end() || write1It == commitOps.end() || write2It == commitOps.end())
+        {
+            return fail("Expected commit supernode to contain all test writes");
+        }
+        const auto write0Pos = std::distance(commitOps.begin(), write0It);
+        const auto write1Pos = std::distance(commitOps.begin(), write1It);
+        const auto write2Pos = std::distance(commitOps.begin(), write2It);
+        if (write2Pos != write0Pos + 1 || write1Pos == write0Pos + 1)
+        {
+            return fail("Expected same-guard writes to stay adjacent inside the event commit supernode");
+        }
+    }
+
+    {
+        currentCase = "commit_guard_event_oversize_bucket";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("commit_guard_event_oversize_bucket");
+        design.markAsTop("commit_guard_event_oversize_bucket");
+
+        const auto clk = makeValue(graph, "clk", 1);
+        const auto en = makeValue(graph, "en", 1);
+        const auto otherEn = makeValue(graph, "other_en", 1);
+        const auto mask = makeValue(graph, "mask", 8);
+        const auto d0 = makeValue(graph, "d0", 8);
+        const auto d1 = makeValue(graph, "d1", 8);
+        const auto d2 = makeValue(graph, "d2", 8);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("en", en);
+        graph.bindInputPort("other_en", otherEn);
+        graph.bindInputPort("mask", mask);
+        graph.bindInputPort("d0", d0);
+        graph.bindInputPort("d1", d1);
+        graph.bindInputPort("d2", d2);
+        for (const char *name : {"q0", "q1", "q2"})
+        {
+            const auto reg = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
+                                                   graph.internSymbol(name));
+            graph.setAttr(reg, "width", static_cast<int64_t>(8));
+            graph.setAttr(reg, "isSigned", false);
+        }
+
+        const auto write0 = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                                                  graph.internSymbol("w0"));
+        graph.addOperand(write0, en);
+        graph.addOperand(write0, d0);
+        graph.addOperand(write0, mask);
+        graph.addOperand(write0, clk);
+        graph.setAttr(write0, "regSymbol", std::string("q0"));
+        graph.setAttr(write0, "eventEdge", std::vector<std::string>{"posedge"});
+        const auto write1 = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                                                  graph.internSymbol("w1"));
+        graph.addOperand(write1, otherEn);
+        graph.addOperand(write1, d1);
+        graph.addOperand(write1, mask);
+        graph.addOperand(write1, clk);
+        graph.setAttr(write1, "regSymbol", std::string("q1"));
+        graph.setAttr(write1, "eventEdge", std::vector<std::string>{"posedge"});
+        const auto write2 = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterWritePort,
+                                                  graph.internSymbol("w2"));
+        graph.addOperand(write2, en);
+        graph.addOperand(write2, d2);
+        graph.addOperand(write2, mask);
+        graph.addOperand(write2, clk);
+        graph.setAttr(write2, "regSymbol", std::string("q2"));
+        graph.setAttr(write2, "eventEdge", std::vector<std::string>{"posedge"});
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
+            .path = "commit_guard_event_oversize_bucket",
+            .maxOpInComputeSupernode = 1,
+            .maxOpInCommitSupernode = 1,
+            .enableCoarsen = false,
+        }));
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected commit guard event oversized bucket schedule to succeed");
+        }
+        const auto schedule = loadSchedule(session, "commit_guard_event_oversize_bucket");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        const uint32_t write0Supernode = (*schedule.opToSupernode)[write0.index - 1];
+        const uint32_t write1Supernode = (*schedule.opToSupernode)[write1.index - 1];
+        const uint32_t write2Supernode = (*schedule.opToSupernode)[write2.index - 1];
+        if (write0Supernode != write2Supernode)
+        {
+            return fail("Expected oversized guard bucket to remain a single commit supernode");
+        }
+        if (write0Supernode == write1Supernode)
+        {
+            return fail("Expected oversized guard bucket not to merge with following guard bucket");
+        }
+        const auto &commitOps = (*schedule.supernodeToOps)[write0Supernode];
+        if (commitOps.size() != 2 ||
+            std::find(commitOps.begin(), commitOps.end(), write0) == commitOps.end() ||
+            std::find(commitOps.begin(), commitOps.end(), write2) == commitOps.end())
+        {
+            return fail("Expected oversized guard bucket supernode to contain exactly the same-guard writes");
         }
     }
 

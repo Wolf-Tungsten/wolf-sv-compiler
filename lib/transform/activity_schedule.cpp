@@ -1242,11 +1242,56 @@ namespace wolvrix::lib::transform
             return key.str();
         }
 
+        std::optional<wolvrix::lib::grh::ValueId> sinkUpdateCondValue(const wolvrix::lib::grh::Operation &op)
+        {
+            switch (op.kind())
+            {
+            case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+            case wolvrix::lib::grh::OperationKind::kLatchWritePort:
+            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
+                break;
+            default:
+                return std::nullopt;
+            }
+
+            const auto operands = op.operands();
+            if (operands.empty())
+            {
+                return std::nullopt;
+            }
+            return operands[0];
+        }
+
+        std::string normalizedSinkEventGuardKey(const wolvrix::lib::grh::Graph &graph,
+                                                const wolvrix::lib::grh::Operation &op,
+                                                wolvrix::lib::grh::OperationId opId,
+                                                const ValueCanonicalMap *canonicalValues)
+        {
+            std::ostringstream key;
+            key << normalizedSinkEventKey(graph, op, canonicalValues);
+            const auto updateCond = sinkUpdateCondValue(op);
+            if (!updateCond)
+            {
+                key << "|guard:opaque:" << static_cast<int>(op.kind());
+                if (!op.symbolText().empty())
+                {
+                    key << ":" << op.symbolText();
+                }
+                key << ":" << opId.index;
+                return key.str();
+            }
+
+            const auto canonicalCond = canonicalActivityValue(*updateCond, canonicalValues);
+            key << "|guard:" << canonicalCond.index;
+            return key.str();
+        }
+
         WorkingPartition buildEventClusteredSinkPartition(const wolvrix::lib::grh::Graph &graph,
                                                           const ActivityOpData &opData,
                                                           const std::vector<uint32_t> &topoPositions,
                                                           std::size_t maxSize,
-                                                          const ValueCanonicalMap *canonicalValues)
+                                                          const ValueCanonicalMap *canonicalValues,
+                                                          bool groupByGuard)
         {
             WorkingPartition partition;
             if (topoPositions.empty())
@@ -1255,8 +1300,101 @@ namespace wolvrix::lib::transform
             }
 
             const std::size_t chunkSize = maxSize == 0 ? topoPositions.size() : maxSize;
-            partition.clusters.reserve((topoPositions.size() + chunkSize - 1) / chunkSize);
-            partition.fixedBoundary.reserve(partition.clusters.capacity());
+
+            if (groupByGuard)
+            {
+                constexpr std::size_t kMaxGuardEventMergeOps = 4096;
+                const std::size_t mergeLimit =
+                    maxSize == 0 ? kMaxGuardEventMergeOps : std::min(maxSize, kMaxGuardEventMergeOps);
+
+                struct EventGuardBuckets
+                {
+                    std::vector<std::string> guardOrder;
+                    std::unordered_map<std::string, std::vector<uint32_t>> positionsByGuard;
+                };
+
+                std::vector<std::string> eventOrder;
+                std::unordered_map<std::string, EventGuardBuckets> bucketsByEvent;
+                eventOrder.reserve(topoPositions.size());
+                bucketsByEvent.reserve(topoPositions.size());
+                for (const uint32_t topoPos : topoPositions)
+                {
+                    const auto opId = opData.topoOps[topoPos];
+                    const auto op = graph.getOperation(opId);
+                    const std::string eventKey = normalizedSinkEventKey(graph, op, canonicalValues);
+                    const std::string guardKey = normalizedSinkEventGuardKey(graph, op, opId, canonicalValues);
+
+                    auto [eventIt, eventInserted] = bucketsByEvent.try_emplace(eventKey);
+                    if (eventInserted)
+                    {
+                        eventOrder.push_back(eventKey);
+                        eventIt->second.positionsByGuard.reserve(4);
+                    }
+
+                    auto &eventBuckets = eventIt->second;
+                    auto [guardIt, guardInserted] = eventBuckets.positionsByGuard.try_emplace(guardKey);
+                    if (guardInserted)
+                    {
+                        eventBuckets.guardOrder.push_back(guardKey);
+                    }
+                    guardIt->second.push_back(topoPos);
+                }
+
+                partition.clusters.reserve(eventOrder.size());
+                partition.fixedBoundary.reserve(eventOrder.size());
+                for (const auto &eventKey : eventOrder)
+                {
+                    const auto eventIt = bucketsByEvent.find(eventKey);
+                    if (eventIt == bucketsByEvent.end())
+                    {
+                        continue;
+                    }
+                    const auto &eventBuckets = eventIt->second;
+                    std::vector<uint32_t> positions;
+                    auto flushPositions = [&]()
+                    {
+                        if (positions.empty())
+                        {
+                            return;
+                        }
+                        partition.clusters.push_back(std::move(positions));
+                        partition.fixedBoundary.push_back(0U);
+                        positions = {};
+                    };
+                    for (const auto &guardKey : eventBuckets.guardOrder)
+                    {
+                        const auto guardIt = eventBuckets.positionsByGuard.find(guardKey);
+                        if (guardIt == eventBuckets.positionsByGuard.end())
+                        {
+                            continue;
+                        }
+                        const auto &guardPositions = guardIt->second;
+                        if (guardPositions.empty())
+                        {
+                            continue;
+                        }
+                        if (guardPositions.size() > mergeLimit)
+                        {
+                            flushPositions();
+                            partition.clusters.emplace_back(guardPositions.begin(), guardPositions.end());
+                            partition.fixedBoundary.push_back(0U);
+                            continue;
+                        }
+                        if (!positions.empty() && positions.size() + guardPositions.size() > mergeLimit)
+                        {
+                            flushPositions();
+                        }
+                        positions.insert(positions.end(), guardPositions.begin(), guardPositions.end());
+                    }
+                    flushPositions();
+                }
+
+                return partition;
+            }
+
+            const std::size_t clusterReserve = (topoPositions.size() + chunkSize - 1) / chunkSize;
+            partition.clusters.reserve(clusterReserve);
+            partition.fixedBoundary.reserve(clusterReserve);
 
             std::vector<std::string> keyOrder;
             std::unordered_map<std::string, std::vector<uint32_t>> positionsByKey;
@@ -1264,8 +1402,9 @@ namespace wolvrix::lib::transform
             positionsByKey.reserve(topoPositions.size());
             for (const uint32_t topoPos : topoPositions)
             {
-                const std::string key =
-                    normalizedSinkEventKey(graph, graph.getOperation(opData.topoOps[topoPos]), canonicalValues);
+                const auto opId = opData.topoOps[topoPos];
+                const auto op = graph.getOperation(opId);
+                const std::string key = normalizedSinkEventKey(graph, op, canonicalValues);
                 auto [it, inserted] = positionsByKey.try_emplace(key);
                 if (inserted)
                 {
@@ -5218,7 +5357,8 @@ namespace wolvrix::lib::transform
                                                  opData,
                                                  sinkTopoPositions,
                                                  maxCommitOps,
-                                                 &canonicalValues);
+                                                 &canonicalValues,
+                                                 options.commitGuardEventBuckets);
             out.stats.commitSinkOps = sinkTopoPositions.size();
             out.stats.commitEventKeyRuns = sinkPartition.clusters.size();
             {
@@ -5226,8 +5366,8 @@ namespace wolvrix::lib::transform
                 uniqueEventKeys.reserve(sinkTopoPositions.size());
                 for (const auto topoPos : sinkTopoPositions)
                 {
-                    uniqueEventKeys.insert(
-                        normalizedSinkEventKey(graph, graph.getOperation(opData.topoOps[topoPos]), &canonicalValues));
+                    const auto op = graph.getOperation(opData.topoOps[topoPos]);
+                    uniqueEventKeys.insert(normalizedSinkEventKey(graph, op, &canonicalValues));
                 }
                 out.stats.commitEventKeys = uniqueEventKeys.size();
             }

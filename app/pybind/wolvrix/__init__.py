@@ -609,6 +609,7 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
     bool_options = [
         ("enable_coarsen", "-enable-coarsen"),
         ("enable_chain_merge", "-enable-chain-merge"),
+        ("commit_guard_event_buckets", "-commit-guard-event-buckets"),
         ("split_oversize_compute_nodes", "-split-oversize-compute-nodes"),
     ]
 

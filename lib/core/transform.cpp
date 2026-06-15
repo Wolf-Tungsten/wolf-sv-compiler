@@ -1089,6 +1089,31 @@ namespace wolvrix::lib::transform
                         return nullptr;
                     }
                 }
+                else if (arg == "-commit-guard-event-buckets")
+                {
+                    if (!parseBoolArg("-commit-guard-event-buckets", options.commitGuardEventBuckets))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-commit-guard-event-buckets="))
+                {
+                    const std::string_view text =
+                        arg.substr(std::string_view("-commit-guard-event-buckets=").size());
+                    if (text == "true" || text == "1" || text == "on")
+                    {
+                        options.commitGuardEventBuckets = true;
+                    }
+                    else if (text == "false" || text == "0" || text == "off")
+                    {
+                        options.commitGuardEventBuckets = false;
+                    }
+                    else
+                    {
+                        error = "invalid -commit-guard-event-buckets value";
+                        return nullptr;
+                    }
+                }
                 else if (arg == "-enable-local-shared-compute")
                 {
                     if (!parseBoolArg("-enable-local-shared-compute", options.enableLocalSharedCompute))

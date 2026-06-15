@@ -63,6 +63,31 @@ namespace
         return count;
     }
 
+    std::size_t findMatchingBrace(std::string_view text, std::size_t openBrace)
+    {
+        if (openBrace == std::string_view::npos || openBrace >= text.size() || text[openBrace] != '{')
+        {
+            return std::string_view::npos;
+        }
+        std::size_t depth = 0;
+        for (std::size_t pos = openBrace; pos < text.size(); ++pos)
+        {
+            if (text[pos] == '{')
+            {
+                ++depth;
+            }
+            else if (text[pos] == '}')
+            {
+                --depth;
+                if (depth == 0)
+                {
+                    return pos;
+                }
+            }
+        }
+        return std::string_view::npos;
+    }
+
     std::vector<std::string_view> splitTabs(std::string_view line)
     {
         std::vector<std::string_view> fields;
@@ -1351,7 +1376,7 @@ namespace
 
         addWrite("batch_reg0_write", "batch_reg0", fireCond0, nextData0);
         addWrite("batch_reg1_write", "batch_reg1", fireCond1, nextData1);
-        addWrite("batch_reg2_write", "batch_reg2", fireCond2, nextData2);
+        addWrite("batch_reg2_write", "batch_reg2", fireCond0, nextData2);
         addWrite("batch_reg3_write", "batch_reg3", fireCond3, nextData3);
 
         ValueId sum01 = makeLogicValue(graph, "sum01", 8);
@@ -3294,6 +3319,29 @@ int main()
         {
             return fail("commit-cond-batch should keep direct per-write commit bodies under the shared event guard");
         }
+        const std::size_t reg0WritePos = commitBatchSched.find("batch_reg0_write");
+        const std::size_t reg1WritePos = commitBatchSched.find("batch_reg1_write");
+        const std::size_t reg2WritePos = commitBatchSched.find("batch_reg2_write");
+        if (reg0WritePos == std::string::npos ||
+            reg1WritePos == std::string::npos ||
+            reg2WritePos == std::string::npos ||
+            reg0WritePos > reg2WritePos)
+        {
+            return fail("commit-cond-batch shared guard fixture should emit reg0 before reg2");
+        }
+        const std::size_t sharedGuardPos = commitBatchSched.rfind("if (", reg0WritePos);
+        const std::size_t sharedGuardOpenBrace =
+            sharedGuardPos == std::string::npos ? std::string::npos : commitBatchSched.find('{', sharedGuardPos);
+        const std::size_t sharedGuardCloseBrace = findMatchingBrace(commitBatchSched, sharedGuardOpenBrace);
+        if (sharedGuardPos == std::string::npos ||
+            sharedGuardOpenBrace == std::string::npos ||
+            sharedGuardCloseBrace == std::string::npos ||
+            sharedGuardOpenBrace > reg0WritePos ||
+            sharedGuardCloseBrace < reg2WritePos ||
+            (sharedGuardOpenBrace < reg1WritePos && reg1WritePos < sharedGuardCloseBrace))
+        {
+            return fail("commit-cond-batch should bucket non-adjacent reg0/reg2 writes under one guard");
+        }
         if (commitBatchSched.find("if ((event_edge_slots_") != std::string::npos ||
             commitBatchSched.find("if (((event_edge_slots_") != std::string::npos)
         {
@@ -3327,6 +3375,9 @@ int main()
             harness << "    sim.eval();\n";
             harness << "    sim.clk = false;\n";
             harness << "    sim.eval();\n";
+            harness << "    if (sim.y != static_cast<std::uint8_t>(13)) {\n";
+            harness << "        return 1;\n";
+            harness << "    }\n";
             harness << "    sim.fire0 = static_cast<std::uint8_t>(0);\n";
             harness << "    sim.fire1 = static_cast<std::uint8_t>(1);\n";
             harness << "    sim.fire2 = static_cast<std::uint8_t>(0);\n";
@@ -3335,6 +3386,9 @@ int main()
             harness << "    sim.eval();\n";
             harness << "    sim.clk = true;\n";
             harness << "    sim.eval();\n";
+            harness << "    if (sim.y != static_cast<std::uint8_t>(29)) {\n";
+            harness << "        return 2;\n";
+            harness << "    }\n";
             harness << "    return 0;\n";
             harness << "}\n";
         }

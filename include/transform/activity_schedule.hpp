@@ -40,6 +40,7 @@ namespace wolvrix::lib::transform
         bool enableCoarsen = true;
         bool enableChainMerge = true;
         bool enableLocalSharedCompute = false;
+        bool commitGuardEventBuckets = true;
         bool splitOversizeComputeNodes = false;
         std::string costModel = "edge-cut";
         std::string exportComputeDagPath;

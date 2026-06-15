@@ -10969,6 +10969,12 @@ namespace wolvrix::lib::emit
             bool operator==(const WritePortGuardKey &) const = default;
         };
 
+        struct CommitWriteGuardGroup
+        {
+            std::string condExpr;
+            std::vector<std::size_t> runIndices;
+        };
+
         struct TableCompressibleScalarStateWriteDesc
         {
             ValueSlotScalarKind kind = ValueSlotScalarKind::kBool;
@@ -11032,6 +11038,32 @@ namespace wolvrix::lib::emit
                 .condExpr = condExpr,
                 .eventExpr = *eventExpr,
             };
+        }
+
+        std::vector<CommitWriteGuardGroup> buildCommitWriteGuardGroups(
+            std::span<const WritePortGuardKey> guardKeys)
+        {
+            std::vector<CommitWriteGuardGroup> groups;
+            groups.reserve(guardKeys.size());
+            for (std::size_t keyIndex = 0; keyIndex < guardKeys.size(); ++keyIndex)
+            {
+                auto groupIt = std::find_if(groups.begin(),
+                                            groups.end(),
+                                            [&](const CommitWriteGuardGroup &group)
+                                            {
+                                                return group.condExpr == guardKeys[keyIndex].condExpr;
+                                            });
+                if (groupIt == groups.end())
+                {
+                    groups.push_back(CommitWriteGuardGroup{
+                        .condExpr = guardKeys[keyIndex].condExpr,
+                        .runIndices = {keyIndex},
+                    });
+                    continue;
+                }
+                groupIt->runIndices.push_back(keyIndex);
+            }
+            return groups;
         }
 
         struct CommitEventClusterInfo
@@ -12134,38 +12166,53 @@ namespace wolvrix::lib::emit
                                 }
                                 ++runEnd;
                             }
+                            std::vector<WritePortGuardKey> guardKeys;
+                            guardKeys.reserve(runEnd - opIndex);
+                            for (std::size_t runIndex = opIndex; runIndex < runEnd; ++runIndex)
+                            {
+                                const auto runOpId = supernodeOps[runIndex];
+                                const Operation runOp = graph.getOperation(runOpId);
+                                const auto guardKey =
+                                    writePortGuardKey(graph, model, runOpId, runOp, &localExprContext);
+                                if (!guardKey)
+                                {
+                                    return emitError("unsupported exact event expression emit",
+                                                     std::string(runOp.symbolText()));
+                                }
+                                guardKeys.push_back(*guardKey);
+                            }
+                            const std::vector<CommitWriteGuardGroup> guardGroups =
+                                buildCommitWriteGuardGroups(
+                                    std::span<const WritePortGuardKey>(guardKeys.data(), guardKeys.size()));
                             if (effectiveEventExpr != "true")
                             {
                                 stream << "            if (" << effectiveEventExpr << ") {\n";
                             }
-                            for (std::size_t guardedIndex = opIndex; guardedIndex < runEnd; ++guardedIndex)
+                            for (const CommitWriteGuardGroup &guardGroup : guardGroups)
                             {
-                                const auto guardedOpId = supernodeOps[guardedIndex];
-                                const Operation guardedOp = graph.getOperation(guardedOpId);
-                                const auto guardedWriteKey =
-                                    writePortGuardKey(graph, model, guardedOpId, guardedOp, &localExprContext);
-                                if (!guardedWriteKey)
-                                {
-                                    return emitError("unsupported exact event expression emit",
-                                                     std::string(guardedOp.symbolText()));
-                                }
-                                const bool needCondGuard = guardedWriteKey->condExpr != "true";
+                                const bool needCondGuard = guardGroup.condExpr != "true";
                                 if (needCondGuard)
                                 {
-                                    stream << "            if (" << guardedWriteKey->condExpr << ") {\n";
+                                    stream << "            if (" << guardGroup.condExpr << ") {\n";
                                 }
-                                if (auto error =
-                                        emitWritePortBody(stream,
-                                                          graph,
-                                                          model,
-                                                          guardedOpId,
-                                                          guardedOp,
-                                                          needCondGuard ? "                " : "            ",
-                                                          &activationContext,
-                                                          &localExprContext,
-                                                          true))
+                                for (const std::size_t relativeRunIndex : guardGroup.runIndices)
                                 {
-                                    return emitError(*error, std::string(guardedOp.symbolText()));
+                                    const std::size_t guardRunIndex = opIndex + relativeRunIndex;
+                                    const auto guardRunOpId = supernodeOps[guardRunIndex];
+                                    const Operation guardRunOp = graph.getOperation(guardRunOpId);
+                                    if (auto error =
+                                            emitWritePortBody(stream,
+                                                              graph,
+                                                              model,
+                                                              guardRunOpId,
+                                                              guardRunOp,
+                                                              needCondGuard ? "                " : "            ",
+                                                              &activationContext,
+                                                              &localExprContext,
+                                                              true))
+                                    {
+                                        return emitError(*error, std::string(guardRunOp.symbolText()));
+                                    }
                                 }
                                 if (needCondGuard)
                                 {
