@@ -1,0 +1,725 @@
+#include "core/grh.hpp"
+#include "core/transform.hpp"
+#include "transform/reg_to_mem.hpp"
+
+#include <iostream>
+#include <map>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+using namespace wolvrix::lib::grh;
+using namespace wolvrix::lib::transform;
+
+namespace
+{
+    int fail(const std::string &message)
+    {
+        std::cerr << "[reg-to-mem-tests] " << message << '\n';
+        return 1;
+    }
+
+    template <typename T>
+    std::optional<T> getAttr(const Operation &op, std::string_view key)
+    {
+        auto attr = op.attr(key);
+        if (!attr)
+        {
+            return std::nullopt;
+        }
+        if (const auto *value = std::get_if<T>(&*attr))
+        {
+            return *value;
+        }
+        return std::nullopt;
+    }
+
+    ValueId makeLogicValue(Graph &graph, std::string_view name, int32_t width)
+    {
+        return graph.createValue(graph.internSymbol(std::string(name)), width, false, ValueType::Logic);
+    }
+
+    ValueId addConstant(Graph &graph,
+                        std::string_view opName,
+                        std::string_view valueName,
+                        int32_t width,
+                        std::string literal)
+    {
+        ValueId value = makeLogicValue(graph, valueName, width);
+        const OperationId op = graph.createOperation(OperationKind::kConstant,
+                                                     graph.internSymbol(std::string(opName)));
+        graph.addResult(op, value);
+        graph.setAttr(op, "constValue", std::move(literal));
+        return value;
+    }
+
+    OperationId addRegister(Graph &graph, std::string_view name, int32_t width)
+    {
+        const OperationId op = graph.createOperation(OperationKind::kRegister,
+                                                     graph.internSymbol(std::string(name)));
+        graph.setAttr(op, "width", static_cast<int64_t>(width));
+        graph.setAttr(op, "isSigned", false);
+        return op;
+    }
+
+    OperationId addRegisterRead(Graph &graph,
+                                std::string_view opName,
+                                std::string_view valueName,
+                                std::string regSymbol,
+                                int32_t width,
+                                ValueId &result)
+    {
+        result = makeLogicValue(graph, valueName, width);
+        const OperationId op = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                     graph.internSymbol(std::string(opName)));
+        graph.addResult(op, result);
+        graph.setAttr(op, "regSymbol", std::move(regSymbol));
+        return op;
+    }
+
+    ValueId addBinary(Graph &graph,
+                      OperationKind kind,
+                      std::string_view opName,
+                      std::string_view valueName,
+                      ValueId lhs,
+                      ValueId rhs,
+                      int32_t width = 1)
+    {
+        ValueId value = makeLogicValue(graph, valueName, width);
+        const OperationId op = graph.createOperation(kind, graph.internSymbol(std::string(opName)));
+        graph.addOperand(op, lhs);
+        graph.addOperand(op, rhs);
+        graph.addResult(op, value);
+        return value;
+    }
+
+    ValueId addUnary(Graph &graph,
+                     OperationKind kind,
+                     std::string_view opName,
+                     std::string_view valueName,
+                     ValueId operand,
+                     int32_t width = 1)
+    {
+        ValueId value = makeLogicValue(graph, valueName, width);
+        const OperationId op = graph.createOperation(kind, graph.internSymbol(std::string(opName)));
+        graph.addOperand(op, operand);
+        graph.addResult(op, value);
+        return value;
+    }
+
+    ValueId addMux(Graph &graph,
+                   std::string_view opName,
+                   std::string_view valueName,
+                   ValueId cond,
+                   ValueId trueValue,
+                   ValueId falseValue,
+                   int32_t width)
+    {
+        ValueId value = makeLogicValue(graph, valueName, width);
+        const OperationId op = graph.createOperation(OperationKind::kMux, graph.internSymbol(std::string(opName)));
+        graph.addOperand(op, cond);
+        graph.addOperand(op, trueValue);
+        graph.addOperand(op, falseValue);
+        graph.addResult(op, value);
+        return value;
+    }
+
+    OperationId addRegisterWrite(Graph &graph,
+                                 std::string_view opName,
+                                 std::string regSymbol,
+                                 ValueId guard,
+                                 ValueId data,
+                                 ValueId mask,
+                                 ValueId clk,
+                                 std::string edge = "posedge")
+    {
+        const OperationId op = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                     graph.internSymbol(std::string(opName)));
+        graph.addOperand(op, guard);
+        graph.addOperand(op, data);
+        graph.addOperand(op, mask);
+        graph.addOperand(op, clk);
+        graph.setAttr(op, "regSymbol", std::move(regSymbol));
+        graph.setAttr(op, "eventEdge", std::vector<std::string>{std::move(edge)});
+        return op;
+    }
+
+    OperationId addSliceArrayAnchor(Graph &graph,
+                                    std::string_view prefix,
+                                    const std::vector<std::string> &regSymbols,
+                                    ValueId index,
+                                    int32_t width,
+                                    ValueId &selected)
+    {
+        std::vector<ValueId> readValues(regSymbols.size());
+        for (std::size_t row = 0; row < regSymbols.size(); ++row)
+        {
+            addRegisterRead(graph,
+                            std::string(prefix) + "_r" + std::to_string(row) + "_read_op",
+                            std::string(prefix) + "_r" + std::to_string(row) + "_read",
+                            regSymbols[row],
+                            width,
+                            readValues[row]);
+        }
+
+        ValueId packed = makeLogicValue(graph,
+                                        std::string(prefix) + "_packed",
+                                        static_cast<int32_t>(width * regSymbols.size()));
+        const OperationId concat = graph.createOperation(OperationKind::kConcat,
+                                                         graph.internSymbol(std::string(prefix) + "_concat"));
+        for (auto it = readValues.rbegin(); it != readValues.rend(); ++it)
+        {
+            graph.addOperand(concat, *it);
+        }
+        graph.addResult(concat, packed);
+
+        selected = makeLogicValue(graph, std::string(prefix) + "_selected", width);
+        const OperationId slice = graph.createOperation(OperationKind::kSliceArray,
+                                                        graph.internSymbol(std::string(prefix) + "_slice"));
+        graph.addOperand(slice, packed);
+        graph.addOperand(slice, index);
+        graph.addResult(slice, selected);
+        graph.setAttr(slice, "sliceWidth", static_cast<int64_t>(width));
+        return slice;
+    }
+
+    int runPass(Design &design, bool trueMerge)
+    {
+        PassManager manager;
+        RegToMemOptions options;
+        options.minElementCount = 2;
+        options.enableTrueMerge = trueMerge;
+        manager.addPass(std::make_unique<RegToMemPass>(options));
+        PassDiagnostics diags;
+        const PassManagerResult result = manager.run(design, diags);
+        if (!result.success || diags.hasError())
+        {
+            return fail("reg-to-mem pass failed");
+        }
+        return 0;
+    }
+
+    int runIntentPass(Design &design)
+    {
+        return runPass(design, false);
+    }
+
+    int runTruePass(Design &design)
+    {
+        return runPass(design, true);
+    }
+
+    std::size_t countKind(const Graph &graph, OperationKind kind)
+    {
+        std::size_t count = 0;
+        for (OperationId opId : graph.operations())
+        {
+            if (graph.getOperation(opId).kind() == kind)
+            {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    std::vector<OperationId> opsOfKind(const Graph &graph, OperationKind kind)
+    {
+        std::vector<OperationId> ops;
+        for (OperationId opId : graph.operations())
+        {
+            if (graph.getOperation(opId).kind() == kind)
+            {
+                ops.push_back(opId);
+            }
+        }
+        return ops;
+    }
+
+    Design buildTrueMergeDesign(bool multiAnchor, bool withReset, bool reduceAndLastRow = false)
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        constexpr int32_t width = 8;
+        constexpr std::size_t rows = 4;
+        std::vector<std::string> regs;
+        regs.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            const std::string reg = "r" + std::to_string(row);
+            regs.push_back(reg);
+            addRegister(graph, reg, width);
+        }
+
+        const ValueId index = makeLogicValue(graph, "index", 2);
+        const ValueId index2 = makeLogicValue(graph, "index2", 2);
+        const ValueId addr = makeLogicValue(graph, "addr", 2);
+        const ValueId wen = makeLogicValue(graph, "wen", 1);
+        const ValueId data = makeLogicValue(graph, "data", width);
+        const ValueId mask = addConstant(graph, "mask_op", "mask", width, "8'hff");
+        const ValueId clk = makeLogicValue(graph, "clk", 1);
+        graph.bindInputPort("index", index);
+        graph.bindInputPort("addr", addr);
+        graph.bindInputPort("wen", wen);
+        graph.bindInputPort("data", data);
+        graph.bindInputPort("clk", clk);
+
+        ValueId selected;
+        addSliceArrayAnchor(graph, "a0", regs, index, width, selected);
+        graph.bindOutputPort("selected", selected);
+        if (multiAnchor)
+        {
+            graph.bindInputPort("index2", index2);
+            ValueId selected2;
+            addSliceArrayAnchor(graph, "a1", regs, index2, width, selected2);
+            graph.bindOutputPort("selected2", selected2);
+        }
+
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            ValueId hit;
+            if (reduceAndLastRow && row + 1 == rows)
+            {
+                hit = addUnary(graph,
+                               OperationKind::kReduceAnd,
+                               "hit" + std::to_string(row) + "_op",
+                               "hit" + std::to_string(row),
+                               addr,
+                               1);
+            }
+            else
+            {
+                const ValueId rowConst = addConstant(graph,
+                                                     "row" + std::to_string(row) + "_op",
+                                                     "row" + std::to_string(row),
+                                                     2,
+                                                     "2'd" + std::to_string(row));
+                hit = addBinary(graph,
+                                OperationKind::kEq,
+                                "hit" + std::to_string(row) + "_op",
+                                "hit" + std::to_string(row),
+                                addr,
+                                rowConst,
+                                1);
+            }
+            const ValueId guard = addBinary(graph,
+                                            reduceAndLastRow ? OperationKind::kAnd : OperationKind::kLogicAnd,
+                                            "guard" + std::to_string(row) + "_op",
+                                            "guard" + std::to_string(row),
+                                            wen,
+                                            hit,
+                                            1);
+            addRegisterWrite(graph,
+                             "write" + std::to_string(row),
+                             regs[row],
+                             guard,
+                             data,
+                             mask,
+                             clk);
+        }
+
+        if (withReset)
+        {
+            const ValueId rstN = makeLogicValue(graph, "rst_n", 1);
+            const ValueId rstMask = addConstant(graph, "rst_mask_op", "rst_mask", width, "8'hff");
+            graph.bindInputPort("rst_n", rstN);
+            for (std::size_t row = 0; row < rows; ++row)
+            {
+                const ValueId rstData = addConstant(graph,
+                                                    "rst_data" + std::to_string(row) + "_op",
+                                                    "rst_data" + std::to_string(row),
+                                                    width,
+                                                    "8'd" + std::to_string(0x10 + row));
+                addRegisterWrite(graph,
+                                 "reset" + std::to_string(row),
+                                 regs[row],
+                                 rstN,
+                                 rstData,
+                                 rstMask,
+                                 clk,
+                                 "negedge");
+            }
+        }
+
+        return design;
+    }
+
+    Design buildTrueMergeCompoundResetDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        constexpr int32_t width = 8;
+        constexpr std::size_t rows = 4;
+        std::vector<std::string> regs;
+        regs.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            const std::string reg = "r" + std::to_string(row);
+            regs.push_back(reg);
+            addRegister(graph, reg, width);
+        }
+
+        const ValueId index = makeLogicValue(graph, "index", 2);
+        const ValueId addr = makeLogicValue(graph, "addr", 2);
+        const ValueId wen = makeLogicValue(graph, "wen", 1);
+        const ValueId reset = makeLogicValue(graph, "reset", 1);
+        const ValueId data = makeLogicValue(graph, "data", width);
+        const ValueId mask = addConstant(graph, "mask_op", "mask", width, "8'hff");
+        const ValueId clk = makeLogicValue(graph, "clk", 1);
+        graph.bindInputPort("index", index);
+        graph.bindInputPort("addr", addr);
+        graph.bindInputPort("wen", wen);
+        graph.bindInputPort("reset", reset);
+        graph.bindInputPort("data", data);
+        graph.bindInputPort("clk", clk);
+
+        ValueId selected;
+        addSliceArrayAnchor(graph, "a0", regs, index, width, selected);
+        graph.bindOutputPort("selected", selected);
+
+        const ValueId notReset = addUnary(graph,
+                                          OperationKind::kLogicNot,
+                                          "not_reset_op",
+                                          "not_reset",
+                                          reset,
+                                          1);
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            const ValueId rowConst = addConstant(graph,
+                                                 "row" + std::to_string(row) + "_op",
+                                                 "row" + std::to_string(row),
+                                                 2,
+                                                 "2'd" + std::to_string(row));
+            const ValueId hit = addBinary(graph,
+                                          OperationKind::kEq,
+                                          "hit" + std::to_string(row) + "_op",
+                                          "hit" + std::to_string(row),
+                                          addr,
+                                          rowConst,
+                                          1);
+            const ValueId wenHit = addBinary(graph,
+                                             OperationKind::kAnd,
+                                             "wen_hit" + std::to_string(row) + "_op",
+                                             "wen_hit" + std::to_string(row),
+                                             wen,
+                                             hit,
+                                             1);
+            const ValueId active = addBinary(graph,
+                                             OperationKind::kLogicAnd,
+                                             "active" + std::to_string(row) + "_op",
+                                             "active" + std::to_string(row),
+                                             notReset,
+                                             wenHit,
+                                             1);
+            const ValueId update = addBinary(graph,
+                                             OperationKind::kLogicOr,
+                                             "update" + std::to_string(row) + "_op",
+                                             "update" + std::to_string(row),
+                                             reset,
+                                             active,
+                                             1);
+            const ValueId resetData = addConstant(graph,
+                                                  "rst_data" + std::to_string(row) + "_op",
+                                                  "rst_data" + std::to_string(row),
+                                                  width,
+                                                  "8'd" + std::to_string(0x20 + row));
+            const ValueId next = addMux(graph,
+                                        "next" + std::to_string(row) + "_op",
+                                        "next" + std::to_string(row),
+                                        active,
+                                        data,
+                                        resetData,
+                                        width);
+            addRegisterWrite(graph,
+                             "write" + std::to_string(row),
+                             regs[row],
+                             update,
+                             next,
+                             mask,
+                             clk);
+        }
+
+        return design;
+    }
+
+    int testSliceDynamicIntent()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        std::vector<ValueId> readValues;
+        std::vector<OperationId> readOps;
+        readValues.resize(4);
+        readOps.resize(4);
+        for (int row = 0; row < 4; ++row)
+        {
+            const std::string reg = "r" + std::to_string(row);
+            addRegister(graph, reg, 8);
+            readOps[static_cast<std::size_t>(row)] =
+                addRegisterRead(graph,
+                                reg + "_read_op",
+                                reg + "_read",
+                                reg,
+                                8,
+                                readValues[static_cast<std::size_t>(row)]);
+        }
+
+        ValueId packed = makeLogicValue(graph, "packed", 32);
+        const OperationId concat = graph.createOperation(OperationKind::kConcat,
+                                                         graph.internSymbol("packed_concat"));
+        for (int row = 3; row >= 0; --row)
+        {
+            graph.addOperand(concat, readValues[static_cast<std::size_t>(row)]);
+        }
+        graph.addResult(concat, packed);
+
+        const ValueId index = makeLogicValue(graph, "index", 2);
+        graph.bindInputPort("index", index);
+        const ValueId elementWidth = addConstant(graph, "const_elem_width", "elem_width", 4, "4'd8");
+        ValueId start = makeLogicValue(graph, "start", 4);
+        const OperationId mul = graph.createOperation(OperationKind::kMul,
+                                                      graph.internSymbol("start_mul"));
+        graph.addOperand(mul, index);
+        graph.addOperand(mul, elementWidth);
+        graph.addResult(mul, start);
+
+        ValueId selected = makeLogicValue(graph, "selected", 8);
+        const OperationId slice = graph.createOperation(OperationKind::kSliceDynamic,
+                                                        graph.internSymbol("selected_slice"));
+        graph.addOperand(slice, packed);
+        graph.addOperand(slice, start);
+        graph.addResult(slice, selected);
+        graph.setAttr(slice, "sliceWidth", int64_t{8});
+        graph.bindOutputPort("selected", selected);
+
+        if (const int rc = runIntentPass(design); rc != 0)
+        {
+            return rc;
+        }
+
+        const Operation sliceOp = graph.getOperation(slice);
+        if (getAttr<std::string>(sliceOp, "regToMem.intent.sliceKind").value_or("") != "slice-dynamic")
+        {
+            return fail("sliceDynamic anchor was not annotated");
+        }
+        const std::string group = getAttr<std::string>(sliceOp, "regToMem.intent.group").value_or("");
+        if (group.empty())
+        {
+            return fail("sliceDynamic anchor missing group attr");
+        }
+        if (getAttr<int64_t>(sliceOp, "regToMem.intent.elementWidth").value_or(0) != 8 ||
+            getAttr<int64_t>(sliceOp, "regToMem.intent.elementCount").value_or(0) != 4)
+        {
+            return fail("sliceDynamic anchor has wrong element shape attrs");
+        }
+
+        const Operation concatOp = graph.getOperation(concat);
+        const auto regSymbols = getAttr<std::vector<std::string>>(concatOp, "regToMem.intent.regSymbols");
+        const auto operandRows = getAttr<std::vector<int64_t>>(concatOp, "regToMem.intent.operandRows");
+        if (!regSymbols || *regSymbols != std::vector<std::string>{"r0", "r1", "r2", "r3"})
+        {
+            return fail("concat regSymbols attr does not preserve row order");
+        }
+        if (!operandRows || *operandRows != std::vector<int64_t>{3, 2, 1, 0})
+        {
+            return fail("concat operandRows attr is wrong");
+        }
+
+        for (int row = 0; row < 4; ++row)
+        {
+            const Operation regOp = graph.getOperation(graph.findOperation("r" + std::to_string(row)));
+            if (getAttr<std::string>(regOp, "regToMem.intent.group").value_or("") != group ||
+                getAttr<int64_t>(regOp, "regToMem.intent.row").value_or(-1) != row)
+            {
+                return fail("register row attrs are wrong");
+            }
+            const Operation readOp = graph.getOperation(readOps[static_cast<std::size_t>(row)]);
+            if (getAttr<std::string>(readOp, "regToMem.intent.group").value_or("") != group ||
+                getAttr<int64_t>(readOp, "regToMem.intent.row").value_or(-1) != row)
+            {
+                return fail("read row attrs are wrong");
+            }
+        }
+        return 0;
+    }
+
+    int testTrueMergeSliceArray()
+    {
+        Design design = buildTrueMergeDesign(false, false);
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kRegister) != 0 ||
+            countKind(graph, OperationKind::kRegisterReadPort) != 0 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 0 ||
+            countKind(graph, OperationKind::kConcat) != 0 ||
+            countKind(graph, OperationKind::kSliceArray) != 0)
+        {
+            return fail("true merge did not remove register/read/write/concat/slice ops");
+        }
+        if (countKind(graph, OperationKind::kMemory) != 1 ||
+            countKind(graph, OperationKind::kMemoryReadPort) != 1 ||
+            countKind(graph, OperationKind::kMemoryWritePort) != 1)
+        {
+            return fail("true merge did not create expected memory ports");
+        }
+        const Operation mem = graph.getOperation(opsOfKind(graph, OperationKind::kMemory).front());
+        const std::string memSymbol = std::string(mem.symbolText());
+        if (getAttr<int64_t>(mem, "width").value_or(0) != 8 ||
+            getAttr<int64_t>(mem, "row").value_or(0) != 4)
+        {
+            return fail("true merge memory shape is wrong");
+        }
+        const Operation read = graph.getOperation(opsOfKind(graph, OperationKind::kMemoryReadPort).front());
+        const Operation write = graph.getOperation(opsOfKind(graph, OperationKind::kMemoryWritePort).front());
+        if (getAttr<std::string>(read, "memSymbol").value_or("") != memSymbol ||
+            getAttr<std::string>(write, "memSymbol").value_or("") != memSymbol)
+        {
+            return fail("true merge memory ports reference wrong memSymbol");
+        }
+        const ValueId output = graph.outputPortValue("selected");
+        if (!output.valid() || graph.valueDef(output) != read.id())
+        {
+            return fail("true merge did not rebind output port to memory read result");
+        }
+        return 0;
+    }
+
+    int testTrueMergeReduceAndLastRowGuard()
+    {
+        Design design = buildTrueMergeDesign(false, false, true);
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 1 ||
+            countKind(graph, OperationKind::kMemoryReadPort) != 1 ||
+            countKind(graph, OperationKind::kMemoryWritePort) != 1 ||
+            countKind(graph, OperationKind::kRegister) != 0 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 0)
+        {
+            return fail("true merge did not match reduce-and all-ones row guard");
+        }
+        return 0;
+    }
+
+    int testTrueMergeMultiAnchor()
+    {
+        Design design = buildTrueMergeDesign(true, false);
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 1 ||
+            countKind(graph, OperationKind::kMemoryReadPort) != 2 ||
+            countKind(graph, OperationKind::kMemoryWritePort) != 1 ||
+            countKind(graph, OperationKind::kRegister) != 0)
+        {
+            return fail("true merge multi-anchor shape is wrong");
+        }
+        return 0;
+    }
+
+    int testTrueMergeResetFill()
+    {
+        Design design = buildTrueMergeDesign(false, true);
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 1 ||
+            countKind(graph, OperationKind::kMemoryReadPort) != 1 ||
+            countKind(graph, OperationKind::kMemoryWritePort) != 1 ||
+            countKind(graph, OperationKind::kMemoryFillPort) != 1 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 0)
+        {
+            return fail("true merge reset/fill shape is wrong");
+        }
+        const Operation fill = graph.getOperation(opsOfKind(graph, OperationKind::kMemoryFillPort).front());
+        if (fill.operands().size() != 3)
+        {
+            return fail("memory fill operand count is wrong");
+        }
+        if (graph.valueWidth(fill.operands()[1]) != 32)
+        {
+            return fail("memory fill did not use packed reset data for per-row reset values");
+        }
+        return 0;
+    }
+
+    int testTrueMergeCompoundResetFill()
+    {
+        Design design = buildTrueMergeCompoundResetDesign();
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 1 ||
+            countKind(graph, OperationKind::kMemoryReadPort) != 1 ||
+            countKind(graph, OperationKind::kMemoryWritePort) != 1 ||
+            countKind(graph, OperationKind::kMemoryFillPort) != 1 ||
+            countKind(graph, OperationKind::kRegister) != 0 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 0)
+        {
+            return fail("true merge compound reset/write shape is wrong");
+        }
+        const Operation fill = graph.getOperation(opsOfKind(graph, OperationKind::kMemoryFillPort).front());
+        if (fill.operands().size() != 3)
+        {
+            return fail("compound reset memory fill operand count is wrong");
+        }
+        if (graph.valueWidth(fill.operands()[1]) != 32)
+        {
+            return fail("compound reset memory fill did not use packed reset data");
+        }
+        return 0;
+    }
+} // namespace
+
+int main()
+{
+    try
+    {
+        if (const int rc = testSliceDynamicIntent(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testTrueMergeSliceArray(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testTrueMergeReduceAndLastRowGuard(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testTrueMergeMultiAnchor(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testTrueMergeResetFill(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testTrueMergeCompoundResetFill(); rc != 0)
+        {
+            return rc;
+        }
+    }
+    catch (const std::exception &ex)
+    {
+        return fail(std::string("unexpected exception: ") + ex.what());
+    }
+    return 0;
+}

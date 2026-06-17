@@ -10,10 +10,10 @@
 #include "transform/instance_inline.hpp"
 #include "transform/latch_transparent_read.hpp"
 #include "transform/mem_to_reg.hpp"
-#include "transform/merge_reg.hpp"
 #include "transform/memory_init_check.hpp"
 #include "transform/memory_read_retime.hpp"
 #include "transform/multidriven_guard.hpp"
+#include "transform/reg_to_mem.hpp"
 #include "transform/repcut.hpp"
 #include "transform/simplify.hpp"
 #include "transform/slice_index_const.hpp"
@@ -423,7 +423,7 @@ namespace wolvrix::lib::transform
             "xmr-resolve",
             "memory-init-check",
             "mem-to-reg",
-            "merge-reg",
+            "reg-to-mem",
             "simplify",
             "stats",
             "strip-debug",
@@ -1585,72 +1585,6 @@ namespace wolvrix::lib::transform
             }
             return std::make_unique<MemToRegPass>(options);
         }
-        if (normalized == "merge-reg")
-        {
-            MergeRegOptions options;
-            for (std::size_t i = 0; i < args.size(); ++i)
-            {
-                const std::string_view arg = args[i];
-                auto parseBoolValue = [&](std::string_view optionName, std::string_view text, bool &out) -> bool {
-                    if (text == "true" || text == "1" || text == "on")
-                    {
-                        out = true;
-                        return true;
-                    }
-                    if (text == "false" || text == "0" || text == "off")
-                    {
-                        out = false;
-                        return true;
-                    }
-                    error = std::string("invalid ") + std::string(optionName) + " value";
-                    return false;
-                };
-                auto parseBoolArg = [&](std::string_view optionName, bool &out) -> bool {
-                    if (i + 1 >= args.size())
-                    {
-                        error = std::string(optionName) + " expects a value";
-                        return false;
-                    }
-                    return parseBoolValue(optionName, args[++i], out);
-                };
-                auto parseNamedBool = [&](std::string_view optionName, bool &out) -> bool {
-                    if (arg == optionName)
-                    {
-                        return parseBoolArg(optionName, out);
-                    }
-                    const std::string optionPrefix = std::string(optionName) + "=";
-                    if (arg.starts_with(optionPrefix))
-                    {
-                        return parseBoolValue(optionName, arg.substr(optionPrefix.size()), out);
-                    }
-                    return true;
-                };
-
-                if (arg == "-enable-scalar-to-memory" ||
-                    arg.starts_with("-enable-scalar-to-memory="))
-                {
-                    if (!parseNamedBool("-enable-scalar-to-memory", options.enableScalarToMemory))
-                    {
-                        return nullptr;
-                    }
-                }
-                else if (arg == "-enable-indexed-bundle-entry-to-wide-register" ||
-                         arg.starts_with("-enable-indexed-bundle-entry-to-wide-register="))
-                {
-                    if (!parseNamedBool("-enable-indexed-bundle-entry-to-wide-register",
-                                        options.enableIndexedBundleEntryToWideRegister))
-                    {
-                        return nullptr;
-                    }
-                }
-                else
-                {
-                    error = "unknown merge-reg option";
-                    return nullptr;
-                }
-            }
-            return std::make_unique<MergeRegPass>(options);
-        }
         if (normalized == "memory-read-retime")
         {
             if (!args.empty())
@@ -1659,6 +1593,58 @@ namespace wolvrix::lib::transform
                 return nullptr;
             }
             return std::make_unique<MemoryReadRetimePass>();
+        }
+        if (normalized == "reg-to-mem")
+        {
+            RegToMemOptions options;
+            for (std::size_t i = 0; i < args.size(); ++i)
+            {
+                const std::string_view arg = args[i];
+                if (arg == "-no-intent")
+                {
+                    options.enableIntent = false;
+                }
+                else if (arg == "-intent")
+                {
+                    options.enableIntent = true;
+                }
+                else if (arg == "-true-merge")
+                {
+                    options.enableTrueMerge = true;
+                }
+                else if (arg == "-no-true-merge")
+                {
+                    options.enableTrueMerge = false;
+                }
+                else if (arg == "-min-element-count")
+                {
+                    if (i + 1 >= args.size())
+                    {
+                        error = "-min-element-count expects a value";
+                        return nullptr;
+                    }
+                    try
+                    {
+                        options.minElementCount = static_cast<std::size_t>(std::stoull(std::string(args[++i])));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -min-element-count value";
+                        return nullptr;
+                    }
+                }
+                else
+                {
+                    error = "unknown reg-to-mem option";
+                    return nullptr;
+                }
+            }
+            if (options.minElementCount < 2)
+            {
+                error = "-min-element-count must be >= 2";
+                return nullptr;
+            }
+            return std::make_unique<RegToMemPass>(options);
         }
         if (normalized == "latch-transparent-read")
         {

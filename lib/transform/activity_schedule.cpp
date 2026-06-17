@@ -2893,6 +2893,8 @@ namespace wolvrix::lib::transform
             std::vector<wolvrix::lib::grh::OperationId> ops;
             std::vector<wolvrix::lib::grh::ValueId> boundaryInputs;
             bool commonExpr = false;
+            bool indivisible = false;
+            std::string intentGroup;
         };
 
         struct CommitNode
@@ -2952,11 +2954,15 @@ namespace wolvrix::lib::transform
                     if (computeNodeId < rewrite.computeNodes.size())
                     {
                         oss << ":ops=" << rewrite.computeNodes[computeNodeId].ops.size();
-                        if (rewrite.computeNodes[computeNodeId].commonExpr)
-                        {
-                            oss << ":common";
-                        }
-                    }
+                if (rewrite.computeNodes[computeNodeId].commonExpr)
+                {
+                    oss << ":common";
+                }
+                if (rewrite.computeNodes[computeNodeId].indivisible)
+                {
+                    oss << ":indivisible";
+                }
+            }
                 }
                 if (nodes.size() > limit)
                 {
@@ -3663,6 +3669,63 @@ namespace wolvrix::lib::transform
                 return owner;
             }
 
+            bool ensureIntentGroupNode(std::string group, std::vector<wolvrix::lib::grh::OperationId> ops)
+            {
+                ops = uniqueOpsPreservingOrder(ops);
+                if (group.empty() || ops.empty())
+                {
+                    return true;
+                }
+                for (const auto opId : ops)
+                {
+                    if (!opId.valid())
+                    {
+                        continue;
+                    }
+                    ensureOpCapacity(opId);
+                    const uint32_t existingOwner = build_.computeNodeOfOp[opId.index];
+                    if (existingOwner != kInvalidActivitySupernodeId)
+                    {
+                        if (existingOwner < build_.computeNodes.size() &&
+                            build_.computeNodes[existingOwner].intentGroup == group)
+                        {
+                            continue;
+                        }
+                        error_ = "activity-schedule reg-to-mem intent group overlaps existing compute node group=" +
+                                 group + " op=" + describeOp(graph_, opId);
+                        return false;
+                    }
+                }
+
+                const uint32_t nodeId = newNode(false);
+                auto &node = build_.computeNodes[nodeId];
+                node.indivisible = true;
+                node.intentGroup = std::move(group);
+                std::sort(ops.begin(), ops.end(), [&](const auto lhs, const auto rhs) {
+                    return topoLessOp(opData_, lhs, rhs);
+                });
+                ops = uniqueOpsPreservingOrder(ops);
+                for (const auto opId : ops)
+                {
+                    if (!opId.valid())
+                    {
+                        continue;
+                    }
+                    ensureOpCapacity(opId);
+                    node.ops.push_back(opId);
+                    build_.computeNodeOfOp[opId.index] = nodeId;
+                }
+                for (const auto opId : ops)
+                {
+                    processOperandsBounded(nodeId, opId);
+                    if (!error_.empty())
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
         private:
             void ensureOpCapacity(wolvrix::lib::grh::OperationId opId)
             {
@@ -3801,10 +3864,14 @@ namespace wolvrix::lib::transform
 
             void processOperands(uint32_t nodeId, wolvrix::lib::grh::OperationId opId)
             {
-                const auto originalOperands = graph_.opOperands(opId);
-                const std::size_t operandCount = originalOperands.size();
-                for (std::size_t operandIndex = 0; operandIndex < operandCount; ++operandIndex)
-                {
+                    const auto originalOperands = graph_.opOperands(opId);
+                    const std::size_t operandCount = originalOperands.size();
+                    const bool nodeIndivisible =
+                        nodeId < build_.computeNodes.size() && build_.computeNodes[nodeId].indivisible;
+                    const bool nodeIsIntentGroup =
+                        nodeId < build_.computeNodes.size() && !build_.computeNodes[nodeId].intentGroup.empty();
+                    for (std::size_t operandIndex = 0; operandIndex < operandCount; ++operandIndex)
+                    {
                     const auto operands = graph_.opOperands(opId);
                     if (operandIndex >= operands.size())
                     {
@@ -3829,6 +3896,32 @@ namespace wolvrix::lib::transform
                     const ActivityOpClass defClass = opClasses_[defOp.index];
                     if (defClass == ActivityOpClass::Source)
                     {
+                        ensureOpCapacity(defOp);
+                        const uint32_t existingOwner = build_.computeNodeOfOp[defOp.index];
+                        if (existingOwner == nodeId)
+                        {
+                            continue;
+                        }
+                        if (nodeIsIntentGroup)
+                        {
+                            ensureSourceOwnerNode(defOp);
+                            if (!error_.empty())
+                            {
+                                return;
+                            }
+                            addBoundary(nodeId, operand);
+                            ++build_.stats.computeNodeBoundaryInputsTotal;
+                            ++build_.stats.computeNodeBoundaryInputSourceSpill;
+                            continue;
+                        }
+                        if (nodeIndivisible)
+                        {
+                            ensureSourceOwnerNode(defOp);
+                            addBoundary(nodeId, operand);
+                            ++build_.stats.computeNodeBoundaryInputsTotal;
+                            ++build_.stats.computeNodeBoundaryInputSourceSpill;
+                            continue;
+                        }
                         if (canAddRawOp(nodeId) && absorbSourceOp(nodeId, defOp))
                         {
                             continue;
@@ -3882,6 +3975,31 @@ namespace wolvrix::lib::transform
                                 noteExistingCommonOwner(defOp, operand);
                             }
                         }
+                        continue;
+                    }
+                    if (nodeIsIntentGroup)
+                    {
+                        addBoundary(nodeId, operand);
+                        ++build_.stats.computeNodeBoundaryInputsTotal;
+                        ++build_.stats.computeNodeBoundaryInputExistingOwner;
+                        continue;
+                    }
+                    if (nodeIndivisible)
+                    {
+                        const bool common =
+                            semanticConsumerCount(graph_,
+                                                  operand,
+                                                  opClasses_,
+                                                  kInvalidActivitySupernodeId,
+                                                  build_.computeNodeOfOp) > 1;
+                        ensureComputeNodeForOp(defOp, common);
+                        if (!error_.empty())
+                        {
+                            return;
+                        }
+                        addBoundary(nodeId, operand);
+                        ++build_.stats.computeNodeBoundaryInputsTotal;
+                        ++build_.stats.computeNodeBoundaryInputExistingOwner;
                         continue;
                     }
 
@@ -3941,6 +4059,122 @@ namespace wolvrix::lib::transform
             bool drainingPendingOperands_ = false;
             std::vector<std::pair<uint32_t, wolvrix::lib::grh::OperationId>> pendingOperandProcesses_;
         };
+
+        struct RegToMemIntentComputeGroup
+        {
+            std::string group;
+            std::vector<wolvrix::lib::grh::OperationId> ops;
+        };
+
+        std::vector<RegToMemIntentComputeGroup>
+        collectRegToMemIntentComputeGroups(const wolvrix::lib::grh::Graph &graph,
+                                           const std::vector<ActivityOpClass> &opClasses)
+        {
+            using wolvrix::lib::grh::OperationId;
+            using wolvrix::lib::grh::OperationKind;
+            using wolvrix::lib::grh::OperationIdHash;
+
+            struct GroupBuild
+            {
+                std::string group;
+                std::vector<OperationId> ops;
+                std::unordered_set<OperationId, OperationIdHash> seen;
+            };
+
+            std::vector<GroupBuild> builders;
+            std::unordered_map<std::string, std::size_t> indexByGroup;
+
+            const auto addOp = [&](GroupBuild &builder, OperationId opId)
+            {
+                if (!opId.valid() || opId.index >= opClasses.size())
+                {
+                    return;
+                }
+                const ActivityOpClass opClass = opClasses[opId.index];
+                if (opClass != ActivityOpClass::Compute && opClass != ActivityOpClass::Source)
+                {
+                    return;
+                }
+                if (builder.seen.insert(opId).second)
+                {
+                    builder.ops.push_back(opId);
+                }
+            };
+
+            for (const auto sliceOpId : graph.operations())
+            {
+                const auto sliceOp = graph.getOperation(sliceOpId);
+                if (sliceOp.kind() != OperationKind::kSliceArray &&
+                    sliceOp.kind() != OperationKind::kSliceDynamic)
+                {
+                    continue;
+                }
+                const auto group = getAttrString(sliceOp, "regToMem.intent.group");
+                const auto role = getAttrString(sliceOp, "regToMem.intent.role");
+                const auto mode = getAttrString(sliceOp, "regToMem.intent.mode");
+                if (!group || group->empty() || role.value_or(std::string()) != "slice" ||
+                    mode.value_or(std::string()) != "array-index")
+                {
+                    continue;
+                }
+                auto [it, inserted] = indexByGroup.emplace(*group, builders.size());
+                if (inserted)
+                {
+                    GroupBuild build;
+                    build.group = *group;
+                    builders.push_back(std::move(build));
+                }
+                GroupBuild &build = builders[it->second];
+                addOp(build, sliceOpId);
+                const auto sliceOperands = sliceOp.operands();
+                if (sliceOperands.empty())
+                {
+                    continue;
+                }
+                const OperationId concatOpId = graph.valueDef(sliceOperands.front());
+                if (!concatOpId.valid())
+                {
+                    continue;
+                }
+                const auto concatOp = graph.getOperation(concatOpId);
+                if (concatOp.kind() != OperationKind::kConcat ||
+                    getAttrString(concatOp, "regToMem.intent.group").value_or(std::string()) != *group)
+                {
+                    continue;
+                }
+                addOp(build, concatOpId);
+                for (const auto operand : concatOp.operands())
+                {
+                    const OperationId readOpId = graph.valueDef(operand);
+                    if (!readOpId.valid())
+                    {
+                        continue;
+                    }
+                    const auto readOp = graph.getOperation(readOpId);
+                    if (readOp.kind() != OperationKind::kRegisterReadPort ||
+                        getAttrString(readOp, "regToMem.intent.group").value_or(std::string()) != *group)
+                    {
+                        continue;
+                    }
+                    addOp(build, readOpId);
+                }
+            }
+
+            std::vector<RegToMemIntentComputeGroup> out;
+            out.reserve(builders.size());
+            for (auto &builder : builders)
+            {
+                if (builder.ops.size() < 3)
+                {
+                    continue;
+                }
+                RegToMemIntentComputeGroup group;
+                group.group = std::move(builder.group);
+                group.ops = std::move(builder.ops);
+                out.push_back(std::move(group));
+            }
+            return out;
+        }
 
         struct ClusterValueEdges
         {
@@ -5340,6 +5574,18 @@ namespace wolvrix::lib::transform
             out = ComputeRewriteBuild{};
             out.computeNodeOfOp.assign(opClasses.size(), kInvalidActivitySupernodeId);
             ComputeNodeBuilder builder(graph, options, opData, opClasses, out, error);
+
+            for (auto &intentGroup : collectRegToMemIntentComputeGroups(graph, opClasses))
+            {
+                if (!builder.ensureIntentGroupNode(std::move(intentGroup.group), std::move(intentGroup.ops)))
+                {
+                    return false;
+                }
+                if (!error.empty())
+                {
+                    return false;
+                }
+            }
 
             const std::size_t maxCommitOps = options.maxOpInCommitSupernode;
             std::vector<uint32_t> sinkTopoPositions;

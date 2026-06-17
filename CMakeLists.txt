@@ -125,10 +125,10 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/memory_init_check.cpp
     lib/transform/memory_read_retime.cpp
     lib/transform/mem_to_reg.cpp
+    lib/transform/reg_to_mem.cpp
     lib/transform/multidriven_guard.cpp
     lib/transform/blackbox_guard.cpp
     lib/transform/comb_lane_pack.cpp
-    lib/transform/merge_reg.cpp
     lib/transform/comb_loop_elim.cpp
     lib/transform/hier_flatten.cpp
     lib/transform/instance_inline.cpp
@@ -630,17 +630,17 @@ target_link_libraries(transform-memory-read-retime
 
 register_test_exe(transform-memory-read-retime)
 
-# transform: merge-reg
-add_executable(transform-merge-reg
-    tests/transform/test_merge_reg.cpp
+# transform: reg-to-mem
+add_executable(transform-reg-to-mem
+    tests/transform/test_reg_to_mem_pass.cpp
 )
 
-target_link_libraries(transform-merge-reg
+target_link_libraries(transform-reg-to-mem
     PRIVATE
         wolvrix-lib
 )
 
-register_test_exe(transform-merge-reg)
+register_test_exe(transform-reg-to-mem)
 
 # transform: strip-debug
 add_executable(transform-strip-debug

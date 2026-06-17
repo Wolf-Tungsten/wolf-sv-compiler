@@ -393,8 +393,8 @@ def _compile_run_pass(name: str, args: list[str], named: dict[str, Any]) -> tupl
         compiled.extend(_compile_comb_loop_elim_kwargs(named))
     elif canonical_name == "mem-to-reg":
         compiled.extend(_compile_mem_to_reg_kwargs(named))
-    elif canonical_name == "merge-reg":
-        compiled.extend(_compile_merge_reg_kwargs(named))
+    elif canonical_name == "reg-to-mem":
+        compiled.extend(_compile_reg_to_mem_kwargs(named))
     elif canonical_name == "simplify":
         compiled.extend(_compile_simplify_kwargs(named))
     elif canonical_name == "stats":
@@ -520,18 +520,23 @@ def _compile_mem_to_reg_kwargs(named: dict[str, Any]) -> list[str]:
     return out
 
 
-def _compile_merge_reg_kwargs(named: dict[str, Any]) -> list[str]:
+def _compile_reg_to_mem_kwargs(named: dict[str, Any]) -> list[str]:
     local = dict(named)
     out: list[str] = []
-    options = [
-        ("enable_scalar_to_memory", "-enable-scalar-to-memory"),
-        ("enable_indexed_bundle_entry_to_wide_register", "-enable-indexed-bundle-entry-to-wide-register"),
-    ]
-    for key, arg in options:
-        value = _pop_named(local, key, None)
-        if value is not None:
-            out.extend([arg, "true" if value else "false"])
-    _ensure_no_extra_named("merge-reg", local)
+    intent = _pop_named(local, "intent", None)
+    if intent is True:
+        out.append("-intent")
+    elif intent is False:
+        out.append("-no-intent")
+    true_merge = _pop_named(local, "true_merge", None)
+    if true_merge is True:
+        out.append("-true-merge")
+    elif true_merge is False:
+        out.append("-no-true-merge")
+    min_element_count = _pop_named(local, "min_element_count", None)
+    if min_element_count is not None:
+        out.extend(["-min-element-count", str(min_element_count)])
+    _ensure_no_extra_named("reg-to-mem", local)
     return out
 
 

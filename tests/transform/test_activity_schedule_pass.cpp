@@ -42,6 +42,20 @@ namespace
         return graph.createValue(graph.internSymbol(name), width, isSigned);
     }
 
+    wolvrix::lib::grh::ValueId makeConstant(wolvrix::lib::grh::Graph &graph,
+                                            const std::string &opName,
+                                            const std::string &valueName,
+                                            int32_t width,
+                                            std::string literal)
+    {
+        const auto value = makeValue(graph, valueName, width);
+        const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kConstant,
+                                              graph.internSymbol(opName));
+        graph.addResult(op, value);
+        graph.setAttr(op, "constValue", std::move(literal));
+        return value;
+    }
+
     bool isCommitPhaseOp(const wolvrix::lib::grh::Operation &op)
     {
         using wolvrix::lib::grh::OperationKind;
@@ -142,6 +156,165 @@ int main()
     std::string currentCase;
     try
     {
+    {
+        currentCase = "reg-to-mem intent group";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("intent_top");
+        design.markAsTop("intent_top");
+
+        const auto idxReg = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
+                                                  graph.internSymbol("idx_reg"));
+        graph.setAttr(idxReg, "width", int64_t{2});
+        graph.setAttr(idxReg, "isSigned", false);
+
+        const auto idx = makeValue(graph, "idx", 2);
+        const auto idxRead = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterReadPort,
+                                                   graph.internSymbol("idx_read_op"));
+        graph.addResult(idxRead, idx);
+        graph.setAttr(idxRead, "regSymbol", std::string("idx_reg"));
+
+        std::vector<wolvrix::lib::grh::OperationId> reads;
+        std::vector<wolvrix::lib::grh::ValueId> readValues;
+        reads.reserve(4);
+        readValues.reserve(4);
+        for (int row = 0; row < 4; ++row)
+        {
+            const std::string reg = "r" + std::to_string(row);
+            const auto regOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
+                                                     graph.internSymbol(reg));
+            graph.setAttr(regOp, "width", int64_t{8});
+            graph.setAttr(regOp, "isSigned", false);
+            graph.setAttr(regOp, "regToMem.intent.group", std::string("rtm_intent_test"));
+            graph.setAttr(regOp, "regToMem.intent.mode", std::string("array-index"));
+            graph.setAttr(regOp, "regToMem.intent.role", std::string("register"));
+            graph.setAttr(regOp, "regToMem.intent.row", static_cast<int64_t>(row));
+            graph.setAttr(regOp, "regToMem.intent.elementWidth", int64_t{8});
+            graph.setAttr(regOp, "regToMem.intent.elementCount", int64_t{4});
+
+            const auto readValue = makeValue(graph, reg + "_read", 8);
+            const auto readOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterReadPort,
+                                                      graph.internSymbol(reg + "_read_op"));
+            graph.addResult(readOp, readValue);
+            graph.setAttr(readOp, "regSymbol", reg);
+            graph.setAttr(readOp, "regToMem.intent.group", std::string("rtm_intent_test"));
+            graph.setAttr(readOp, "regToMem.intent.mode", std::string("array-index"));
+            graph.setAttr(readOp, "regToMem.intent.role", std::string("read"));
+            graph.setAttr(readOp, "regToMem.intent.row", static_cast<int64_t>(row));
+            reads.push_back(readOp);
+            readValues.push_back(readValue);
+        }
+
+        const auto packed = makeValue(graph, "packed", 32);
+        const auto concat = graph.createOperation(wolvrix::lib::grh::OperationKind::kConcat,
+                                                  graph.internSymbol("packed_concat"));
+        for (int row = 3; row >= 0; --row)
+        {
+            graph.addOperand(concat, readValues[static_cast<std::size_t>(row)]);
+        }
+        graph.addResult(concat, packed);
+        graph.setAttr(concat, "regToMem.intent.group", std::string("rtm_intent_test"));
+        graph.setAttr(concat, "regToMem.intent.mode", std::string("array-index"));
+        graph.setAttr(concat, "regToMem.intent.role", std::string("concat"));
+        graph.setAttr(concat, "regToMem.intent.elementWidth", int64_t{8});
+        graph.setAttr(concat, "regToMem.intent.elementCount", int64_t{4});
+
+        const auto selected = makeValue(graph, "selected", 8);
+        const auto slice = graph.createOperation(wolvrix::lib::grh::OperationKind::kSliceArray,
+                                                 graph.internSymbol("selected_slice"));
+        graph.addOperand(slice, packed);
+        graph.addOperand(slice, idx);
+        graph.addResult(slice, selected);
+        graph.setAttr(slice, "sliceWidth", int64_t{8});
+        graph.setAttr(slice, "regToMem.intent.group", std::string("rtm_intent_test"));
+        graph.setAttr(slice, "regToMem.intent.mode", std::string("array-index"));
+        graph.setAttr(slice, "regToMem.intent.role", std::string("slice"));
+        graph.setAttr(slice, "regToMem.intent.sliceKind", std::string("slice-array"));
+        graph.setAttr(slice, "regToMem.intent.elementWidth", int64_t{8});
+        graph.setAttr(slice, "regToMem.intent.elementCount", int64_t{4});
+        graph.bindOutputPort("selected", selected);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(
+            ActivityScheduleOptions{.path = "intent_top",
+                                    .maxOpInComputeSupernode = 64,
+                                    .maxOpInComputeNode = 2,
+                                    .enableCoarsen = false}));
+
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected activity-schedule pass to succeed for reg-to-mem intent group");
+        }
+        const auto schedule = loadSchedule(session, "intent_top");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        if (schedule.opToSupernode == nullptr || schedule.supernodeToOps == nullptr)
+        {
+            return fail("Missing activity-schedule outputs for reg-to-mem intent group");
+        }
+        if (slice.index == 0 || slice.index > schedule.opToSupernode->size())
+        {
+            return fail("slice op missing from op-to-supernode map");
+        }
+        const uint32_t owner = (*schedule.opToSupernode)[slice.index - 1];
+        if (owner == kInvalidActivitySupernodeId || owner >= schedule.supernodeToOps->size())
+        {
+            return fail("slice op has invalid supernode owner");
+        }
+        const auto &ownerOps = (*schedule.supernodeToOps)[owner];
+        if (std::find(ownerOps.begin(), ownerOps.end(), concat) == ownerOps.end())
+        {
+            return fail("reg-to-mem intent concat was split from slice");
+        }
+        const auto scheduledConcatOperands = graph.opOperands(concat);
+        for (const auto readValue : scheduledConcatOperands)
+        {
+            const auto read = graph.valueDef(readValue);
+            if (std::find(ownerOps.begin(), ownerOps.end(), read) == ownerOps.end())
+            {
+                return fail("reg-to-mem intent read was split from slice");
+            }
+        }
+        const auto scheduledSliceOperands = graph.opOperands(slice);
+        if (scheduledSliceOperands.size() != 2)
+        {
+            return fail("reg-to-mem intent slice operands were rewritten unexpectedly");
+        }
+        const auto scheduledIndex = scheduledSliceOperands[1];
+        const auto scheduledIndexRead = graph.valueDef(scheduledIndex);
+        if (!scheduledIndexRead.valid() ||
+            graph.opKind(scheduledIndexRead) != wolvrix::lib::grh::OperationKind::kRegisterReadPort)
+        {
+            return fail("reg-to-mem intent index should still be defined by a register read");
+        }
+        if (scheduledIndexRead.index == 0 || scheduledIndexRead.index > schedule.opToSupernode->size())
+        {
+            return fail("reg-to-mem intent index read missing from op-to-supernode map");
+        }
+        const uint32_t indexOwner = (*schedule.opToSupernode)[scheduledIndexRead.index - 1];
+        if (indexOwner == kInvalidActivitySupernodeId || indexOwner >= schedule.supernodeToOps->size())
+        {
+            return fail("reg-to-mem intent index read has invalid supernode owner");
+        }
+        if (indexOwner == owner)
+        {
+            const auto &mergedOps = (*schedule.supernodeToOps)[owner];
+            if (std::find(mergedOps.begin(), mergedOps.end(), scheduledIndexRead) == mergedOps.end())
+            {
+                return fail("reg-to-mem intent index read owner does not contain the read op");
+            }
+        }
+        else if (!hasFanoutTo(*schedule.valueFanout, scheduledIndex, owner))
+        {
+            return fail("reg-to-mem intent index boundary value is not scheduled into the intent group");
+        }
+    }
+
     {
         currentCase = "top";
         wolvrix::lib::grh::Design design;

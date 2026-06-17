@@ -51,6 +51,7 @@ namespace wolvrix::lib::emit
         using wolvrix::lib::transform::ActivityScheduleValueFanout;
 
         constexpr std::size_t kInlineSystemTaskArgLimit = 16;
+        constexpr std::size_t kRegToMemIntentIndexInlineOpLimit = 32;
 
         template <typename T>
         std::optional<T> getAttribute(const Operation &op, std::string_view key)
@@ -2242,7 +2243,7 @@ namespace wolvrix::lib::emit
                 uint32_t bit = 0;
                 std::string_view name;
             };
-            constexpr std::array<ReasonName, 10> kReasonNames = {{
+            constexpr std::array<ReasonName, 11> kReasonNames = {{
                 {1u << 0u, "output"},
                 {1u << 1u, "inout"},
                 {1u << 2u, "waveform"},
@@ -2253,6 +2254,7 @@ namespace wolvrix::lib::emit
                 {1u << 7u, "non_logic"},
                 {1u << 8u, "side_effect_result"},
                 {1u << 9u, "phase_crossing"},
+                {1u << 10u, "reg_to_mem_intent_index"},
             }};
             std::string out;
             for (const auto &entry : kReasonNames)
@@ -2377,6 +2379,21 @@ namespace wolvrix::lib::emit
             std::size_t wordCount = 0;
             std::optional<InitExprCode> initExpr;
             std::vector<std::optional<InitExprCode>> memoryInitRowExprs;
+            bool regToMemIntentStorage = false;
+            std::string regToMemIntentGroup;
+            std::string regToMemIntentFieldName;
+            std::size_t regToMemIntentRow = 0;
+            std::size_t regToMemIntentElementCount = 0;
+        };
+
+        struct RegToMemIntentStorageDecl
+        {
+            std::string group;
+            std::string fieldName;
+            std::string cppType;
+            int32_t elementWidth = 0;
+            bool isSigned = false;
+            std::size_t elementCount = 0;
         };
 
         InitExprCode randomInitExprForWidth(int32_t width)
@@ -2541,6 +2558,8 @@ namespace wolvrix::lib::emit
             std::vector<ValueId> commitInputValues;
             std::vector<std::size_t> activeIdBySupernode;
             std::unordered_map<std::string, StateDecl> stateBySymbol;
+            std::unordered_map<std::string, RegToMemIntentStorageDecl> regToMemIntentStorageByGroup;
+            std::unordered_map<OperationId, std::string, OperationIdHash> regToMemIntentSliceGroupByOp;
             std::unordered_map<std::string, std::vector<uint32_t>> stateHeadSupernodesBySymbol;
             std::unordered_map<OperationId, WriteDecl, OperationIdHash> writeByOp;
             std::unordered_map<std::string, StateShadowDecl> stateShadowBySymbol;
@@ -3290,6 +3309,10 @@ namespace wolvrix::lib::emit
                 {
                     continue;
                 }
+                if (stateIt->second.regToMemIntentStorage)
+                {
+                    continue;
+                }
                 orderedEntries.push_back(OrderedLogicStorageEntry{
                     .kind = OrderedLogicStorageEntry::Kind::kState,
                     .stateSymbol = stateSymbol,
@@ -3341,6 +3364,10 @@ namespace wolvrix::lib::emit
             {
                 const auto stateIt = model.stateBySymbol.find(stateSymbol);
                 if (stateIt == model.stateBySymbol.end() || stateIt->second.kind == StateDecl::Kind::Memory)
+                {
+                    continue;
+                }
+                if (stateIt->second.regToMemIntentStorage)
                 {
                     continue;
                 }
@@ -3494,6 +3521,11 @@ namespace wolvrix::lib::emit
                     StateDecl &state = model.stateBySymbol.at(entry.stateSymbol);
                     if (state.kind == StateDecl::Kind::Memory)
                     {
+                        continue;
+                    }
+                    if (state.regToMemIntentStorage)
+                    {
+                        state.slotIndex = kInvalidIndex;
                         continue;
                     }
                     if (isWideLogicWidth(state.width))
@@ -3776,7 +3808,7 @@ namespace wolvrix::lib::emit
             }
 
             const auto noteStateAnchor = [&](std::size_t &anchor, const StateDecl &state) {
-                if (state.kind == StateDecl::Kind::Memory)
+                if (state.kind == StateDecl::Kind::Memory || state.regToMemIntentStorage)
                 {
                     return;
                 }
@@ -4351,6 +4383,11 @@ namespace wolvrix::lib::emit
             return "state_mem_" + sanitizeIdentifier(symbol) + "_" + std::to_string(uniqueIndex) + "_";
         }
 
+        std::string regToMemIntentStorageFieldName(std::string_view group)
+        {
+            return "state_reg_to_mem_" + sanitizeIdentifier(group) + "_";
+        }
+
         std::string stateStorageFieldName(StateDecl::Kind kind, std::string_view symbol, std::size_t uniqueIndex)
         {
             switch (kind)
@@ -4372,6 +4409,10 @@ namespace wolvrix::lib::emit
 
         std::string stateRef(const StateDecl &state)
         {
+            if (state.regToMemIntentStorage)
+            {
+                return state.regToMemIntentFieldName + "[" + std::to_string(state.regToMemIntentRow) + "]";
+            }
             if (state.kind == StateDecl::Kind::Memory)
             {
                 return state.fieldName;
@@ -4545,12 +4586,15 @@ namespace wolvrix::lib::emit
                     continue;
                 }
                 const std::string aliasName =
-                    isWideLogicWidth(stateIt->second.width)
-                        ? ("grhsim_state_words_" + std::to_string(stateIt->second.wordCount) + "_slot_" +
-                           std::to_string(stateIt->second.slotIndex))
-                        : ("grhsim_state_scalar_" +
-                           std::to_string(static_cast<std::size_t>(stateIt->second.scalarKind)) + "_slot_" +
-                           std::to_string(stateIt->second.slotIndex));
+                    stateIt->second.regToMemIntentStorage
+                        ? ("grhsim_state_reg_to_mem_" + sanitizeIdentifier(stateIt->second.regToMemIntentGroup) +
+                           "_row_" + std::to_string(stateIt->second.regToMemIntentRow))
+                        : (isWideLogicWidth(stateIt->second.width)
+                               ? ("grhsim_state_words_" + std::to_string(stateIt->second.wordCount) + "_slot_" +
+                                  std::to_string(stateIt->second.slotIndex))
+                               : ("grhsim_state_scalar_" +
+                                  std::to_string(static_cast<std::size_t>(stateIt->second.scalarKind)) + "_slot_" +
+                                  std::to_string(stateIt->second.slotIndex)));
                 aliases.push_back(SupernodeStorageRefAliasDecl{
                     .aliasName = aliasName,
                     .initExpr = stateRef(stateIt->second),
@@ -5168,6 +5212,49 @@ namespace wolvrix::lib::emit
                 }
             }
             return true;
+        }
+
+        std::optional<ValueId> regToMemIntentSliceIndexValue(const Graph &graph, const Operation &op)
+        {
+            if ((op.kind() != OperationKind::kSliceArray && op.kind() != OperationKind::kSliceDynamic) ||
+                op.operands().size() != 2 ||
+                getAttribute<std::string>(op, "regToMem.intent.mode").value_or(std::string()) != "array-index" ||
+                !getAttribute<std::string>(op, "regToMem.intent.group"))
+            {
+                return std::nullopt;
+            }
+            if (op.kind() == OperationKind::kSliceArray)
+            {
+                return op.operands()[1];
+            }
+
+            const auto elementWidth = getAttribute<int64_t>(op, "regToMem.intent.elementWidth");
+            if (!elementWidth || *elementWidth <= 0)
+            {
+                return std::nullopt;
+            }
+            const OperationId startDefId = graph.valueDef(op.operands()[1]);
+            if (!startDefId.valid())
+            {
+                return std::nullopt;
+            }
+            const Operation startDef = graph.getOperation(startDefId);
+            if (startDef.kind() != OperationKind::kMul || startDef.operands().size() != 2)
+            {
+                return std::nullopt;
+            }
+            const std::size_t width = static_cast<std::size_t>(*elementWidth);
+            const auto lhsConst = constLogicIndexValue(graph, startDef.operands()[0], width + 1u);
+            if (lhsConst && *lhsConst == width)
+            {
+                return startDef.operands()[1];
+            }
+            const auto rhsConst = constLogicIndexValue(graph, startDef.operands()[1], width + 1u);
+            if (rhsConst && *rhsConst == width)
+            {
+                return startDef.operands()[0];
+            }
+            return std::nullopt;
         }
 
         bool isConstLogicAllOnes(const Graph &graph, ValueId value, int32_t width)
@@ -6066,6 +6153,8 @@ namespace wolvrix::lib::emit
             model.stateBySymbol.clear();
             model.stateOrder.clear();
             model.stateFieldDecls.clear();
+            model.regToMemIntentStorageByGroup.clear();
+            model.regToMemIntentSliceGroupByOp.clear();
             model.stateLogicScalarSlotCounts = {};
             model.stateLogicWideSlotCountsByWords.clear();
             model.packedArrayLaneViewByValue.clear();
@@ -6184,27 +6273,102 @@ namespace wolvrix::lib::emit
                             error = "storage width must be positive: " + state.symbol;
                             return false;
                         }
+                        if (state.kind == StateDecl::Kind::Register)
+                        {
+                            const auto intentGroup = getAttribute<std::string>(op, "regToMem.intent.group");
+                            const auto intentMode = getAttribute<std::string>(op, "regToMem.intent.mode");
+                            const auto intentRow = getAttribute<int64_t>(op, "regToMem.intent.row");
+                            const auto intentElementWidth =
+                                getAttribute<int64_t>(op, "regToMem.intent.elementWidth");
+                            const auto intentElementCount =
+                                getAttribute<int64_t>(op, "regToMem.intent.elementCount");
+                            if (intentGroup || intentRow || intentElementWidth || intentElementCount)
+                            {
+                                if (!intentGroup || !intentRow || !intentElementWidth || !intentElementCount ||
+                                    intentMode.value_or(std::string()) != "array-index")
+                                {
+                                    error = "incomplete reg-to-mem intent attrs on register: " + state.symbol;
+                                    return false;
+                                }
+                                if (*intentElementWidth != state.width)
+                                {
+                                    error = "reg-to-mem intent width mismatch on register: " + state.symbol;
+                                    return false;
+                                }
+                                if (*intentElementCount <= 0 || *intentRow < 0 || *intentRow >= *intentElementCount)
+                                {
+                                    error = "reg-to-mem intent row out of range on register: " + state.symbol;
+                                    return false;
+                                }
+
+                                state.regToMemIntentStorage = true;
+                                state.regToMemIntentGroup = *intentGroup;
+                                state.regToMemIntentRow = static_cast<std::size_t>(*intentRow);
+                                state.regToMemIntentElementCount =
+                                    static_cast<std::size_t>(*intentElementCount);
+                                state.regToMemIntentFieldName =
+                                    regToMemIntentStorageFieldName(*intentGroup);
+                                state.cppType = logicCppType(state.width);
+                                if (isWideLogicWidth(state.width))
+                                {
+                                    state.wordCount = logicWordCount(state.width);
+                                }
+                                else
+                                {
+                                    state.scalarKind = valueScalarSlotKindForWidth(state.width);
+                                }
+
+                                auto storageIt = model.regToMemIntentStorageByGroup.find(*intentGroup);
+                                if (storageIt == model.regToMemIntentStorageByGroup.end())
+                                {
+                                    RegToMemIntentStorageDecl storage;
+                                    storage.group = *intentGroup;
+                                    storage.fieldName = state.regToMemIntentFieldName;
+                                    storage.elementWidth = state.width;
+                                    storage.isSigned = state.isSigned;
+                                    storage.elementCount = state.regToMemIntentElementCount;
+                                    storage.cppType =
+                                        fixedArrayType(logicCppType(state.width), storage.elementCount);
+                                    model.regToMemIntentStorageByGroup.emplace(*intentGroup, std::move(storage));
+                                }
+                                else
+                                {
+                                    const RegToMemIntentStorageDecl &storage = storageIt->second;
+                                    if (storage.elementWidth != state.width ||
+                                        storage.isSigned != state.isSigned ||
+                                        storage.elementCount != state.regToMemIntentElementCount ||
+                                        storage.fieldName != state.regToMemIntentFieldName)
+                                    {
+                                        error = "reg-to-mem intent group mismatch on register: " + state.symbol;
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
                         const std::string cppType =
                             isWideLogicWidth(state.width)
                                 ? logicCppType(state.width)
                                 : scalarLogicSlotCppType(valueScalarSlotKindForWidth(state.width));
-                        state.cppType = cppType;
-                        if (isWideLogicWidth(state.width))
+                        if (!state.regToMemIntentStorage)
                         {
-                            state.wordCount = logicWordCount(state.width);
-                            model.stateLogicWideSlotCountsByWords[state.wordCount]++;
-                            stateLogicStorageOffset = alignTo(stateLogicStorageOffset, alignof(std::uint64_t));
-                            state.slotIndex = stateLogicStorageOffset;
-                            stateLogicStorageOffset += state.wordCount * sizeof(std::uint64_t);
-                        }
-                        else
-                        {
-                            state.scalarKind = valueScalarSlotKindForWidth(state.width);
-                            stateLogicStorageOffset =
-                                alignTo(stateLogicStorageOffset, valuePackedScalarSlotAlignment(state.scalarKind));
-                            state.slotIndex = stateLogicStorageOffset;
-                            model.stateLogicScalarSlotCounts[static_cast<std::size_t>(state.scalarKind)]++;
-                            stateLogicStorageOffset += valuePackedScalarSlotByteSize(state.scalarKind);
+                            state.cppType = cppType;
+                            if (isWideLogicWidth(state.width))
+                            {
+                                state.wordCount = logicWordCount(state.width);
+                                model.stateLogicWideSlotCountsByWords[state.wordCount]++;
+                                stateLogicStorageOffset = alignTo(stateLogicStorageOffset, alignof(std::uint64_t));
+                                state.slotIndex = stateLogicStorageOffset;
+                                stateLogicStorageOffset += state.wordCount * sizeof(std::uint64_t);
+                            }
+                            else
+                            {
+                                state.scalarKind = valueScalarSlotKindForWidth(state.width);
+                                stateLogicStorageOffset =
+                                    alignTo(stateLogicStorageOffset, valuePackedScalarSlotAlignment(state.scalarKind));
+                                state.slotIndex = stateLogicStorageOffset;
+                                model.stateLogicScalarSlotCounts[static_cast<std::size_t>(state.scalarKind)]++;
+                                stateLogicStorageOffset += valuePackedScalarSlotByteSize(state.scalarKind);
+                            }
                         }
                         if (auto initValue = getAttribute<std::string>(op, "initValue"))
                         {
@@ -6265,6 +6429,21 @@ namespace wolvrix::lib::emit
                 default:
                     break;
                 }
+            }
+
+            std::vector<std::string> regToMemIntentGroups;
+            regToMemIntentGroups.reserve(model.regToMemIntentStorageByGroup.size());
+            for (const auto &[group, _] : model.regToMemIntentStorageByGroup)
+            {
+                (void)_;
+                regToMemIntentGroups.push_back(group);
+            }
+            std::sort(regToMemIntentGroups.begin(), regToMemIntentGroups.end());
+            for (const std::string &group : regToMemIntentGroups)
+            {
+                const RegToMemIntentStorageDecl &storage = model.regToMemIntentStorageByGroup.at(group);
+                model.stateFieldDecls.push_back("    " + storage.cppType + " " + storage.fieldName + " = " +
+                                                storage.cppType + "{};");
             }
 
             model.stateLogicStorageBytes = stateLogicStorageOffset;
@@ -6656,6 +6835,65 @@ namespace wolvrix::lib::emit
                 }
             }
 
+            std::unordered_set<ValueId, ValueIdHash> regToMemIntentIndexValues;
+            {
+                constexpr uint32_t kNoSupernode = std::numeric_limits<uint32_t>::max();
+                std::vector<uint32_t> opSupernode;
+                if (!graph.operations().empty())
+                {
+                    opSupernode.assign(graph.operations().back().index + 1u, kNoSupernode);
+                }
+                for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps.size(); ++supernodeId)
+                {
+                    for (const OperationId opId : schedule.supernodeToOps[supernodeId])
+                    {
+                        if (opId.index >= opSupernode.size())
+                        {
+                            opSupernode.resize(opId.index + 1u, kNoSupernode);
+                        }
+                        opSupernode[opId.index] = supernodeId;
+                    }
+                }
+                auto noteIntentIndexFanout = [&](ValueId valueId, uint32_t supernodeId) {
+                    if (!valueId.valid() || model.inputFieldByValue.contains(valueId) ||
+                        !isComputeSupernode(model, supernodeId) ||
+                        supernodeId >= model.activeIdBySupernode.size() ||
+                        model.activeIdBySupernode[supernodeId] == kInvalidIndex)
+                    {
+                        return;
+                    }
+                    auto &fanout = model.boundaryFanoutByValue[valueId];
+                    fanout.push_back(static_cast<uint32_t>(model.activeIdBySupernode[supernodeId]));
+                };
+                for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps.size(); ++supernodeId)
+                {
+                    for (const OperationId opId : schedule.supernodeToOps[supernodeId])
+                    {
+                        const Operation op = graph.getOperation(opId);
+                        const auto indexValue = regToMemIntentSliceIndexValue(graph, op);
+                        if (!indexValue)
+                        {
+                            continue;
+                        }
+                        regToMemIntentIndexValues.insert(*indexValue);
+                        const OperationId defOpId = graph.valueDef(*indexValue);
+                        const uint32_t defSupernode =
+                            defOpId.valid() && defOpId.index < opSupernode.size()
+                                ? opSupernode[defOpId.index]
+                                : kNoSupernode;
+                        if (defSupernode != supernodeId)
+                        {
+                            noteIntentIndexFanout(*indexValue, supernodeId);
+                        }
+                    }
+                }
+                for (auto &[valueId, fanout] : model.boundaryFanoutByValue)
+                {
+                    (void)valueId;
+                    sortUniqueVector(fanout);
+                }
+            }
+
             discoverPackedArrayLaneViews(graph, waveformValueIds, model);
 
             std::unordered_set<ValueId, ValueIdHash> persistentValues;
@@ -6672,6 +6910,7 @@ namespace wolvrix::lib::emit
                 kPersistentNonLogic = 1u << 7u,
                 kPersistentSideEffectResult = 1u << 8u,
                 kPersistentPhaseCrossing = 1u << 9u,
+                kPersistentRegToMemIntentIndex = 1u << 10u,
             };
             std::unordered_map<ValueId, uint32_t, ValueIdHash> persistentReasonByValue;
             persistentReasonByValue.reserve(graph.values().size());
@@ -6713,6 +6952,10 @@ namespace wolvrix::lib::emit
             {
                 (void)_;
                 markPersistent(valueId, kPersistentBoundaryFanout);
+            }
+            for (ValueId valueId : regToMemIntentIndexValues)
+            {
+                markPersistent(valueId, kPersistentRegToMemIntentIndex);
             }
             for (OperationId opId : graph.operations())
             {
@@ -7100,6 +7343,81 @@ namespace wolvrix::lib::emit
                 }
             }
             return valueRef(model, value);
+        }
+
+        std::optional<std::string> pureExprForValue(
+            const Graph &graph,
+            const EmitModel &model,
+            ValueId value,
+            std::unordered_map<ValueId, std::optional<std::string>, ValueIdHash> &cache,
+            std::unordered_map<ValueId, std::size_t, ValueIdHash> &costCache,
+            std::size_t &totalOps,
+            std::size_t opBudget);
+
+        std::string resolvedRegToMemIntentIndexExpr(const Graph &graph,
+                                                    const EmitModel &model,
+                                                    ValueId value,
+                                                    const SupernodeLocalExprContext *context = nullptr)
+        {
+            if (context != nullptr)
+            {
+                const auto storedIt = context->storedValueRefByValue.find(value);
+                if (storedIt != context->storedValueRefByValue.end())
+                {
+                    return storedIt->second;
+                }
+            }
+            if (const auto *expr = findSupernodeLocalExpr(context, value); expr != nullptr)
+            {
+                return "(" + expr->expr + ")";
+            }
+            if (auto inputIt = model.inputFieldByValue.find(value); inputIt != model.inputFieldByValue.end())
+            {
+                return inputIt->second;
+            }
+
+            const OperationId defOpId = graph.valueDef(value);
+            if (defOpId.valid())
+            {
+                const Operation defOp = graph.getOperation(defOpId);
+                if (defOp.kind() == OperationKind::kConstant)
+                {
+                    if (auto expr = constantExpr(graph, defOp, value))
+                    {
+                        return *expr;
+                    }
+                }
+                if (defOp.kind() == OperationKind::kRegisterReadPort ||
+                    defOp.kind() == OperationKind::kLatchReadPort)
+                {
+                    const char *symbolAttr =
+                        defOp.kind() == OperationKind::kRegisterReadPort ? "regSymbol" : "latchSymbol";
+                    if (auto symbol = getAttribute<std::string>(defOp, symbolAttr))
+                    {
+                        if (auto stateIt = model.stateBySymbol.find(*symbol); stateIt != model.stateBySymbol.end())
+                        {
+                            return resolvedStateRefExpr(stateIt->second, context);
+                        }
+                    }
+                }
+            }
+
+            std::unordered_map<ValueId, std::optional<std::string>, ValueIdHash> exprCache;
+            std::unordered_map<ValueId, std::size_t, ValueIdHash> costCache;
+            std::size_t totalOps = 0;
+            if (auto pureExpr = pureExprForValue(
+                    graph,
+                    model,
+                    value,
+                    exprCache,
+                    costCache,
+                    totalOps,
+                    kRegToMemIntentIndexInlineOpLimit))
+            {
+                return *pureExpr;
+            }
+
+            return resolvedScheduleValueExpr(model, value, context);
         }
 
         bool isCheapScalarInlineExpr(std::string_view expr) noexcept
@@ -10309,6 +10627,135 @@ namespace wolvrix::lib::emit
             return result;
         }
 
+        struct RegToMemIntentRowAccessExpr
+        {
+            std::string rowExpr;
+            std::string inRangeExpr;
+            bool alwaysInRange = false;
+        };
+
+        std::optional<ValueId> regToMemIntentSliceDynamicIndexValue(const Graph &graph,
+                                                                    const Operation &op,
+                                                                    int64_t elementWidth)
+        {
+            (void)elementWidth;
+            if (op.kind() != OperationKind::kSliceDynamic)
+            {
+                return std::nullopt;
+            }
+            return regToMemIntentSliceIndexValue(graph, op);
+        }
+
+        std::optional<RegToMemIntentRowAccessExpr>
+        regToMemIntentRowAccessExpr(const Graph &graph,
+                                    const EmitModel &model,
+                                    const Operation &op,
+                                    ValueId indexValue,
+                                    std::string_view indexExpr)
+        {
+            if ((op.kind() != OperationKind::kSliceArray && op.kind() != OperationKind::kSliceDynamic) ||
+                op.operands().size() != 2 || op.results().empty() || !indexValue.valid())
+            {
+                return std::nullopt;
+            }
+            const auto group = getAttribute<std::string>(op, "regToMem.intent.group");
+            const auto mode = getAttribute<std::string>(op, "regToMem.intent.mode");
+            const auto elementWidth = getAttribute<int64_t>(op, "regToMem.intent.elementWidth");
+            const auto elementCount = getAttribute<int64_t>(op, "regToMem.intent.elementCount");
+            const auto sliceWidth = getAttribute<int64_t>(op, "sliceWidth");
+            if (!group || mode.value_or(std::string()) != "array-index" ||
+                !elementWidth || !elementCount || !sliceWidth ||
+                *elementWidth <= 0 || *elementCount <= 0 ||
+                *sliceWidth != *elementWidth ||
+                graph.valueWidth(op.results().front()) != *elementWidth)
+            {
+                return std::nullopt;
+            }
+            const auto storageIt = model.regToMemIntentStorageByGroup.find(*group);
+            if (storageIt == model.regToMemIntentStorageByGroup.end())
+            {
+                return std::nullopt;
+            }
+            const RegToMemIntentStorageDecl &storage = storageIt->second;
+            if (storage.elementWidth != *elementWidth ||
+                storage.elementCount != static_cast<std::size_t>(*elementCount))
+            {
+                return std::nullopt;
+            }
+            const int32_t indexWidth = graph.valueWidth(indexValue);
+            RegToMemIntentRowAccessExpr access;
+            if (isWideLogicWidth(indexWidth))
+            {
+                const std::size_t wordCount = logicWordCount(indexWidth);
+                access.rowExpr =
+                    storage.fieldName + "[static_cast<std::size_t>((" + std::string(indexExpr) + ")[0])]";
+                std::ostringstream cond;
+                cond << "(";
+                for (std::size_t i = 1; i < wordCount; ++i)
+                {
+                    if (i != 1)
+                    {
+                        cond << " && ";
+                    }
+                    cond << "((" << indexExpr << ")[" << i << "] == UINT64_C(0))";
+                }
+                if (wordCount > 1)
+                {
+                    cond << " && ";
+                }
+                cond << "((" << indexExpr << ")[0] < " << storage.elementCount << "u))";
+                access.inRangeExpr = cond.str();
+                access.alwaysInRange = false;
+                return access;
+            }
+            const std::string scalarIndexExpr =
+                "static_cast<std::uint64_t>(" + std::string(indexExpr) + ")";
+            if (indexWidth > 0 && indexWidth < 64 &&
+                (UINT64_C(1) << static_cast<std::size_t>(indexWidth)) <=
+                    static_cast<std::uint64_t>(storage.elementCount))
+            {
+                access.rowExpr = storage.fieldName + "[static_cast<std::size_t>(" + scalarIndexExpr + ")]";
+                access.inRangeExpr = "true";
+                access.alwaysInRange = true;
+                return access;
+            }
+            access.rowExpr = storage.fieldName + "[static_cast<std::size_t>(" + scalarIndexExpr + ")]";
+            access.inRangeExpr = "(" + scalarIndexExpr + " < " + std::to_string(storage.elementCount) + "u)";
+            access.alwaysInRange = false;
+            return access;
+        }
+
+        std::optional<std::string> regToMemIntentSliceExpr(const Graph &graph,
+                                                           const EmitModel &model,
+                                                           const Operation &op,
+                                                           ValueId resultValue,
+                                                           ValueId indexValue,
+                                                           std::string_view indexExpr)
+        {
+            auto access = regToMemIntentRowAccessExpr(graph, model, op, indexValue, indexExpr);
+            if (!access)
+            {
+                return std::nullopt;
+            }
+            if (isWideLogicValue(graph, resultValue))
+            {
+                if (access->alwaysInRange)
+                {
+                    return access->rowExpr;
+                }
+                return "((" + access->inRangeExpr + ") ? " + access->rowExpr + " : " +
+                       wordsArrayTypeForWidth(graph.valueWidth(resultValue)) + "{})";
+            }
+            const std::string rowExpr =
+                "static_cast<" + cppTypeForValue(graph, resultValue) + ">(" + access->rowExpr + ")";
+            if (access->alwaysInRange)
+            {
+                return rowExpr;
+            }
+            return "((" + access->inRangeExpr + ") ? " + rowExpr + " : " +
+                   defaultInitExprForLogicWidth(graph.valueWidth(resultValue)) + ")";
+        }
+
         std::optional<std::string> eventExprMaterializedBodyForValue(
             const Graph &graph,
             const EmitModel &model,
@@ -10394,11 +10841,17 @@ namespace wolvrix::lib::emit
                                                     ValueId value,
                                                     std::unordered_map<ValueId, std::optional<std::string>, ValueIdHash> &cache,
                                                     std::unordered_map<ValueId, std::size_t, ValueIdHash> &costCache,
-                                                    std::size_t &totalOps)
+                                                    std::size_t &totalOps,
+                                                    std::size_t opBudget)
         {
             if (auto it = cache.find(value); it != cache.end())
             {
-                totalOps += costCache[value];
+                const std::size_t cachedCost = costCache[value];
+                if (cachedCost > opBudget || totalOps > opBudget - cachedCost)
+                {
+                    return std::nullopt;
+                }
+                totalOps += cachedCost;
                 return it->second;
             }
 
@@ -10462,12 +10915,17 @@ namespace wolvrix::lib::emit
                             break;
                         }
                         std::size_t operandCost = 0;
-                        auto addrExpr = pureExprForValue(graph, model, operands[0], cache, costCache, operandCost);
+                        auto addrExpr =
+                            pureExprForValue(graph, model, operands[0], cache, costCache, operandCost, opBudget);
                         if (!addrExpr)
                         {
                             break;
                         }
-                        cost += operandCost + 1;
+                        if (operandCost + 1u > opBudget)
+                        {
+                            break;
+                        }
+                        cost += operandCost + 1u;
                         const MemoryRowAccessExpr rowAccess =
                             memoryRowAccessExpr(graph, operands[0], *addrExpr, stateIt->second.rowCount);
                         const std::string rowExpr = stateRef(stateIt->second) + "[" + rowAccess.rowExpr + "]";
@@ -10540,8 +10998,20 @@ namespace wolvrix::lib::emit
                         for (ValueId operand : operands)
                         {
                             std::size_t operandCost = 0;
-                            auto operandExpr = pureExprForValue(graph, model, operand, cache, costCache, operandCost);
+                            auto operandExpr = pureExprForValue(
+                                graph,
+                                model,
+                                operand,
+                                cache,
+                                costCache,
+                                operandCost,
+                                cost >= opBudget ? 0u : opBudget - cost);
                             if (!operandExpr)
+                            {
+                                operandExprs.clear();
+                                break;
+                            }
+                            if (operandCost > opBudget - cost)
                             {
                                 operandExprs.clear();
                                 break;
@@ -10553,7 +11023,11 @@ namespace wolvrix::lib::emit
                         {
                             break;
                         }
-                        cost += 1;
+                        if (cost + 1u > opBudget)
+                        {
+                            break;
+                        }
+                        cost += 1u;
                         if (opNeedsWordLogicEmit(graph, op))
                         {
                             expr = eventWordLogicExprForOp(graph, model, op, value, operandExprs);
@@ -11268,7 +11742,7 @@ namespace wolvrix::lib::emit
                 return std::nullopt;
             }
             const StateDecl &state = stateIt->second;
-            if (isWideLogicWidth(state.width) || state.slotIndex == kInvalidIndex)
+            if (state.regToMemIntentStorage || isWideLogicWidth(state.width) || state.slotIndex == kInvalidIndex)
             {
                 return std::nullopt;
             }
@@ -12668,6 +13142,65 @@ namespace wolvrix::lib::emit
                         {
                             return emitError("unsupported kSystemFunction result type in grhsim-cpp emit",
                                              std::string(op.symbolText()));
+                        }
+                        if ((op.kind() == OperationKind::kSliceArray || op.kind() == OperationKind::kSliceDynamic) &&
+                            operands.size() == 2)
+                        {
+                            ValueId indexValue = ValueId::invalid();
+                            if (op.kind() == OperationKind::kSliceArray)
+                            {
+                                indexValue = operands[1];
+                            }
+                            else
+                            {
+                                const auto elementWidth = getAttribute<int64_t>(op, "regToMem.intent.elementWidth");
+                                if (elementWidth)
+                                {
+                                    if (auto normalized = regToMemIntentSliceDynamicIndexValue(graph, op, *elementWidth))
+                                    {
+                                        indexValue = *normalized;
+                                    }
+                                }
+                            }
+                            if (indexValue.valid())
+                            {
+                                const std::string indexExpr =
+                                    resolvedRegToMemIntentIndexExpr(graph, model, indexValue, &localExprContext);
+                                if (auto expr = regToMemIntentSliceExpr(
+                                        graph,
+                                        model,
+                                        op,
+                                        resultValue,
+                                        indexValue,
+                                        indexExpr))
+                                {
+                                    emitValueAssignmentComment(stream, graph, model, resultValue, "        ");
+                                    if (isWideLogicValue(graph, resultValue))
+                                    {
+                                        emitLogicAssignFromWideWordsExpr(stream,
+                                                                         graph,
+                                                                         model,
+                                                                         resultValue,
+                                                                         *expr,
+                                                                         &localExprContext,
+                                                                         &activationContext,
+                                                                         &deferredActivationContext);
+                                    }
+                                    else
+                                    {
+                                        emitLogicAssignFromScalarExpr(stream,
+                                                                      graph,
+                                                                      model,
+                                                                      resultValue,
+                                                                      "static_cast<std::uint64_t>(" + *expr + ")",
+                                                                      true,
+                                                                      &localExprContext,
+                                                                      &activationContext,
+                                                                      &deferredActivationContext);
+                                    }
+                                    break;
+                                }
+                            }
                         }
                         if (op.kind() == OperationKind::kSystemFunction)
                         {
