@@ -470,6 +470,13 @@ namespace wolvrix::lib::grh
         }
         if (graph != expected)
         {
+            if (std::getenv("WOLF_DEBUG_GRAPH_ID"))
+            {
+                std::fprintf(stderr,
+                             "[graph-id] operation index=%u gen=%u graph=%u/%u expected=%u/%u\n",
+                             index, generation, graph.index, graph.generation,
+                             expected.index, expected.generation);
+            }
             throw std::runtime_error("OperationId used with mismatched GraphId");
         }
     }

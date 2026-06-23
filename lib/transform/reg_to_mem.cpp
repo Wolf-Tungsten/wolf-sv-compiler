@@ -89,6 +89,24 @@ namespace wolvrix::lib::transform
             std::vector<AnchorCandidate> anchors;
             int32_t elementWidth = 0;
             std::size_t elementCount = 0;
+            std::string intentGroupName;
+            std::string storageGroupName;
+            std::vector<std::string> storageRegSymbols;
+            std::size_t storageElementCount = 0;
+            std::size_t storageRowOffset = 0;
+            bool sharesStorage = false;
+            bool overlapsOtherCandidate = false;
+        };
+
+        struct GroupAnchorsResult
+        {
+            std::vector<GroupCandidate> groups;
+            std::size_t candidateGroups = 0;
+            std::size_t candidateAnchors = 0;
+            std::size_t candidateMembers = 0;
+            std::size_t conflictGroups = 0;
+            std::size_t conflictAnchors = 0;
+            std::size_t conflictMembers = 0;
         };
 
         struct WritePortInfo
@@ -164,6 +182,12 @@ namespace wolvrix::lib::transform
         struct RegToMemStats
         {
             std::size_t graphs = 0;
+            std::size_t intentCandidateGroups = 0;
+            std::size_t intentCandidateAnchors = 0;
+            std::size_t intentCandidateMembers = 0;
+            std::size_t intentConflictGroups = 0;
+            std::size_t intentConflictAnchors = 0;
+            std::size_t intentConflictMembers = 0;
             std::size_t intentGroups = 0;
             std::size_t intentAnchors = 0;
             std::size_t intentMembers = 0;
@@ -277,6 +301,96 @@ namespace wolvrix::lib::transform
                 out << symbol.size() << ':' << symbol << ';';
             }
             return out.str();
+        }
+
+        std::string layoutKey(const AnchorCandidate &anchor)
+        {
+            std::ostringstream out;
+            out << anchor.elementWidth << ':' << anchor.elementCount << ':' << rowKey(anchor.regSymbols);
+            return out.str();
+        }
+
+        std::optional<std::size_t> contiguousSubsequenceOffset(const std::vector<std::string> &needle,
+                                                               const std::vector<std::string> &haystack)
+        {
+            if (needle.empty() || needle.size() > haystack.size())
+            {
+                return std::nullopt;
+            }
+            const std::size_t lastStart = haystack.size() - needle.size();
+            for (std::size_t start = 0; start <= lastStart; ++start)
+            {
+                bool matched = true;
+                for (std::size_t i = 0; i < needle.size(); ++i)
+                {
+                    if (needle[i] != haystack[start + i])
+                    {
+                        matched = false;
+                        break;
+                    }
+                }
+                if (matched)
+                {
+                    return start;
+                }
+            }
+            return std::nullopt;
+        }
+
+        bool groupsCanShareStorage(const GroupCandidate &view,
+                                   const GroupCandidate &storage,
+                                   std::size_t *rowOffset = nullptr)
+        {
+            if (view.elementWidth != storage.elementWidth ||
+                view.elementCount != view.regSymbols.size() ||
+                storage.elementCount != storage.regSymbols.size())
+            {
+                return false;
+            }
+            const auto offset = contiguousSubsequenceOffset(view.regSymbols, storage.regSymbols);
+            if (!offset)
+            {
+                return false;
+            }
+            if (rowOffset != nullptr)
+            {
+                *rowOffset = *offset;
+            }
+            return true;
+        }
+
+        bool groupSharesReadOpsWithFamily(
+            const GroupCandidate &group,
+            const std::unordered_map<OperationId, std::size_t, OperationIdHash> &readOwnerByOp)
+        {
+            for (const auto &anchor : group.anchors)
+            {
+                for (const OperationId readOp : anchor.readOps)
+                {
+                    if (readOp.valid() && readOwnerByOp.find(readOp) != readOwnerByOp.end())
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        void addGroupReadsToFamily(
+            const GroupCandidate &group,
+            std::size_t groupIndex,
+            std::unordered_map<OperationId, std::size_t, OperationIdHash> &readOwnerByOp)
+        {
+            for (const auto &anchor : group.anchors)
+            {
+                for (const OperationId readOp : anchor.readOps)
+                {
+                    if (readOp.valid())
+                    {
+                        readOwnerByOp.emplace(readOp, groupIndex);
+                    }
+                }
+            }
         }
 
         bool isRegisterDecl(const Graph &graph, const std::string &symbol)
@@ -775,6 +889,10 @@ namespace wolvrix::lib::transform
             {
                 return std::nullopt;
             }
+            if (elementWidth == 1)
+            {
+                return startValue;
+            }
             const OperationId defOpId = graph.valueDef(startValue);
             if (!defOpId.valid())
             {
@@ -941,9 +1059,9 @@ namespace wolvrix::lib::transform
                 graph, uses, sliceOpId, operands[0], *indexValue, *sliceWidth, std::string("slice-dynamic"));
         }
 
-        std::vector<AnchorCandidate> discoverAnchors(const Graph &graph,
-                                                     const ValueUseIndex &uses,
-                                                     std::size_t minElementCount)
+        std::vector<AnchorCandidate> discoverIntentAnchors(const Graph &graph,
+                                                           const ValueUseIndex &uses,
+                                                           std::size_t minElementCount)
         {
             std::vector<AnchorCandidate> anchors;
             for (OperationId opId : graph.operations())
@@ -971,33 +1089,223 @@ namespace wolvrix::lib::transform
             return anchors;
         }
 
-        std::vector<GroupCandidate> groupAnchors(std::vector<AnchorCandidate> anchors)
+        GroupAnchorsResult groupAnchors(std::vector<AnchorCandidate> anchors)
         {
-            std::vector<GroupCandidate> groups;
+            GroupAnchorsResult result;
             std::unordered_map<std::string, std::size_t> indexByKey;
             for (auto &anchor : anchors)
             {
-                const std::string key = rowKey(anchor.regSymbols);
+                const std::string key = layoutKey(anchor);
                 auto it = indexByKey.find(key);
                 if (it == indexByKey.end())
                 {
-                    const std::size_t groupIndex = groups.size();
+                    const std::size_t groupIndex = result.groups.size();
                     indexByKey.emplace(key, groupIndex);
                     GroupCandidate group;
                     group.regSymbols = anchor.regSymbols;
                     group.elementWidth = anchor.elementWidth;
                     group.elementCount = anchor.elementCount;
-                    groups.push_back(std::move(group));
+                    result.groups.push_back(std::move(group));
                     it = indexByKey.find(key);
                 }
-                GroupCandidate &group = groups[it->second];
-                if (group.elementWidth != anchor.elementWidth || group.elementCount != anchor.elementCount)
+                GroupCandidate &group = result.groups[it->second];
+                group.anchors.push_back(std::move(anchor));
+            }
+
+            result.candidateGroups = result.groups.size();
+            for (const GroupCandidate &group : result.groups)
+            {
+                result.candidateAnchors += group.anchors.size();
+                result.candidateMembers += group.regSymbols.size();
+            }
+
+            for (std::size_t groupIndex = 0; groupIndex < result.groups.size(); ++groupIndex)
+            {
+                GroupCandidate &group = result.groups[groupIndex];
+                group.intentGroupName = "rtm_intent_" + std::to_string(groupIndex);
+                group.storageGroupName = group.intentGroupName;
+                group.storageRegSymbols = group.regSymbols;
+                group.storageElementCount = group.elementCount;
+                group.storageRowOffset = 0;
+                group.sharesStorage = false;
+            }
+
+            std::unordered_map<std::string, std::vector<std::size_t>> ownersByReg;
+            for (std::size_t groupIndex = 0; groupIndex < result.groups.size(); ++groupIndex)
+            {
+                for (const std::string &regSymbol : result.groups[groupIndex].regSymbols)
+                {
+                    ownersByReg[regSymbol].push_back(groupIndex);
+                }
+            }
+
+            std::vector<std::vector<std::size_t>> overlapping(result.groups.size());
+            for (const auto &[regSymbol, owners] : ownersByReg)
+            {
+                (void)regSymbol;
+                for (std::size_t i = 0; i < owners.size(); ++i)
+                {
+                    for (std::size_t j = i + 1; j < owners.size(); ++j)
+                    {
+                        overlapping[owners[i]].push_back(owners[j]);
+                        overlapping[owners[j]].push_back(owners[i]);
+                    }
+                }
+            }
+            for (auto &neighbors : overlapping)
+            {
+                std::sort(neighbors.begin(), neighbors.end());
+                neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
+            }
+
+            const std::size_t unassigned = std::numeric_limits<std::size_t>::max();
+            std::vector<std::size_t> storageOf(result.groups.size(), unassigned);
+            std::vector<std::size_t> rowOffsets(result.groups.size(), 0);
+            std::vector<std::size_t> familySizes(result.groups.size(), 0);
+            std::vector<uint8_t> conflicted(result.groups.size(), 0);
+            std::vector<std::size_t> selectedStorageRoots;
+            std::vector<std::unordered_map<OperationId, std::size_t, OperationIdHash>> familyReadOwnerByRoot(
+                result.groups.size());
+
+            std::vector<std::size_t> order;
+            order.reserve(result.groups.size());
+            for (std::size_t groupIndex = 0; groupIndex < result.groups.size(); ++groupIndex)
+            {
+                order.push_back(groupIndex);
+            }
+            std::sort(order.begin(), order.end(), [&](std::size_t lhs, std::size_t rhs) {
+                const GroupCandidate &left = result.groups[lhs];
+                const GroupCandidate &right = result.groups[rhs];
+                if (left.elementCount != right.elementCount)
+                {
+                    return left.elementCount > right.elementCount;
+                }
+                if (left.elementWidth != right.elementWidth)
+                {
+                    return left.elementWidth < right.elementWidth;
+                }
+                const std::string leftKey = rowKey(left.regSymbols);
+                const std::string rightKey = rowKey(right.regSymbols);
+                if (leftKey != rightKey)
+                {
+                    return leftKey < rightKey;
+                }
+                return lhs < rhs;
+            });
+
+            const auto groupsOverlap = [&](std::size_t lhs, std::size_t rhs) {
+                const auto &neighbors = overlapping[lhs];
+                return std::binary_search(neighbors.begin(), neighbors.end(), rhs);
+            };
+
+            for (const std::size_t groupIndex : order)
+            {
+                if (storageOf[groupIndex] != unassigned || conflicted[groupIndex] != 0)
                 {
                     continue;
                 }
-                group.anchors.push_back(std::move(anchor));
+
+                bool assignedToExistingStorage = false;
+                bool conflictsWithExistingStorage = false;
+                for (const std::size_t storageIndex : selectedStorageRoots)
+                {
+                    std::size_t rowOffset = 0;
+                    if (groupsCanShareStorage(result.groups[groupIndex], result.groups[storageIndex], &rowOffset) &&
+                        !groupSharesReadOpsWithFamily(result.groups[groupIndex],
+                                                      familyReadOwnerByRoot[storageIndex]))
+                    {
+                        storageOf[groupIndex] = storageIndex;
+                        rowOffsets[groupIndex] = rowOffset;
+                        ++familySizes[storageIndex];
+                        addGroupReadsToFamily(result.groups[groupIndex],
+                                              groupIndex,
+                                              familyReadOwnerByRoot[storageIndex]);
+                        assignedToExistingStorage = true;
+                        break;
+                    }
+                    if (groupsOverlap(groupIndex, storageIndex))
+                    {
+                        conflictsWithExistingStorage = true;
+                    }
+                }
+                if (assignedToExistingStorage)
+                {
+                    continue;
+                }
+                if (conflictsWithExistingStorage)
+                {
+                    conflicted[groupIndex] = 1;
+                    continue;
+                }
+
+                storageOf[groupIndex] = groupIndex;
+                rowOffsets[groupIndex] = 0;
+                familySizes[groupIndex] = 1;
+                selectedStorageRoots.push_back(groupIndex);
+                addGroupReadsToFamily(result.groups[groupIndex],
+                                      groupIndex,
+                                      familyReadOwnerByRoot[groupIndex]);
+                for (std::size_t viewIndex = 0; viewIndex < result.groups.size(); ++viewIndex)
+                {
+                    if (viewIndex == groupIndex ||
+                        storageOf[viewIndex] != unassigned ||
+                        conflicted[viewIndex] != 0)
+                    {
+                        continue;
+                    }
+                    std::size_t rowOffset = 0;
+                    if (groupsCanShareStorage(result.groups[viewIndex], result.groups[groupIndex], &rowOffset) &&
+                        !groupSharesReadOpsWithFamily(result.groups[viewIndex],
+                                                      familyReadOwnerByRoot[groupIndex]))
+                    {
+                        storageOf[viewIndex] = groupIndex;
+                        rowOffsets[viewIndex] = rowOffset;
+                        ++familySizes[groupIndex];
+                        addGroupReadsToFamily(result.groups[viewIndex],
+                                              viewIndex,
+                                              familyReadOwnerByRoot[groupIndex]);
+                    }
+                }
             }
-            return groups;
+
+            for (std::size_t groupIndex = 0; groupIndex < result.groups.size(); ++groupIndex)
+            {
+                if (conflicted[groupIndex] != 0)
+                {
+                    continue;
+                }
+                const std::size_t storageIndex = storageOf[groupIndex];
+                if (storageIndex == unassigned)
+                {
+                    conflicted[groupIndex] = 1;
+                    continue;
+                }
+                GroupCandidate &group = result.groups[groupIndex];
+                const GroupCandidate &storage = result.groups[storageIndex];
+                group.storageGroupName = storage.intentGroupName;
+                group.storageRegSymbols = storage.regSymbols;
+                group.storageElementCount = storage.elementCount;
+                group.storageRowOffset = rowOffsets[groupIndex];
+                group.sharesStorage = familySizes[storageIndex] > 1;
+                group.overlapsOtherCandidate = !overlapping[groupIndex].empty();
+            }
+
+            std::vector<GroupCandidate> filteredGroups;
+            filteredGroups.reserve(result.groups.size());
+            for (std::size_t groupIndex = 0; groupIndex < result.groups.size(); ++groupIndex)
+            {
+                if (conflicted[groupIndex] != 0)
+                {
+                    const GroupCandidate &group = result.groups[groupIndex];
+                    ++result.conflictGroups;
+                    result.conflictAnchors += group.anchors.size();
+                    result.conflictMembers += group.regSymbols.size();
+                    continue;
+                }
+                filteredGroups.push_back(std::move(result.groups[groupIndex]));
+            }
+            result.groups = std::move(filteredGroups);
+            return result;
         }
 
         std::unordered_map<std::string, std::vector<WritePortInfo>> collectRegisterWrites(const Graph &graph)
@@ -1969,10 +2277,19 @@ namespace wolvrix::lib::transform
             return true;
         }
 
-        void annotateGroup(Graph &graph, const GroupCandidate &group, std::size_t groupIndex)
+        void annotateGroup(Graph &graph, const GroupCandidate &group, std::size_t fallbackGroupIndex)
         {
-            const std::string groupName = "rtm_intent_" + std::to_string(groupIndex);
+            const std::string groupName = group.intentGroupName.empty()
+                                              ? "rtm_intent_" + std::to_string(fallbackGroupIndex)
+                                              : group.intentGroupName;
+            const std::string storageGroupName = group.storageGroupName.empty()
+                                                     ? groupName
+                                                     : group.storageGroupName;
             const std::vector<std::string> regSymbols = group.regSymbols;
+            const std::vector<std::string> storageRegSymbols =
+                group.storageRegSymbols.empty() ? group.regSymbols : group.storageRegSymbols;
+            const std::size_t storageElementCount =
+                group.storageElementCount == 0 ? group.elementCount : group.storageElementCount;
             std::vector<int64_t> rows;
             rows.reserve(group.elementCount);
             for (std::size_t i = 0; i < group.elementCount; ++i)
@@ -1990,6 +2307,12 @@ namespace wolvrix::lib::transform
                 graph.setAttr(anchor.concatOp, "regToMem.intent.elementCount", static_cast<int64_t>(group.elementCount));
                 graph.setAttr(anchor.concatOp, "regToMem.intent.regSymbols", regSymbols);
                 graph.setAttr(anchor.concatOp, "regToMem.intent.operandRows", anchor.operandRows);
+                graph.setAttr(anchor.concatOp, "regToMem.intent.storageGroup", storageGroupName);
+                graph.setAttr(anchor.concatOp, "regToMem.intent.storageElementCount",
+                              static_cast<int64_t>(storageElementCount));
+                graph.setAttr(anchor.concatOp, "regToMem.intent.storageRegSymbols", storageRegSymbols);
+                graph.setAttr(anchor.concatOp, "regToMem.intent.storageRowOffset",
+                              static_cast<int64_t>(group.storageRowOffset));
 
                 graph.setAttr(anchor.sliceOp, "regToMem.intent.version", int64_t{1});
                 graph.setAttr(anchor.sliceOp, "regToMem.intent.group", groupName);
@@ -1998,6 +2321,11 @@ namespace wolvrix::lib::transform
                 graph.setAttr(anchor.sliceOp, "regToMem.intent.sliceKind", anchor.sliceKind);
                 graph.setAttr(anchor.sliceOp, "regToMem.intent.elementWidth", static_cast<int64_t>(group.elementWidth));
                 graph.setAttr(anchor.sliceOp, "regToMem.intent.elementCount", static_cast<int64_t>(group.elementCount));
+                graph.setAttr(anchor.sliceOp, "regToMem.intent.storageGroup", storageGroupName);
+                graph.setAttr(anchor.sliceOp, "regToMem.intent.storageElementCount",
+                              static_cast<int64_t>(storageElementCount));
+                graph.setAttr(anchor.sliceOp, "regToMem.intent.storageRowOffset",
+                              static_cast<int64_t>(group.storageRowOffset));
 
                 for (std::size_t i = 0; i < anchor.readOps.size(); ++i)
                 {
@@ -2008,22 +2336,27 @@ namespace wolvrix::lib::transform
                     graph.setAttr(readOp, "regToMem.intent.role", std::string("read"));
                     graph.setAttr(readOp, "regToMem.intent.mode", std::string("array-index"));
                     graph.setAttr(readOp, "regToMem.intent.row", row);
+                    graph.setAttr(readOp, "regToMem.intent.storageGroup", storageGroupName);
+                    graph.setAttr(readOp, "regToMem.intent.storageRow", row + static_cast<int64_t>(group.storageRowOffset));
                 }
 
-                for (std::size_t row = 0; row < group.regSymbols.size(); ++row)
+                for (std::size_t row = 0; row < storageRegSymbols.size(); ++row)
                 {
-                    const OperationId regOp = graph.findOperation(group.regSymbols[row]);
+                    const OperationId regOp = graph.findOperation(storageRegSymbols[row]);
                     if (!regOp.valid())
                     {
                         continue;
                     }
                     graph.setAttr(regOp, "regToMem.intent.version", int64_t{1});
-                    graph.setAttr(regOp, "regToMem.intent.group", groupName);
+                    graph.setAttr(regOp, "regToMem.intent.group", storageGroupName);
                     graph.setAttr(regOp, "regToMem.intent.role", std::string("register"));
                     graph.setAttr(regOp, "regToMem.intent.mode", std::string("array-index"));
                     graph.setAttr(regOp, "regToMem.intent.row", static_cast<int64_t>(row));
                     graph.setAttr(regOp, "regToMem.intent.elementWidth", static_cast<int64_t>(group.elementWidth));
-                    graph.setAttr(regOp, "regToMem.intent.elementCount", static_cast<int64_t>(group.elementCount));
+                    graph.setAttr(regOp, "regToMem.intent.elementCount", static_cast<int64_t>(storageElementCount));
+                    graph.setAttr(regOp, "regToMem.intent.storageGroup", storageGroupName);
+                    graph.setAttr(regOp, "regToMem.intent.storageElementCount",
+                                  static_cast<int64_t>(storageElementCount));
                 }
             }
         }
@@ -2070,12 +2403,12 @@ namespace wolvrix::lib::transform
                        " use_values=" + std::to_string(valueUses.size()));
 
             stageStart = ProfileClock::now();
-            auto anchors = discoverAnchors(graph, valueUses, options_.minElementCount);
+            auto anchors = discoverIntentAnchors(graph, valueUses, options_.minElementCount);
             const int64_t discoverAnchorsMs = elapsedMs(stageStart);
             profile.discoverAnchorsMs += discoverAnchorsMs;
             profileLog("graph_stage index=" + std::to_string(graphIndex) +
-                       " stage=discover_anchors ms=" + std::to_string(discoverAnchorsMs) +
-                       " anchors=" + std::to_string(anchors.size()));
+                       " stage=discover_intent_anchors ms=" + std::to_string(discoverAnchorsMs) +
+                       " intent_anchors=" + std::to_string(anchors.size()));
             if (anchors.empty())
             {
                 profileLog("graph_done index=" + std::to_string(graphIndex) +
@@ -2085,12 +2418,22 @@ namespace wolvrix::lib::transform
             }
 
             stageStart = ProfileClock::now();
-            auto groups = groupAnchors(std::move(anchors));
+            auto groupedAnchors = groupAnchors(std::move(anchors));
+            stats.intentCandidateGroups += groupedAnchors.candidateGroups;
+            stats.intentCandidateAnchors += groupedAnchors.candidateAnchors;
+            stats.intentCandidateMembers += groupedAnchors.candidateMembers;
+            stats.intentConflictGroups += groupedAnchors.conflictGroups;
+            stats.intentConflictAnchors += groupedAnchors.conflictAnchors;
+            stats.intentConflictMembers += groupedAnchors.conflictMembers;
+            auto groups = std::move(groupedAnchors.groups);
             const int64_t groupAnchorsMs = elapsedMs(stageStart);
             profile.groupAnchorsMs += groupAnchorsMs;
             profileLog("graph_stage index=" + std::to_string(graphIndex) +
                        " stage=group_anchors ms=" + std::to_string(groupAnchorsMs) +
-                       " groups=" + std::to_string(groups.size()));
+                       " candidate_groups=" + std::to_string(groupedAnchors.candidateGroups) +
+                       " groups=" + std::to_string(groups.size()) +
+                       " conflict_groups=" + std::to_string(groupedAnchors.conflictGroups) +
+                       " conflict_anchors=" + std::to_string(groupedAnchors.conflictAnchors));
 
             stageStart = ProfileClock::now();
             const auto readsByReg = options_.enableTrueMerge
@@ -2116,6 +2459,8 @@ namespace wolvrix::lib::transform
             std::size_t visitedGroups = 0;
             std::size_t graphTrueGroups = 0;
             std::size_t graphIntentGroups = 0;
+            const std::size_t graphIntentCandidateGroups = groupedAnchors.candidateGroups;
+            const std::size_t graphIntentConflictGroups = groupedAnchors.conflictGroups;
             std::size_t graphSkippedTrue = 0;
             for (auto &group : groups)
             {
@@ -2141,7 +2486,7 @@ namespace wolvrix::lib::transform
                                " element_width=" + std::to_string(group.elementWidth));
                 }
                 bool trueMerged = false;
-                if (options_.enableTrueMerge)
+                if (options_.enableTrueMerge && !group.sharesStorage && !group.overlapsOtherCandidate)
                 {
                     auto trueCandidate = matchTrueMerge(graph,
                                                         valueUses,
@@ -2193,6 +2538,11 @@ namespace wolvrix::lib::transform
                         ++graphSkippedTrue;
                     }
                 }
+                else if (options_.enableTrueMerge && (group.sharesStorage || group.overlapsOtherCandidate))
+                {
+                    ++stats.skippedTrueCandidates;
+                    ++graphSkippedTrue;
+                }
                 if (trueMerged)
                 {
                     continue;
@@ -2213,6 +2563,8 @@ namespace wolvrix::lib::transform
                        " total_ms=" + std::to_string(elapsedMs(graphStart)) +
                        " groups=" + std::to_string(groups.size()) +
                        " visited_groups=" + std::to_string(visitedGroups) +
+                       " intent_candidate_groups=" + std::to_string(graphIntentCandidateGroups) +
+                       " intent_conflict_groups=" + std::to_string(graphIntentConflictGroups) +
                        " true_groups=" + std::to_string(graphTrueGroups) +
                        " true_skipped=" + std::to_string(graphSkippedTrue) +
                        " intent_groups=" + std::to_string(graphIntentGroups));
@@ -2243,6 +2595,12 @@ namespace wolvrix::lib::transform
 
         diags().info(std::string(kPassId),
                      "reg-to-mem: graphs=" + std::to_string(stats.graphs) +
+                         " intent_candidate_groups=" + std::to_string(stats.intentCandidateGroups) +
+                         " intent_candidate_anchors=" + std::to_string(stats.intentCandidateAnchors) +
+                         " intent_candidate_members=" + std::to_string(stats.intentCandidateMembers) +
+                         " intent_conflict_groups=" + std::to_string(stats.intentConflictGroups) +
+                         " intent_conflict_anchors=" + std::to_string(stats.intentConflictAnchors) +
+                         " intent_conflict_members=" + std::to_string(stats.intentConflictMembers) +
                          " true_groups=" + std::to_string(stats.trueGroups) +
                          " true_anchors=" + std::to_string(stats.trueAnchors) +
                          " true_members=" + std::to_string(stats.trueMembers) +

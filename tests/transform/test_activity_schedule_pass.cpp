@@ -110,6 +110,45 @@ namespace
         return std::find(succs.begin(), succs.end(), supernode) != succs.end();
     }
 
+    bool supernodeContains(const ActivityScheduleSupernodeToOps &supernodeToOps,
+                           uint32_t supernode,
+                           wolvrix::lib::grh::OperationId opId)
+    {
+        if (supernode == kInvalidActivitySupernodeId || supernode >= supernodeToOps.size())
+        {
+            return false;
+        }
+        const auto &ops = supernodeToOps[supernode];
+        return std::find(ops.begin(), ops.end(), opId) != ops.end();
+    }
+
+    bool stateReadHasSupernode(const ActivityScheduleStateReadSupernodes &stateReadSupernodes,
+                               const std::string &stateSymbol,
+                               uint32_t supernode)
+    {
+        const auto it = stateReadSupernodes.find(stateSymbol);
+        if (it == stateReadSupernodes.end())
+        {
+            return false;
+        }
+        const auto &supernodes = it->second;
+        return std::find(supernodes.begin(), supernodes.end(), supernode) != supernodes.end();
+    }
+
+    void setIntentShape(wolvrix::lib::grh::Graph &graph,
+                        wolvrix::lib::grh::OperationId opId,
+                        const std::string &group,
+                        const std::string &role,
+                        int64_t elementWidth,
+                        int64_t elementCount)
+    {
+        graph.setAttr(opId, "regToMem.intent.group", group);
+        graph.setAttr(opId, "regToMem.intent.mode", std::string("array-index"));
+        graph.setAttr(opId, "regToMem.intent.role", role);
+        graph.setAttr(opId, "regToMem.intent.elementWidth", elementWidth);
+        graph.setAttr(opId, "regToMem.intent.elementCount", elementCount);
+    }
+
     int validateCommonScheduleShape(const wolvrix::lib::grh::Graph &graph,
                                     const ScheduleView &schedule)
     {
@@ -217,6 +256,10 @@ int main()
         graph.setAttr(concat, "regToMem.intent.role", std::string("concat"));
         graph.setAttr(concat, "regToMem.intent.elementWidth", int64_t{8});
         graph.setAttr(concat, "regToMem.intent.elementCount", int64_t{4});
+        graph.setAttr(concat, "regToMem.intent.regSymbols",
+                      std::vector<std::string>{"r0", "r1", "r2", "r3"});
+        graph.setAttr(concat, "regToMem.intent.operandRows",
+                      std::vector<int64_t>{3, 2, 1, 0});
 
         const auto selected = makeValue(graph, "selected", 8);
         const auto slice = graph.createOperation(wolvrix::lib::grh::OperationKind::kSliceArray,
@@ -312,6 +355,254 @@ int main()
         else if (!hasFanoutTo(*schedule.valueFanout, scheduledIndex, owner))
         {
             return fail("reg-to-mem intent index boundary value is not scheduled into the intent group");
+        }
+        for (int row = 0; row < 4; ++row)
+        {
+            if (!stateReadHasSupernode(*schedule.stateReadSupernodes, "r" + std::to_string(row), owner))
+            {
+                return fail("reg-to-mem intent slice missing storage-register activation mapping");
+            }
+        }
+    }
+
+    {
+        currentCase = "reg-to-mem dynamic intent index";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("intent_dynamic");
+        design.markAsTop("intent_dynamic");
+
+        const std::string group = "rtm_intent_dyn";
+        const auto idx = makeValue(graph, "idx", 2);
+        const auto one = makeConstant(graph, "one_const", "one", 2, "2'd1");
+        graph.bindInputPort("idx", idx);
+
+        const auto idxPlus = makeValue(graph, "idx_plus", 2);
+        const auto idxAdd = graph.createOperation(wolvrix::lib::grh::OperationKind::kAdd,
+                                                  graph.internSymbol("idx_plus_add"));
+        graph.addOperand(idxAdd, idx);
+        graph.addOperand(idxAdd, one);
+        graph.addResult(idxAdd, idxPlus);
+
+        std::vector<wolvrix::lib::grh::ValueId> readValues;
+        readValues.reserve(4);
+        for (int row = 0; row < 4; ++row)
+        {
+            const std::string reg = "r" + std::to_string(row);
+            const auto regOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
+                                                     graph.internSymbol(reg));
+            graph.setAttr(regOp, "width", int64_t{8});
+            graph.setAttr(regOp, "isSigned", false);
+            setIntentShape(graph, regOp, group, "register", 8, 4);
+            graph.setAttr(regOp, "regToMem.intent.row", static_cast<int64_t>(row));
+
+            const auto readValue = makeValue(graph, reg + "_read", 8);
+            const auto readOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterReadPort,
+                                                      graph.internSymbol(reg + "_read_op"));
+            graph.addResult(readOp, readValue);
+            graph.setAttr(readOp, "regSymbol", reg);
+            graph.setAttr(readOp, "regToMem.intent.group", group);
+            graph.setAttr(readOp, "regToMem.intent.mode", std::string("array-index"));
+            graph.setAttr(readOp, "regToMem.intent.role", std::string("read"));
+            graph.setAttr(readOp, "regToMem.intent.row", static_cast<int64_t>(row));
+            readValues.push_back(readValue);
+        }
+
+        const auto packed = makeValue(graph, "packed", 32);
+        const auto concat = graph.createOperation(wolvrix::lib::grh::OperationKind::kConcat,
+                                                  graph.internSymbol("packed_concat"));
+        for (int row = 3; row >= 0; --row)
+        {
+            graph.addOperand(concat, readValues[static_cast<std::size_t>(row)]);
+        }
+        graph.addResult(concat, packed);
+        setIntentShape(graph, concat, group, "concat", 8, 4);
+        graph.setAttr(concat, "regToMem.intent.regSymbols",
+                      std::vector<std::string>{"r0", "r1", "r2", "r3"});
+        graph.setAttr(concat, "regToMem.intent.operandRows",
+                      std::vector<int64_t>{3, 2, 1, 0});
+
+        const auto elemWidth = makeConstant(graph, "elem_width_const", "elem_width", 4, "4'd8");
+        const auto start = makeValue(graph, "start", 4);
+        const auto mul = graph.createOperation(wolvrix::lib::grh::OperationKind::kMul,
+                                               graph.internSymbol("start_mul"));
+        graph.addOperand(mul, idxPlus);
+        graph.addOperand(mul, elemWidth);
+        graph.addResult(mul, start);
+
+        const auto selected = makeValue(graph, "selected", 8);
+        const auto slice = graph.createOperation(wolvrix::lib::grh::OperationKind::kSliceDynamic,
+                                                 graph.internSymbol("selected_slice"));
+        graph.addOperand(slice, packed);
+        graph.addOperand(slice, start);
+        graph.addResult(slice, selected);
+        graph.setAttr(slice, "sliceWidth", int64_t{8});
+        setIntentShape(graph, slice, group, "slice", 8, 4);
+        graph.setAttr(slice, "regToMem.intent.sliceKind", std::string("slice-dynamic"));
+        graph.bindOutputPort("selected", selected);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(
+            ActivityScheduleOptions{.path = "intent_dynamic",
+                                    .maxOpInComputeSupernode = 6,
+                                    .maxOpInComputeNode = 2,
+                                    .enableCoarsen = false}));
+
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected activity-schedule pass to succeed for dynamic reg-to-mem intent group");
+        }
+        const auto schedule = loadSchedule(session, "intent_dynamic");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        const uint32_t sliceOwner = (*schedule.opToSupernode)[slice.index - 1];
+        const uint32_t addOwner = (*schedule.opToSupernode)[idxAdd.index - 1];
+        const uint32_t mulOwner = (*schedule.opToSupernode)[mul.index - 1];
+        if (sliceOwner == kInvalidActivitySupernodeId || addOwner == kInvalidActivitySupernodeId)
+        {
+            return fail("dynamic intent slice or canonical index producer missing from schedule");
+        }
+        if (!supernodeContains(*schedule.supernodeToOps, sliceOwner, concat))
+        {
+            return fail("dynamic reg-to-mem intent concat was split from slice");
+        }
+        if (supernodeContains(*schedule.supernodeToOps, sliceOwner, idxAdd))
+        {
+            return fail("dynamic reg-to-mem intent should treat canonical index producer as boundary");
+        }
+        if (mulOwner != kInvalidActivitySupernodeId)
+        {
+            return fail("dynamic reg-to-mem intent should not schedule start-mul as the semantic index dependency");
+        }
+        if (!hasFanoutTo(*schedule.valueFanout, idxPlus, sliceOwner))
+        {
+            return fail("dynamic reg-to-mem intent missing canonical index fanout into intent group");
+        }
+        for (int row = 0; row < 4; ++row)
+        {
+            if (!stateReadHasSupernode(*schedule.stateReadSupernodes, "r" + std::to_string(row), sliceOwner))
+            {
+                return fail("dynamic reg-to-mem intent slice missing storage-register activation mapping");
+            }
+        }
+    }
+
+    {
+        currentCase = "reg-to-mem dynamic input intent index";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("intent_dynamic_input");
+        design.markAsTop("intent_dynamic_input");
+
+        const std::string group = "rtm_intent_dyn_input";
+        const auto idx = makeValue(graph, "idx", 2);
+        graph.bindInputPort("idx", idx);
+
+        std::vector<wolvrix::lib::grh::ValueId> readValues;
+        readValues.reserve(4);
+        for (int row = 0; row < 4; ++row)
+        {
+            const std::string reg = "r" + std::to_string(row);
+            const auto regOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
+                                                     graph.internSymbol(reg));
+            graph.setAttr(regOp, "width", int64_t{8});
+            graph.setAttr(regOp, "isSigned", false);
+            setIntentShape(graph, regOp, group, "register", 8, 4);
+            graph.setAttr(regOp, "regToMem.intent.row", static_cast<int64_t>(row));
+
+            const auto readValue = makeValue(graph, reg + "_read", 8);
+            const auto readOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterReadPort,
+                                                      graph.internSymbol(reg + "_read_op"));
+            graph.addResult(readOp, readValue);
+            graph.setAttr(readOp, "regSymbol", reg);
+            graph.setAttr(readOp, "regToMem.intent.group", group);
+            graph.setAttr(readOp, "regToMem.intent.mode", std::string("array-index"));
+            graph.setAttr(readOp, "regToMem.intent.role", std::string("read"));
+            graph.setAttr(readOp, "regToMem.intent.row", static_cast<int64_t>(row));
+            readValues.push_back(readValue);
+        }
+
+        const auto packed = makeValue(graph, "packed", 32);
+        const auto concat = graph.createOperation(wolvrix::lib::grh::OperationKind::kConcat,
+                                                  graph.internSymbol("packed_concat"));
+        for (int row = 3; row >= 0; --row)
+        {
+            graph.addOperand(concat, readValues[static_cast<std::size_t>(row)]);
+        }
+        graph.addResult(concat, packed);
+        setIntentShape(graph, concat, group, "concat", 8, 4);
+        graph.setAttr(concat, "regToMem.intent.regSymbols",
+                      std::vector<std::string>{"r0", "r1", "r2", "r3"});
+        graph.setAttr(concat, "regToMem.intent.operandRows",
+                      std::vector<int64_t>{3, 2, 1, 0});
+
+        const auto elemWidth = makeConstant(graph, "elem_width_const", "elem_width", 4, "4'd8");
+        const auto start = makeValue(graph, "start", 5);
+        const auto mul = graph.createOperation(wolvrix::lib::grh::OperationKind::kMul,
+                                               graph.internSymbol("start_mul"));
+        graph.addOperand(mul, idx);
+        graph.addOperand(mul, elemWidth);
+        graph.addResult(mul, start);
+
+        const auto selected = makeValue(graph, "selected", 8);
+        const auto slice = graph.createOperation(wolvrix::lib::grh::OperationKind::kSliceDynamic,
+                                                 graph.internSymbol("selected_slice"));
+        graph.addOperand(slice, packed);
+        graph.addOperand(slice, start);
+        graph.addResult(slice, selected);
+        graph.setAttr(slice, "sliceWidth", int64_t{8});
+        setIntentShape(graph, slice, group, "slice", 8, 4);
+        graph.setAttr(slice, "regToMem.intent.sliceKind", std::string("slice-dynamic"));
+        graph.bindOutputPort("selected", selected);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(
+            ActivityScheduleOptions{.path = "intent_dynamic_input",
+                                    .maxOpInComputeSupernode = 6,
+                                    .maxOpInComputeNode = 2,
+                                    .enableCoarsen = false}));
+
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected activity-schedule pass to succeed for dynamic input reg-to-mem intent group");
+        }
+        const auto schedule = loadSchedule(session, "intent_dynamic_input");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        const uint32_t sliceOwner = (*schedule.opToSupernode)[slice.index - 1];
+        const uint32_t mulOwner = (*schedule.opToSupernode)[mul.index - 1];
+        if (sliceOwner == kInvalidActivitySupernodeId)
+        {
+            return fail("dynamic input reg-to-mem intent slice missing from schedule");
+        }
+        if (!supernodeContains(*schedule.supernodeToOps, sliceOwner, concat))
+        {
+            return fail("dynamic input reg-to-mem intent concat was split from slice");
+        }
+        if (mulOwner != kInvalidActivitySupernodeId)
+        {
+            return fail("dynamic input reg-to-mem intent should not schedule start-mul as dependency");
+        }
+        if (!hasFanoutTo(*schedule.valueFanout, idx, sliceOwner))
+        {
+            return fail("dynamic input reg-to-mem intent missing input index fanout into intent group");
+        }
+        for (int row = 0; row < 4; ++row)
+        {
+            if (!stateReadHasSupernode(*schedule.stateReadSupernodes, "r" + std::to_string(row), sliceOwner))
+            {
+                return fail("dynamic input reg-to-mem intent slice missing storage-register activation mapping");
+            }
         }
     }
 
