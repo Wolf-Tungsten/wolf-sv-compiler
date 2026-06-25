@@ -8,8 +8,8 @@
 
 - 为缺失 symbol 的可分区 op 补内部 symbol
 - 冻结 graph
-- 显式分类 `source` / `sink` / `compute` / `declaration`
-- 将 `kConstant` / `kRegisterReadPort` / `kLatchReadPort` 的 compute 侧 use 前置 clone
+- 显式分类为 `ActivityOpClass::{Source,Sink,Compute,Declaration}`
+- 将 `ActivityOpClass::Source` 到 compute 的 use 前置 clone；其中 `kMemoryReadPort` 仍保留并处理自身 operand 依赖
 - 重新冻结并重建 op topo 数据
 - 通过 `buildComputeNodeRewrite(...)` 构造 compute node / commit node 中间模型
 - 在 compute-node cluster DAG 上做 topo ordering / coarsen / 连续分段，生成最终 `computeSupernode`
@@ -17,6 +17,10 @@
 - 导出 `supernode_to_ops` / `op_to_supernode` / `dag` / `supernode_kind` / `compute_nodes_by_supernode` / `value_fanout` / `topo_order` / `state_read_supernodes` / `summary_stats`
 
 这个 pass 目前主要服务于 `grhsim-cpp` emit。
+
+当前 GrhSIM 静态调度和运行时 activity 执行的完整术语与流程见
+[GrhSIM Scheduling](../emit/grhsim-scheduling.md)。本文保留 pass 入口、session
+输出、历史实验记录和旧路径说明。
 
 ## 路径语义
 
@@ -34,7 +38,7 @@
 | 选项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `-path` | 无 | 目标 graph / 实例路径，必填 |
-| `-max-op-in-compute-supernode` | `128` | 连续 DP 分段时的目标 op 数上限；它不是 coarsen merge 上限，也不是最终 `supernode_to_ops[i].size()` 的硬上限 |
+| `-max-op-in-compute-supernode` | `128` | compute-node cluster coarsen 和连续 DP 分段的 op 数上限；它不是 emit 文件大小上限 |
 | `-max-op-in-commit-supernode` | `4096` | 单个 `commitSupernode` 最多包含的 sink op 数 |
 | `-export-compute-dag` | 无 | 将 compute op DAG 导出为 `topo-graph-partition-harness` 使用的 `wolvrix.compute-op-dag.v1` JSON |
 
@@ -72,144 +76,52 @@
 
 这些 key 的写入位置见 [activity_schedule.cpp](../../lib/transform/activity_schedule.cpp)。
 
-## 当前 compute node / commit node 语义
+## 当前主路径概要
 
-截至 `2026-05-23`，`activity-schedule` 主路径保留 `source` / `compute` / `sink` / `declaration` 语义分类，并显式构造 `ComputeRewriteBuild` 中间模型：
+截至 `2026-06-24`，`activity-schedule` 主路径保留
+`ActivityOpClass::{Source,Sink,Compute,Declaration}` 内部分类，并显式构造
+`ComputeRewriteBuild` 中间模型。
+完整术语和运行时语义见 [GrhSIM Scheduling](../emit/grhsim-scheduling.md)，这里仅保留
+pass 内部概要。
 
 1. 初次 `buildActivityOpData(...)` 只收集可分区 op，并按 operand def 建 op topo DAG。
-2. `cloneSourceUsesForCompute(...)` 会把 source op 到 compute op 的每个 use 前置 clone，并把 compute operand 改接到 clone value；source -> commit 仍保留原始 source value。
+2. `cloneSourceUsesForCompute(...)` 会把 `ActivityOpClass::Source` 到 compute op 的每个 use 前置 clone；source-class value 到 commit 的 use 仍保留原始 value。
 3. 如果发生 clone，pass 会重新 `freeze()` 并重建 `ActivityOpData` / `opClasses`。
-4. `buildComputeNodeRewrite(...)` 先按 sink event key 构造 `commitNodes`，再为仍有调度用途的 source op 和每个 compute op 构造 `computeNodes`。
-5. 当前默认 `ComputeNode` 通常只含一个 op；其 `boundaryInputs` 是由其他 compute node 产生、并被本 node 读取的 operand value。
-6. `buildComputeDag(...)` 基于 `boundaryInputs` 建 compute-node DAG。
-7. `materializeComputeNodeSchedule(...)` 在 compute-node DAG 上做 cluster topo / coarsen / DP 分段，然后展开成最终 `computeSupernode`；随后追加 `commitSupernode`。
+4. `buildComputeNodeRewrite(...)` 先按 sink event key / guard key 构造 `commitNodes`，再从 commit input、output/inout 根和无 result compute op 出发构造 `computeNodes`。
+5. `ComputeNode` 可包含多个 source-class op / compute op；builder 会吸收局部组合依赖，遇到共享表达式、副作用 op、不可分 intent group 或容量限制时保留 boundary。
+6. `buildComputeDag(...)` 基于 `boundaryInputs` 建 compute-node DAG；若产生 cycle，会尝试把 cycle 中的多 op compute node 拆回 singleton。
+7. `materializeComputeNodeSchedule(...)` 在 compute-node cluster DAG 上做 topo / coarsen / DP 分段，然后展开成最终 `computeSupernode`；随后追加 `commitSupernode`。
 
-`sink op` 包括：
-
-- 只包含本地 state write：
-  - `kRegisterWritePort`
-  - `kLatchWritePort`
-  - `kMemoryWritePort`
-- `kMemoryFillPort`
-
-`source op` 只包括：
+这里的 `source-class op` 是 `ActivityOpClass::Source` 的内部分类名，不表示无依赖起点。
+当前包括：
 
 - `kConstant`
 - `kRegisterReadPort`
 - `kLatchReadPort`
+- `kMemoryReadPort`
 
-`kMemoryReadPort` 是 compute op，不作为 source clone 处理。`kSystemTask` / `kDpicCall` 也按普通 compute op 处理。
+其中 `kMemoryReadPort` 仍有地址/使能等 operand；compute node builder 会继续处理这些 operand，必要时把它们记录为 boundary。
 
-关键不变量：
+`sink-class op` 包括：
 
-- source op 到 compute op 的 use 会在调度初始化前 clone；source op 不能克隆到 `commitSupernode`
-- direct source -> commit 依赖通过原始 source value 的 `value_fanout` 保留
-- sink op 只出现在 `commitSupernode`
-- `commitSupernode` 不作为 value producer 产生出边
-- `supernode_kind` 显式标记最终 supernode 是 `compute` 还是 `commit`
-- `compute_nodes_by_supernode` 记录最终 compute supernode 由哪些 compute node 展开得到；commit supernode 对应空列表
+- `kRegisterWritePort`
+- `kLatchWritePort`
+- `kMemoryWritePort`
+- `kMemoryFillPort`
 
-## 当前 computeSupernode 调度算法
+`kSystemTask` / `kDpicCall` 按普通 compute op 处理；它们的 event / side effect
+语义由 `grhsim-cpp` emit 阶段生成的运行时代码处理。
 
-截至 `2026-05-23`，主路径的 `computeSupernode` 调度逻辑对应 source 前置 clone + `buildComputeNodeRewrite(...)` + `materializeComputeNodeSchedule(...)`，行为如下：
+当前 compute supernode materialize 的关键点：
 
-1. 对 source -> compute use 前置 clone；source -> commit 仍保留 direct source dependency。
-2. 对每个仍有调度用途的 source op 和每个 compute op 初始化一个 compute node，并按 boundary input 建 compute-node DAG。
-3. 初始 cluster 是“每个 compute node 各自一个 cluster”，按 compute-node topo order 初始化，再通过 `orderNodeClustersTopologically(...)` 重新排序；topo ready tie-break 会优先选择与前一个 cluster 有更多 activation 连接的候选。
-4. 如果启用 coarsen，按小流水线反复执行策略：
-  - `out1`：当前 cluster 只有一个后继时，按 activation gain 从高到低尝试与该后继合并。
-  - `in1`：当前 cluster 只有一个前驱时，按 activation gain 从高到低尝试与该前驱合并。
-  - `boundary-gain`：按跨 cluster boundary activation edge weight 从高到低尝试合并 producer/consumer cluster。
-  - 当前代码把 coarsen merge 上限设为 `std::numeric_limits<std::size_t>::max()`，所以 coarsen 本身不受 `maxOpInComputeSupernode` 约束。
-5. coarsen 之后，按 topo 顺序做连续分段 DP；DP 用 `maxOpInComputeSupernode` 限制一个 segment 内的 op 数，但不会拆开已经 coarsen 到一起的单个 cluster。
-6. DP segment 被 flatten 成 compute node 列表，再展开为最终 `computeSupernode` op 列表；每个 supernode 内会再做一次 local op topo sort。
-7. 最终追加 commit supernode，并从实际 supernode 内容重新构造 `op_to_supernode` / `dag` / `value_fanout` / `state_read_supernodes` / `topo_order`。
-
-当前主路径里：
-
-- 分段输入只包含 compute node cluster，不混入 `commitSupernode`
-- 不再使用旧 `WorkingPartition` 路径里的 `fixedBoundary`
-- 当前 DP 只优化 topo 连续段，不做任意 DAG partition
-- `maxOpInComputeSupernode` 是 DP 目标约束，不是 coarsen 硬约束；如果 coarsen 产生 oversized cluster，DP 会把该 cluster 保留为单独 segment
-
-### Boundary activation 权重
-
-当前 compute 侧会为 cluster DAG 额外统计 `ClusterValueEdges`：
-
-- `valueFanouts` 记录每个 compute-side boundary value 的 producer cluster 和 distinct target clusters。
-- `(fromCluster, toCluster)` weight 是 `fromCluster -> toCluster` 上不同 boundary value 形成的 activation edge 数。
-- 同一个 value 在同一个 target cluster 内有多个 use，只算一条 activation edge；同一个 value 扇出到多个 target cluster，会按 target cluster 数累计。
-
-这个权重同时服务三处：
-
-- topo ready tie-break
-- `boundary-gain` coarsen
-- 连续分段 DP 的 activation cost
-
-它只统计 compute node cluster 之间的 value 依赖；commit 输入依赖仍在最终 `value_fanout` materialize 阶段处理。
-
-当前优化目标以 `boundary_activation_edges` 为主，因为它同时覆盖：
-
-- `boundary_values`：多少唯一 value 跨 supernode。
-- fanout：每个跨 supernode value 激活多少个目标 supernode。
-
-因此一个 merge 的收益不只看是否消掉某个唯一 value，也看它能否减少该 value 的跨 supernode 目标数。
-
-### Topo-aware ordering
-
-初始和 coarsen 后的 cluster 排序都必须保持 DAG topo 合法。当前使用 Kahn-style ready set：
-
-1. ready set 默认按 cluster id 保持确定性。
-2. 如果上一个输出 cluster 对某个 ready candidate 有 activation 边，则优先选择 activation weight 最大的 candidate。
-3. 若 weight 相同，回退到较小 cluster id。
-
-这个规则只改变同一 topo frontier 内的 tie-break，不改变依赖方向，因此不会引入新 cycle。实现上只检查上一个 cluster 的 outgoing value edge，避免在百万级 ready set 上全扫描。
-
-### Coarsen pipeline
-
-coarsen 阶段是一个小流水线，每轮按固定顺序执行策略，直到整轮没有变化：
-
-1. `out1`
-   - 当前 cluster 只有一个后继时，尝试合并到该后继。
-   - 候选要求 producer -> consumer activation weight 非零，并按该 weight 降序处理。
-   - 使用 DSU 批量合并候选，之后统一 canonicalize，并用 topo check 验证结果。
-   - 适合吞掉线性 producer -> consumer 链。
-2. `in1`
-   - 当前 cluster 只有一个前驱时，尝试合并到该前驱。
-   - 候选要求 producer -> consumer activation weight 非零，并按该 weight 降序处理。
-   - 同样使用 DSU 批量合并，最后统一做 topo check。
-   - 适合吞掉线性 consumer tail。
-3. `boundary-gain`
-   - 按 cluster pair 的 boundary activation edge weight 从高到低尝试合并。
-   - 目标是优先消掉 activation 连接最紧的 supernode 边。
-   - 先尝试一轮 batch matching：同一 batch 内每个 cluster 最多参与一次 merge。
-   - 如果 batch merge 后无法得到合法 topo order，则退回到按候选逐个尝试，接受第一个 topo 合法的 merge。
-
-所有策略共享的合法性约束：
-
-- 合并后必须能重新得到合法 topo order。
-- 当前代码没有对 coarsen 后 cluster 大小设置 `maxOpInComputeSupernode` 上限。
-
-后续新增策略应作为新的 pipeline stage 插入，而不是绕开统一约束。每个 stage 应只负责产生候选 merge；合法性仍由 topo check 兜底。如果需要把 `maxOpInComputeSupernode` 变成 coarsen 硬约束，应先修改 `materializeComputeNodeSchedule(...)` 里传给 `tryMergeNode*` 的 `coarsenMaxNodes`。
-
-### Boundary-aware DP
-
-coarsen 后，DP 只在 topo-ordered cluster 序列上做连续分段，不做任意 DAG partition。
-
-约束：
-
-- 单个 segment 的 compute-node op 总数不超过 `maxOpInComputeSupernode`。
-- 如果单个 cluster 已经超过上限，保留为单独 segment。
-
-目标函数：
-
-```text
-cost(segment) = incoming_boundary_activation_edges + 1
-```
-
-其中 `incoming_boundary_activation_edges` 是该 segment 消费、但 producer 不在同一 segment 内的 compute-side boundary value distinct source-target segment 数。若同一个 value 在同一 segment 内被多个 cluster 使用，只算一次；若同一个 value 扇出到多个 segment，则每个 target segment 各算一次。`+1` 是轻量 segment 数惩罚，用于在 activation cost 相同时偏向更少 segment。
-
-DP 只决定最终 computeSupernode 的连续分段边界。最终 `value_fanout`、`dag`、`state_read_supernodes` 仍在 materialize 阶段从实际 supernode 内容重新计算。
+- 分段输入只包含 compute node cluster，不混入 `commitSupernode`。
+- 不再使用旧 `WorkingPartition` 路径里的 `fixedBoundary`。
+- 当前 DP 只优化 topo 连续段，不做任意 DAG partition。
+- `maxOpInComputeSupernode` 同时约束 compute-node cluster coarsen 和 DP 分段；它不是 emit 文件大小上限。
+- Coarsen pipeline 是 `out1` / `in1` / `siblings`，每轮批量合并后重新 topo check。
+- `out1` / `in1` 候选按 producer/consumer 之间的 boundary activation weight 降序排序。
+- DP 目标函数是 `incoming_boundary_activation_edges + 1`，同成本时偏向更长 segment。
+- 最终 `value_fanout`、`dag`、`state_read_supernodes` 会在 materialize 阶段从实际 supernode 内容重新计算。
 
 ## 旧路径遗留说明
 
