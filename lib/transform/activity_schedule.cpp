@@ -3155,6 +3155,470 @@ namespace wolvrix::lib::transform
             return out;
         }
 
+        // NO0207 Phase A：静态变化概率（活动度）传播。在 PRE-clone 逻辑图的拓扑序上正向计算每个
+        // op 的输出翻转概率 pi ∈ [0,1]。NO0208 §附录 A 修复：放弃「一律乘积补」（它度量「任一输入
+        // 翻转」、随深度单调饱和），改用 transition-density 式的「转移函数」传播——让逻辑掩蔽点
+        // （AND/OR、mux 选择、比较/归约的位宽收缩）衰减活动度，仅 XOR/算术/拼接这类「任一输入变化
+        // 基本都传到输出」的 op 保留透传（乘积补）。信号概率固定取 p1=0.5（最大熵，prototype）。
+        // 仍按「源代表」分组去相关（同源多输入取组内 max）。纯分析，不改划分；返回按 op index 的
+        // pi（-1=非 eligible）；只在 PRE-clone 图上算（source clone 会复制 read op）。
+        struct ActivityPiStats
+        {
+            std::size_t computeOps = 0;
+            std::size_t highActivity = 0;
+            std::size_t multiSource = 0;
+            std::size_t histogram[6] = {0, 0, 0, 0, 0, 0};
+            // NO0208 sanity：每 op-kind 与每逻辑深度的 pi 均值（核对转移函数与"是否随深度再饱和"）
+            double kindSum[64] = {0};
+            std::uint64_t kindCnt[64] = {0};
+            double depthSum[7] = {0};
+            std::uint64_t depthCnt[7] = {0};
+        };
+
+        std::vector<float> computeActivityPi(const wolvrix::lib::grh::Graph &graph,
+                                             const ActivityScheduleOptions &options,
+                                             const ActivityOpData &data,
+                                             ActivityPiStats &stats)
+        {
+            namespace grh = wolvrix::lib::grh;
+            stats = ActivityPiStats{};
+            std::vector<float> piByOpIndex(data.maxOpIndex + 1, -1.0F);
+            const std::size_t count = data.topoOps.size();
+            if (count == 0)
+            {
+                return piByOpIndex;
+            }
+
+            const float piData = static_cast<float>(options.piDataInput);
+            const float piReg = static_cast<float>(options.piRegRead);
+            const float piHigh = static_cast<float>(options.piHighThreshold);
+            constexpr uint32_t kMultiRep = kInvalidActivitySupernodeId;
+
+            std::vector<float> topoPi(count, 0.0F);
+            std::vector<uint32_t> rep(count, kMultiRep);
+            std::vector<uint16_t> depth(count, 0); // 逻辑深度（max 输入深度 + 1；源/输入=0）
+
+            // NO0207 Step 2 修复：源代表按状态符号（register/latch symbol）归并，使同一寄存器
+            // 经不同 read port / slice 进入的输入被识别为同源去相关；外部输入按 value id 归并；
+            // 常量/无符号读各取唯一 rep。rep 用稠密计数（远不会撞上 kMultiRep）。
+            uint32_t nextRep = 0;
+            std::unordered_map<std::string, uint32_t> symbolRep;
+            std::unordered_map<uint32_t, uint32_t> extValueRep;
+            auto internSymbolRep = [&](const std::string &s) -> uint32_t {
+                auto [it, inserted] = symbolRep.emplace(s, nextRep);
+                if (inserted)
+                {
+                    ++nextRep;
+                }
+                return it->second;
+            };
+            auto internExtRep = [&](uint32_t valueIndex) -> uint32_t {
+                auto [it, inserted] = extValueRep.emplace(valueIndex, nextRep);
+                if (inserted)
+                {
+                    ++nextRep;
+                }
+                return it->second;
+            };
+            auto freshRep = [&]() -> uint32_t { return nextRep++; };
+
+            struct PiInput
+            {
+                float pi;
+                uint32_t rep;
+            };
+            std::vector<PiInput> ins;
+
+            // 输出源代表：所有输入共享同一真实 rep 且无多源/外部输入时继承之，否则多源。
+            auto resolveRep = [&](const std::vector<PiInput> &items) -> uint32_t {
+                uint32_t single = kMultiRep;
+                for (const auto &it : items)
+                {
+                    if (it.rep == kMultiRep)
+                    {
+                        return kMultiRep;
+                    }
+                    if (single == kMultiRep)
+                    {
+                        single = it.rep;
+                    }
+                    else if (single != it.rep)
+                    {
+                        return kMultiRep;
+                    }
+                }
+                return single;
+            };
+            // 源去相关：把输入按源代表分组，同组取组内 max（避免同源 reconvergence 被重复计），
+            // 每个 kMultiRep 输入各自独立成组。返回每个独立源组的活动度。
+            auto groupActs = [&](const std::vector<PiInput> &items) -> std::vector<float> {
+                std::unordered_map<uint32_t, float> gm;
+                std::vector<float> out;
+                for (const auto &it : items)
+                {
+                    const float p = std::clamp(it.pi, 0.0F, 1.0F);
+                    if (it.rep == kMultiRep)
+                    {
+                        out.push_back(p);
+                    }
+                    else
+                    {
+                        auto [iter, inserted] = gm.emplace(it.rep, p);
+                        if (!inserted)
+                        {
+                            iter->second = std::max(iter->second, p);
+                        }
+                    }
+                }
+                for (const auto &e : gm)
+                {
+                    out.push_back(e.second);
+                }
+                return out;
+            };
+            // 透传（乘积补）：任一独立源变化基本都传到输出（XOR / 算术 / 拼接）。
+            auto transparentCombine = [&](const std::vector<float> &g) -> float {
+                double keep = 1.0;
+                for (const float v : g)
+                {
+                    keep *= (1.0 - static_cast<double>(v));
+                }
+                return static_cast<float>(std::clamp(1.0 - keep, 0.0, 1.0));
+            };
+            // 逻辑掩蔽（AND/OR 系，p1=0.5）：n 输入门每输入观察概率 0.5^(n-1)，对宽门强衰减。
+            auto maskedCombine = [&](const std::vector<float> &g) -> float {
+                if (g.empty())
+                {
+                    return 0.0F;
+                }
+                double coef = 1.0;
+                for (std::size_t k = 1; k < g.size(); ++k)
+                {
+                    coef *= 0.5;
+                }
+                double sum = 0.0;
+                for (const float v : g)
+                {
+                    sum += static_cast<double>(v);
+                }
+                return static_cast<float>(std::clamp(coef * sum, 0.0, 1.0));
+            };
+            // 位宽收缩到 1 bit（比较 / 归约）：输出活动度按 0.5 衰减。
+            auto narrowCombine = [&](const std::vector<float> &g) -> float {
+                return 0.5F * transparentCombine(g);
+            };
+            auto maxPi = [&](const std::vector<PiInput> &items) -> float {
+                float m = 0.0F;
+                for (const auto &it : items)
+                {
+                    m = std::max(m, std::clamp(it.pi, 0.0F, 1.0F));
+                }
+                return m;
+            };
+
+            for (std::size_t pos = 0; pos < count; ++pos)
+            {
+                const auto opId = data.topoOps[pos];
+                const auto kind = data.topoKinds[pos];
+
+                ins.clear();
+                uint16_t maxOpDepth = 0;
+                bool anyEligibleOperand = false;
+                for (const auto operand : graph.opOperands(opId))
+                {
+                    const auto defOp = graph.valueDef(operand);
+                    uint32_t defPos = kMultiRep;
+                    if (defOp.valid() && defOp.index < data.topoPosByOpIndex.size())
+                    {
+                        defPos = data.topoPosByOpIndex[defOp.index];
+                    }
+                    if (defPos != kMultiRep && static_cast<std::size_t>(defPos) < count)
+                    {
+                        ins.push_back(PiInput{topoPi[defPos], rep[defPos]});
+                        maxOpDepth = std::max(maxOpDepth, depth[defPos]);
+                        anyEligibleOperand = true;
+                    }
+                    else
+                    {
+                        // 外部输入 / 非 eligible 产生者：按数据输入先验；同一 value 归并为同源。
+                        ins.push_back(PiInput{piData, internExtRep(operand.index)});
+                    }
+                }
+
+                float pi = 0.0F;
+                uint32_t outRep = kMultiRep;
+                switch (kind)
+                {
+                case grh::OperationKind::kConstant:
+                    pi = 0.0F;
+                    outRep = freshRep(); // 常量恒不变，rep 唯一即可
+                    break;
+                case grh::OperationKind::kRegisterReadPort:
+                case grh::OperationKind::kLatchReadPort:
+                {
+                    pi = piReg;
+                    const auto sym = stateSymbolForReadOp(graph.getOperation(opId));
+                    outRep = (sym && !sym->empty()) ? internSymbolRep(*sym) : freshRep();
+                    break;
+                }
+                case grh::OperationKind::kMemoryReadPort:
+                    pi = ins.empty() ? piReg : maxPi(ins); // π(memread) ≈ π(address)
+                    outRep = resolveRep(ins);
+                    break;
+                // 单数据通路透传：活动度 = 输入活动度
+                case grh::OperationKind::kAssign:
+                case grh::OperationKind::kSliceStatic:
+                case grh::OperationKind::kSliceDynamic:
+                case grh::OperationKind::kSliceArray:
+                case grh::OperationKind::kReplicate:
+                case grh::OperationKind::kNot:
+                case grh::OperationKind::kLogicNot:
+                case grh::OperationKind::kShl:
+                case grh::OperationKind::kLShr:
+                case grh::OperationKind::kAShr:
+                    pi = maxPi(ins);
+                    outRep = resolveRep(ins);
+                    break;
+                // 位宽收缩到 1 bit 的归约：衰减
+                case grh::OperationKind::kReduceAnd:
+                case grh::OperationKind::kReduceOr:
+                case grh::OperationKind::kReduceXor:
+                case grh::OperationKind::kReduceNor:
+                case grh::OperationKind::kReduceNand:
+                case grh::OperationKind::kReduceXnor:
+                    pi = 0.5F * maxPi(ins);
+                    outRep = resolveRep(ins);
+                    break;
+                // 逻辑掩蔽门（AND/OR 系）：活动度被旁路信号掩蔽而衰减
+                case grh::OperationKind::kAnd:
+                case grh::OperationKind::kOr:
+                case grh::OperationKind::kLogicAnd:
+                case grh::OperationKind::kLogicOr:
+                    pi = maskedCombine(groupActs(ins));
+                    outRep = resolveRep(ins);
+                    break;
+                // XOR 系：对每个输入都完全敏感，透传
+                case grh::OperationKind::kXor:
+                case grh::OperationKind::kXnor:
+                    pi = transparentCombine(groupActs(ins));
+                    outRep = resolveRep(ins);
+                    break;
+                // 比较：宽输入压成 1 bit，衰减
+                case grh::OperationKind::kEq:
+                case grh::OperationKind::kNe:
+                case grh::OperationKind::kCaseEq:
+                case grh::OperationKind::kCaseNe:
+                case grh::OperationKind::kWildcardEq:
+                case grh::OperationKind::kWildcardNe:
+                case grh::OperationKind::kLt:
+                case grh::OperationKind::kLe:
+                case grh::OperationKind::kGt:
+                case grh::OperationKind::kGe:
+                    pi = narrowCombine(groupActs(ins));
+                    outRep = resolveRep(ins);
+                    break;
+                // 算术 / 拼接：任一输入变化基本传到输出，透传
+                case grh::OperationKind::kAdd:
+                case grh::OperationKind::kSub:
+                case grh::OperationKind::kMul:
+                case grh::OperationKind::kDiv:
+                case grh::OperationKind::kMod:
+                case grh::OperationKind::kConcat:
+                    pi = transparentCombine(groupActs(ins));
+                    outRep = resolveRep(ins);
+                    break;
+                case grh::OperationKind::kMux:
+                {
+                    const float sel = ins.empty() ? 0.0F : std::clamp(ins[0].pi, 0.0F, 1.0F);
+                    double branchSum = 0.0;
+                    std::size_t nb = 0;
+                    for (std::size_t k = 1; k < ins.size(); ++k)
+                    {
+                        branchSum += static_cast<double>(std::clamp(ins[k].pi, 0.0F, 1.0F));
+                        ++nb;
+                    }
+                    const float branchMean =
+                        nb ? static_cast<float>(branchSum / static_cast<double>(nb)) : 0.0F;
+                    // 选中分支活动透传 + sel 翻转贡献（p1=0.5 → 分支差异概率≈0.5）
+                    pi = std::clamp(branchMean + 0.5F * sel, 0.0F, 1.0F);
+                    outRep = kMultiRep;
+                    break;
+                }
+                default:
+                    // 其他（system func / dpic / xmr / sink 等）：保守透传
+                    pi = transparentCombine(groupActs(ins));
+                    outRep = resolveRep(ins);
+                    break;
+                }
+
+                topoPi[pos] = pi;
+                rep[pos] = outRep;
+                const uint16_t opDepth =
+                    anyEligibleOperand ? static_cast<uint16_t>(std::min<int>(maxOpDepth + 1, 65535)) : 0;
+                depth[pos] = opDepth;
+                if (opId.index < piByOpIndex.size())
+                {
+                    piByOpIndex[opId.index] = pi;
+                }
+
+                if (classifyActivityOp(kind) == ActivityOpClass::Compute)
+                {
+                    ++stats.computeOps;
+                    if (outRep == kMultiRep && !ins.empty())
+                    {
+                        ++stats.multiSource;
+                    }
+                }
+                if (pi >= piHigh)
+                {
+                    ++stats.highActivity;
+                }
+                const std::size_t bucket = pi < 0.05F   ? 0
+                                           : pi < 0.2F  ? 1
+                                           : pi < 0.5F  ? 2
+                                           : pi < 0.8F  ? 3
+                                           : pi < 0.95F ? 4
+                                                        : 5;
+                ++stats.histogram[bucket];
+
+                const std::size_t kindIdx = static_cast<std::size_t>(kind);
+                if (kindIdx < 64)
+                {
+                    stats.kindSum[kindIdx] += pi;
+                    ++stats.kindCnt[kindIdx];
+                }
+                const std::size_t depthBucket = opDepth == 0    ? 0
+                                                : opDepth <= 2  ? 1
+                                                : opDepth <= 5  ? 2
+                                                : opDepth <= 10 ? 3
+                                                : opDepth <= 20 ? 4
+                                                : opDepth <= 40 ? 5
+                                                                : 6;
+                stats.depthSum[depthBucket] += pi;
+                ++stats.depthCnt[depthBucket];
+            }
+
+            return piByOpIndex;
+        }
+
+        // NO0208 Phase D：测量 computeNode 对 MFFC 的忠实度。在同一 PRE-DP 图上算 MFFC 参考
+        // （rep[u] 反向线性近似：只看 compute 消费者，全部同 rep 则继承、否则自成根），再与 builder
+        // 的 computeNodeOfOp 对比 compute→compute 边——MFFC 认为同锥(rep 相同) vs builder 同
+        // computeNode；差值即 builder 在 MFFC 之外引入的碎片化。只读，仅 prob 策略下调用。
+        struct MffcCoverageStats
+        {
+            std::uint64_t computeEdges = 0;
+            std::uint64_t mffcInternal = 0;        // rep[src]==rep[dst]
+            std::uint64_t cnInternal = 0;          // computeNode 相同
+            std::uint64_t mffcInternalCnSplit = 0; // MFFC 同锥但 builder 拆开
+            std::uint64_t mffcGroups = 0;
+        };
+
+        MffcCoverageStats measureMffcCoverage(const ActivityOpData &data, const ComputeRewriteBuild &rewrite)
+        {
+            MffcCoverageStats s;
+            const std::size_t count = data.topoOps.size();
+            if (count == 0)
+            {
+                return s;
+            }
+            std::vector<uint8_t> isCompute(count, 0);
+            for (std::size_t pos = 0; pos < count; ++pos)
+            {
+                isCompute[pos] =
+                    (classifyActivityOp(data.topoKinds[pos]) == ActivityOpClass::Compute) ? 1U : 0U;
+            }
+            // compute→compute 消费者邻接（topo-pos 空间，CSR）
+            std::vector<uint32_t> outDeg(count, 0);
+            for (const auto &[src, dst] : data.topoEdges)
+            {
+                if (isCompute[src] && isCompute[dst])
+                {
+                    ++outDeg[src];
+                }
+            }
+            std::vector<std::size_t> off(count + 1, 0);
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                off[i + 1] = off[i] + outDeg[i];
+            }
+            std::vector<uint32_t> cons(off[count]);
+            std::vector<std::size_t> cur(off.begin(), off.end() - 1);
+            for (const auto &[src, dst] : data.topoEdges)
+            {
+                if (isCompute[src] && isCompute[dst])
+                {
+                    cons[cur[src]++] = dst;
+                }
+            }
+            // MFFC rep[]：反向拓扑；全部 compute 消费者同 rep 则继承，否则自成根（split / sink）
+            constexpr uint32_t kNoRep = kInvalidActivitySupernodeId;
+            std::vector<uint32_t> rep(count, kNoRep);
+            for (std::size_t i = count; i-- > 0;)
+            {
+                if (!isCompute[i])
+                {
+                    continue;
+                }
+                uint32_t single = kNoRep;
+                bool any = false;
+                bool split = false;
+                for (std::size_t e = off[i]; e < off[i + 1]; ++e)
+                {
+                    const uint32_t r = rep[cons[e]]; // dst > i，反向已处理
+                    if (!any)
+                    {
+                        single = r;
+                        any = true;
+                    }
+                    else if (single != r)
+                    {
+                        split = true;
+                        break;
+                    }
+                }
+                rep[i] = (any && !split) ? single : static_cast<uint32_t>(i);
+            }
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                if (isCompute[i] && rep[i] == static_cast<uint32_t>(i))
+                {
+                    ++s.mffcGroups;
+                }
+            }
+            for (const auto &[src, dst] : data.topoEdges)
+            {
+                if (!isCompute[src] || !isCompute[dst])
+                {
+                    continue;
+                }
+                ++s.computeEdges;
+                const bool mffcSame = (rep[src] == rep[dst]);
+                const auto srcOp = data.topoOps[src];
+                const auto dstOp = data.topoOps[dst];
+                const uint32_t cnSrc = srcOp.index < rewrite.computeNodeOfOp.size()
+                                           ? rewrite.computeNodeOfOp[srcOp.index]
+                                           : kInvalidActivitySupernodeId;
+                const uint32_t cnDst = dstOp.index < rewrite.computeNodeOfOp.size()
+                                           ? rewrite.computeNodeOfOp[dstOp.index]
+                                           : kInvalidActivitySupernodeId;
+                const bool cnSame = (cnSrc != kInvalidActivitySupernodeId && cnSrc == cnDst);
+                if (mffcSame)
+                {
+                    ++s.mffcInternal;
+                    if (!cnSame)
+                    {
+                        ++s.mffcInternalCnSplit;
+                    }
+                }
+                if (cnSame)
+                {
+                    ++s.cnInternal;
+                }
+            }
+            return s;
+        }
+
         bool isObservableRootValue(const wolvrix::lib::grh::Graph &graph,
                                    wolvrix::lib::grh::ValueId value) noexcept
         {
@@ -5934,6 +6398,206 @@ namespace wolvrix::lib::transform
             }
         }
 
+        // NO0208 Phase D：MFFC rep[]（topo-pos 空间）。反向拓扑；compute 节点的全部 compute 消费者
+        // 同 rep 则继承、否则自成根。非 compute 节点 rep 保持 kInvalid。
+        std::vector<uint32_t> computeMffcRep(const ActivityOpData &data)
+        {
+            const std::size_t count = data.topoOps.size();
+            std::vector<uint32_t> rep(count, kInvalidActivitySupernodeId);
+            if (count == 0)
+            {
+                return rep;
+            }
+            std::vector<uint8_t> isCompute(count, 0);
+            for (std::size_t pos = 0; pos < count; ++pos)
+            {
+                isCompute[pos] =
+                    (classifyActivityOp(data.topoKinds[pos]) == ActivityOpClass::Compute) ? 1U : 0U;
+            }
+            std::vector<uint32_t> outDeg(count, 0);
+            for (const auto &[s, d] : data.topoEdges)
+            {
+                if (isCompute[s] && isCompute[d])
+                {
+                    ++outDeg[s];
+                }
+            }
+            std::vector<std::size_t> off(count + 1, 0);
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                off[i + 1] = off[i] + outDeg[i];
+            }
+            std::vector<uint32_t> cons(off[count]);
+            std::vector<std::size_t> cur(off.begin(), off.end() - 1);
+            for (const auto &[s, d] : data.topoEdges)
+            {
+                if (isCompute[s] && isCompute[d])
+                {
+                    cons[cur[s]++] = d;
+                }
+            }
+            for (std::size_t i = count; i-- > 0;)
+            {
+                if (!isCompute[i])
+                {
+                    continue;
+                }
+                uint32_t single = kInvalidActivitySupernodeId;
+                bool any = false;
+                bool split = false;
+                for (std::size_t e = off[i]; e < off[i + 1]; ++e)
+                {
+                    const uint32_t r = rep[cons[e]];
+                    if (!any)
+                    {
+                        single = r;
+                        any = true;
+                    }
+                    else if (single != r)
+                    {
+                        split = true;
+                        break;
+                    }
+                }
+                rep[i] = (any && !split) ? single : static_cast<uint32_t>(i);
+            }
+            return rep;
+        }
+
+        // NO0208 Phase D：把 builder 因保守 local reconvergent-absorb 而 over-split 的 computeNode
+        // 合并到理想 MFFC 锥（仅 prob 策略）。用 rep[] 把同锥的 compute→compute 边对应的 computeNode
+        // 用并查集合并，受 maxOpInComputeNode cap 约束；再 recompute owners/boundaries。DAG 重建与
+        // cap 可能引发的 quotient 环修复，交给调用点后面已有的 cycle-split 循环。
+        void mergeComputeNodesToMffc(ComputeRewriteBuild &build,
+                                     const ActivityOpData &data,
+                                     const wolvrix::lib::grh::Graph &graph,
+                                     std::size_t maxOpsPerNode)
+        {
+            const std::size_t count = data.topoOps.size();
+            const std::size_t n = build.computeNodes.size();
+            if (count == 0 || n == 0)
+            {
+                return;
+            }
+            const std::vector<uint32_t> rep = computeMffcRep(data);
+            // 每个 builder 节点的代表锥 rep（取节点内最大 topo 的 compute op）与 topo 排序键。
+            // intent / indivisible 节点不参与合并（保留 reg-to-mem 语义）。
+            std::vector<uint32_t> nodeRep(n, kInvalidActivitySupernodeId);
+            std::vector<uint32_t> nodeTopo(n, 0);
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                const ComputeNode &node = build.computeNodes[i];
+                if (node.indivisible || !node.intentGroup.empty())
+                {
+                    continue;
+                }
+                bool found = false;
+                uint32_t bestTopo = 0;
+                uint32_t r = kInvalidActivitySupernodeId;
+                for (const auto opId : node.ops)
+                {
+                    const uint32_t pos = (opId.index < data.topoPosByOpIndex.size())
+                                             ? data.topoPosByOpIndex[opId.index]
+                                             : kInvalidActivitySupernodeId;
+                    if (pos == kInvalidActivitySupernodeId || pos >= count)
+                    {
+                        continue;
+                    }
+                    if (classifyActivityOp(data.topoKinds[pos]) != ActivityOpClass::Compute)
+                    {
+                        continue;
+                    }
+                    if (!found || pos > bestTopo)
+                    {
+                        bestTopo = pos;
+                        r = rep[pos];
+                        found = true;
+                    }
+                }
+                if (found)
+                {
+                    nodeRep[i] = r;
+                    nodeTopo[i] = bestTopo;
+                }
+            }
+
+            std::unordered_map<uint32_t, std::vector<uint32_t>> coneNodes;
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                if (nodeRep[i] != kInvalidActivitySupernodeId)
+                {
+                    coneNodes[nodeRep[i]].push_back(i);
+                }
+            }
+
+            std::vector<ComputeNode> merged;
+            merged.reserve(n);
+            std::vector<uint8_t> consumed(n, 0);
+            // 同锥节点按 topo 排序后做「topo 连续分块」合并（受 cap 约束）——连续分块保证 quotient
+            // 无环，避免任意并查集合并造成的跨 topo straddle 环（曾导致 cycle-split storm）。
+            for (auto &entry : coneNodes)
+            {
+                auto &ids = entry.second;
+                std::sort(ids.begin(), ids.end(), [&](uint32_t a, uint32_t b) {
+                    if (nodeTopo[a] != nodeTopo[b])
+                    {
+                        return nodeTopo[a] < nodeTopo[b];
+                    }
+                    return a < b;
+                });
+                std::size_t curIdx = SIZE_MAX;
+                std::size_t chunkOps = 0;
+                for (const uint32_t id : ids)
+                {
+                    const std::size_t sz = build.computeNodes[id].ops.size();
+                    if (curIdx == SIZE_MAX || (maxOpsPerNode != 0 && chunkOps + sz > maxOpsPerNode))
+                    {
+                        curIdx = merged.size();
+                        merged.emplace_back();
+                        chunkOps = 0;
+                    }
+                    const ComputeNode &src = build.computeNodes[id];
+                    merged[curIdx].ops.insert(merged[curIdx].ops.end(), src.ops.begin(), src.ops.end());
+                    chunkOps += sz;
+                    consumed[id] = 1;
+                }
+            }
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                if (!consumed[i])
+                {
+                    merged.push_back(std::move(build.computeNodes[i]));
+                }
+            }
+            std::size_t commonExprCount = 0;
+            for (auto &node : merged)
+            {
+                std::sort(node.ops.begin(),
+                          node.ops.end(),
+                          [&](wolvrix::lib::grh::OperationId a, wolvrix::lib::grh::OperationId b) {
+                              const uint32_t pa = a.index < data.topoPosByOpIndex.size()
+                                                      ? data.topoPosByOpIndex[a.index]
+                                                      : kInvalidActivitySupernodeId;
+                              const uint32_t pb = b.index < data.topoPosByOpIndex.size()
+                                                      ? data.topoPosByOpIndex[b.index]
+                                                      : kInvalidActivitySupernodeId;
+                              if (pa != pb)
+                              {
+                                  return pa < pb;
+                              }
+                              return a.index < b.index;
+                          });
+                node.commonExpr = (node.ops.size() == 1);
+                if (node.commonExpr)
+                {
+                    ++commonExprCount;
+                }
+            }
+            build.computeNodes = std::move(merged);
+            build.stats.commonExprComputeNodes = commonExprCount;
+            recomputeComputeNodeOwnersAndBoundaries(build, graph);
+        }
+
         bool buildComputeNodeRewrite(wolvrix::lib::grh::Graph &graph,
                                      const ActivityScheduleOptions &options,
                                      const ActivityOpData &opData,
@@ -6109,6 +6773,13 @@ namespace wolvrix::lib::transform
                 {
                     return false;
                 }
+            }
+
+            // NO0208 Phase D：把 over-split 的 computeNode 合并到理想 MFFC 锥（仅 prob）。放在
+            // cycle-split 循环之前，cap 可能引入的 quotient 环由下面的循环统一修复。
+            if (options.partitionPolicy == "prob")
+            {
+                mergeComputeNodesToMffc(out, opData, graph, options.maxOpInComputeNode);
             }
 
             constexpr std::size_t kMaxComputeNodeCycleSplitIters = 1024;
@@ -7021,6 +7692,13 @@ namespace wolvrix::lib::transform
             result.failed = true;
             return result;
         }
+        if (options_.partitionPolicy != "plain" && options_.partitionPolicy != "prob")
+        {
+            error("activity-schedule -partition-policy must be \"plain\" or \"prob\"");
+            result.failed = true;
+            return result;
+        }
+        logInfo("activity-schedule partition policy: " + options_.partitionPolicy);
 
         std::string resolveError;
         const std::optional<std::string> targetGraphName =
@@ -7087,6 +7765,57 @@ namespace wolvrix::lib::transform
                 " topo_edges=" + std::to_string(opData.topoEdges.size()) +
                 " elapsed_ms=" + std::to_string(buildOpDataMs));
 
+        // NO0207 Phase A：在 PRE-clone 逻辑图上计算静态变化概率（仅 prob 策略；纯分析，
+        // 不改 plain 路径与调度输出）。piByOpIndex 在 source clone 后的 opData 重建中仍有效，
+        // 用于检视 pi 模型；后续 Phase B/C/E 的成本/增益再消费它。
+        std::vector<float> piByOpIndex;
+        if (options_.partitionPolicy == "prob")
+        {
+            ActivityPiStats piStats;
+            piByOpIndex = computeActivityPi(*graph, options_, opData, piStats);
+            logInfo("activity-schedule probability(pi): ops=" +
+                    std::to_string(opData.topoOps.size()) +
+                    " compute_ops=" + std::to_string(piStats.computeOps) +
+                    " high_activity=" + std::to_string(piStats.highActivity) +
+                    " multi_source=" + std::to_string(piStats.multiSource) +
+                    " hist[0,.05)=" + std::to_string(piStats.histogram[0]) +
+                    " [.05,.2)=" + std::to_string(piStats.histogram[1]) +
+                    " [.2,.5)=" + std::to_string(piStats.histogram[2]) +
+                    " [.5,.8)=" + std::to_string(piStats.histogram[3]) +
+                    " [.8,.95)=" + std::to_string(piStats.histogram[4]) +
+                    " [.95,1]=" + std::to_string(piStats.histogram[5]));
+
+            std::string piKindLine = "activity-schedule pi mean by kind:";
+            for (std::size_t k = 0; k < 64; ++k)
+            {
+                if (piStats.kindCnt[k] == 0)
+                {
+                    continue;
+                }
+                const double mean = piStats.kindSum[k] / static_cast<double>(piStats.kindCnt[k]);
+                piKindLine +=
+                    " " +
+                    std::string(wolvrix::lib::grh::toString(static_cast<wolvrix::lib::grh::OperationKind>(k))) +
+                    "=" + std::to_string(mean) + "(" + std::to_string(piStats.kindCnt[k]) + ")";
+            }
+            logInfo(piKindLine);
+
+            static const char *const kDepthLabels[7] = {"d0", "d1-2", "d3-5", "d6-10",
+                                                        "d11-20", "d21-40", "d41+"};
+            std::string piDepthLine = "activity-schedule pi mean by depth:";
+            for (std::size_t d = 0; d < 7; ++d)
+            {
+                if (piStats.depthCnt[d] == 0)
+                {
+                    continue;
+                }
+                const double mean = piStats.depthSum[d] / static_cast<double>(piStats.depthCnt[d]);
+                piDepthLine += " " + std::string(kDepthLabels[d]) + "=" + std::to_string(mean) + "(" +
+                               std::to_string(piStats.depthCnt[d]) + ")";
+            }
+            logInfo(piDepthLine);
+        }
+
         std::vector<ActivityOpClass> opClasses = buildOpClasses(*graph, opData.maxOpIndex);
         ComputeNodeRewriteStats precloneStats;
         ValueCanonicalMap canonicalValues;
@@ -7150,6 +7879,26 @@ namespace wolvrix::lib::transform
                 " commit_nodes=" + std::to_string(rewrite.commitNodes.size()) +
                 " cycle_split_iters=" + std::to_string(rewrite.stats.computeNodeCycleSplitIters) +
                 " elapsed_ms=" + std::to_string(computeNodeMs));
+        if (options_.partitionPolicy == "prob")
+        {
+            // NO0208 Phase D：核对 computeNode 是否忠实 MFFC（只读）。
+            const MffcCoverageStats mffc = measureMffcCoverage(opData, rewrite);
+            const double etaEdge = mffc.mffcInternal ? static_cast<double>(mffc.cnInternal) /
+                                                           static_cast<double>(mffc.mffcInternal)
+                                                     : 0.0;
+            const double splitFrac = mffc.mffcInternal
+                                         ? static_cast<double>(mffc.mffcInternalCnSplit) /
+                                               static_cast<double>(mffc.mffcInternal)
+                                         : 0.0;
+            logInfo("activity-schedule mffc-coverage: compute_edges=" + std::to_string(mffc.computeEdges) +
+                    " mffc_internal=" + std::to_string(mffc.mffcInternal) +
+                    " cn_internal=" + std::to_string(mffc.cnInternal) +
+                    " mffc_but_cn_split=" + std::to_string(mffc.mffcInternalCnSplit) +
+                    " eta_edge=" + std::to_string(etaEdge) +
+                    " split_frac=" + std::to_string(splitFrac) +
+                    " mffc_groups=" + std::to_string(mffc.mffcGroups) +
+                    " compute_nodes=" + std::to_string(rewrite.computeNodes.size()));
+        }
         if (!exportComputeDagJson(*graph, options_, rewrite, buildError))
         {
             error(*graph, buildError);
@@ -7176,6 +7925,15 @@ namespace wolvrix::lib::transform
         ComputeNodeMaterializePerfStats materializePerf;
         const auto materializeStart = std::chrono::steady_clock::now();
         logInfo("activity-schedule progress: final_materialize start");
+        if (options_.partitionPolicy == "prob")
+        {
+            // NO0207 概率驱动划分：当前仅建立框架与门控开关，作为后续阶段的接缝。
+            // Phase A–G（概率传播 / 节点成本 / 超图聚合 / MFFC 校验 / 增益粗化 /
+            // 概率加权 DP / FM 精修）尚未实现；暂经 plain 路径产出，保证与现状逐字节
+            // 一致、开关可安全开启。后续按 NO0208 进展逐阶段在此接缝处替换。
+            logInfo("activity-schedule partition_policy=prob: probability algorithm not yet "
+                    "implemented; routing through plain coarsen (identical output)");
+        }
         if (!materializeComputeNodeSchedule(*graph, options_, rewrite, build, &materializePerf, buildError))
         {
             error(*graph, buildError);
@@ -7208,6 +7966,11 @@ namespace wolvrix::lib::transform
         setSessionValue(keyPrefix + "state_read_supernodes",
                         build.stateReadSupernodes,
                         "activity-schedule.state-read-supernodes");
+        if (!piByOpIndex.empty())
+        {
+            // NO0207 Phase A：导出 PRE-clone 静态变化概率，供检视/校验（按 op index，-1=非 eligible）。
+            setSessionValue(keyPrefix + "op_pi", piByOpIndex, "activity-schedule.op-pi");
+        }
         const ActivityScheduleSummaryStats summaryStats =
             buildActivityScheduleSummaryStats(build, rewrite, opData, *graph);
         setSessionValue(keyPrefix + "summary_stats",

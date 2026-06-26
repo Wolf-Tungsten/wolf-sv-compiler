@@ -43,6 +43,16 @@ namespace wolvrix::lib::transform
         bool commitGuardEventBuckets = true;
         bool splitOversizeComputeNodes = false;
         std::string costModel = "edge-cut";
+        // NO0207 概率驱动划分（框架；算法尚未实现）。默认 "plain" 与现状逐字节一致。
+        // 以下数值均为占位默认，实现 Phase A–G 时由参数扫描标定，现阶段不参与划分决策。
+        std::string partitionPolicy = "plain"; // "plain" | "prob"
+        double piDataInput = 0.1;              // 数据 InputPort 静态变化概率先验
+        double piRegRead = 0.2;                // RegisterRead 静态变化概率先验
+        double piHighThreshold = 0.9;          // 高活跃节点阈值
+        double phiMin = 0.6;                   // 内聚度下限
+        double cBpMiss = 8.0;                  // 分支预测失误惩罚（相对 C_check_fast）
+        std::size_t footprintMaxBytes = 32 * 1024; // F_max：宿主 x86 L1D 容量假设
+        std::size_t fmRefineMaxRounds = 4;     // FM 边界精修轮数
         std::string exportComputeDagPath;
     };
 

@@ -1195,6 +1195,67 @@ namespace wolvrix::lib::transform
                 {
                     options.costModel = std::string(arg.substr(std::string_view("-cost-model=").size()));
                 }
+                else if (arg == "-partition-policy")
+                {
+                    if (!parseStringArg("-partition-policy", options.partitionPolicy))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-partition-policy="))
+                {
+                    options.partitionPolicy =
+                        std::string(arg.substr(std::string_view("-partition-policy=").size()));
+                }
+                else if (arg == "-pi-data-input")
+                {
+                    if (!parseDoubleArg("-pi-data-input", options.piDataInput))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-pi-reg-read")
+                {
+                    if (!parseDoubleArg("-pi-reg-read", options.piRegRead))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-pi-high-threshold")
+                {
+                    if (!parseDoubleArg("-pi-high-threshold", options.piHighThreshold))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-phi-min")
+                {
+                    if (!parseDoubleArg("-phi-min", options.phiMin))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-c-bp-miss")
+                {
+                    if (!parseDoubleArg("-c-bp-miss", options.cBpMiss))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-footprint-max-bytes")
+                {
+                    if (!parseSizeArg("-footprint-max-bytes", options.footprintMaxBytes))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-fm-refine-max-rounds")
+                {
+                    if (!parseSizeArg("-fm-refine-max-rounds", options.fmRefineMaxRounds))
+                    {
+                        return nullptr;
+                    }
+                }
                 else if (arg == "-export-compute-dag")
                 {
                     if (!parseStringArg("-export-compute-dag", options.exportComputeDagPath))

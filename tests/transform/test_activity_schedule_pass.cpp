@@ -3,12 +3,14 @@
 #include "transform/activity_schedule.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace wolvrix::lib::transform;
@@ -1605,6 +1607,137 @@ int main()
             std::find(commitOps.begin(), commitOps.end(), write2) == commitOps.end())
         {
             return fail("Expected oversized guard bucket supernode to contain exactly the same-guard writes");
+        }
+    }
+
+    {
+        // NO0207 Phase A: static change-probability propagation (-partition-policy=prob).
+        currentCase = "Phase A static probability propagation";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("pi_top");
+        design.markAsTop("pi_top");
+        using K = wolvrix::lib::grh::OperationKind;
+
+        auto makeRegRead = [&](const std::string &reg)
+            -> std::pair<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::ValueId> {
+            const auto regOp = graph.createOperation(K::kRegister, graph.internSymbol(reg));
+            graph.setAttr(regOp, "width", int64_t{8});
+            graph.setAttr(regOp, "isSigned", false);
+            const auto val = makeValue(graph, reg + "_read", 8);
+            const auto readOp =
+                graph.createOperation(K::kRegisterReadPort, graph.internSymbol(reg + "_read_op"));
+            graph.addResult(readOp, val);
+            graph.setAttr(readOp, "regSymbol", reg);
+            return {readOp, val};
+        };
+
+        const auto [aReadOp, aRead] = makeRegRead("pa");
+        const auto [bReadOp, bRead] = makeRegRead("pb");
+        (void)bReadOp;
+
+        const auto c0Val = makeValue(graph, "pi_c0", 8);
+        const auto c0Op = graph.createOperation(K::kConstant, graph.internSymbol("pi_c0_op"));
+        graph.addResult(c0Op, c0Val);
+        graph.setAttr(c0Op, "constValue", std::string("0"));
+
+        auto makeAssign = [&](const std::string &name, wolvrix::lib::grh::ValueId in) {
+            const auto v = makeValue(graph, name, 8);
+            const auto op = graph.createOperation(K::kAssign, graph.internSymbol(name + "_op"));
+            graph.addOperand(op, in);
+            graph.addResult(op, v);
+            return v;
+        };
+        const auto a1 = makeAssign("pi_a1", aRead);
+        const auto a2 = makeAssign("pi_a2", aRead);
+
+        const auto csVal = makeValue(graph, "pi_cs", 16);
+        const auto concatSame = graph.createOperation(K::kConcat, graph.internSymbol("pi_concat_same"));
+        graph.addOperand(concatSame, a1);
+        graph.addOperand(concatSame, a2);
+        graph.addResult(concatSame, csVal);
+
+        const auto cdVal = makeValue(graph, "pi_cd", 16);
+        const auto concatDiff = graph.createOperation(K::kConcat, graph.internSymbol("pi_concat_diff"));
+        graph.addOperand(concatDiff, aRead);
+        graph.addOperand(concatDiff, bRead);
+        graph.addResult(concatDiff, cdVal);
+
+        const auto mxVal = makeValue(graph, "pi_mx", 8);
+        const auto muxOp = graph.createOperation(K::kMux, graph.internSymbol("pi_mux"));
+        graph.addOperand(muxOp, aRead); // sel
+        graph.addOperand(muxOp, bRead); // a
+        graph.addOperand(muxOp, c0Val); // b
+        graph.addResult(muxOp, mxVal);
+
+        // NO0208 §附录 A: 逻辑掩蔽 vs 透传 —— AND 衰减、XOR 透传
+        const auto andVal = makeValue(graph, "pi_and", 8);
+        const auto andOp = graph.createOperation(K::kAnd, graph.internSymbol("pi_and_op"));
+        graph.addOperand(andOp, aRead);
+        graph.addOperand(andOp, bRead);
+        graph.addResult(andOp, andVal);
+
+        const auto xorVal = makeValue(graph, "pi_xor", 8);
+        const auto xorOp = graph.createOperation(K::kXor, graph.internSymbol("pi_xor_op"));
+        graph.addOperand(xorOp, aRead);
+        graph.addOperand(xorOp, bRead);
+        graph.addResult(xorOp, xorVal);
+
+        graph.bindOutputPort("o_cs", csVal);
+        graph.bindOutputPort("o_cd", cdVal);
+        graph.bindOutputPort("o_mx", mxVal);
+        graph.bindOutputPort("o_and", andVal);
+        graph.bindOutputPort("o_xor", xorVal);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(
+            ActivityScheduleOptions{.path = "pi_top", .partitionPolicy = "prob"}));
+
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected activity-schedule (prob) to succeed for pi propagation");
+        }
+
+        const auto *pi = getSessionValue<std::vector<float>>(session, "pi_top.activity_schedule.op_pi");
+        if (pi == nullptr)
+        {
+            return fail("Expected op_pi session value under prob policy");
+        }
+        auto piOf = [&](wolvrix::lib::grh::OperationId op) -> float {
+            return op.index < pi->size() ? (*pi)[op.index] : -1.0F;
+        };
+        auto near = [](float got, float want) { return std::fabs(got - want) < 1e-3F; };
+
+        if (!near(piOf(c0Op), 0.0F))
+        {
+            return fail("Expected constant pi=0");
+        }
+        if (!near(piOf(aReadOp), 0.2F))
+        {
+            return fail("Expected register-read pi=piRegRead(0.2)");
+        }
+        if (!near(piOf(concatSame), 0.2F))
+        {
+            return fail("Expected same-source concat pi=0.2 (source de-correlated)");
+        }
+        if (!near(piOf(concatDiff), 0.36F))
+        {
+            return fail("Expected independent concat pi=0.36 (transparent product-complement)");
+        }
+        if (!near(piOf(andOp), 0.2F))
+        {
+            return fail("Expected AND pi=0.2 (logical-masking attenuation, p1=0.5)");
+        }
+        if (!near(piOf(xorOp), 0.36F))
+        {
+            return fail("Expected XOR pi=0.36 (transparent)");
+        }
+        if (!near(piOf(muxOp), 0.2F))
+        {
+            return fail("Expected mux pi=0.2 (branch mean + 0.5*sel)");
         }
     }
 
