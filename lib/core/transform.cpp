@@ -1256,6 +1256,82 @@ namespace wolvrix::lib::transform
                         return nullptr;
                     }
                 }
+                else if (arg == "-prob-dp-cost")
+                {
+                    if (!parseBoolArg("-prob-dp-cost", options.probDpCost))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-prob-dp-cost="))
+                {
+                    const std::string_view text = arg.substr(std::string_view("-prob-dp-cost=").size());
+                    if (text == "true" || text == "1" || text == "on")
+                    {
+                        options.probDpCost = true;
+                    }
+                    else if (text == "false" || text == "0" || text == "off")
+                    {
+                        options.probDpCost = false;
+                    }
+                    else
+                    {
+                        error = "invalid -prob-dp-cost value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-prob-dp-cost-mode")
+                {
+                    if (!parseStringArg("-prob-dp-cost-mode", options.probDpCostMode))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-prob-dp-cost-mode="))
+                {
+                    options.probDpCostMode =
+                        std::string(arg.substr(std::string_view("-prob-dp-cost-mode=").size()));
+                }
+                else if (arg == "-prob-dp-alpha")
+                {
+                    if (!parseDoubleArg("-prob-dp-alpha", options.probDpAlpha))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-prob-dp-alpha="))
+                {
+                    try
+                    {
+                        options.probDpAlpha =
+                            std::stod(std::string(arg.substr(std::string_view("-prob-dp-alpha=").size())));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -prob-dp-alpha value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-prob-dp-segment-penalty")
+                {
+                    if (!parseDoubleArg("-prob-dp-segment-penalty", options.probDpSegmentPenalty))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-prob-dp-segment-penalty="))
+                {
+                    try
+                    {
+                        options.probDpSegmentPenalty = std::stod(std::string(
+                            arg.substr(std::string_view("-prob-dp-segment-penalty=").size())));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -prob-dp-segment-penalty value";
+                        return nullptr;
+                    }
+                }
                 else if (arg == "-export-compute-dag")
                 {
                     if (!parseStringArg("-export-compute-dag", options.exportComputeDagPath))

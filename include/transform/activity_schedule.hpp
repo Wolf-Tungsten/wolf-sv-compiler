@@ -53,6 +53,10 @@ namespace wolvrix::lib::transform
         double cBpMiss = 8.0;                  // 分支预测失误惩罚（相对 C_check_fast）
         std::size_t footprintMaxBytes = 32 * 1024; // F_max：宿主 x86 L1D 容量假设
         std::size_t fmRefineMaxRounds = 4;     // FM 边界精修轮数
+        bool probDpCost = false;               // prob 路径下 DP 是否使用概率加权 boundary cost（实验项）
+        std::string probDpCostMode = "mixed-pi"; // "pi" | "mixed-pi" | "change" | "mixed-change"
+        double probDpAlpha = 1.0;              // mixed-* cost 中概率/变化权重项系数
+        double probDpSegmentPenalty = 1.25;    // probDpCost=true 时 DP 每段固定惩罚
         std::string exportComputeDagPath;
     };
 
@@ -76,6 +80,7 @@ namespace wolvrix::lib::transform
     struct ActivityScheduleSummaryStats
     {
         using KindCountMap = std::map<std::string, std::size_t>;
+        using KindDoubleMap = std::map<std::string, double>;
 
         std::size_t supernodes = 0;
         std::size_t computeSupernodes = 0;
@@ -95,6 +100,14 @@ namespace wolvrix::lib::transform
         std::size_t otherComputeMultiTargetActivationEdges = 0;
         std::size_t otherComputeUniqueSupernodePairs = 0;
         std::size_t otherComputeDuplicateActivationEdges = 0;
+        double boundaryValuePiSum = 0.0;
+        double boundaryEdgePiSum = 0.0;
+        double computeComputeEdgePiSum = 0.0;
+        double computeCommitEdgePiSum = 0.0;
+        double boundaryValueChangeWeightSum = 0.0;
+        double boundaryEdgeChangeWeightSum = 0.0;
+        double computeComputeEdgeChangeWeightSum = 0.0;
+        double computeCommitEdgeChangeWeightSum = 0.0;
         std::size_t computeNodes = 0;
         std::size_t computeNodeOpsTotal = 0;
         std::size_t computeNodeCycleSplitIters = 0;
@@ -127,6 +140,8 @@ namespace wolvrix::lib::transform
         std::size_t graphValues = 0;
         KindCountMap activationEdgesBySourceKind;
         KindCountMap activationSourceValuesBySourceKind;
+        KindDoubleMap activationEdgePiBySourceKind;
+        KindDoubleMap activationEdgeChangeWeightBySourceKind;
         KindCountMap computeNodeBoundaryExistingCommonOwnerByKind;
         KindCountMap computeNodeBoundaryExistingCommonOwnerByWidthBucket;
         KindCountMap computeNodeBoundaryExistingCommonOwnerByFanoutBucket;

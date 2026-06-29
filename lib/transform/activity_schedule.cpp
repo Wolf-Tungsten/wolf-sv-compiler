@@ -4,13 +4,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <set>
@@ -339,6 +342,22 @@ namespace wolvrix::lib::transform
         regToMemIntentSliceStorageReadSymbols(const wolvrix::lib::grh::Graph &graph,
                                               const wolvrix::lib::grh::Operation &op);
 
+        struct ActivityScheduleValueWeightStats
+        {
+            std::vector<double> piByValueIndex;
+            std::vector<double> changeWeightByValueIndex;
+        };
+
+        double activityScheduleValueWeightAt(const std::vector<double> *weights,
+                                             std::size_t valueIndex)
+        {
+            if (weights == nullptr || valueIndex >= weights->size())
+            {
+                return 0.0;
+            }
+            return std::max(0.0, (*weights)[valueIndex]);
+        }
+
         std::string encodeActivityScheduleSummaryStatsJson(const ActivityScheduleSummaryStats &stats)
         {
             const auto emitCountMap = [](std::ostringstream &out,
@@ -358,7 +377,25 @@ namespace wolvrix::lib::transform
                 }
                 out << "}";
             };
+            const auto emitDoubleMap = [](std::ostringstream &out,
+                                          std::string_view key,
+                                          const ActivityScheduleSummaryStats::KindDoubleMap &counts)
+            {
+                out << ",\"" << key << "\":{";
+                bool first = true;
+                for (const auto &[name, value] : counts)
+                {
+                    if (!first)
+                    {
+                        out << ",";
+                    }
+                    first = false;
+                    out << "\"" << name << "\":" << value;
+                }
+                out << "}";
+            };
             std::ostringstream out;
+            out << std::setprecision(17);
             out << "{";
             out << "\"supernodes\":" << stats.supernodes;
             out << ",\"compute_supernodes\":" << stats.computeSupernodes;
@@ -380,6 +417,16 @@ namespace wolvrix::lib::transform
                 << stats.otherComputeMultiTargetActivationEdges;
             out << ",\"other_compute_unique_supernode_pairs\":" << stats.otherComputeUniqueSupernodePairs;
             out << ",\"other_compute_duplicate_activation_edges\":" << stats.otherComputeDuplicateActivationEdges;
+            out << ",\"boundary_value_pi_sum\":" << stats.boundaryValuePiSum;
+            out << ",\"boundary_edge_pi_sum\":" << stats.boundaryEdgePiSum;
+            out << ",\"compute_compute_edge_pi_sum\":" << stats.computeComputeEdgePiSum;
+            out << ",\"compute_commit_edge_pi_sum\":" << stats.computeCommitEdgePiSum;
+            out << ",\"boundary_value_change_weight_sum\":" << stats.boundaryValueChangeWeightSum;
+            out << ",\"boundary_edge_change_weight_sum\":" << stats.boundaryEdgeChangeWeightSum;
+            out << ",\"compute_compute_edge_change_weight_sum\":"
+                << stats.computeComputeEdgeChangeWeightSum;
+            out << ",\"compute_commit_edge_change_weight_sum\":"
+                << stats.computeCommitEdgeChangeWeightSum;
             out << ",\"compute_nodes\":" << stats.computeNodes;
             out << ",\"compute_node_ops_total\":" << stats.computeNodeOpsTotal;
             out << ",\"compute_node_cycle_split_iters\":" << stats.computeNodeCycleSplitIters;
@@ -422,6 +469,10 @@ namespace wolvrix::lib::transform
             out << ",\"graph_values\":" << stats.graphValues;
             emitCountMap(out, "activation_edges_by_source_kind", stats.activationEdgesBySourceKind);
             emitCountMap(out, "activation_source_values_by_source_kind", stats.activationSourceValuesBySourceKind);
+            emitDoubleMap(out, "activation_edge_pi_by_source_kind", stats.activationEdgePiBySourceKind);
+            emitDoubleMap(out,
+                          "activation_edge_change_weight_by_source_kind",
+                          stats.activationEdgeChangeWeightBySourceKind);
             emitCountMap(out,
                          "compute_node_boundary_existing_common_owner_by_kind",
                          stats.computeNodeBoundaryExistingCommonOwnerByKind);
@@ -439,7 +490,8 @@ namespace wolvrix::lib::transform
         ActivityScheduleSummaryStats buildActivityScheduleSummaryStats(const ActivityScheduleBuild &build,
                                                                        const RewriteBuildT &rewrite,
                                                                        const OpDataT &opData,
-                                                                       const wolvrix::lib::grh::Graph &graph)
+                                                                       const wolvrix::lib::grh::Graph &graph,
+                                                                       const ActivityScheduleValueWeightStats *valueWeights)
         {
             ActivityScheduleSummaryStats stats;
             std::unordered_set<uint64_t> otherComputeUniquePairs;
@@ -508,6 +560,19 @@ namespace wolvrix::lib::transform
                 }
                 ++stats.boundaryValues;
                 stats.boundaryActivationEdges += fanout.size();
+                const std::size_t sourceValueIndex = valueIndex + 1;
+                const double valuePi =
+                    activityScheduleValueWeightAt(valueWeights == nullptr ? nullptr : &valueWeights->piByValueIndex,
+                                                  sourceValueIndex);
+                const double valueChangeWeight =
+                    activityScheduleValueWeightAt(valueWeights == nullptr
+                                                      ? nullptr
+                                                      : &valueWeights->changeWeightByValueIndex,
+                                                  sourceValueIndex);
+                stats.boundaryValuePiSum += valuePi;
+                stats.boundaryValueChangeWeightSum += valueChangeWeight;
+                stats.boundaryEdgePiSum += valuePi * static_cast<double>(fanout.size());
+                stats.boundaryEdgeChangeWeightSum += valueChangeWeight * static_cast<double>(fanout.size());
                 const std::string sourceKindName =
                     valueIndex + 1 < build.valueSourceKind.size()
                         ? std::string(wolvrix::lib::grh::toString(build.valueSourceKind[valueIndex + 1]))
@@ -578,13 +643,19 @@ namespace wolvrix::lib::transform
                             (static_cast<uint64_t>(sourceSupernode) << 32) | targetSupernode;
                         otherComputeUniquePairs.insert(packed);
                     }
+                    stats.activationEdgePiBySourceKind[sourceKindName] += valuePi;
+                    stats.activationEdgeChangeWeightBySourceKind[sourceKindName] += valueChangeWeight;
                     if (build.supernodeKinds[targetSupernode] == ActivityScheduleSupernodeKind::Compute)
                     {
                         ++stats.computeComputeValuePairs;
+                        stats.computeComputeEdgePiSum += valuePi;
+                        stats.computeComputeEdgeChangeWeightSum += valueChangeWeight;
                     }
                     else if (build.supernodeKinds[targetSupernode] == ActivityScheduleSupernodeKind::Commit)
                     {
                         ++stats.computeCommitValuePairs;
+                        stats.computeCommitEdgePiSum += valuePi;
+                        stats.computeCommitEdgeChangeWeightSum += valueChangeWeight;
                     }
                 }
             }
@@ -660,6 +731,7 @@ namespace wolvrix::lib::transform
                 bool out1Changed = false;
                 bool in1Changed = false;
                 bool siblingsChanged = false;
+                bool probChanged = false;
                 bool tailStopped = false;
                 std::uint64_t elapsedMs = 0;
             };
@@ -670,6 +742,7 @@ namespace wolvrix::lib::transform
             std::uint64_t topoAfterCoarsenMs = 0;
             std::uint64_t buildClusterViewMs = 0;
             std::uint64_t dpSegmentMs = 0;
+            std::uint64_t fmRefineMs = 0;
             std::uint64_t flattenSegmentsMs = 0;
             std::uint64_t buildFinalSupernodesMs = 0;
             std::uint64_t buildFinalDagMs = 0;
@@ -681,6 +754,26 @@ namespace wolvrix::lib::transform
             std::size_t coarsenOut1Merges = 0;
             std::size_t coarsenIn1Merges = 0;
             std::size_t coarsenSiblingMerges = 0;
+            std::size_t probCoarsenCandidates = 0;
+            std::size_t probCoarsenMerges = 0;
+            std::size_t probCoarsenRejectedFootprint = 0;
+            std::size_t probCoarsenRejectedPhi = 0;
+            std::size_t probCoarsenRejectedWeight = 0;
+            std::size_t probCoarsenRejectedSize = 0;
+            std::size_t probCoarsenRejectedCycle = 0;
+            std::size_t probCoarsenSeedAggregates = 0;
+            std::size_t probCoarsenFullAggregates = 0;
+            std::uint64_t probCoarsenAggregateMs = 0;
+            double probCoarsenTotalGain = 0.0;
+            std::size_t fmRefineRounds = 0;
+            std::size_t fmRefineCandidates = 0;
+            std::size_t fmRefineMoves = 0;
+            std::size_t fmRefineRejectedFootprint = 0;
+            std::size_t fmRefineRejectedPhi = 0;
+            std::size_t fmRefineRejectedWeight = 0;
+            std::size_t fmRefineRejectedSize = 0;
+            std::size_t fmRefineRejectedCycle = 0;
+            double fmRefineTotalGain = 0.0;
             std::size_t segments = 0;
             std::size_t computeSupernodes = 0;
             std::size_t splitOversizeComputeNodes = 0;
@@ -3501,6 +3594,189 @@ namespace wolvrix::lib::transform
             return piByOpIndex;
         }
 
+        enum class ActivityCostClass : uint8_t
+        {
+            Const,
+            Src,
+            Comp,
+            Sink
+        };
+
+        struct ActivityCostStats
+        {
+            std::size_t eligibleOps = 0;
+            std::size_t constOps = 0;
+            std::size_t srcOps = 0;
+            std::size_t compOps = 0;
+            std::size_t sinkOps = 0;
+            double totalComputeWeight = 0.0;
+            double totalChangeWeight = 0.0;
+            std::uint64_t totalFootprintBytes = 0;
+            std::uint64_t widthUnitHistogram[6] = {0, 0, 0, 0, 0, 0};
+            double kindWeightSum[64] = {0};
+            std::uint64_t kindCnt[64] = {0};
+        };
+
+        struct ActivityCostModel
+        {
+            std::vector<double> computeWeightByOpIndex;
+            std::vector<double> changeWeightByOpIndex;
+            std::vector<std::uint64_t> footprintBytesByOpIndex;
+        };
+
+        ActivityCostClass classifyActivityCostClass(wolvrix::lib::grh::OperationKind kind) noexcept
+        {
+            switch (kind)
+            {
+            case wolvrix::lib::grh::OperationKind::kConstant:
+                return ActivityCostClass::Const;
+            case wolvrix::lib::grh::OperationKind::kRegisterReadPort:
+            case wolvrix::lib::grh::OperationKind::kLatchReadPort:
+            case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
+                return ActivityCostClass::Src;
+            case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+            case wolvrix::lib::grh::OperationKind::kLatchWritePort:
+            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
+            case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
+            case wolvrix::lib::grh::OperationKind::kSystemTask:
+            case wolvrix::lib::grh::OperationKind::kDpicCall:
+                return ActivityCostClass::Sink;
+            default:
+                return ActivityCostClass::Comp;
+            }
+        }
+
+        double activityCostClassUnit(ActivityCostClass costClass) noexcept
+        {
+            switch (costClass)
+            {
+            case ActivityCostClass::Const:
+                return 0.125;
+            case ActivityCostClass::Src:
+                return 2.0;
+            case ActivityCostClass::Comp:
+                return 1.0;
+            case ActivityCostClass::Sink:
+                return 0.0;
+            }
+            return 1.0;
+        }
+
+        std::uint64_t activityComputeUnitsForWidth(int32_t width) noexcept
+        {
+            if (width <= 0)
+            {
+                return 1;
+            }
+            if (width <= 64)
+            {
+                return 1;
+            }
+            return (static_cast<std::uint64_t>(width) + 63ULL) / 64ULL;
+        }
+
+        std::uint64_t activityFootprintBytesForWidth(int32_t width) noexcept
+        {
+            if (width <= 1)
+            {
+                return 1;
+            }
+            if (width <= 8)
+            {
+                return 1;
+            }
+            if (width <= 16)
+            {
+                return 2;
+            }
+            if (width <= 32)
+            {
+                return 4;
+            }
+            if (width <= 64)
+            {
+                return 8;
+            }
+            return 8ULL * ((static_cast<std::uint64_t>(width) + 63ULL) / 64ULL);
+        }
+
+        int32_t activityOpResultWidth(const wolvrix::lib::grh::Graph &graph,
+                                      wolvrix::lib::grh::OperationId opId)
+        {
+            const auto results = graph.opResults(opId);
+            int32_t width = 0;
+            for (const auto value : results)
+            {
+                width = std::max(width, graph.valueWidth(value));
+            }
+            return width > 0 ? width : 1;
+        }
+
+        ActivityCostModel computeActivityCostModel(const wolvrix::lib::grh::Graph &graph,
+                                                   const ActivityOpData &data,
+                                                   const std::vector<float> &piByOpIndex,
+                                                   ActivityCostStats &stats)
+        {
+            stats = ActivityCostStats{};
+            ActivityCostModel out;
+            out.computeWeightByOpIndex.assign(data.maxOpIndex + 1, -1.0);
+            out.changeWeightByOpIndex.assign(data.maxOpIndex + 1, -1.0);
+            out.footprintBytesByOpIndex.assign(data.maxOpIndex + 1, 0);
+
+            for (const auto opId : data.topoOps)
+            {
+                const auto kind = graph.opKind(opId);
+                const ActivityCostClass costClass = classifyActivityCostClass(kind);
+                const bool hasResult = !graph.opResults(opId).empty();
+                const int32_t width = activityOpResultWidth(graph, opId);
+                const std::uint64_t units = activityComputeUnitsForWidth(width);
+                const std::uint64_t footprintBytes =
+                    (costClass == ActivityCostClass::Sink || !hasResult) ? 0 : activityFootprintBytesForWidth(width);
+                const double weight = activityCostClassUnit(costClass) * static_cast<double>(units);
+                const double pi =
+                    (opId.index < piByOpIndex.size() && piByOpIndex[opId.index] >= 0.0F)
+                        ? static_cast<double>(piByOpIndex[opId.index])
+                        : 0.0;
+                const double changeWeight = weight * std::clamp(pi, 0.0, 1.0);
+
+                if (opId.index < out.computeWeightByOpIndex.size())
+                {
+                    out.computeWeightByOpIndex[opId.index] = weight;
+                    out.changeWeightByOpIndex[opId.index] = changeWeight;
+                    out.footprintBytesByOpIndex[opId.index] = footprintBytes;
+                }
+
+                ++stats.eligibleOps;
+                stats.totalComputeWeight += weight;
+                stats.totalChangeWeight += changeWeight;
+                stats.totalFootprintBytes += footprintBytes;
+                switch (costClass)
+                {
+                case ActivityCostClass::Const: ++stats.constOps; break;
+                case ActivityCostClass::Src: ++stats.srcOps; break;
+                case ActivityCostClass::Comp: ++stats.compOps; break;
+                case ActivityCostClass::Sink: ++stats.sinkOps; break;
+                }
+
+                const std::size_t unitBucket = units <= 1 ? 0
+                                             : units <= 2 ? 1
+                                             : units <= 4 ? 2
+                                             : units <= 8 ? 3
+                                             : units <= 16 ? 4
+                                                           : 5;
+                ++stats.widthUnitHistogram[unitBucket];
+
+                const std::size_t kindIdx = static_cast<std::size_t>(kind);
+                if (kindIdx < 64)
+                {
+                    stats.kindWeightSum[kindIdx] += weight;
+                    ++stats.kindCnt[kindIdx];
+                }
+            }
+
+            return out;
+        }
+
         // NO0208 Phase D：测量 computeNode 对 MFFC 的忠实度。在同一 PRE-DP 图上算 MFFC 参考
         // （rep[u] 反向线性近似：只看 compute 消费者，全部同 rep 则继承、否则自成根），再与 builder
         // 的 computeNodeOfOp 对比 compute→compute 边——MFFC 认为同锥(rep 相同) vs builder 同
@@ -5022,6 +5298,7 @@ namespace wolvrix::lib::transform
             std::unordered_map<uint64_t, std::size_t> weights;
             std::vector<std::vector<std::pair<uint32_t, std::size_t>>> outgoing;
             std::vector<ValueFanout> valueFanouts;
+            std::vector<wolvrix::lib::grh::ValueId> fanoutValues;
             std::vector<std::vector<uint32_t>> sourceValuesByCluster;
             std::vector<std::vector<uint32_t>> targetValuesByCluster;
         };
@@ -5585,6 +5862,7 @@ namespace wolvrix::lib::transform
                             ClusterValueEdges::ValueFanout fanout;
                             fanout.sourceCluster = fromCluster;
                             out.valueFanouts.push_back(std::move(fanout));
+                            out.fanoutValues.push_back(boundary);
                             if (fromCluster < out.sourceValuesByCluster.size())
                             {
                                 out.sourceValuesByCluster[fromCluster].push_back(it->second);
@@ -5630,6 +5908,694 @@ namespace wolvrix::lib::transform
                           });
             }
             return out;
+        }
+
+        // NO0207 Phase C：computeNode/cluster 层的概率超图聚合。这里只构建只读分析结构，
+        // 不改变 plain/prob 当前 materialize 路径；Phase E/F 会复用这些 W/pi/edge 数据。
+        struct ActivityHyperedge
+        {
+            std::uint64_t count = 0;
+            double totalProb = 0.0;
+        };
+
+        struct ActivityHypergraphAggregate
+        {
+            std::vector<double> nodeWeight;
+            std::vector<double> nodeChangeWeight;
+            std::vector<std::uint64_t> nodeFootprintBytes;
+            std::vector<double> nodeActiveProb;
+            std::vector<uint32_t> nodeMinTopo;
+            std::vector<uint32_t> nodeMaxTopo;
+            std::vector<uint32_t> nodeOpCount;
+            std::vector<uint32_t> edgeFrom;
+            std::vector<uint32_t> edgeTo;
+            std::vector<std::uint64_t> edgeCount;
+            std::vector<double> edgeTotalProb;
+            std::uint64_t boundaryValues = 0;
+            std::uint64_t externalBoundaryValues = 0;
+            std::uint64_t canonicalCloneValues = 0;
+        };
+
+        struct ProbCoarsenClusterAggregate
+        {
+            ActivityHypergraphAggregate aggregate;
+            std::unordered_map<std::uint64_t, double> edgeProb;
+        };
+
+        struct ActivityPairValueKey
+        {
+            std::uint64_t pair = 0;
+            wolvrix::lib::grh::ValueId value;
+
+            bool operator==(const ActivityPairValueKey &other) const noexcept
+            {
+                return pair == other.pair && value == other.value;
+            }
+        };
+
+        struct ActivityPairValueKeyHash
+        {
+            std::size_t operator()(const ActivityPairValueKey &key) const noexcept
+            {
+                const auto valueHash = wolvrix::lib::grh::ValueIdHash{}(key.value);
+                return static_cast<std::size_t>(key.pair ^ (key.pair >> 32)) ^
+                       (valueHash + 0x9e3779b97f4a7c15ull + (valueHash << 6) + (valueHash >> 2));
+            }
+        };
+
+        struct ActivityTargetValueKey
+        {
+            uint32_t target = 0;
+            wolvrix::lib::grh::ValueId value;
+
+            bool operator==(const ActivityTargetValueKey &other) const noexcept
+            {
+                return target == other.target && value == other.value;
+            }
+        };
+
+        struct ActivityTargetValueKeyHash
+        {
+            std::size_t operator()(const ActivityTargetValueKey &key) const noexcept
+            {
+                const auto valueHash = wolvrix::lib::grh::ValueIdHash{}(key.value);
+                return static_cast<std::size_t>(key.target) ^
+                       (valueHash + 0x9e3779b97f4a7c15ull + (valueHash << 6) + (valueHash >> 2));
+            }
+        };
+
+        wolvrix::lib::grh::OperationId activityCanonicalDataOpForOp(
+            const wolvrix::lib::grh::Graph &graph,
+            wolvrix::lib::grh::OperationId opId,
+            const ValueCanonicalMap &canonicalValues)
+        {
+            if (!opId.valid())
+            {
+                return opId;
+            }
+            for (const auto result : graph.opResults(opId))
+            {
+                const auto canonical = canonicalActivityValue(result, &canonicalValues);
+                if (canonical.valid() && canonical != result)
+                {
+                    const auto canonicalDef = graph.valueDef(canonical);
+                    if (canonicalDef.valid())
+                    {
+                        return canonicalDef;
+                    }
+                }
+            }
+            return opId;
+        }
+
+        double activityPiForOp(const wolvrix::lib::grh::Graph &graph,
+                               const ActivityScheduleOptions &options,
+                               const std::vector<float> &piByOpIndex,
+                               wolvrix::lib::grh::OperationId opId)
+        {
+            if (opId.valid() && opId.index < piByOpIndex.size() && piByOpIndex[opId.index] >= 0.0F)
+            {
+                return std::clamp(static_cast<double>(piByOpIndex[opId.index]), 0.0, 1.0);
+            }
+            if (!opId.valid())
+            {
+                return std::clamp(options.piDataInput, 0.0, 1.0);
+            }
+            switch (graph.opKind(opId))
+            {
+            case wolvrix::lib::grh::OperationKind::kConstant:
+                return 0.0;
+            case wolvrix::lib::grh::OperationKind::kRegisterReadPort:
+            case wolvrix::lib::grh::OperationKind::kLatchReadPort:
+                return std::clamp(options.piRegRead, 0.0, 1.0);
+            default:
+                return 0.0;
+            }
+        }
+
+        double activityPiForValue(const wolvrix::lib::grh::Graph &graph,
+                                  const ActivityScheduleOptions &options,
+                                  const ValueCanonicalMap &canonicalValues,
+                                  const std::vector<float> &piByOpIndex,
+                                  wolvrix::lib::grh::ValueId value)
+        {
+            const auto canonical = canonicalActivityValue(value, &canonicalValues);
+            const auto defOp = graph.valueDef(canonical);
+            if (defOp.valid())
+            {
+                return activityPiForOp(graph, options, piByOpIndex, defOp);
+            }
+            return std::clamp(options.piDataInput, 0.0, 1.0);
+        }
+
+        double activityComputeWeightForOp(const wolvrix::lib::grh::Graph &graph,
+                                          const ValueCanonicalMap &canonicalValues,
+                                          const ActivityCostModel &costModel,
+                                          wolvrix::lib::grh::OperationId opId)
+        {
+            const auto dataOp = activityCanonicalDataOpForOp(graph, opId, canonicalValues);
+            if (dataOp.valid() &&
+                dataOp.index < costModel.computeWeightByOpIndex.size() &&
+                costModel.computeWeightByOpIndex[dataOp.index] >= 0.0)
+            {
+                return costModel.computeWeightByOpIndex[dataOp.index];
+            }
+            if (!dataOp.valid())
+            {
+                return 0.0;
+            }
+            const ActivityCostClass costClass = classifyActivityCostClass(graph.opKind(dataOp));
+            return activityCostClassUnit(costClass) *
+                   static_cast<double>(activityComputeUnitsForWidth(activityOpResultWidth(graph, dataOp)));
+        }
+
+        double activityChangeWeightForOp(const wolvrix::lib::grh::Graph &graph,
+                                         const ActivityScheduleOptions &options,
+                                         const ValueCanonicalMap &canonicalValues,
+                                         const ActivityCostModel &costModel,
+                                         const std::vector<float> &piByOpIndex,
+                                         wolvrix::lib::grh::OperationId opId)
+        {
+            const auto dataOp = activityCanonicalDataOpForOp(graph, opId, canonicalValues);
+            if (dataOp.valid() &&
+                dataOp.index < costModel.changeWeightByOpIndex.size() &&
+                costModel.changeWeightByOpIndex[dataOp.index] >= 0.0)
+            {
+                return costModel.changeWeightByOpIndex[dataOp.index];
+            }
+            return activityComputeWeightForOp(graph, canonicalValues, costModel, opId) *
+                   activityPiForOp(graph, options, piByOpIndex, dataOp);
+        }
+
+        ActivityScheduleValueWeightStats buildActivityScheduleValueWeightStats(
+            const wolvrix::lib::grh::Graph &graph,
+            const ActivityScheduleOptions &options,
+            const ComputeRewriteBuild &rewrite,
+            const ActivityCostModel &costModel,
+            const std::vector<float> &piByOpIndex)
+        {
+            ActivityScheduleValueWeightStats out;
+            if (graph.values().empty())
+            {
+                return out;
+            }
+            out.piByValueIndex.assign(graph.values().back().index + 1, 0.0);
+            out.changeWeightByValueIndex.assign(graph.values().back().index + 1, 0.0);
+            for (const auto valueId : graph.values())
+            {
+                if (!valueId.valid() || valueId.index >= out.piByValueIndex.size())
+                {
+                    continue;
+                }
+                const auto canonical = canonicalActivityValue(valueId, &rewrite.canonicalValues);
+                const auto defOp = graph.valueDef(canonical);
+                const double pi =
+                    activityPiForValue(graph, options, rewrite.canonicalValues, piByOpIndex, valueId);
+                double weight = 0.0;
+                if (defOp.valid())
+                {
+                    weight = activityComputeWeightForOp(graph, rewrite.canonicalValues, costModel, defOp);
+                }
+                else
+                {
+                    weight = static_cast<double>(activityComputeUnitsForWidth(graph.valueWidth(canonical)));
+                }
+                out.piByValueIndex[valueId.index] = pi;
+                out.changeWeightByValueIndex[valueId.index] = std::max(0.0, weight) * pi;
+            }
+            return out;
+        }
+
+        ActivityHypergraphAggregate buildActivityHypergraphAggregate(
+            const wolvrix::lib::grh::Graph &graph,
+            const ActivityScheduleOptions &options,
+            const ActivityOpData &opData,
+            const ComputeRewriteBuild &rewrite,
+            const NodeClusterView &view,
+            const ActivityCostModel &costModel,
+            const std::vector<float> &piByOpIndex)
+        {
+            ActivityHypergraphAggregate out;
+            const std::size_t clusters = view.members.size();
+            out.nodeWeight.assign(clusters, 0.0);
+            out.nodeChangeWeight.assign(clusters, 0.0);
+            out.nodeFootprintBytes.assign(clusters, 0);
+            out.nodeActiveProb.assign(clusters, 0.0);
+            out.nodeMinTopo.assign(clusters, kInvalidActivitySupernodeId);
+            out.nodeMaxTopo.assign(clusters, 0);
+            out.nodeOpCount.assign(clusters, 0);
+
+            std::vector<double> activeKeep(clusters, 1.0);
+            std::unordered_set<ActivityTargetValueKey, ActivityTargetValueKeyHash> activeSeenValues;
+            std::unordered_map<std::uint64_t, ActivityHyperedge> edgeMap;
+            std::unordered_set<ActivityPairValueKey, ActivityPairValueKeyHash> seenEdgeValues;
+            std::unordered_set<ActivityPairValueKey, ActivityPairValueKeyHash> seenEdgeProbValues;
+
+            for (uint32_t clusterId = 0; clusterId < clusters; ++clusterId)
+            {
+                std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash>
+                    footprintValues;
+                for (const auto nodeId : view.members[clusterId])
+                {
+                    if (nodeId >= rewrite.computeNodes.size())
+                    {
+                        continue;
+                    }
+                    const auto &node = rewrite.computeNodes[nodeId];
+                    for (const auto opId : node.ops)
+                    {
+                        ++out.nodeOpCount[clusterId];
+                        const uint32_t topoPos = topoPosForOp(opData, opId);
+                        if (topoPos != kInvalidActivitySupernodeId)
+                        {
+                            out.nodeMinTopo[clusterId] = std::min(out.nodeMinTopo[clusterId], topoPos);
+                            out.nodeMaxTopo[clusterId] = std::max(out.nodeMaxTopo[clusterId], topoPos);
+                        }
+
+                        out.nodeWeight[clusterId] +=
+                            activityComputeWeightForOp(graph, rewrite.canonicalValues, costModel, opId);
+                        out.nodeChangeWeight[clusterId] +=
+                            activityChangeWeightForOp(graph,
+                                                      options,
+                                                      rewrite.canonicalValues,
+                                                      costModel,
+                                                      piByOpIndex,
+                                                      opId);
+
+                        const auto dataOp = activityCanonicalDataOpForOp(graph, opId, rewrite.canonicalValues);
+                        const double opPi = activityPiForOp(graph, options, piByOpIndex, dataOp);
+                        if (dataOp.valid() &&
+                            classifyActivityCostClass(graph.opKind(dataOp)) == ActivityCostClass::Src)
+                        {
+                            for (const auto result : graph.opResults(opId))
+                            {
+                                const auto canonical = canonicalActivityValue(result, &rewrite.canonicalValues);
+                                ActivityTargetValueKey key{clusterId, canonical};
+                                if (activeSeenValues.insert(key).second)
+                                {
+                                    activeKeep[clusterId] *= (1.0 - std::clamp(opPi, 0.0, 1.0));
+                                }
+                            }
+                        }
+
+                        const ActivityCostClass costClass =
+                            dataOp.valid() ? classifyActivityCostClass(graph.opKind(dataOp))
+                                           : ActivityCostClass::Sink;
+                        if (costClass == ActivityCostClass::Sink)
+                        {
+                            continue;
+                        }
+                        for (const auto result : graph.opResults(opId))
+                        {
+                            const auto canonical = canonicalActivityValue(result, &rewrite.canonicalValues);
+                            if (canonical != result)
+                            {
+                                ++out.canonicalCloneValues;
+                            }
+                            if (canonical.valid() && footprintValues.insert(canonical).second)
+                            {
+                                out.nodeFootprintBytes[clusterId] +=
+                                    activityFootprintBytesForWidth(graph.valueWidth(canonical));
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (uint32_t toCluster = 0; toCluster < clusters; ++toCluster)
+            {
+                for (const auto nodeId : view.members[toCluster])
+                {
+                    if (nodeId >= rewrite.computeNodes.size())
+                    {
+                        continue;
+                    }
+                    for (const auto boundary : rewrite.computeNodes[nodeId].boundaryInputs)
+                    {
+                        ++out.boundaryValues;
+                        const auto canonicalBoundary = canonicalActivityValue(boundary, &rewrite.canonicalValues);
+                        const auto defOp = graph.valueDef(boundary);
+                        uint32_t fromCluster = kInvalidActivitySupernodeId;
+                        if (defOp.valid() && defOp.index < rewrite.computeNodeOfOp.size())
+                        {
+                            const uint32_t predNode = rewrite.computeNodeOfOp[defOp.index];
+                            if (predNode != kInvalidActivitySupernodeId &&
+                                predNode < view.clusterOfNode.size())
+                            {
+                                fromCluster = view.clusterOfNode[predNode];
+                            }
+                        }
+                        if (fromCluster == toCluster)
+                        {
+                            continue;
+                        }
+
+                        ActivityTargetValueKey activeKey{toCluster, canonicalBoundary};
+                        if (activeSeenValues.insert(activeKey).second)
+                        {
+                            const double p = activityPiForValue(graph,
+                                                                options,
+                                                                rewrite.canonicalValues,
+                                                                piByOpIndex,
+                                                                boundary);
+                            activeKeep[toCluster] *= (1.0 - std::clamp(p, 0.0, 1.0));
+                        }
+
+                        if (fromCluster == kInvalidActivitySupernodeId)
+                        {
+                            continue;
+                        }
+                        ++out.externalBoundaryValues;
+                        const std::uint64_t pair = packClusterPair(fromCluster, toCluster);
+                        auto &edge = edgeMap[pair];
+                        ActivityPairValueKey countKey{pair, boundary};
+                        if (seenEdgeValues.insert(countKey).second)
+                        {
+                            ++edge.count;
+                        }
+                        ActivityPairValueKey probKey{pair, canonicalBoundary};
+                        if (seenEdgeProbValues.insert(probKey).second)
+                        {
+                            edge.totalProb += activityPiForValue(graph,
+                                                                 options,
+                                                                 rewrite.canonicalValues,
+                                                                 piByOpIndex,
+                                                                 boundary);
+                        }
+                    }
+                }
+            }
+
+            for (uint32_t clusterId = 0; clusterId < clusters; ++clusterId)
+            {
+                out.nodeActiveProb[clusterId] = std::clamp(1.0 - activeKeep[clusterId], 0.0, 1.0);
+                if (out.nodeMinTopo[clusterId] == kInvalidActivitySupernodeId)
+                {
+                    out.nodeMaxTopo[clusterId] = kInvalidActivitySupernodeId;
+                }
+            }
+
+            std::vector<std::pair<std::uint64_t, ActivityHyperedge>> orderedEdges(edgeMap.begin(),
+                                                                                  edgeMap.end());
+            std::sort(orderedEdges.begin(),
+                      orderedEdges.end(),
+                      [](const auto &lhs, const auto &rhs)
+                      {
+                          return lhs.first < rhs.first;
+                      });
+            out.edgeFrom.reserve(orderedEdges.size());
+            out.edgeTo.reserve(orderedEdges.size());
+            out.edgeCount.reserve(orderedEdges.size());
+            out.edgeTotalProb.reserve(orderedEdges.size());
+            for (const auto &[packed, edge] : orderedEdges)
+            {
+                out.edgeFrom.push_back(static_cast<uint32_t>(packed >> 32));
+                out.edgeTo.push_back(static_cast<uint32_t>(packed & 0xffffffffu));
+                out.edgeCount.push_back(edge.count);
+                out.edgeTotalProb.push_back(edge.totalProb);
+            }
+            return out;
+        }
+
+        ProbCoarsenClusterAggregate buildProbCoarsenClusterAggregateFromSeed(
+            const ActivityHypergraphAggregate &seed,
+            const NodeClusterView &view)
+        {
+            ProbCoarsenClusterAggregate out;
+            auto &agg = out.aggregate;
+            const std::size_t clusters = view.members.size();
+            agg.nodeWeight.assign(clusters, 0.0);
+            agg.nodeChangeWeight.assign(clusters, 0.0);
+            agg.nodeFootprintBytes.assign(clusters, 0);
+            agg.nodeActiveProb.assign(clusters, 0.0);
+            agg.nodeMinTopo.assign(clusters, kInvalidActivitySupernodeId);
+            agg.nodeMaxTopo.assign(clusters, kInvalidActivitySupernodeId);
+            agg.nodeOpCount.assign(clusters, 0);
+            agg.boundaryValues = seed.boundaryValues;
+            agg.canonicalCloneValues = seed.canonicalCloneValues;
+
+            for (uint32_t clusterId = 0; clusterId < clusters; ++clusterId)
+            {
+                uint32_t minTopo = kInvalidActivitySupernodeId;
+                uint32_t maxTopo = 0;
+                bool anyTopo = false;
+                for (const auto nodeId : view.members[clusterId])
+                {
+                    if (nodeId < seed.nodeWeight.size())
+                    {
+                        agg.nodeWeight[clusterId] += seed.nodeWeight[nodeId];
+                    }
+                    if (nodeId < seed.nodeChangeWeight.size())
+                    {
+                        agg.nodeChangeWeight[clusterId] += seed.nodeChangeWeight[nodeId];
+                    }
+                    if (nodeId < seed.nodeFootprintBytes.size())
+                    {
+                        agg.nodeFootprintBytes[clusterId] += seed.nodeFootprintBytes[nodeId];
+                    }
+                    if (nodeId < seed.nodeActiveProb.size())
+                    {
+                        agg.nodeActiveProb[clusterId] =
+                            std::max(agg.nodeActiveProb[clusterId],
+                                     std::clamp(seed.nodeActiveProb[nodeId], 0.0, 1.0));
+                    }
+                    if (nodeId < seed.nodeOpCount.size())
+                    {
+                        agg.nodeOpCount[clusterId] += seed.nodeOpCount[nodeId];
+                    }
+                    if (nodeId < seed.nodeMinTopo.size())
+                    {
+                        const uint32_t nodeMin = seed.nodeMinTopo[nodeId];
+                        if (nodeMin != kInvalidActivitySupernodeId)
+                        {
+                            minTopo = std::min(minTopo, nodeMin);
+                            anyTopo = true;
+                        }
+                    }
+                    if (nodeId < seed.nodeMaxTopo.size())
+                    {
+                        const uint32_t nodeMax = seed.nodeMaxTopo[nodeId];
+                        if (nodeMax != kInvalidActivitySupernodeId)
+                        {
+                            maxTopo = std::max(maxTopo, nodeMax);
+                            anyTopo = true;
+                        }
+                    }
+                }
+                if (anyTopo)
+                {
+                    agg.nodeMinTopo[clusterId] = minTopo;
+                    agg.nodeMaxTopo[clusterId] = maxTopo;
+                }
+            }
+
+            out.edgeProb.reserve(seed.edgeFrom.size() * 2 + 1);
+            for (std::size_t i = 0; i < seed.edgeFrom.size(); ++i)
+            {
+                if (i >= seed.edgeTo.size() || i >= seed.edgeTotalProb.size())
+                {
+                    continue;
+                }
+                const uint32_t fromNode = seed.edgeFrom[i];
+                const uint32_t toNode = seed.edgeTo[i];
+                if (fromNode >= view.clusterOfNode.size() || toNode >= view.clusterOfNode.size())
+                {
+                    continue;
+                }
+                const uint32_t fromCluster = view.clusterOfNode[fromNode];
+                const uint32_t toCluster = view.clusterOfNode[toNode];
+                if (fromCluster == kInvalidActivitySupernodeId ||
+                    toCluster == kInvalidActivitySupernodeId ||
+                    fromCluster == toCluster)
+                {
+                    continue;
+                }
+                out.edgeProb[packClusterPair(fromCluster, toCluster)] += seed.edgeTotalProb[i];
+                if (i < seed.edgeCount.size())
+                {
+                    agg.externalBoundaryValues += seed.edgeCount[i];
+                }
+            }
+            return out;
+        }
+
+        ProbCoarsenClusterAggregate buildProbCoarsenClusterAggregateFromGraph(
+            const wolvrix::lib::grh::Graph &graph,
+            const ActivityScheduleOptions &options,
+            const ActivityOpData &opData,
+            const ComputeRewriteBuild &rewrite,
+            const NodeClusterView &view,
+            const ActivityCostModel &costModel,
+            const std::vector<float> &piByOpIndex)
+        {
+            ProbCoarsenClusterAggregate out;
+            out.aggregate =
+                buildActivityHypergraphAggregate(graph, options, opData, rewrite, view, costModel, piByOpIndex);
+            out.edgeProb.reserve(out.aggregate.edgeFrom.size() * 2 + 1);
+            for (std::size_t i = 0; i < out.aggregate.edgeFrom.size(); ++i)
+            {
+                if (i < out.aggregate.edgeTo.size() && i < out.aggregate.edgeTotalProb.size())
+                {
+                    out.edgeProb[packClusterPair(out.aggregate.edgeFrom[i], out.aggregate.edgeTo[i])] +=
+                        out.aggregate.edgeTotalProb[i];
+                }
+            }
+            return out;
+        }
+
+        template <typename T>
+        T percentileOfSortedGeneric(const std::vector<T> &values, std::size_t pct)
+        {
+            if (values.empty())
+            {
+                return T{};
+            }
+            const std::size_t index =
+                std::min(values.size() - 1, (values.size() - 1) * pct / static_cast<std::size_t>(100));
+            return values[index];
+        }
+
+        std::string summarizeActivityHypergraphAggregate(const ActivityHypergraphAggregate &agg)
+        {
+            double totalWeight = 0.0;
+            double totalChangeWeight = 0.0;
+            double totalActiveProb = 0.0;
+            std::uint64_t totalFootprint = 0;
+            std::vector<double> weights = agg.nodeWeight;
+            std::vector<double> changeWeights = agg.nodeChangeWeight;
+            std::vector<double> active = agg.nodeActiveProb;
+            std::vector<std::uint64_t> footprints = agg.nodeFootprintBytes;
+            for (std::size_t i = 0; i < agg.nodeWeight.size(); ++i)
+            {
+                totalWeight += agg.nodeWeight[i];
+                totalChangeWeight += i < agg.nodeChangeWeight.size() ? agg.nodeChangeWeight[i] : 0.0;
+                totalActiveProb += i < agg.nodeActiveProb.size() ? agg.nodeActiveProb[i] : 0.0;
+                totalFootprint += i < agg.nodeFootprintBytes.size() ? agg.nodeFootprintBytes[i] : 0;
+            }
+            std::sort(weights.begin(), weights.end());
+            std::sort(changeWeights.begin(), changeWeights.end());
+            std::sort(active.begin(), active.end());
+            std::sort(footprints.begin(), footprints.end());
+
+            std::uint64_t totalEdgeCount = 0;
+            double totalEdgeProb = 0.0;
+            std::vector<std::uint64_t> edgeCounts = agg.edgeCount;
+            std::vector<double> edgeProbs = agg.edgeTotalProb;
+            for (std::size_t i = 0; i < agg.edgeCount.size(); ++i)
+            {
+                totalEdgeCount += agg.edgeCount[i];
+                totalEdgeProb += i < agg.edgeTotalProb.size() ? agg.edgeTotalProb[i] : 0.0;
+            }
+            std::sort(edgeCounts.begin(), edgeCounts.end());
+            std::sort(edgeProbs.begin(), edgeProbs.end());
+
+            const double meanWeight =
+                agg.nodeWeight.empty() ? 0.0 : totalWeight / static_cast<double>(agg.nodeWeight.size());
+            const double meanChange =
+                agg.nodeChangeWeight.empty() ? 0.0
+                                             : totalChangeWeight / static_cast<double>(agg.nodeChangeWeight.size());
+            const double meanActive =
+                agg.nodeActiveProb.empty() ? 0.0 : totalActiveProb / static_cast<double>(agg.nodeActiveProb.size());
+
+            std::ostringstream oss;
+            oss << "nodes=" << agg.nodeWeight.size()
+                << " edges=" << agg.edgeFrom.size()
+                << " boundary_values=" << agg.boundaryValues
+                << " inter_node_boundary_values=" << agg.externalBoundaryValues
+                << " canonical_clone_values=" << agg.canonicalCloneValues
+                << " total_weight=" << totalWeight
+                << " mean_weight=" << meanWeight
+                << " weight_p50=" << percentileOfSortedGeneric(weights, 50)
+                << " weight_p90=" << percentileOfSortedGeneric(weights, 90)
+                << " weight_p99=" << percentileOfSortedGeneric(weights, 99)
+                << " weight_max=" << (weights.empty() ? 0.0 : weights.back())
+                << " total_change_weight=" << totalChangeWeight
+                << " mean_change_weight=" << meanChange
+                << " change_p90=" << percentileOfSortedGeneric(changeWeights, 90)
+                << " total_footprint_bytes=" << totalFootprint
+                << " footprint_p50=" << percentileOfSortedGeneric(footprints, 50)
+                << " footprint_p90=" << percentileOfSortedGeneric(footprints, 90)
+                << " footprint_p99=" << percentileOfSortedGeneric(footprints, 99)
+                << " footprint_max=" << (footprints.empty() ? 0 : footprints.back())
+                << " mean_active_prob=" << meanActive
+                << " active_p50=" << percentileOfSortedGeneric(active, 50)
+                << " active_p90=" << percentileOfSortedGeneric(active, 90)
+                << " active_p99=" << percentileOfSortedGeneric(active, 99)
+                << " active_max=" << (active.empty() ? 0.0 : active.back())
+                << " edge_count_total=" << totalEdgeCount
+                << " edge_count_p90=" << percentileOfSortedGeneric(edgeCounts, 90)
+                << " edge_count_max=" << (edgeCounts.empty() ? 0 : edgeCounts.back())
+                << " edge_total_prob=" << totalEdgeProb
+                << " edge_prob_p90=" << percentileOfSortedGeneric(edgeProbs, 90)
+                << " edge_prob_max=" << (edgeProbs.empty() ? 0.0 : edgeProbs.back());
+            return oss.str();
+        }
+
+        std::string summarizeTopActivityHypergraphNodes(const ActivityHypergraphAggregate &agg,
+                                                        std::size_t limit)
+        {
+            struct Entry
+            {
+                uint32_t node = 0;
+                double weight = 0.0;
+                double changeWeight = 0.0;
+                std::uint64_t footprint = 0;
+                double activeProb = 0.0;
+                uint32_t minTopo = kInvalidActivitySupernodeId;
+                uint32_t maxTopo = kInvalidActivitySupernodeId;
+                uint32_t ops = 0;
+            };
+            std::vector<Entry> entries;
+            entries.reserve(agg.nodeWeight.size());
+            for (uint32_t i = 0; i < agg.nodeWeight.size(); ++i)
+            {
+                entries.push_back(Entry{
+                    i,
+                    agg.nodeWeight[i],
+                    i < agg.nodeChangeWeight.size() ? agg.nodeChangeWeight[i] : 0.0,
+                    i < agg.nodeFootprintBytes.size() ? agg.nodeFootprintBytes[i] : 0,
+                    i < agg.nodeActiveProb.size() ? agg.nodeActiveProb[i] : 0.0,
+                    i < agg.nodeMinTopo.size() ? agg.nodeMinTopo[i] : kInvalidActivitySupernodeId,
+                    i < agg.nodeMaxTopo.size() ? agg.nodeMaxTopo[i] : kInvalidActivitySupernodeId,
+                    i < agg.nodeOpCount.size() ? agg.nodeOpCount[i] : 0,
+                });
+            }
+            std::sort(entries.begin(),
+                      entries.end(),
+                      [](const Entry &lhs, const Entry &rhs)
+                      {
+                          if (lhs.footprint != rhs.footprint)
+                          {
+                              return lhs.footprint > rhs.footprint;
+                          }
+                          if (lhs.weight != rhs.weight)
+                          {
+                              return lhs.weight > rhs.weight;
+                          }
+                          return lhs.node < rhs.node;
+                      });
+            std::ostringstream oss;
+            const std::size_t n = std::min(limit, entries.size());
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                if (i != 0)
+                {
+                    oss << " ";
+                }
+                const auto &e = entries[i];
+                oss << "#" << e.node
+                    << "{ops=" << e.ops
+                    << ",W=" << e.weight
+                    << ",change=" << e.changeWeight
+                    << ",footprint=" << e.footprint
+                    << ",active=" << e.activeProb;
+                if (e.minTopo != kInvalidActivitySupernodeId)
+                {
+                    oss << ",topo=[" << e.minTopo << "," << e.maxTopo << "]";
+                }
+                oss << "}";
+            }
+            return oss.str();
         }
 
         std::vector<std::vector<uint32_t>> canonicalizeNodeClusters(std::vector<std::vector<uint32_t>> clusters,
@@ -6158,10 +7124,382 @@ namespace wolvrix::lib::transform
             return true;
         }
 
+        double probCoarsenCheckCost(double activeProb, const ActivityScheduleOptions &options)
+        {
+            const double p = std::clamp(activeProb, 0.0, 1.0);
+            if (p <= 0.0 || p >= 1.0)
+            {
+                return 0.0;
+            }
+            double cost = 1.0;
+            if (p >= 0.2 && p <= 0.8)
+            {
+                cost += std::max(0.0, options.cBpMiss);
+            }
+            return cost;
+        }
+
+        double probCoarsenPhi(double weight, double changeWeight, double activeProb)
+        {
+            const double denom = weight * activeProb;
+            if (denom <= 1e-12)
+            {
+                return changeWeight <= 1e-12 ? 1.0 : 0.0;
+            }
+            return changeWeight / denom;
+        }
+
+        bool tryMergeNodeProb(std::vector<std::vector<uint32_t>> &clusters,
+                              const std::vector<std::vector<uint32_t>> &nodeDag,
+                              std::size_t nodeCount,
+                              const std::vector<uint32_t> &nodeTopoPos,
+                              const std::vector<uint32_t> &nodeOpSizes,
+                              std::size_t maxOps,
+                              const ComputeRewriteBuild &rewrite,
+                              const wolvrix::lib::grh::Graph &graph,
+                              const ActivityScheduleOptions &options,
+                              const ActivityOpData &opData,
+                              const ActivityCostModel &costModel,
+                              const std::vector<float> &piByOpIndex,
+                              const ActivityHypergraphAggregate *probSeedHypergraph,
+                              ComputeNodeMaterializePerfStats *perf)
+        {
+            const auto view = buildNodeClusterView(clusters, nodeDag, nodeCount);
+            if (view.members.size() < 2)
+            {
+                return false;
+            }
+
+            const bool canUseSeed =
+                probSeedHypergraph != nullptr &&
+                probSeedHypergraph->nodeWeight.size() >= nodeCount &&
+                probSeedHypergraph->nodeChangeWeight.size() >= nodeCount &&
+                probSeedHypergraph->nodeFootprintBytes.size() >= nodeCount &&
+                probSeedHypergraph->nodeActiveProb.size() >= nodeCount &&
+                probSeedHypergraph->nodeOpCount.size() >= nodeCount;
+            const auto aggregateStart = std::chrono::steady_clock::now();
+            const ProbCoarsenClusterAggregate probAgg =
+                canUseSeed
+                    ? buildProbCoarsenClusterAggregateFromSeed(*probSeedHypergraph, view)
+                    : buildProbCoarsenClusterAggregateFromGraph(graph,
+                                                               options,
+                                                               opData,
+                                                               rewrite,
+                                                               view,
+                                                               costModel,
+                                                               piByOpIndex);
+            if (perf)
+            {
+                perf->probCoarsenAggregateMs += elapsedMs(aggregateStart);
+                if (canUseSeed)
+                {
+                    ++perf->probCoarsenSeedAggregates;
+                }
+                else
+                {
+                    ++perf->probCoarsenFullAggregates;
+                }
+            }
+            const auto &agg = probAgg.aggregate;
+            const auto &edgeProb = probAgg.edgeProb;
+            const auto edgeTotalProb = [&](uint32_t from, uint32_t to) -> double {
+                const auto it = edgeProb.find(packClusterPair(from, to));
+                return it == edgeProb.end() ? 0.0 : it->second;
+            };
+
+            struct Candidate
+            {
+                uint32_t lhs = 0;
+                uint32_t rhs = 0;
+                double gain = 0.0;
+                double phi = 0.0;
+                double active = 0.0;
+                std::uint64_t footprint = 0;
+                std::size_t ops = 0;
+                bool sibling = false;
+            };
+
+            std::vector<Candidate> candidates;
+            candidates.reserve(view.members.size());
+
+            const auto rejectSize = [&]() {
+                if (perf)
+                {
+                    ++perf->probCoarsenRejectedSize;
+                }
+            };
+            const auto rejectFootprint = [&]() {
+                if (perf)
+                {
+                    ++perf->probCoarsenRejectedFootprint;
+                }
+            };
+            const auto rejectPhi = [&]() {
+                if (perf)
+                {
+                    ++perf->probCoarsenRejectedPhi;
+                }
+            };
+            const auto rejectWeight = [&]() {
+                if (perf)
+                {
+                    ++perf->probCoarsenRejectedWeight;
+                }
+            };
+
+            const auto considerCandidate = [&](uint32_t lhs, uint32_t rhs, bool sibling) {
+                if (lhs == rhs || lhs >= view.members.size() || rhs >= view.members.size())
+                {
+                    return;
+                }
+                if (rhs < lhs)
+                {
+                    std::swap(lhs, rhs);
+                }
+                const std::size_t lhsOps = clusterOpSize(view.members[lhs], nodeOpSizes);
+                const std::size_t rhsOps = clusterOpSize(view.members[rhs], nodeOpSizes);
+                const std::size_t mergedOps = lhsOps + rhsOps;
+                if (maxOps != std::numeric_limits<std::size_t>::max() && mergedOps > maxOps)
+                {
+                    rejectSize();
+                    return;
+                }
+
+                const double lhsWeight = lhs < agg.nodeWeight.size() ? agg.nodeWeight[lhs] : 0.0;
+                const double rhsWeight = rhs < agg.nodeWeight.size() ? agg.nodeWeight[rhs] : 0.0;
+                const double lhsChange = lhs < agg.nodeChangeWeight.size() ? agg.nodeChangeWeight[lhs] : 0.0;
+                const double rhsChange = rhs < agg.nodeChangeWeight.size() ? agg.nodeChangeWeight[rhs] : 0.0;
+                const double lhsActive = lhs < agg.nodeActiveProb.size() ? agg.nodeActiveProb[lhs] : 0.0;
+                const double rhsActive = rhs < agg.nodeActiveProb.size() ? agg.nodeActiveProb[rhs] : 0.0;
+                const std::uint64_t lhsFootprint =
+                    lhs < agg.nodeFootprintBytes.size() ? agg.nodeFootprintBytes[lhs] : 0;
+                const std::uint64_t rhsFootprint =
+                    rhs < agg.nodeFootprintBytes.size() ? agg.nodeFootprintBytes[rhs] : 0;
+                const std::uint64_t mergedFootprint = lhsFootprint + rhsFootprint;
+                if (options.footprintMaxBytes != 0 && mergedFootprint > options.footprintMaxBytes)
+                {
+                    rejectFootprint();
+                    return;
+                }
+
+                const double mergedWeight = lhsWeight + rhsWeight;
+                if (maxOps != std::numeric_limits<std::size_t>::max() &&
+                    mergedWeight > static_cast<double>(maxOps))
+                {
+                    rejectWeight();
+                    return;
+                }
+                const double mergedChange = lhsChange + rhsChange;
+                const double mergedActive = std::max(std::clamp(lhsActive, 0.0, 1.0),
+                                                     std::clamp(rhsActive, 0.0, 1.0));
+                const double phi = probCoarsenPhi(mergedWeight, mergedChange, mergedActive);
+                const double phiThreshold = mergedActive >= std::clamp(options.piHighThreshold, 0.0, 1.0)
+                                                ? std::max(0.0, options.phiMin * 0.5)
+                                                : std::max(0.0, options.phiMin);
+                if (phi + 1e-12 < phiThreshold)
+                {
+                    rejectPhi();
+                    return;
+                }
+
+                const double directSaved =
+                    edgeTotalProb(lhs, rhs) * rhsWeight + edgeTotalProb(rhs, lhs) * lhsWeight;
+                const double checkSaved =
+                    probCoarsenCheckCost(lhsActive, options) +
+                    probCoarsenCheckCost(rhsActive, options) -
+                    probCoarsenCheckCost(mergedActive, options);
+                const double beforeWork = lhsActive * lhsWeight + rhsActive * rhsWeight;
+                const double afterWork = mergedActive * mergedWeight;
+                const double gain = directSaved + checkSaved - std::max(0.0, afterWork - beforeWork);
+                const bool highActivity = mergedActive >= std::clamp(options.piHighThreshold, 0.0, 1.0);
+                if (gain < (highActivity ? 0.0 : 1e-12))
+                {
+                    return;
+                }
+                candidates.push_back(Candidate{
+                    lhs,
+                    rhs,
+                    gain,
+                    phi,
+                    mergedActive,
+                    mergedFootprint,
+                    mergedOps,
+                    sibling,
+                });
+            };
+
+            if (options.enableChainMerge)
+            {
+                for (uint32_t clusterId = 0; clusterId < view.members.size(); ++clusterId)
+                {
+                    if (clusterId >= view.succs.size() || view.succs[clusterId].size() != 1)
+                    {
+                        continue;
+                    }
+                    const uint32_t succ = view.succs[clusterId].front();
+                    if (succ < view.preds.size() && view.preds[succ].size() == 1 &&
+                        view.preds[succ].front() == clusterId)
+                    {
+                        considerCandidate(clusterId, succ, false);
+                    }
+                }
+            }
+
+            std::unordered_map<std::uint64_t, std::vector<std::vector<uint32_t>>> buckets;
+            buckets.reserve(view.members.size());
+            for (uint32_t clusterId = 0; clusterId < view.members.size(); ++clusterId)
+            {
+                if (view.preds[clusterId].empty())
+                {
+                    continue;
+                }
+                auto &bucket = buckets[nodeSiblingPredHash(view.preds[clusterId])];
+                auto groupIt = std::find_if(bucket.begin(),
+                                            bucket.end(),
+                                            [&](const auto &group)
+                                            {
+                                                return !group.empty() &&
+                                                       view.preds[group.front()] == view.preds[clusterId];
+                                            });
+                if (groupIt == bucket.end())
+                {
+                    bucket.push_back(std::vector<uint32_t>{clusterId});
+                }
+                else
+                {
+                    groupIt->push_back(clusterId);
+                }
+            }
+            for (auto &[_, bucket] : buckets)
+            {
+                for (auto &siblings : bucket)
+                {
+                    if (siblings.size() < 2)
+                    {
+                        continue;
+                    }
+                    std::sort(siblings.begin(), siblings.end());
+                    for (std::size_t i = 1; i < siblings.size(); ++i)
+                    {
+                        considerCandidate(siblings[i - 1], siblings[i], true);
+                    }
+                }
+            }
+
+            if (perf)
+            {
+                perf->probCoarsenCandidates += candidates.size();
+            }
+            if (candidates.empty())
+            {
+                return false;
+            }
+
+            std::sort(candidates.begin(),
+                      candidates.end(),
+                      [](const Candidate &lhs, const Candidate &rhs)
+                      {
+                          if (lhs.gain != rhs.gain)
+                          {
+                              return lhs.gain > rhs.gain;
+                          }
+                          if (lhs.sibling != rhs.sibling)
+                          {
+                              return lhs.sibling > rhs.sibling;
+                          }
+                          if (lhs.phi != rhs.phi)
+                          {
+                              return lhs.phi > rhs.phi;
+                          }
+                          if (lhs.footprint != rhs.footprint)
+                          {
+                              return lhs.footprint < rhs.footprint;
+                          }
+                          if (lhs.lhs != rhs.lhs)
+                          {
+                              return lhs.lhs < rhs.lhs;
+                          }
+                          return lhs.rhs < rhs.rhs;
+                      });
+
+            DisjointSet dsu(view.members.size());
+            std::vector<uint8_t> used(view.members.size(), 0);
+            bool changed = false;
+            std::size_t acceptedMerges = 0;
+            std::size_t acceptedSiblingMerges = 0;
+            std::size_t acceptedChainMerges = 0;
+            double acceptedGain = 0.0;
+            for (const auto &candidate : candidates)
+            {
+                uint32_t lhs = dsu.find(candidate.lhs);
+                uint32_t rhs = dsu.find(candidate.rhs);
+                if (lhs == rhs || used[candidate.lhs] != 0 || used[candidate.rhs] != 0)
+                {
+                    continue;
+                }
+                if (dsu.unite(lhs, rhs))
+                {
+                    used[candidate.lhs] = 1;
+                    used[candidate.rhs] = 1;
+                    changed = true;
+                    ++acceptedMerges;
+                    acceptedGain += candidate.gain;
+                    if (candidate.sibling)
+                    {
+                        ++acceptedSiblingMerges;
+                    }
+                    else
+                    {
+                        ++acceptedChainMerges;
+                    }
+                }
+            }
+            if (!changed)
+            {
+                return false;
+            }
+
+            std::unordered_map<uint32_t, uint32_t> rootToCluster;
+            std::vector<std::vector<uint32_t>> out;
+            out.reserve(view.members.size());
+            for (uint32_t clusterId = 0; clusterId < view.members.size(); ++clusterId)
+            {
+                const uint32_t root = dsu.find(clusterId);
+                auto [it, inserted] = rootToCluster.emplace(root, static_cast<uint32_t>(out.size()));
+                if (inserted)
+                {
+                    out.push_back({});
+                }
+                out[it->second].insert(out[it->second].end(),
+                                       view.members[clusterId].begin(),
+                                       view.members[clusterId].end());
+            }
+            out = canonicalizeNodeClusters(std::move(out), nodeTopoPos);
+            if (!orderNodeClustersTopologically(out, nodeDag, nodeCount, &rewrite, &graph))
+            {
+                if (perf)
+                {
+                    ++perf->probCoarsenRejectedCycle;
+                }
+                return false;
+            }
+            if (perf)
+            {
+                perf->probCoarsenMerges += acceptedMerges;
+                perf->probCoarsenTotalGain += acceptedGain;
+                perf->coarsenSiblingMerges += acceptedSiblingMerges;
+                perf->coarsenOut1Merges += acceptedChainMerges;
+            }
+            clusters = std::move(out);
+            return true;
+        }
+
         std::vector<std::vector<uint32_t>> buildComputeSupernodeSegments(const NodeClusterView &view,
                                                                          const ClusterValueEdges &valueEdges,
                                                                          const std::vector<uint32_t> &nodeOpSizes,
-                                                                         std::size_t maxNodes)
+                                                                         std::size_t maxNodes,
+                                                                         const std::vector<double> *valueWeights,
+                                                                         double segmentPenalty)
         {
             const std::size_t count = view.members.size();
             if (count == 0)
@@ -6179,16 +7517,23 @@ namespace wolvrix::lib::transform
                 return prefixSize[end] - prefixSize[begin];
             };
 
-            constexpr std::size_t kInf = std::numeric_limits<std::size_t>::max() / 4;
-            std::vector<std::size_t> dp(count + 1, kInf);
+            constexpr double kInf = std::numeric_limits<double>::infinity();
+            std::vector<double> dp(count + 1, kInf);
             std::vector<std::size_t> prev(count + 1, 0);
             std::vector<uint32_t> targetSeen(valueEdges.valueFanouts.size(), 0);
             std::vector<uint32_t> countedIncoming(valueEdges.valueFanouts.size(), 0);
+            const auto fanoutWeight = [&](uint32_t valueId) -> double {
+                if (valueWeights != nullptr && valueId < valueWeights->size())
+                {
+                    return std::max(0.0, (*valueWeights)[valueId]);
+                }
+                return 1.0;
+            };
             dp[0] = 0;
             for (std::size_t end = 1; end <= count; ++end)
             {
                 const uint32_t stamp = static_cast<uint32_t>(end);
-                std::size_t incomingActivationCost = 0;
+                double incomingActivationCost = 0.0;
                 for (std::size_t begin = end; begin > 0; --begin)
                 {
                     const std::size_t start = begin - 1;
@@ -6213,7 +7558,7 @@ namespace wolvrix::lib::transform
                             if (valueEdges.valueFanouts[valueId].sourceCluster < start)
                             {
                                 countedIncoming[valueId] = stamp;
-                                ++incomingActivationCost;
+                                incomingActivationCost += fanoutWeight(valueId);
                             }
                         }
                     }
@@ -6224,7 +7569,7 @@ namespace wolvrix::lib::transform
                             if (valueId < countedIncoming.size() && countedIncoming[valueId] == stamp)
                             {
                                 countedIncoming[valueId] = 0;
-                                --incomingActivationCost;
+                                incomingActivationCost -= fanoutWeight(valueId);
                             }
                         }
                     }
@@ -6232,10 +7577,9 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const std::size_t segmentPenalty = 1;
-                    const std::size_t candidate = dp[start] + incomingActivationCost + segmentPenalty;
-                    if (candidate < dp[end] ||
-                        (candidate == dp[end] && (end - start) > (end - prev[end])))
+                    const double candidate = dp[start] + incomingActivationCost + segmentPenalty;
+                    if (candidate + 1e-12 < dp[end] ||
+                        (std::fabs(candidate - dp[end]) <= 1e-12 && (end - start) > (end - prev[end])))
                     {
                         dp[end] = candidate;
                         prev[end] = start;
@@ -6269,6 +7613,468 @@ namespace wolvrix::lib::transform
                 }
                 segments.push_back(std::move(segment));
             }
+            return segments;
+        }
+
+        std::vector<double> buildProbSegmentValueWeights(const wolvrix::lib::grh::Graph &graph,
+                                                         const ActivityScheduleOptions &options,
+                                                         const ComputeRewriteBuild &rewrite,
+                                                         const ActivityCostModel &costModel,
+                                                         const ClusterValueEdges &valueEdges,
+                                                         const std::vector<float> &piByOpIndex)
+        {
+            std::vector<double> weights(valueEdges.valueFanouts.size(), 1.0);
+            for (uint32_t valueId = 0; valueId < valueEdges.fanoutValues.size(); ++valueId)
+            {
+                const auto value = valueEdges.fanoutValues[valueId];
+                const double pi = std::max(0.0,
+                                           activityPiForValue(graph,
+                                                              options,
+                                                              rewrite.canonicalValues,
+                                                              piByOpIndex,
+                                                              value));
+                const auto canonical = canonicalActivityValue(value, &rewrite.canonicalValues);
+                const auto defOp = graph.valueDef(canonical);
+                const double sourceWeight =
+                    defOp.valid() ? activityComputeWeightForOp(graph, rewrite.canonicalValues, costModel, defOp)
+                                  : static_cast<double>(activityComputeUnitsForWidth(graph.valueWidth(canonical)));
+                const double changeWeight = std::max(0.0, sourceWeight) * pi;
+                if (options.probDpCostMode == "pi")
+                {
+                    weights[valueId] = pi;
+                }
+                else if (options.probDpCostMode == "change")
+                {
+                    weights[valueId] = changeWeight;
+                }
+                else if (options.probDpCostMode == "mixed-change")
+                {
+                    weights[valueId] = 1.0 + std::max(0.0, options.probDpAlpha) * changeWeight;
+                }
+                else
+                {
+                    weights[valueId] = 1.0 + std::max(0.0, options.probDpAlpha) * pi;
+                }
+            }
+            return weights;
+        }
+
+        struct FmSegmentStats
+        {
+            std::size_t ops = 0;
+            std::uint64_t footprint = 0;
+            double weight = 0.0;
+            double changeWeight = 0.0;
+            double activeProb = 0.0;
+        };
+
+        bool probFmSegmentPhiOk(const FmSegmentStats &before,
+                                const FmSegmentStats &after,
+                                const ActivityScheduleOptions &options)
+        {
+            if (after.ops == 0)
+            {
+                return false;
+            }
+            const double threshold = after.activeProb >= std::clamp(options.piHighThreshold, 0.0, 1.0)
+                                         ? std::max(0.0, options.phiMin * 0.5)
+                                         : std::max(0.0, options.phiMin);
+            const double beforePhi = probCoarsenPhi(before.weight, before.changeWeight, before.activeProb);
+            const double afterPhi = probCoarsenPhi(after.weight, after.changeWeight, after.activeProb);
+            if (beforePhi + 1e-12 < threshold)
+            {
+                return afterPhi + 1e-12 >= beforePhi;
+            }
+            return afterPhi + 1e-12 >= threshold;
+        }
+
+        bool probFmMovePreservesSegmentTopo(const NodeClusterView &view,
+                                            const std::vector<uint32_t> &ownerByCluster,
+                                            uint32_t clusterId,
+                                            uint32_t newSegment)
+        {
+            if (clusterId >= ownerByCluster.size())
+            {
+                return false;
+            }
+            for (const uint32_t pred : view.preds[clusterId])
+            {
+                if (pred >= ownerByCluster.size())
+                {
+                    continue;
+                }
+                const uint32_t predSegment = ownerByCluster[pred];
+                if (predSegment == kInvalidActivitySupernodeId || predSegment == newSegment)
+                {
+                    continue;
+                }
+                if (predSegment >= newSegment)
+                {
+                    return false;
+                }
+            }
+            for (const uint32_t succ : view.succs[clusterId])
+            {
+                if (succ >= ownerByCluster.size())
+                {
+                    continue;
+                }
+                const uint32_t succSegment = ownerByCluster[succ];
+                if (succSegment == kInvalidActivitySupernodeId || succSegment == newSegment)
+                {
+                    continue;
+                }
+                if (newSegment >= succSegment)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        double probFmMoveGain(const ClusterValueEdges &valueEdges,
+                              const std::vector<double> &valueWeights,
+                              const std::vector<uint32_t> &ownerByCluster,
+                              uint32_t clusterId,
+                              uint32_t oldSegment,
+                              uint32_t newSegment)
+        {
+            double gain = 0.0;
+            const auto valueWeight = [&](uint32_t valueId) -> double {
+                if (valueId < valueWeights.size())
+                {
+                    return std::max(0.0, valueWeights[valueId]);
+                }
+                return 1.0;
+            };
+            const auto owner = [&](uint32_t cluster) -> uint32_t {
+                return cluster < ownerByCluster.size() ? ownerByCluster[cluster] : kInvalidActivitySupernodeId;
+            };
+            if (clusterId < valueEdges.sourceValuesByCluster.size())
+            {
+                for (const uint32_t valueId : valueEdges.sourceValuesByCluster[clusterId])
+                {
+                    if (valueId >= valueEdges.valueFanouts.size())
+                    {
+                        continue;
+                    }
+                    const double weight = valueWeight(valueId);
+                    for (const uint32_t targetCluster : valueEdges.valueFanouts[valueId].targetClusters)
+                    {
+                        const uint32_t targetSegment = owner(targetCluster);
+                        if (targetSegment == kInvalidActivitySupernodeId)
+                        {
+                            continue;
+                        }
+                        const double oldCut = targetSegment == oldSegment ? 0.0 : weight;
+                        const double newCut = targetSegment == newSegment ? 0.0 : weight;
+                        gain += oldCut - newCut;
+                    }
+                }
+            }
+            if (clusterId < valueEdges.targetValuesByCluster.size())
+            {
+                for (const uint32_t valueId : valueEdges.targetValuesByCluster[clusterId])
+                {
+                    if (valueId >= valueEdges.valueFanouts.size())
+                    {
+                        continue;
+                    }
+                    const uint32_t sourceSegment = owner(valueEdges.valueFanouts[valueId].sourceCluster);
+                    if (sourceSegment == kInvalidActivitySupernodeId)
+                    {
+                        continue;
+                    }
+                    const double weight = valueWeight(valueId);
+                    const double oldCut = sourceSegment == oldSegment ? 0.0 : weight;
+                    const double newCut = sourceSegment == newSegment ? 0.0 : weight;
+                    gain += oldCut - newCut;
+                }
+            }
+            return gain;
+        }
+
+        std::vector<std::vector<uint32_t>> refineComputeSupernodeSegmentsProb(
+            const NodeClusterView &view,
+            const ClusterValueEdges &valueEdges,
+            const std::vector<uint32_t> &nodeOpSizes,
+            std::vector<std::vector<uint32_t>> segments,
+            const ActivityHypergraphAggregate &clusterAgg,
+            const std::vector<double> &valueWeights,
+            const ActivityScheduleOptions &options,
+            std::size_t maxOps,
+            ComputeNodeMaterializePerfStats *perf)
+        {
+            if (segments.size() < 2 || options.fmRefineMaxRounds == 0)
+            {
+                return segments;
+            }
+            std::vector<uint32_t> ownerByCluster(view.members.size(), kInvalidActivitySupernodeId);
+            auto rebuildOwners = [&]() {
+                std::fill(ownerByCluster.begin(), ownerByCluster.end(), kInvalidActivitySupernodeId);
+                for (uint32_t segmentId = 0; segmentId < segments.size(); ++segmentId)
+                {
+                    for (const uint32_t clusterId : segments[segmentId])
+                    {
+                        if (clusterId < ownerByCluster.size())
+                        {
+                            ownerByCluster[clusterId] = segmentId;
+                        }
+                    }
+                }
+            };
+            rebuildOwners();
+
+            std::vector<std::size_t> clusterOps(view.members.size(), 0);
+            for (uint32_t clusterId = 0; clusterId < view.members.size(); ++clusterId)
+            {
+                clusterOps[clusterId] = clusterOpSize(view.members[clusterId], nodeOpSizes);
+            }
+
+            std::vector<FmSegmentStats> segmentStats(segments.size());
+            auto addClusterToStats = [&](FmSegmentStats &stats, uint32_t clusterId) {
+                if (clusterId >= view.members.size())
+                {
+                    return;
+                }
+                stats.ops += clusterOps[clusterId];
+                if (clusterId < clusterAgg.nodeFootprintBytes.size())
+                {
+                    stats.footprint += clusterAgg.nodeFootprintBytes[clusterId];
+                }
+                if (clusterId < clusterAgg.nodeWeight.size())
+                {
+                    stats.weight += clusterAgg.nodeWeight[clusterId];
+                }
+                if (clusterId < clusterAgg.nodeChangeWeight.size())
+                {
+                    stats.changeWeight += clusterAgg.nodeChangeWeight[clusterId];
+                }
+                if (clusterId < clusterAgg.nodeActiveProb.size())
+                {
+                    stats.activeProb =
+                        std::max(stats.activeProb, std::clamp(clusterAgg.nodeActiveProb[clusterId], 0.0, 1.0));
+                }
+            };
+            auto removeClusterFromStats = [&](FmSegmentStats stats, uint32_t clusterId) {
+                if (clusterId < clusterOps.size())
+                {
+                    stats.ops = stats.ops >= clusterOps[clusterId] ? stats.ops - clusterOps[clusterId] : 0;
+                }
+                if (clusterId < clusterAgg.nodeFootprintBytes.size())
+                {
+                    stats.footprint = stats.footprint >= clusterAgg.nodeFootprintBytes[clusterId]
+                                          ? stats.footprint - clusterAgg.nodeFootprintBytes[clusterId]
+                                          : 0;
+                }
+                if (clusterId < clusterAgg.nodeWeight.size())
+                {
+                    stats.weight -= clusterAgg.nodeWeight[clusterId];
+                }
+                if (clusterId < clusterAgg.nodeChangeWeight.size())
+                {
+                    stats.changeWeight -= clusterAgg.nodeChangeWeight[clusterId];
+                }
+                stats.weight = std::max(0.0, stats.weight);
+                stats.changeWeight = std::max(0.0, stats.changeWeight);
+                // Keep the old segment active probability as a conservative upper bound. Recomputing the
+                // exact max after each tentative move would require scanning the whole segment.
+                return stats;
+            };
+            for (uint32_t segmentId = 0; segmentId < segments.size(); ++segmentId)
+            {
+                for (const uint32_t clusterId : segments[segmentId])
+                {
+                    addClusterToStats(segmentStats[segmentId], clusterId);
+                }
+            }
+
+            struct Candidate
+            {
+                uint32_t cluster = 0;
+                uint32_t from = 0;
+                uint32_t to = 0;
+                double gain = 0.0;
+            };
+
+            for (std::size_t round = 0; round < options.fmRefineMaxRounds; ++round)
+            {
+                std::vector<Candidate> candidates;
+                std::size_t boundaryClusters = 0;
+                for (uint32_t clusterId = 0; clusterId < view.members.size(); ++clusterId)
+                {
+                    const uint32_t from = ownerByCluster[clusterId];
+                    if (from == kInvalidActivitySupernodeId || from >= segments.size())
+                    {
+                        continue;
+                    }
+                    std::vector<uint32_t> dests;
+                    dests.reserve(view.preds[clusterId].size() + view.succs[clusterId].size());
+                    for (const uint32_t pred : view.preds[clusterId])
+                    {
+                        if (pred < ownerByCluster.size() && ownerByCluster[pred] != from &&
+                            ownerByCluster[pred] != kInvalidActivitySupernodeId)
+                        {
+                            dests.push_back(ownerByCluster[pred]);
+                        }
+                    }
+                    for (const uint32_t succ : view.succs[clusterId])
+                    {
+                        if (succ < ownerByCluster.size() && ownerByCluster[succ] != from &&
+                            ownerByCluster[succ] != kInvalidActivitySupernodeId)
+                        {
+                            dests.push_back(ownerByCluster[succ]);
+                        }
+                    }
+                    if (dests.empty())
+                    {
+                        continue;
+                    }
+                    ++boundaryClusters;
+                    std::sort(dests.begin(), dests.end());
+                    dests.erase(std::unique(dests.begin(), dests.end()), dests.end());
+                    for (const uint32_t to : dests)
+                    {
+                        const double gain =
+                            probFmMoveGain(valueEdges, valueWeights, ownerByCluster, clusterId, from, to);
+                        if (gain > 1e-12)
+                        {
+                            candidates.push_back(Candidate{clusterId, from, to, gain});
+                        }
+                    }
+                }
+                if (perf)
+                {
+                    perf->fmRefineCandidates += candidates.size();
+                }
+                if (candidates.empty())
+                {
+                    break;
+                }
+                std::sort(candidates.begin(),
+                          candidates.end(),
+                          [](const Candidate &lhs, const Candidate &rhs)
+                          {
+                              if (lhs.gain != rhs.gain)
+                              {
+                                  return lhs.gain > rhs.gain;
+                              }
+                              if (lhs.cluster != rhs.cluster)
+                              {
+                                  return lhs.cluster < rhs.cluster;
+                              }
+                              return lhs.to < rhs.to;
+                          });
+
+                std::vector<uint8_t> movedThisRound(view.members.size(), 0);
+                std::size_t roundMoves = 0;
+                double roundGain = 0.0;
+                for (const Candidate &candidate : candidates)
+                {
+                    const uint32_t clusterId = candidate.cluster;
+                    if (clusterId >= ownerByCluster.size() || movedThisRound[clusterId] != 0)
+                    {
+                        continue;
+                    }
+                    const uint32_t from = ownerByCluster[clusterId];
+                    const uint32_t to = candidate.to;
+                    if (from == kInvalidActivitySupernodeId || to == kInvalidActivitySupernodeId ||
+                        from == to || from >= segments.size() || to >= segments.size())
+                    {
+                        continue;
+                    }
+                    if (segments[from].size() <= 1)
+                    {
+                        if (perf)
+                        {
+                            ++perf->fmRefineRejectedSize;
+                        }
+                        continue;
+                    }
+                    const double gain =
+                        probFmMoveGain(valueEdges, valueWeights, ownerByCluster, clusterId, from, to);
+                    if (gain <= 1e-12)
+                    {
+                        continue;
+                    }
+                    const std::size_t ops = clusterId < clusterOps.size() ? clusterOps[clusterId] : 0;
+                    if (maxOps != 0 && segmentStats[to].ops + ops > maxOps)
+                    {
+                        if (perf)
+                        {
+                            ++perf->fmRefineRejectedSize;
+                        }
+                        continue;
+                    }
+                    FmSegmentStats nextFrom = removeClusterFromStats(segmentStats[from], clusterId);
+                    FmSegmentStats nextTo = segmentStats[to];
+                    addClusterToStats(nextTo, clusterId);
+                    if (options.footprintMaxBytes != 0 && nextTo.footprint > options.footprintMaxBytes)
+                    {
+                        if (perf)
+                        {
+                            ++perf->fmRefineRejectedFootprint;
+                        }
+                        continue;
+                    }
+                    if (maxOps != 0 && nextTo.weight > static_cast<double>(maxOps))
+                    {
+                        if (perf)
+                        {
+                            ++perf->fmRefineRejectedWeight;
+                        }
+                        continue;
+                    }
+                    if (!probFmSegmentPhiOk(segmentStats[to], nextTo, options) ||
+                        !probFmSegmentPhiOk(segmentStats[from], nextFrom, options))
+                    {
+                        if (perf)
+                        {
+                            ++perf->fmRefineRejectedPhi;
+                        }
+                        continue;
+                    }
+                    if (!probFmMovePreservesSegmentTopo(view, ownerByCluster, clusterId, to))
+                    {
+                        if (perf)
+                        {
+                            ++perf->fmRefineRejectedCycle;
+                        }
+                        continue;
+                    }
+
+                    auto &fromMembers = segments[from];
+                    const auto eraseIt = std::find(fromMembers.begin(), fromMembers.end(), clusterId);
+                    if (eraseIt == fromMembers.end())
+                    {
+                        continue;
+                    }
+                    fromMembers.erase(eraseIt);
+                    segments[to].push_back(clusterId);
+                    std::sort(segments[to].begin(), segments[to].end());
+                    ownerByCluster[clusterId] = to;
+                    segmentStats[from] = nextFrom;
+                    segmentStats[to] = nextTo;
+                    movedThisRound[clusterId] = 1;
+                    ++roundMoves;
+                    roundGain += gain;
+                }
+                if (roundMoves == 0)
+                {
+                    break;
+                }
+                if (perf)
+                {
+                    ++perf->fmRefineRounds;
+                    perf->fmRefineMoves += roundMoves;
+                    perf->fmRefineTotalGain += roundGain;
+                }
+                if (boundaryClusters > 100 && roundMoves * 100 < boundaryClusters)
+                {
+                    break;
+                }
+            }
+
             return segments;
         }
 
@@ -6607,6 +8413,7 @@ namespace wolvrix::lib::transform
                                      std::string &error)
         {
             out = ComputeRewriteBuild{};
+            out.canonicalValues = canonicalValues;
             out.computeNodeOfOp.assign(opClasses.size(), kInvalidActivitySupernodeId);
             ComputeNodeBuilder builder(graph, options, opData, opClasses, out, error);
 
@@ -7087,6 +8894,10 @@ namespace wolvrix::lib::transform
 
         bool materializeComputeNodeSchedule(const wolvrix::lib::grh::Graph &graph,
                                             const ActivityScheduleOptions &options,
+                                            const ActivityOpData &opData,
+                                            const ActivityCostModel *costModel,
+                                            const std::vector<float> *piByOpIndex,
+                                            const ActivityHypergraphAggregate *probSeedHypergraph,
                                             ComputeRewriteBuild &rewrite,
                                             ActivityScheduleBuild &build,
                                             ComputeNodeMaterializePerfStats *perf,
@@ -7153,44 +8964,36 @@ namespace wolvrix::lib::transform
                     bool out1Changed = false;
                     bool in1Changed = false;
                     bool siblingsChanged = false;
-                    if (options.enableChainMerge)
+                    bool probChanged = false;
+                    if (options.partitionPolicy == "prob")
                     {
-                        const std::size_t clustersBeforeOut1 = clusters.size();
-                        out1Changed = tryMergeNodeOut1(clusters,
+                        if (costModel == nullptr || piByOpIndex == nullptr)
+                        {
+                            error = "activity-schedule prob coarsen missing probability cost model";
+                            return false;
+                        }
+                        probChanged = tryMergeNodeProb(clusters,
                                                        rewrite.computeDag,
                                                        rewrite.computeNodes.size(),
                                                        nodeTopoPos,
                                                        nodeOpSizes,
                                                        coarsenMaxOps,
                                                        rewrite,
-                                                       graph);
-                        if (out1Changed && perf)
-                        {
-                            perf->coarsenOut1Merges += clustersBeforeOut1 >= clusters.size()
-                                                           ? clustersBeforeOut1 - clusters.size()
-                                                           : 0;
-                        }
-                        changed = out1Changed || changed;
-
-                        const std::size_t clustersBeforeIn1 = clusters.size();
-                        in1Changed = tryMergeNodeIn1(clusters,
-                                                     rewrite.computeDag,
-                                                     rewrite.computeNodes.size(),
-                                                     nodeTopoPos,
-                                                     nodeOpSizes,
-                                                     coarsenMaxOps,
-                                                     rewrite,
-                                                     graph);
-                        if (in1Changed && perf)
-                        {
-                            perf->coarsenIn1Merges += clustersBeforeIn1 >= clusters.size()
-                                                          ? clustersBeforeIn1 - clusters.size()
-                                                          : 0;
-                        }
-                        changed = in1Changed || changed;
+                                                       graph,
+                                                       options,
+                                                       opData,
+                                                       *costModel,
+                                                       *piByOpIndex,
+                                                       probSeedHypergraph,
+                                                       perf);
+                        changed = probChanged || changed;
                     }
-                    const std::size_t clustersBeforeSiblings = clusters.size();
-                    siblingsChanged = tryMergeNodeSiblings(clusters,
+                    else
+                    {
+                        if (options.enableChainMerge)
+                        {
+                            const std::size_t clustersBeforeOut1 = clusters.size();
+                            out1Changed = tryMergeNodeOut1(clusters,
                                                            rewrite.computeDag,
                                                            rewrite.computeNodes.size(),
                                                            nodeTopoPos,
@@ -7198,13 +9001,48 @@ namespace wolvrix::lib::transform
                                                            coarsenMaxOps,
                                                            rewrite,
                                                            graph);
-                    if (siblingsChanged && perf)
-                    {
-                        perf->coarsenSiblingMerges += clustersBeforeSiblings >= clusters.size()
-                                                          ? clustersBeforeSiblings - clusters.size()
-                                                          : 0;
+                            if (out1Changed && perf)
+                            {
+                                perf->coarsenOut1Merges += clustersBeforeOut1 >= clusters.size()
+                                                               ? clustersBeforeOut1 - clusters.size()
+                                                               : 0;
+                            }
+                            changed = out1Changed || changed;
+
+                            const std::size_t clustersBeforeIn1 = clusters.size();
+                            in1Changed = tryMergeNodeIn1(clusters,
+                                                         rewrite.computeDag,
+                                                         rewrite.computeNodes.size(),
+                                                         nodeTopoPos,
+                                                         nodeOpSizes,
+                                                         coarsenMaxOps,
+                                                         rewrite,
+                                                         graph);
+                            if (in1Changed && perf)
+                            {
+                                perf->coarsenIn1Merges += clustersBeforeIn1 >= clusters.size()
+                                                              ? clustersBeforeIn1 - clusters.size()
+                                                              : 0;
+                            }
+                            changed = in1Changed || changed;
+                        }
+                        const std::size_t clustersBeforeSiblings = clusters.size();
+                        siblingsChanged = tryMergeNodeSiblings(clusters,
+                                                               rewrite.computeDag,
+                                                               rewrite.computeNodes.size(),
+                                                               nodeTopoPos,
+                                                               nodeOpSizes,
+                                                               coarsenMaxOps,
+                                                               rewrite,
+                                                               graph);
+                        if (siblingsChanged && perf)
+                        {
+                            perf->coarsenSiblingMerges += clustersBeforeSiblings >= clusters.size()
+                                                              ? clustersBeforeSiblings - clusters.size()
+                                                              : 0;
+                        }
+                        changed = siblingsChanged || changed;
                     }
-                    changed = siblingsChanged || changed;
                     if (perf)
                     {
                         const std::size_t clustersAfterIter = clusters.size();
@@ -7238,6 +9076,7 @@ namespace wolvrix::lib::transform
                             .out1Changed = out1Changed,
                             .in1Changed = in1Changed,
                             .siblingsChanged = siblingsChanged,
+                            .probChanged = probChanged,
                             .tailStopped = tailStopped,
                             .elapsedMs = elapsedMs(iterStart),
                         });
@@ -7297,11 +9136,81 @@ namespace wolvrix::lib::transform
 
             const auto dpSegmentStart = std::chrono::steady_clock::now();
             const auto clusterValueEdges = buildClusterValueEdges(clusterView, rewrite, graph);
-            const auto segments =
-                buildComputeSupernodeSegments(clusterView, clusterValueEdges, nodeOpSizes, maxOpsPerComputeSupernode);
+            std::vector<double> probSegmentValueWeights;
+            const std::vector<double> *segmentValueWeights = nullptr;
+            if (options.partitionPolicy == "prob" && options.probDpCost && piByOpIndex != nullptr)
+            {
+                probSegmentValueWeights =
+                    buildProbSegmentValueWeights(graph,
+                                                 options,
+                                                 rewrite,
+                                                 *costModel,
+                                                 clusterValueEdges,
+                                                 *piByOpIndex);
+                segmentValueWeights = &probSegmentValueWeights;
+            }
+            const double dpSegmentPenalty =
+                (options.partitionPolicy == "prob" && options.probDpCost)
+                    ? std::max(0.0, options.probDpSegmentPenalty)
+                    : 1.0;
+            auto segments =
+                buildComputeSupernodeSegments(clusterView,
+                                              clusterValueEdges,
+                                              nodeOpSizes,
+                                              maxOpsPerComputeSupernode,
+                                              segmentValueWeights,
+                                              dpSegmentPenalty);
             if (perf)
             {
                 perf->dpSegmentMs = elapsedMs(dpSegmentStart);
+                perf->segments = segments.size();
+            }
+
+            const auto fmRefineStart = std::chrono::steady_clock::now();
+            if (options.partitionPolicy == "prob" &&
+                options.fmRefineMaxRounds != 0 &&
+                costModel != nullptr &&
+                piByOpIndex != nullptr)
+            {
+                std::vector<double> fmValueWeights =
+                    !probSegmentValueWeights.empty()
+                        ? probSegmentValueWeights
+                        : buildProbSegmentValueWeights(graph,
+                                                       options,
+                                                       rewrite,
+                                                       *costModel,
+                                                       clusterValueEdges,
+                                                       *piByOpIndex);
+                const bool canUseSeed =
+                    probSeedHypergraph != nullptr &&
+                    probSeedHypergraph->nodeWeight.size() >= rewrite.computeNodes.size() &&
+                    probSeedHypergraph->nodeChangeWeight.size() >= rewrite.computeNodes.size() &&
+                    probSeedHypergraph->nodeFootprintBytes.size() >= rewrite.computeNodes.size() &&
+                    probSeedHypergraph->nodeActiveProb.size() >= rewrite.computeNodes.size() &&
+                    probSeedHypergraph->nodeOpCount.size() >= rewrite.computeNodes.size();
+                const ProbCoarsenClusterAggregate fmAgg =
+                    canUseSeed
+                        ? buildProbCoarsenClusterAggregateFromSeed(*probSeedHypergraph, clusterView)
+                        : buildProbCoarsenClusterAggregateFromGraph(graph,
+                                                                   options,
+                                                                   opData,
+                                                                   rewrite,
+                                                                   clusterView,
+                                                                   *costModel,
+                                                                   *piByOpIndex);
+                segments = refineComputeSupernodeSegmentsProb(clusterView,
+                                                              clusterValueEdges,
+                                                              nodeOpSizes,
+                                                              std::move(segments),
+                                                              fmAgg.aggregate,
+                                                              fmValueWeights,
+                                                              options,
+                                                              maxOpsPerComputeSupernode,
+                                                              perf);
+            }
+            if (perf)
+            {
+                perf->fmRefineMs = elapsedMs(fmRefineStart);
                 perf->segments = segments.size();
             }
 
@@ -7698,7 +9607,25 @@ namespace wolvrix::lib::transform
             result.failed = true;
             return result;
         }
+        if (options_.probDpCostMode != "pi" &&
+            options_.probDpCostMode != "mixed-pi" &&
+            options_.probDpCostMode != "change" &&
+            options_.probDpCostMode != "mixed-change")
+        {
+            error("activity-schedule -prob-dp-cost-mode must be pi, mixed-pi, change, or mixed-change");
+            result.failed = true;
+            return result;
+        }
         logInfo("activity-schedule partition policy: " + options_.partitionPolicy);
+        if (options_.partitionPolicy == "prob")
+        {
+            logInfo("activity-schedule prob dp: enabled=" +
+                    std::string(options_.probDpCost ? "true" : "false") +
+                    " mode=" + options_.probDpCostMode +
+                    " alpha=" + std::to_string(options_.probDpAlpha) +
+                    " segment_penalty=" + std::to_string(options_.probDpSegmentPenalty) +
+                    " fm_rounds=" + std::to_string(options_.fmRefineMaxRounds));
+        }
 
         std::string resolveError;
         const std::optional<std::string> targetGraphName =
@@ -7769,6 +9696,8 @@ namespace wolvrix::lib::transform
         // 不改 plain 路径与调度输出）。piByOpIndex 在 source clone 后的 opData 重建中仍有效，
         // 用于检视 pi 模型；后续 Phase B/C/E 的成本/增益再消费它。
         std::vector<float> piByOpIndex;
+        ActivityCostModel costModel;
+        ActivityHypergraphAggregate hypergraph;
         if (options_.partitionPolicy == "prob")
         {
             ActivityPiStats piStats;
@@ -7814,6 +9743,39 @@ namespace wolvrix::lib::transform
                                std::to_string(piStats.depthCnt[d]) + ")";
             }
             logInfo(piDepthLine);
+
+            ActivityCostStats costStats;
+            costModel = computeActivityCostModel(*graph, opData, piByOpIndex, costStats);
+            logInfo("activity-schedule cost-model: ops=" +
+                    std::to_string(costStats.eligibleOps) +
+                    " const=" + std::to_string(costStats.constOps) +
+                    " src=" + std::to_string(costStats.srcOps) +
+                    " comp=" + std::to_string(costStats.compOps) +
+                    " sink=" + std::to_string(costStats.sinkOps) +
+                    " total_weight=" + std::to_string(costStats.totalComputeWeight) +
+                    " total_change_weight=" + std::to_string(costStats.totalChangeWeight) +
+                    " total_footprint_bytes=" + std::to_string(costStats.totalFootprintBytes) +
+                    " units[1]=" + std::to_string(costStats.widthUnitHistogram[0]) +
+                    " [2]=" + std::to_string(costStats.widthUnitHistogram[1]) +
+                    " [3,4]=" + std::to_string(costStats.widthUnitHistogram[2]) +
+                    " [5,8]=" + std::to_string(costStats.widthUnitHistogram[3]) +
+                    " [9,16]=" + std::to_string(costStats.widthUnitHistogram[4]) +
+                    " [17+]=" + std::to_string(costStats.widthUnitHistogram[5]));
+
+            std::string costKindLine = "activity-schedule cost weight mean by kind:";
+            for (std::size_t k = 0; k < 64; ++k)
+            {
+                if (costStats.kindCnt[k] == 0)
+                {
+                    continue;
+                }
+                const double mean = costStats.kindWeightSum[k] / static_cast<double>(costStats.kindCnt[k]);
+                costKindLine +=
+                    " " +
+                    std::string(wolvrix::lib::grh::toString(static_cast<wolvrix::lib::grh::OperationKind>(k))) +
+                    "=" + std::to_string(mean) + "(" + std::to_string(costStats.kindCnt[k]) + ")";
+            }
+            logInfo(costKindLine);
         }
 
         std::vector<ActivityOpClass> opClasses = buildOpClasses(*graph, opData.maxOpIndex);
@@ -7898,6 +9860,28 @@ namespace wolvrix::lib::transform
                     " split_frac=" + std::to_string(splitFrac) +
                     " mffc_groups=" + std::to_string(mffc.mffcGroups) +
                     " compute_nodes=" + std::to_string(rewrite.computeNodes.size()));
+
+            // NO0207 Phase C：以 computeNode=MFFC seed 为节点，构建概率超图聚合（只读）。
+            const auto hyperStart = std::chrono::steady_clock::now();
+            std::vector<std::vector<uint32_t>> singletonClusters(rewrite.computeNodes.size());
+            for (uint32_t nodeId = 0; nodeId < rewrite.computeNodes.size(); ++nodeId)
+            {
+                singletonClusters[nodeId].push_back(nodeId);
+            }
+            const NodeClusterView hyperView =
+                buildNodeClusterView(singletonClusters, rewrite.computeDag, rewrite.computeNodes.size());
+            hypergraph = buildActivityHypergraphAggregate(*graph,
+                                                          options_,
+                                                          opData,
+                                                          rewrite,
+                                                          hyperView,
+                                                          costModel,
+                                                          piByOpIndex);
+            logInfo("activity-schedule probability-hypergraph: " +
+                    summarizeActivityHypergraphAggregate(hypergraph) +
+                    " elapsed_ms=" + std::to_string(elapsedMs(hyperStart)));
+            logInfo("activity-schedule probability-hypergraph top-footprint: " +
+                    summarizeTopActivityHypergraphNodes(hypergraph, 8));
         }
         if (!exportComputeDagJson(*graph, options_, rewrite, buildError))
         {
@@ -7927,14 +9911,18 @@ namespace wolvrix::lib::transform
         logInfo("activity-schedule progress: final_materialize start");
         if (options_.partitionPolicy == "prob")
         {
-            // NO0207 概率驱动划分：当前仅建立框架与门控开关，作为后续阶段的接缝。
-            // Phase A–G（概率传播 / 节点成本 / 超图聚合 / MFFC 校验 / 增益粗化 /
-            // 概率加权 DP / FM 精修）尚未实现；暂经 plain 路径产出，保证与现状逐字节
-            // 一致、开关可安全开启。后续按 NO0208 进展逐阶段在此接缝处替换。
-            logInfo("activity-schedule partition_policy=prob: probability algorithm not yet "
-                    "implemented; routing through plain coarsen (identical output)");
+            logInfo("activity-schedule partition_policy=prob: using probability-driven compute coarsen");
         }
-        if (!materializeComputeNodeSchedule(*graph, options_, rewrite, build, &materializePerf, buildError))
+        if (!materializeComputeNodeSchedule(*graph,
+                                            options_,
+                                            opData,
+                                            options_.partitionPolicy == "prob" ? &costModel : nullptr,
+                                            options_.partitionPolicy == "prob" ? &piByOpIndex : nullptr,
+                                            options_.partitionPolicy == "prob" ? &hypergraph : nullptr,
+                                            rewrite,
+                                            build,
+                                            &materializePerf,
+                                            buildError))
         {
             error(*graph, buildError);
             result.failed = true;
@@ -7971,8 +9959,99 @@ namespace wolvrix::lib::transform
             // NO0207 Phase A：导出 PRE-clone 静态变化概率，供检视/校验（按 op index，-1=非 eligible）。
             setSessionValue(keyPrefix + "op_pi", piByOpIndex, "activity-schedule.op-pi");
         }
+        if (!costModel.computeWeightByOpIndex.empty())
+        {
+            // NO0207 Phase B：导出 PRE-clone op 级成本模型。compute_weight 是执行槽位成本，
+            // change_weight=compute_weight*pi，footprint_bytes 是宿主 L1D 工作集估计。
+            setSessionValue(keyPrefix + "op_compute_weight",
+                            costModel.computeWeightByOpIndex,
+                            "activity-schedule.op-compute-weight");
+            setSessionValue(keyPrefix + "op_change_weight",
+                            costModel.changeWeightByOpIndex,
+                            "activity-schedule.op-change-weight");
+            setSessionValue(keyPrefix + "op_footprint_bytes",
+                            costModel.footprintBytesByOpIndex,
+                            "activity-schedule.op-footprint-bytes");
+        }
+        if (!hypergraph.nodeWeight.empty())
+        {
+            // NO0207 Phase C：导出 computeNode 层概率超图聚合。当前仅分析/供后续 Phase E/F 消费，
+            // 不影响 materialize 输出。
+            setSessionValue(keyPrefix + "compute_node_weight",
+                            hypergraph.nodeWeight,
+                            "activity-schedule.compute-node-weight");
+            setSessionValue(keyPrefix + "compute_node_change_weight",
+                            hypergraph.nodeChangeWeight,
+                            "activity-schedule.compute-node-change-weight");
+            setSessionValue(keyPrefix + "compute_node_footprint_bytes",
+                            hypergraph.nodeFootprintBytes,
+                            "activity-schedule.compute-node-footprint-bytes");
+            setSessionValue(keyPrefix + "compute_node_active_prob",
+                            hypergraph.nodeActiveProb,
+                            "activity-schedule.compute-node-active-prob");
+            setSessionValue(keyPrefix + "compute_node_min_topo",
+                            hypergraph.nodeMinTopo,
+                            "activity-schedule.compute-node-min-topo");
+            setSessionValue(keyPrefix + "compute_node_max_topo",
+                            hypergraph.nodeMaxTopo,
+                            "activity-schedule.compute-node-max-topo");
+            setSessionValue(keyPrefix + "compute_node_op_count",
+                            hypergraph.nodeOpCount,
+                            "activity-schedule.compute-node-op-count");
+            setSessionValue(keyPrefix + "compute_node_edge_from",
+                            hypergraph.edgeFrom,
+                            "activity-schedule.compute-node-edge-from");
+            setSessionValue(keyPrefix + "compute_node_edge_to",
+                            hypergraph.edgeTo,
+                            "activity-schedule.compute-node-edge-to");
+            setSessionValue(keyPrefix + "compute_node_edge_count",
+                            hypergraph.edgeCount,
+                            "activity-schedule.compute-node-edge-count");
+            setSessionValue(keyPrefix + "compute_node_edge_total_prob",
+                            hypergraph.edgeTotalProb,
+                            "activity-schedule.compute-node-edge-total-prob");
+        }
+        if (options_.partitionPolicy == "prob")
+        {
+            std::ostringstream probStats;
+            probStats << "candidates=" << materializePerf.probCoarsenCandidates
+                      << " merges=" << materializePerf.probCoarsenMerges
+                      << " gain=" << materializePerf.probCoarsenTotalGain
+                      << " reject_size=" << materializePerf.probCoarsenRejectedSize
+                      << " reject_footprint=" << materializePerf.probCoarsenRejectedFootprint
+                      << " reject_phi=" << materializePerf.probCoarsenRejectedPhi
+                      << " reject_weight=" << materializePerf.probCoarsenRejectedWeight
+                      << " reject_cycle=" << materializePerf.probCoarsenRejectedCycle
+                      << " seed_aggregates=" << materializePerf.probCoarsenSeedAggregates
+                      << " full_aggregates=" << materializePerf.probCoarsenFullAggregates
+                      << " aggregate_ms=" << materializePerf.probCoarsenAggregateMs
+                      << " fm_rounds=" << materializePerf.fmRefineRounds
+                      << " fm_candidates=" << materializePerf.fmRefineCandidates
+                      << " fm_moves=" << materializePerf.fmRefineMoves
+                      << " fm_gain=" << materializePerf.fmRefineTotalGain
+                      << " fm_reject_size=" << materializePerf.fmRefineRejectedSize
+                      << " fm_reject_footprint=" << materializePerf.fmRefineRejectedFootprint
+                      << " fm_reject_phi=" << materializePerf.fmRefineRejectedPhi
+                      << " fm_reject_weight=" << materializePerf.fmRefineRejectedWeight
+                      << " fm_reject_cycle=" << materializePerf.fmRefineRejectedCycle
+                      << " fm_ms=" << materializePerf.fmRefineMs;
+            setSessionValue(keyPrefix + "prob_coarsen_stats",
+                            probStats.str(),
+                            "activity-schedule.prob-coarsen-stats");
+        }
+        ActivityScheduleValueWeightStats valueWeightStats;
+        const ActivityScheduleValueWeightStats *summaryValueWeights = nullptr;
+        if (options_.partitionPolicy == "prob" && !piByOpIndex.empty())
+        {
+            valueWeightStats = buildActivityScheduleValueWeightStats(*graph,
+                                                                     options_,
+                                                                     rewrite,
+                                                                     costModel,
+                                                                     piByOpIndex);
+            summaryValueWeights = &valueWeightStats;
+        }
         const ActivityScheduleSummaryStats summaryStats =
-            buildActivityScheduleSummaryStats(build, rewrite, opData, *graph);
+            buildActivityScheduleSummaryStats(build, rewrite, opData, *graph, summaryValueWeights);
         setSessionValue(keyPrefix + "summary_stats",
                         encodeActivityScheduleSummaryStatsJson(summaryStats),
                         "stats");
@@ -8002,6 +10081,7 @@ namespace wolvrix::lib::transform
                 " topo_after_coarsen=" + std::to_string(materializePerf.topoAfterCoarsenMs) +
                 " build_cluster_view=" + std::to_string(materializePerf.buildClusterViewMs) +
                 " dp_segment=" + std::to_string(materializePerf.dpSegmentMs) +
+                " fm_refine=" + std::to_string(materializePerf.fmRefineMs) +
                 " flatten_segments=" + std::to_string(materializePerf.flattenSegmentsMs) +
                 " build_final_supernodes=" + std::to_string(materializePerf.buildFinalSupernodesMs) +
                 " build_final_dag=" + std::to_string(materializePerf.buildFinalDagMs) +
@@ -8018,6 +10098,26 @@ namespace wolvrix::lib::transform
                 " out1_merges=" + std::to_string(materializePerf.coarsenOut1Merges) +
                 " in1_merges=" + std::to_string(materializePerf.coarsenIn1Merges) +
                 " sibling_merges=" + std::to_string(materializePerf.coarsenSiblingMerges) +
+                " prob_candidates=" + std::to_string(materializePerf.probCoarsenCandidates) +
+                " prob_merges=" + std::to_string(materializePerf.probCoarsenMerges) +
+                " prob_gain=" + std::to_string(materializePerf.probCoarsenTotalGain) +
+                " prob_reject_size=" + std::to_string(materializePerf.probCoarsenRejectedSize) +
+                " prob_reject_footprint=" + std::to_string(materializePerf.probCoarsenRejectedFootprint) +
+                " prob_reject_phi=" + std::to_string(materializePerf.probCoarsenRejectedPhi) +
+                " prob_reject_weight=" + std::to_string(materializePerf.probCoarsenRejectedWeight) +
+                " prob_reject_cycle=" + std::to_string(materializePerf.probCoarsenRejectedCycle) +
+                " prob_seed_aggregates=" + std::to_string(materializePerf.probCoarsenSeedAggregates) +
+                " prob_full_aggregates=" + std::to_string(materializePerf.probCoarsenFullAggregates) +
+                " prob_aggregate_ms=" + std::to_string(materializePerf.probCoarsenAggregateMs) +
+                " fm_rounds=" + std::to_string(materializePerf.fmRefineRounds) +
+                " fm_candidates=" + std::to_string(materializePerf.fmRefineCandidates) +
+                " fm_moves=" + std::to_string(materializePerf.fmRefineMoves) +
+                " fm_gain=" + std::to_string(materializePerf.fmRefineTotalGain) +
+                " fm_reject_size=" + std::to_string(materializePerf.fmRefineRejectedSize) +
+                " fm_reject_footprint=" + std::to_string(materializePerf.fmRefineRejectedFootprint) +
+                " fm_reject_phi=" + std::to_string(materializePerf.fmRefineRejectedPhi) +
+                " fm_reject_weight=" + std::to_string(materializePerf.fmRefineRejectedWeight) +
+                " fm_reject_cycle=" + std::to_string(materializePerf.fmRefineRejectedCycle) +
                 " clusters_before=" + std::to_string(materializePerf.clustersBeforeCoarsen) +
                 " clusters_after=" + std::to_string(materializePerf.clustersAfterCoarsen) +
                 " tail_stopped=" + std::string(materializePerf.coarsenTailStopped ? "true" : "false") +
@@ -8034,6 +10134,7 @@ namespace wolvrix::lib::transform
                     " out1=" + (iter.out1Changed ? std::string("1") : std::string("0")) +
                     " in1=" + (iter.in1Changed ? std::string("1") : std::string("0")) +
                     " siblings=" + (iter.siblingsChanged ? std::string("1") : std::string("0")) +
+                    " prob=" + (iter.probChanged ? std::string("1") : std::string("0")) +
                     " tail_stop=" + (iter.tailStopped ? std::string("1") : std::string("0")) +
                     " elapsed_ms=" + std::to_string(iter.elapsedMs));
         }
