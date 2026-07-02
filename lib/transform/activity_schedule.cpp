@@ -3,6 +3,7 @@
 #include "core/toposort.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cctype>
@@ -338,6 +339,20 @@ namespace wolvrix::lib::transform
 
         bool isRegToMemIntentSlice(const wolvrix::lib::grh::Operation &op);
 
+        std::optional<wolvrix::lib::grh::ValueId>
+        regToMemIntentSliceIndexValue(const wolvrix::lib::grh::Graph &graph,
+                                      const wolvrix::lib::grh::Operation &op);
+
+        wolvrix::lib::grh::OperationId activityCanonicalDataOpForOp(
+            const wolvrix::lib::grh::Graph &graph,
+            wolvrix::lib::grh::OperationId opId,
+            const ValueCanonicalMap &canonicalValues);
+
+        std::uint64_t activityComputeUnitsForWidth(int32_t width) noexcept;
+
+        int32_t activityOpResultWidth(const wolvrix::lib::grh::Graph &graph,
+                                      wolvrix::lib::grh::OperationId opId);
+
         std::vector<std::string>
         regToMemIntentSliceStorageReadSymbols(const wolvrix::lib::grh::Graph &graph,
                                               const wolvrix::lib::grh::Operation &op);
@@ -356,6 +371,2286 @@ namespace wolvrix::lib::transform
                 return 0.0;
             }
             return std::max(0.0, (*weights)[valueIndex]);
+        }
+
+        std::string activityScheduleCbawSourceKindName(wolvrix::lib::grh::OperationKind kind)
+        {
+            switch (kind)
+            {
+            case wolvrix::lib::grh::OperationKind::kRegisterReadPort:
+            case wolvrix::lib::grh::OperationKind::kLatchReadPort:
+                return "state_read";
+            case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
+                return "memory_read";
+            case wolvrix::lib::grh::OperationKind::kConstant:
+                return "constant";
+            default:
+                return "compute_like";
+            }
+        }
+
+        std::string activityScheduleCbawTargetKindName(const ActivityScheduleBuild &build,
+                                                       uint32_t supernode)
+        {
+            if (supernode >= build.supernodeKinds.size())
+            {
+                return "unknown";
+            }
+            return build.supernodeKinds[supernode] == ActivityScheduleSupernodeKind::Commit ? "commit"
+                                                                                            : "compute";
+        }
+
+        std::size_t activityScheduleValueByteCost(const wolvrix::lib::grh::Graph &graph,
+                                                  std::size_t valueIndex)
+        {
+            if (valueIndex == 0 || valueIndex > graph.values().size())
+            {
+                return 1;
+            }
+            wolvrix::lib::grh::ValueId value;
+            value.graph = graph.id();
+            value.index = static_cast<uint32_t>(valueIndex);
+            const int32_t width = graph.valueWidth(value);
+            if (width <= 0)
+            {
+                return 1;
+            }
+            return static_cast<std::size_t>((static_cast<std::uint64_t>(width) + 7u) / 8u);
+        }
+
+        std::size_t percentileFromSorted(const std::vector<std::size_t> &values,
+                                         std::size_t numerator,
+                                         std::size_t denominator)
+        {
+            if (values.empty())
+            {
+                return 0;
+            }
+            const std::size_t index =
+                ((values.size() - 1) * numerator + denominator - 1) / denominator;
+            return values[std::min(index, values.size() - 1)];
+        }
+
+        bool activityScheduleDagHasCycle(const ActivityScheduleDag &dag)
+        {
+            std::vector<uint32_t> indegree(dag.size(), 0);
+            for (const auto &succs : dag)
+            {
+                for (const uint32_t succ : succs)
+                {
+                    if (succ < indegree.size())
+                    {
+                        ++indegree[succ];
+                    }
+                }
+            }
+            std::vector<uint32_t> stack;
+            stack.reserve(dag.size());
+            for (uint32_t node = 0; node < indegree.size(); ++node)
+            {
+                if (indegree[node] == 0)
+                {
+                    stack.push_back(node);
+                }
+            }
+            std::size_t visited = 0;
+            while (!stack.empty())
+            {
+                const uint32_t node = stack.back();
+                stack.pop_back();
+                ++visited;
+                if (node >= dag.size())
+                {
+                    continue;
+                }
+                for (const uint32_t succ : dag[node])
+                {
+                    if (succ < indegree.size() && --indegree[succ] == 0)
+                    {
+                        stack.push_back(succ);
+                    }
+                }
+            }
+            return visited != dag.size();
+        }
+
+        std::uint64_t packActivitySchedulePair(uint32_t lhs, uint32_t rhs) noexcept
+        {
+            return (static_cast<std::uint64_t>(lhs) << 32) | static_cast<std::uint64_t>(rhs);
+        }
+
+        bool activityScheduleOpUsesValue(const wolvrix::lib::grh::Graph &graph,
+                                         wolvrix::lib::grh::OperationId opId,
+                                         wolvrix::lib::grh::ValueId value)
+        {
+            if (!opId.valid() || !value.valid())
+            {
+                return false;
+            }
+            const auto op = graph.getOperation(opId);
+            for (const auto operand : op.operands())
+            {
+                if (operand == value)
+                {
+                    return true;
+                }
+            }
+            if (isRegToMemIntentSlice(op))
+            {
+                if (const auto indexValue = regToMemIntentSliceIndexValue(graph, op))
+                {
+                    return *indexValue == value;
+                }
+            }
+            return false;
+        }
+
+        std::size_t activityScheduleHelperCallEstimate(wolvrix::lib::grh::OperationKind kind,
+                                                       int32_t width) noexcept
+        {
+            const bool wide = width > 64;
+            switch (kind)
+            {
+            case wolvrix::lib::grh::OperationKind::kDiv:
+            case wolvrix::lib::grh::OperationKind::kMod:
+                return 1;
+            case wolvrix::lib::grh::OperationKind::kConcat:
+            case wolvrix::lib::grh::OperationKind::kReplicate:
+            case wolvrix::lib::grh::OperationKind::kSliceStatic:
+            case wolvrix::lib::grh::OperationKind::kSliceDynamic:
+            case wolvrix::lib::grh::OperationKind::kSliceArray:
+            case wolvrix::lib::grh::OperationKind::kShl:
+            case wolvrix::lib::grh::OperationKind::kLShr:
+            case wolvrix::lib::grh::OperationKind::kAShr:
+                return wide ? 1 : 0;
+            case wolvrix::lib::grh::OperationKind::kSystemFunction:
+            case wolvrix::lib::grh::OperationKind::kDpicCall:
+                return 1;
+            default:
+                return 0;
+            }
+        }
+
+        std::size_t activityScheduleBranchEstimate(wolvrix::lib::grh::OperationKind kind) noexcept
+        {
+            switch (kind)
+            {
+            case wolvrix::lib::grh::OperationKind::kMux:
+            case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
+            case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+            case wolvrix::lib::grh::OperationKind::kLatchWritePort:
+            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
+            case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
+            case wolvrix::lib::grh::OperationKind::kSystemTask:
+                return 1;
+            default:
+                return 0;
+            }
+        }
+
+        void recordActivityScheduleResourceDistribution(
+            ActivityScheduleCbawStats::KindCountMap &p50,
+            ActivityScheduleCbawStats::KindCountMap &p90,
+            ActivityScheduleCbawStats::KindCountMap &p99,
+            ActivityScheduleCbawStats::KindCountMap &p995,
+            ActivityScheduleCbawStats::KindCountMap &maxValues,
+            ActivityScheduleCbawStats::KindCountMap &caps,
+            ActivityScheduleCbawStats::KindCountMap &exceptions,
+            std::string_view name,
+            std::vector<std::size_t> values)
+        {
+            std::sort(values.begin(), values.end());
+            const std::string key(name);
+            p50[key] = percentileFromSorted(values, 50, 100);
+            p90[key] = percentileFromSorted(values, 90, 100);
+            p99[key] = percentileFromSorted(values, 99, 100);
+            p995[key] = percentileFromSorted(values, 995, 1000);
+            maxValues[key] = values.empty() ? 0 : values.back();
+            const std::size_t cap = p995[key] == 0 ? maxValues[key] : p995[key];
+            caps[key] = cap;
+            exceptions[key] =
+                cap == 0
+                    ? 0
+                    : static_cast<std::size_t>(std::count_if(values.begin(),
+                                                             values.end(),
+                                                             [&](std::size_t value)
+                                                             { return value > cap; }));
+        }
+
+        struct ActivityScheduleTriggerSignature
+        {
+            std::array<std::uint64_t, 4> words{};
+
+            bool operator==(const ActivityScheduleTriggerSignature &other) const noexcept
+            {
+                return words == other.words;
+            }
+
+            bool empty() const noexcept
+            {
+                return words[0] == 0 && words[1] == 0 && words[2] == 0 && words[3] == 0;
+            }
+
+            void mergeFrom(const ActivityScheduleTriggerSignature &other) noexcept
+            {
+                for (std::size_t i = 0; i < words.size(); ++i)
+                {
+                    words[i] |= other.words[i];
+                }
+            }
+        };
+
+        struct ActivityScheduleTriggerSignatureHash
+        {
+            std::size_t operator()(const ActivityScheduleTriggerSignature &signature) const noexcept
+            {
+                std::uint64_t hash = 0x9e3779b97f4a7c15ull;
+                for (const auto word : signature.words)
+                {
+                    hash ^= word + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+                }
+                return static_cast<std::size_t>(hash);
+            }
+        };
+
+        std::uint64_t activityScheduleSplitMix64(std::uint64_t value) noexcept
+        {
+            value += 0x9e3779b97f4a7c15ull;
+            value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
+            value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
+            return value ^ (value >> 31);
+        }
+
+        void activityScheduleAddTrigger(ActivityScheduleTriggerSignature &signature,
+                                        wolvrix::lib::grh::ValueId canonicalValue) noexcept
+        {
+            constexpr std::size_t kTriggerSignatureBits = 256;
+            constexpr std::size_t kTriggerSignatureHashFunctions = 4;
+            const std::uint64_t seed = static_cast<std::uint64_t>(canonicalValue.index);
+            for (std::size_t hashIndex = 0; hashIndex < kTriggerSignatureHashFunctions; ++hashIndex)
+            {
+                const std::uint64_t hash =
+                    activityScheduleSplitMix64(seed ^ (0xd6e8feb86659fd93ull * (hashIndex + 1)));
+                const std::size_t bit = static_cast<std::size_t>(hash % kTriggerSignatureBits);
+                signature.words[bit / 64] |= std::uint64_t{1} << (bit % 64);
+            }
+        }
+
+        std::size_t activityScheduleTriggerPopcount(const ActivityScheduleTriggerSignature &signature) noexcept
+        {
+            std::size_t count = 0;
+            for (const auto word : signature.words)
+            {
+                count += static_cast<std::size_t>(__builtin_popcountll(word));
+            }
+            return count;
+        }
+
+        std::size_t activityScheduleEstimatedTriggerCount(std::size_t popcount) noexcept
+        {
+            constexpr double kTriggerSignatureBits = 256.0;
+            constexpr double kTriggerSignatureHashFunctions = 4.0;
+            if (popcount == 0)
+            {
+                return 0;
+            }
+            if (popcount >= static_cast<std::size_t>(kTriggerSignatureBits))
+            {
+                return static_cast<std::size_t>(kTriggerSignatureBits);
+            }
+            const double fill = static_cast<double>(popcount) / kTriggerSignatureBits;
+            const double estimate =
+                -(kTriggerSignatureBits / kTriggerSignatureHashFunctions) * std::log(1.0 - fill);
+            return static_cast<std::size_t>(std::llround(std::max(0.0, estimate)));
+        }
+
+        bool activityScheduleIsVolatileTriggerKind(wolvrix::lib::grh::OperationKind kind) noexcept
+        {
+            switch (kind)
+            {
+            case wolvrix::lib::grh::OperationKind::kRegisterReadPort:
+            case wolvrix::lib::grh::OperationKind::kLatchReadPort:
+            case wolvrix::lib::grh::OperationKind::kMemoryReadPort:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        std::size_t activityScheduleRatioPpm(std::size_t numerator, std::size_t denominator) noexcept
+        {
+            if (denominator == 0)
+            {
+                return 0;
+            }
+            return static_cast<std::size_t>(
+                (static_cast<std::uint64_t>(numerator) * 1000000ull) /
+                static_cast<std::uint64_t>(denominator));
+        }
+
+        bool activityScheduleIsPassthroughKind(wolvrix::lib::grh::OperationKind kind) noexcept
+        {
+            switch (kind)
+            {
+            case wolvrix::lib::grh::OperationKind::kAssign:
+            case wolvrix::lib::grh::OperationKind::kSliceStatic:
+            case wolvrix::lib::grh::OperationKind::kSliceDynamic:
+            case wolvrix::lib::grh::OperationKind::kSliceArray:
+            case wolvrix::lib::grh::OperationKind::kReplicate:
+                return true;
+            case wolvrix::lib::grh::OperationKind::kConcat:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        bool activityScheduleIsGuardLikeKind(wolvrix::lib::grh::OperationKind kind) noexcept
+        {
+            switch (kind)
+            {
+            case wolvrix::lib::grh::OperationKind::kMux:
+            case wolvrix::lib::grh::OperationKind::kAnd:
+            case wolvrix::lib::grh::OperationKind::kOr:
+            case wolvrix::lib::grh::OperationKind::kLogicAnd:
+            case wolvrix::lib::grh::OperationKind::kLogicOr:
+            case wolvrix::lib::grh::OperationKind::kNot:
+            case wolvrix::lib::grh::OperationKind::kLogicNot:
+            case wolvrix::lib::grh::OperationKind::kEq:
+            case wolvrix::lib::grh::OperationKind::kNe:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        bool activityScheduleIsAggregateShapeKind(wolvrix::lib::grh::OperationKind kind) noexcept
+        {
+            switch (kind)
+            {
+            case wolvrix::lib::grh::OperationKind::kConcat:
+            case wolvrix::lib::grh::OperationKind::kSliceArray:
+            case wolvrix::lib::grh::OperationKind::kSliceDynamic:
+            case wolvrix::lib::grh::OperationKind::kSliceStatic:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        bool activityScheduleHasRegToMemIntent(const wolvrix::lib::grh::Operation &op) noexcept
+        {
+            const auto group = getAttrString(op, "regToMem.intent.group");
+            const auto role = getAttrString(op, "regToMem.intent.role");
+            const auto mode = getAttrString(op, "regToMem.intent.mode");
+            return group && !group->empty() && role && !role->empty() &&
+                   (!mode || *mode == "array-index");
+        }
+
+        template <typename RewriteBuildT, typename OpDataT>
+        ActivityScheduleCbawStats buildActivityScheduleCbawStats(const ActivityScheduleBuild &build,
+                                                                 const RewriteBuildT &rewrite,
+                                                                 const OpDataT &,
+                                                                 const wolvrix::lib::grh::Graph &graph,
+                                                                 const ActivityScheduleSummaryStats &summaryStats)
+        {
+            struct ValueUseGroup
+            {
+                wolvrix::lib::grh::ValueId canonicalValue;
+                uint32_t sourceSupernode = kInvalidActivitySupernodeId;
+                wolvrix::lib::grh::OperationKind sourceKind = wolvrix::lib::grh::OperationKind::kConstant;
+                std::vector<uint32_t> targetSupernodes;
+                std::size_t consumerUseCount = 0;
+                std::size_t cloneUseCount = 0;
+                bool cloneWidthMismatch = false;
+            };
+
+            std::unordered_map<wolvrix::lib::grh::ValueId,
+                               ValueUseGroup,
+                               wolvrix::lib::grh::ValueIdHash>
+                valueGroups;
+
+            const auto noteUse = [&](wolvrix::lib::grh::ValueId usedValue, uint32_t targetSupernode)
+            {
+                if (!usedValue.valid() || usedValue.index == 0 || targetSupernode >= build.supernodeToOps.size())
+                {
+                    return;
+                }
+                const auto canonical = canonicalActivityValue(usedValue, &rewrite.canonicalValues);
+                if (!canonical.valid())
+                {
+                    return;
+                }
+                const auto defOp = graph.valueDef(canonical);
+                if (!defOp.valid())
+                {
+                    return;
+                }
+                uint32_t sourceSupernode = kInvalidActivitySupernodeId;
+                const wolvrix::lib::grh::OperationKind sourceKind = graph.opKind(defOp);
+                if (defOp.index > 0 && defOp.index - 1 < build.opToSupernode.size())
+                {
+                    sourceSupernode = build.opToSupernode[defOp.index - 1];
+                }
+                if (sourceSupernode == targetSupernode)
+                {
+                    return;
+                }
+                auto [it, inserted] = valueGroups.emplace(canonical, ValueUseGroup{});
+                auto &group = it->second;
+                if (inserted)
+                {
+                    group.canonicalValue = canonical;
+                    group.sourceSupernode = sourceSupernode;
+                    group.sourceKind = sourceKind;
+                }
+                ++group.consumerUseCount;
+                if (canonical != usedValue)
+                {
+                    ++group.cloneUseCount;
+                    if (graph.valueWidth(canonical) != graph.valueWidth(usedValue))
+                    {
+                        group.cloneWidthMismatch = true;
+                    }
+                }
+                if (std::find(group.targetSupernodes.begin(),
+                              group.targetSupernodes.end(),
+                              targetSupernode) == group.targetSupernodes.end())
+                {
+                    group.targetSupernodes.push_back(targetSupernode);
+                }
+            };
+
+            for (uint32_t supernodeId = 0; supernodeId < build.supernodeToOps.size(); ++supernodeId)
+            {
+                for (const auto opId : build.supernodeToOps[supernodeId])
+                {
+                    const auto op = graph.getOperation(opId);
+                    for (const auto operand : op.operands())
+                    {
+                        noteUse(operand, supernodeId);
+                    }
+                    if (isRegToMemIntentSlice(op))
+                    {
+                        if (const auto indexValue = regToMemIntentSliceIndexValue(graph, op))
+                        {
+                            noteUse(*indexValue, supernodeId);
+                        }
+                    }
+                }
+            }
+
+            ActivityScheduleCbawStats stats;
+            std::unordered_set<uint64_t> canonicalDependencyEdges;
+            std::vector<ActivityScheduleCbawStats::TopRoot> topRoots;
+            topRoots.reserve(valueGroups.size());
+            for (auto &[_, group] : valueGroups)
+            {
+                auto &targets = group.targetSupernodes;
+                if (targets.empty())
+                {
+                    continue;
+                }
+                std::sort(targets.begin(), targets.end());
+                ++stats.canonicalValueUseGroups;
+                stats.canonicalCrossBoundaryTargetCount += targets.size();
+                stats.canonicalCrossBoundaryConsumerUseCount += group.consumerUseCount;
+                if (group.cloneUseCount != 0)
+                {
+                    ++stats.sourceCloneCanonicalizedGroups;
+                }
+                if (group.cloneWidthMismatch)
+                {
+                    ++stats.cloneWidthMismatchGroups;
+                }
+                const std::size_t valueIndex = group.canonicalValue.index;
+                const std::string sourceKindName = activityScheduleCbawSourceKindName(group.sourceKind);
+                std::size_t computeTargets = 0;
+                std::size_t commitTargets = 0;
+                for (const uint32_t target : targets)
+                {
+                    if (target < build.supernodeKinds.size() &&
+                        build.supernodeKinds[target] == ActivityScheduleSupernodeKind::Compute)
+                    {
+                        ++stats.canonicalComputeMaterializedValueTargetCount;
+                        ++computeTargets;
+                    }
+                    else if (target < build.supernodeKinds.size() &&
+                             build.supernodeKinds[target] == ActivityScheduleSupernodeKind::Commit)
+                    {
+                        ++stats.canonicalComputeCommitValueTargetCount;
+                        ++commitTargets;
+                    }
+                    if (group.sourceSupernode != kInvalidActivitySupernodeId)
+                    {
+                        canonicalDependencyEdges.insert(packActivitySchedulePair(group.sourceSupernode, target));
+                    }
+                }
+                topRoots.push_back(ActivityScheduleCbawStats::TopRoot{
+                    .valueIndex = valueIndex,
+                    .targetCount = targets.size(),
+                    .computeTargetCount = computeTargets,
+                    .commitTargetCount = commitTargets,
+                    .consumerUseCount = group.consumerUseCount,
+                    .valueBytes = static_cast<std::uint64_t>(activityScheduleValueByteCost(graph, valueIndex)),
+                    .sourceKind = sourceKindName,
+                });
+            }
+            stats.canonicalSupernodeDependencyEdgeCount = canonicalDependencyEdges.size();
+
+            std::unordered_set<uint64_t> replayDependencyEdges;
+            for (std::size_t valueOffset = 0; valueOffset < build.valueFanout.size(); ++valueOffset)
+            {
+                const auto &targets = build.valueFanout[valueOffset];
+                if (targets.empty())
+                {
+                    continue;
+                }
+                ++stats.valueUseGroups;
+                stats.crossBoundaryTargetCount += targets.size();
+                stats.crossBoundaryValueBytes +=
+                    static_cast<std::uint64_t>(activityScheduleValueByteCost(graph, valueOffset + 1)) *
+                    static_cast<std::uint64_t>(targets.size());
+                const uint32_t sourceSupernode =
+                    valueOffset + 1 < build.valueSourceSupernode.size()
+                        ? build.valueSourceSupernode[valueOffset + 1]
+                        : kInvalidActivitySupernodeId;
+                const auto sourceKind =
+                    valueOffset + 1 < build.valueSourceKind.size()
+                        ? build.valueSourceKind[valueOffset + 1]
+                        : wolvrix::lib::grh::OperationKind::kConstant;
+                const std::string sourceKindName = activityScheduleCbawSourceKindName(sourceKind);
+                stats.sourceKindMatrix[sourceKindName] += targets.size();
+                for (const uint32_t target : targets)
+                {
+                    const std::string targetKindName = activityScheduleCbawTargetKindName(build, target);
+                    stats.targetKindMatrix[targetKindName] += 1;
+                    stats.sourceTargetKindMatrix[sourceKindName + "->" + targetKindName] += 1;
+                    if (target < build.supernodeKinds.size() &&
+                        build.supernodeKinds[target] == ActivityScheduleSupernodeKind::Compute)
+                    {
+                        ++stats.computeMaterializedValueTargetCount;
+                    }
+                    else if (target < build.supernodeKinds.size() &&
+                             build.supernodeKinds[target] == ActivityScheduleSupernodeKind::Commit)
+                    {
+                        ++stats.computeCommitValueTargetCount;
+                    }
+                    if (sourceSupernode != kInvalidActivitySupernodeId)
+                    {
+                        replayDependencyEdges.insert(packActivitySchedulePair(sourceSupernode, target));
+                    }
+                }
+            }
+            stats.supernodeDependencyEdgeCount = replayDependencyEdges.size();
+
+            std::vector<std::size_t> computeOpCounts;
+            std::vector<std::size_t> liveValueBytes;
+            std::vector<std::size_t> temporaryBytes;
+            std::vector<std::size_t> emittedCodeUnits;
+            std::vector<std::size_t> helperCallCounts;
+            std::vector<std::size_t> branchCounts;
+            computeOpCounts.reserve(build.supernodeToOps.size());
+            liveValueBytes.reserve(build.supernodeToOps.size());
+            temporaryBytes.reserve(build.supernodeToOps.size());
+            emittedCodeUnits.reserve(build.supernodeToOps.size());
+            helperCallCounts.reserve(build.supernodeToOps.size());
+            branchCounts.reserve(build.supernodeToOps.size());
+            for (uint32_t supernodeId = 0; supernodeId < build.supernodeToOps.size(); ++supernodeId)
+            {
+                if (supernodeId >= build.supernodeKinds.size() ||
+                    build.supernodeKinds[supernodeId] != ActivityScheduleSupernodeKind::Compute)
+                {
+                    continue;
+                }
+                ++stats.computeSupernodes;
+                computeOpCounts.push_back(build.supernodeToOps[supernodeId].size());
+                std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash>
+                    liveValues;
+                std::size_t liveBytes = 0;
+                std::size_t tempBytes = 0;
+                std::size_t codeUnits = 0;
+                std::size_t helperCalls = 0;
+                std::size_t branches = 0;
+                for (const auto opId : build.supernodeToOps[supernodeId])
+                {
+                    const auto op = graph.getOperation(opId);
+                    const auto canonicalDataOp = activityCanonicalDataOpForOp(graph, opId, rewrite.canonicalValues);
+                    const auto dataOp = canonicalDataOp.valid() ? graph.getOperation(canonicalDataOp) : op;
+                    const auto kind = dataOp.kind();
+                    const int32_t width = activityOpResultWidth(graph, canonicalDataOp.valid() ? canonicalDataOp
+                                                                                               : opId);
+                    codeUnits += static_cast<std::size_t>(activityComputeUnitsForWidth(width));
+                    helperCalls += activityScheduleHelperCallEstimate(kind, width);
+                    branches += activityScheduleBranchEstimate(kind);
+                    for (const auto result : op.results())
+                    {
+                        const auto canonical = canonicalActivityValue(result, &rewrite.canonicalValues);
+                        if (canonical.valid() && liveValues.insert(canonical).second)
+                        {
+                            const std::size_t bytes = activityScheduleValueByteCost(graph, canonical.index);
+                            liveBytes += bytes;
+                            tempBytes += bytes;
+                        }
+                    }
+                    for (const auto operand : op.operands())
+                    {
+                        const auto canonical = canonicalActivityValue(operand, &rewrite.canonicalValues);
+                        if (canonical.valid() && liveValues.insert(canonical).second)
+                        {
+                            liveBytes += activityScheduleValueByteCost(graph, canonical.index);
+                        }
+                    }
+                    if (isRegToMemIntentSlice(op))
+                    {
+                        if (const auto indexValue = regToMemIntentSliceIndexValue(graph, op))
+                        {
+                            const auto canonical = canonicalActivityValue(*indexValue, &rewrite.canonicalValues);
+                            if (canonical.valid() && liveValues.insert(canonical).second)
+                            {
+                                liveBytes += activityScheduleValueByteCost(graph, canonical.index);
+                            }
+                        }
+                    }
+                }
+                liveValueBytes.push_back(liveBytes);
+                temporaryBytes.push_back(tempBytes);
+                emittedCodeUnits.push_back(codeUnits);
+                helperCallCounts.push_back(helperCalls);
+                branchCounts.push_back(branches);
+            }
+
+            recordActivityScheduleResourceDistribution(stats.resourceP50,
+                                                       stats.resourceP90,
+                                                       stats.resourceP99,
+                                                       stats.resourceP995,
+                                                       stats.resourceMax,
+                                                       stats.resourceCap,
+                                                       stats.resourceBaselineExceptions,
+                                                       "op_count",
+                                                       computeOpCounts);
+            recordActivityScheduleResourceDistribution(stats.resourceP50,
+                                                       stats.resourceP90,
+                                                       stats.resourceP99,
+                                                       stats.resourceP995,
+                                                       stats.resourceMax,
+                                                       stats.resourceCap,
+                                                       stats.resourceBaselineExceptions,
+                                                       "live_value_bytes",
+                                                       liveValueBytes);
+            recordActivityScheduleResourceDistribution(stats.resourceP50,
+                                                       stats.resourceP90,
+                                                       stats.resourceP99,
+                                                       stats.resourceP995,
+                                                       stats.resourceMax,
+                                                       stats.resourceCap,
+                                                       stats.resourceBaselineExceptions,
+                                                       "temporary_bytes",
+                                                       temporaryBytes);
+            recordActivityScheduleResourceDistribution(stats.resourceP50,
+                                                       stats.resourceP90,
+                                                       stats.resourceP99,
+                                                       stats.resourceP995,
+                                                       stats.resourceMax,
+                                                       stats.resourceCap,
+                                                       stats.resourceBaselineExceptions,
+                                                       "emitted_code_units",
+                                                       emittedCodeUnits);
+            recordActivityScheduleResourceDistribution(stats.resourceP50,
+                                                       stats.resourceP90,
+                                                       stats.resourceP99,
+                                                       stats.resourceP995,
+                                                       stats.resourceMax,
+                                                       stats.resourceCap,
+                                                       stats.resourceBaselineExceptions,
+                                                       "helper_call_count",
+                                                       helperCallCounts);
+            recordActivityScheduleResourceDistribution(stats.resourceP50,
+                                                       stats.resourceP90,
+                                                       stats.resourceP99,
+                                                       stats.resourceP995,
+                                                       stats.resourceMax,
+                                                       stats.resourceCap,
+                                                       stats.resourceBaselineExceptions,
+                                                       "branch_count",
+                                                       branchCounts);
+            stats.computeSupernodeOpCountP50 = stats.resourceP50["op_count"];
+            stats.computeSupernodeOpCountP90 = stats.resourceP90["op_count"];
+            stats.computeSupernodeOpCountP99 = stats.resourceP99["op_count"];
+            stats.computeSupernodeOpCountP995 = stats.resourceP995["op_count"];
+            stats.computeSupernodeOpCountMax = stats.resourceMax["op_count"];
+            stats.resourceOpCountCap = stats.resourceCap["op_count"];
+            stats.resourceOpCountBaselineExceptions = stats.resourceBaselineExceptions["op_count"];
+
+            constexpr std::size_t kTriggerSignatureBits = 256;
+            constexpr std::size_t kTriggerSignatureHashFunctions = 4;
+            constexpr std::size_t kTriggerSaturationThresholdBits = 192;
+            stats.triggerSignatureBits = kTriggerSignatureBits;
+            stats.triggerSignatureHashFunctions = kTriggerSignatureHashFunctions;
+            stats.triggerSaturationThresholdBits = kTriggerSaturationThresholdBits;
+
+            std::vector<ActivityScheduleTriggerSignature> triggerSignatures(build.supernodeToOps.size());
+            std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash>
+                volatileTriggerValues;
+            for (uint32_t supernodeId = 0; supernodeId < build.supernodeToOps.size(); ++supernodeId)
+            {
+                if (supernodeId >= build.supernodeKinds.size() ||
+                    build.supernodeKinds[supernodeId] != ActivityScheduleSupernodeKind::Compute)
+                {
+                    continue;
+                }
+                auto &signature = triggerSignatures[supernodeId];
+                for (const auto opId : build.supernodeToOps[supernodeId])
+                {
+                    const auto op = graph.getOperation(opId);
+                    if (!activityScheduleIsVolatileTriggerKind(op.kind()))
+                    {
+                        continue;
+                    }
+                    for (const auto result : op.results())
+                    {
+                        const auto canonical = canonicalActivityValue(result, &rewrite.canonicalValues);
+                        if (!canonical.valid())
+                        {
+                            continue;
+                        }
+                        volatileTriggerValues.insert(canonical);
+                        activityScheduleAddTrigger(signature, canonical);
+                    }
+                }
+                for (const auto opId : build.supernodeToOps[supernodeId])
+                {
+                    const auto op = graph.getOperation(opId);
+                    const auto noteInputTrigger = [&](wolvrix::lib::grh::ValueId value)
+                    {
+                        const auto canonical = canonicalActivityValue(value, &rewrite.canonicalValues);
+                        if (!canonical.valid())
+                        {
+                            return;
+                        }
+                        if (graph.valueDef(canonical).valid() || !graph.valueIsInput(canonical))
+                        {
+                            return;
+                        }
+                        volatileTriggerValues.insert(canonical);
+                        activityScheduleAddTrigger(signature, canonical);
+                    };
+                    for (const auto operand : op.operands())
+                    {
+                        noteInputTrigger(operand);
+                    }
+                    if (isRegToMemIntentSlice(op))
+                    {
+                        if (const auto indexValue = regToMemIntentSliceIndexValue(graph, op))
+                        {
+                            noteInputTrigger(*indexValue);
+                        }
+                    }
+                }
+            }
+            stats.triggerVolatileSourceValues = volatileTriggerValues.size();
+
+            for (const uint32_t supernodeId : build.topoOrder)
+            {
+                if (supernodeId >= build.dag.size())
+                {
+                    continue;
+                }
+                const auto &signature = triggerSignatures[supernodeId];
+                if (signature.empty())
+                {
+                    continue;
+                }
+                for (const uint32_t succ : build.dag[supernodeId])
+                {
+                    if (succ < triggerSignatures.size())
+                    {
+                        triggerSignatures[succ].mergeFrom(signature);
+                    }
+                }
+            }
+
+            std::vector<std::size_t> triggerPopcounts;
+            std::vector<std::size_t> triggerEstimatedCounts;
+            triggerPopcounts.reserve(stats.computeSupernodes);
+            triggerEstimatedCounts.reserve(stats.computeSupernodes);
+            std::unordered_map<ActivityScheduleTriggerSignature,
+                               std::size_t,
+                               ActivityScheduleTriggerSignatureHash>
+                triggerBuckets;
+            std::unordered_map<ActivityScheduleTriggerSignature,
+                               std::size_t,
+                               ActivityScheduleTriggerSignatureHash>
+                nonEmptyTriggerBuckets;
+            for (uint32_t supernodeId = 0; supernodeId < build.supernodeToOps.size(); ++supernodeId)
+            {
+                if (supernodeId >= build.supernodeKinds.size() ||
+                    build.supernodeKinds[supernodeId] != ActivityScheduleSupernodeKind::Compute)
+                {
+                    continue;
+                }
+                const auto &signature = triggerSignatures[supernodeId];
+                const std::size_t popcount = activityScheduleTriggerPopcount(signature);
+                triggerPopcounts.push_back(popcount);
+                triggerEstimatedCounts.push_back(activityScheduleEstimatedTriggerCount(popcount));
+                if (signature.empty())
+                {
+                    ++stats.triggerEmptyComputeSupernodes;
+                }
+                else
+                {
+                    ++stats.triggerComputeSupernodesWithTrigger;
+                    ++nonEmptyTriggerBuckets[signature];
+                }
+                if (popcount >= kTriggerSaturationThresholdBits)
+                {
+                    ++stats.triggerSignatureSaturatedComputeSupernodes;
+                }
+                ++triggerBuckets[signature];
+            }
+
+            std::sort(triggerPopcounts.begin(), triggerPopcounts.end());
+            std::sort(triggerEstimatedCounts.begin(), triggerEstimatedCounts.end());
+            stats.triggerSignaturePopcountP50 = percentileFromSorted(triggerPopcounts, 50, 100);
+            stats.triggerSignaturePopcountP90 = percentileFromSorted(triggerPopcounts, 90, 100);
+            stats.triggerSignaturePopcountP99 = percentileFromSorted(triggerPopcounts, 99, 100);
+            stats.triggerSignaturePopcountP995 = percentileFromSorted(triggerPopcounts, 995, 1000);
+            stats.triggerSignaturePopcountMax = triggerPopcounts.empty() ? 0 : triggerPopcounts.back();
+            stats.triggerEstimatedCountP50 = percentileFromSorted(triggerEstimatedCounts, 50, 100);
+            stats.triggerEstimatedCountP90 = percentileFromSorted(triggerEstimatedCounts, 90, 100);
+            stats.triggerEstimatedCountP99 = percentileFromSorted(triggerEstimatedCounts, 99, 100);
+            stats.triggerEstimatedCountP995 = percentileFromSorted(triggerEstimatedCounts, 995, 1000);
+            stats.triggerEstimatedCountMax =
+                triggerEstimatedCounts.empty() ? 0 : triggerEstimatedCounts.back();
+            stats.triggerSignatureSaturatedRatioPpm =
+                activityScheduleRatioPpm(stats.triggerSignatureSaturatedComputeSupernodes,
+                                         stats.computeSupernodes);
+
+            stats.triggerEqualBucketCount = triggerBuckets.size();
+            for (const auto &[signature, count] : triggerBuckets)
+            {
+                (void)signature;
+                stats.triggerEqualBucketLargest = std::max(stats.triggerEqualBucketLargest, count);
+                if (count > 1)
+                {
+                    ++stats.triggerEqualBucketMultiCount;
+                    stats.triggerEqualBucketCoveredSupernodes += count;
+                }
+            }
+            stats.triggerEqualBucketCoveredSupernodeRatioPpm =
+                activityScheduleRatioPpm(stats.triggerEqualBucketCoveredSupernodes,
+                                         stats.computeSupernodes);
+
+            stats.triggerNonEmptyEqualBucketCount = nonEmptyTriggerBuckets.size();
+            for (const auto &[signature, count] : nonEmptyTriggerBuckets)
+            {
+                (void)signature;
+                stats.triggerNonEmptyEqualBucketLargest =
+                    std::max(stats.triggerNonEmptyEqualBucketLargest, count);
+                if (count > 1)
+                {
+                    ++stats.triggerNonEmptyEqualBucketMultiCount;
+                    stats.triggerNonEmptyEqualBucketCoveredSupernodes += count;
+                }
+            }
+            stats.triggerNonEmptyEqualBucketCoveredSupernodeRatioPpm =
+                activityScheduleRatioPpm(stats.triggerNonEmptyEqualBucketCoveredSupernodes,
+                                         stats.computeSupernodes);
+
+            std::unordered_set<std::uint64_t> equalTriggerDependencyEdges;
+            std::unordered_set<std::uint64_t> nonEmptyEqualTriggerDependencyEdges;
+            for (std::size_t valueOffset = 0; valueOffset < build.valueFanout.size(); ++valueOffset)
+            {
+                const auto &targets = build.valueFanout[valueOffset];
+                if (targets.empty())
+                {
+                    continue;
+                }
+                const uint32_t sourceSupernode =
+                    valueOffset + 1 < build.valueSourceSupernode.size()
+                        ? build.valueSourceSupernode[valueOffset + 1]
+                        : kInvalidActivitySupernodeId;
+                if (sourceSupernode >= build.supernodeKinds.size() ||
+                    build.supernodeKinds[sourceSupernode] != ActivityScheduleSupernodeKind::Compute)
+                {
+                    continue;
+                }
+                const auto &sourceSignature = triggerSignatures[sourceSupernode];
+                for (const uint32_t target : targets)
+                {
+                    if (target >= build.supernodeKinds.size() ||
+                        build.supernodeKinds[target] != ActivityScheduleSupernodeKind::Compute)
+                    {
+                        continue;
+                    }
+                    if (!(sourceSignature == triggerSignatures[target]))
+                    {
+                        continue;
+                    }
+                    ++stats.triggerEqualBucketInternalizableBoundaryTargets;
+                    ++stats.triggerEqualBucketInternalizableComputeTargets;
+                    equalTriggerDependencyEdges.insert(packActivitySchedulePair(sourceSupernode, target));
+                    if (!sourceSignature.empty())
+                    {
+                        ++stats.triggerNonEmptyEqualBucketInternalizableBoundaryTargets;
+                        ++stats.triggerNonEmptyEqualBucketInternalizableComputeTargets;
+                        nonEmptyEqualTriggerDependencyEdges.insert(
+                            packActivitySchedulePair(sourceSupernode, target));
+                    }
+                }
+            }
+            stats.triggerEqualBucketInternalizableDependencyEdges =
+                equalTriggerDependencyEdges.size();
+            stats.triggerNonEmptyEqualBucketInternalizableDependencyEdges =
+                nonEmptyEqualTriggerDependencyEdges.size();
+            const bool triggerSaturated =
+                stats.triggerSignatureSaturatedRatioPpm > 250000;
+            const bool equalCoverageLow =
+                stats.triggerNonEmptyEqualBucketCoveredSupernodeRatioPpm < 10000 ||
+                stats.triggerNonEmptyEqualBucketInternalizableComputeTargets == 0;
+            if (stats.computeSupernodes == 0)
+            {
+                stats.triggerAteNoGoReason = "no_compute_supernodes";
+            }
+            else if (triggerSaturated)
+            {
+                stats.triggerAteNoGoReason = "trigger_signature_saturation";
+            }
+            else if (equalCoverageLow)
+            {
+                stats.triggerAteNoGoReason = "low_equal_trigger_coverage";
+            }
+            else
+            {
+                stats.triggerAteEqualMergeRecommended = 1;
+            }
+
+            const auto recordSeedGroup = [&](std::string_view rule, std::size_t members)
+            {
+                if (members == 0)
+                {
+                    return;
+                }
+                ++stats.semanticSeedGroups;
+                stats.semanticRuleSeedGroups[std::string(rule)] += 1;
+            };
+            const auto recordMergeHintGroup = [&](std::string_view rule, std::size_t members)
+            {
+                if (members == 0)
+                {
+                    return;
+                }
+                ++stats.semanticMergeHintGroups;
+                stats.semanticRuleMergeHintGroups[std::string(rule)] += 1;
+            };
+            const auto recordDebugLabel = [&](std::string_view rule, std::size_t count = 1)
+            {
+                if (count == 0)
+                {
+                    return;
+                }
+                stats.semanticDebugLabels += count;
+                stats.semanticRuleDebugLabels[std::string(rule)] += count;
+            };
+
+            std::unordered_set<std::string> rtmGroups;
+            std::unordered_set<std::string> aggregateFamilies;
+            std::unordered_map<uint32_t, std::size_t> predCountBySupernode;
+            std::map<std::vector<uint32_t>, std::size_t> siblingMembersByPreds;
+            std::unordered_map<std::string, std::size_t> guardDomainMembers;
+            std::unordered_map<std::string, std::size_t> sinkConeMembers;
+            std::unordered_set<std::string> sinkConeLabels;
+            std::unordered_set<uint32_t> rtmSupernodes;
+            std::unordered_set<uint32_t> aggregateSupernodes;
+            std::unordered_set<uint32_t> guardSupernodes;
+            std::unordered_set<uint32_t> sinkSupernodes;
+            std::unordered_set<uint32_t> passthroughSupernodes;
+            std::vector<std::vector<uint32_t>> computePredsBySupernode(build.supernodeToOps.size());
+
+            for (uint32_t source = 0; source < build.dag.size(); ++source)
+            {
+                const auto &succs = build.dag[source];
+                if (source < build.supernodeKinds.size() &&
+                    build.supernodeKinds[source] == ActivityScheduleSupernodeKind::Compute &&
+                    succs.size() == 1)
+                {
+                    ++stats.semanticPlainOut1Hints;
+                    recordMergeHintGroup("plain_out1", 2);
+                }
+                for (const uint32_t succ : succs)
+                {
+                    if (succ < build.supernodeKinds.size() &&
+                        build.supernodeKinds[succ] == ActivityScheduleSupernodeKind::Compute)
+                    {
+                        ++predCountBySupernode[succ];
+                        if (source < build.supernodeKinds.size() &&
+                            build.supernodeKinds[source] == ActivityScheduleSupernodeKind::Compute &&
+                            succ < computePredsBySupernode.size())
+                        {
+                            computePredsBySupernode[succ].push_back(source);
+                        }
+                    }
+                }
+            }
+            for (const auto &[supernode, predCount] : predCountBySupernode)
+            {
+                if (supernode < build.supernodeKinds.size() &&
+                    build.supernodeKinds[supernode] == ActivityScheduleSupernodeKind::Compute &&
+                    predCount == 1)
+                {
+                    ++stats.semanticPlainIn1Hints;
+                    recordMergeHintGroup("plain_in1", 2);
+                }
+            }
+            for (uint32_t target = 0; target < build.supernodeToOps.size(); ++target)
+            {
+                if (target >= build.supernodeKinds.size() ||
+                    build.supernodeKinds[target] != ActivityScheduleSupernodeKind::Compute)
+                {
+                    continue;
+                }
+                auto preds = target < computePredsBySupernode.size()
+                                 ? computePredsBySupernode[target]
+                                 : std::vector<uint32_t>{};
+                std::sort(preds.begin(), preds.end());
+                preds.erase(std::unique(preds.begin(), preds.end()), preds.end());
+                if (!preds.empty())
+                {
+                    ++siblingMembersByPreds[preds];
+                }
+            }
+            for (const auto &[preds, members] : siblingMembersByPreds)
+            {
+                (void)preds;
+                if (members > 1)
+                {
+                    ++stats.semanticPlainSiblingGroups;
+                    stats.semanticPlainSiblingMembers += members;
+                    recordMergeHintGroup("plain_siblings", members);
+                }
+            }
+
+            for (uint32_t supernodeId = 0; supernodeId < build.supernodeToOps.size(); ++supernodeId)
+            {
+                if (supernodeId >= build.supernodeKinds.size() ||
+                    build.supernodeKinds[supernodeId] != ActivityScheduleSupernodeKind::Compute)
+                {
+                    continue;
+                }
+                uint32_t currentPassthroughRun = 0;
+                for (const auto opId : build.supernodeToOps[supernodeId])
+                {
+                    const auto op = graph.getOperation(opId);
+                    const auto kind = op.kind();
+                    if (activityScheduleHasRegToMemIntent(op))
+                    {
+                        const auto group = getAttrString(op, "regToMem.intent.group").value_or(std::string());
+                        if (!group.empty())
+                        {
+                            rtmGroups.insert(group);
+                        }
+                        ++stats.semanticRtmIntentOps;
+                        rtmSupernodes.insert(supernodeId);
+                        recordDebugLabel("rtm_intent");
+                    }
+                    if (activityScheduleIsAggregateShapeKind(kind))
+                    {
+                        std::string key;
+                        if (const auto group = getAttrString(op, "regToMem.intent.group"))
+                        {
+                            key = "rtm:" + *group;
+                        }
+                        else if (!op.operands().empty())
+                        {
+                            const auto canonical = canonicalActivityValue(op.operands().front(),
+                                                                          &rewrite.canonicalValues);
+                            key = canonical.valid() ? "value:" + std::to_string(canonical.index)
+                                                    : "op:" + std::to_string(opId.index);
+                        }
+                        else
+                        {
+                            key = "op:" + std::to_string(opId.index);
+                        }
+                        aggregateFamilies.insert(key);
+                        aggregateSupernodes.insert(supernodeId);
+                        recordDebugLabel("aggregate_shape");
+                    }
+                    if (activityScheduleIsGuardLikeKind(kind))
+                    {
+                        std::string guardKey;
+                        if (kind == wolvrix::lib::grh::OperationKind::kMux && !op.operands().empty())
+                        {
+                            const auto canonical = canonicalActivityValue(op.operands().front(),
+                                                                          &rewrite.canonicalValues);
+                            guardKey = canonical.valid() ? "mux:" + std::to_string(canonical.index)
+                                                         : "mux:unknown";
+                        }
+                        else if ((kind == wolvrix::lib::grh::OperationKind::kAnd ||
+                                  kind == wolvrix::lib::grh::OperationKind::kLogicAnd ||
+                                  kind == wolvrix::lib::grh::OperationKind::kOr ||
+                                  kind == wolvrix::lib::grh::OperationKind::kLogicOr) &&
+                                 !op.operands().empty())
+                        {
+                            std::vector<std::size_t> oneBitInputs;
+                            for (const auto operand : op.operands())
+                            {
+                                const auto canonical = canonicalActivityValue(operand,
+                                                                              &rewrite.canonicalValues);
+                                if (canonical.valid() && graph.valueWidth(canonical) == 1)
+                                {
+                                    oneBitInputs.push_back(canonical.index);
+                                }
+                            }
+                            if (!oneBitInputs.empty())
+                            {
+                                std::sort(oneBitInputs.begin(), oneBitInputs.end());
+                                guardKey = "logic:" + std::to_string(oneBitInputs.front());
+                            }
+                        }
+                        if (guardKey.empty())
+                        {
+                            ++stats.semanticGuardUnknownOps;
+                            recordDebugLabel("guard_unknown");
+                        }
+                        else
+                        {
+                            ++guardDomainMembers[guardKey];
+                            guardSupernodes.insert(supernodeId);
+                            recordDebugLabel("guard_domain");
+                        }
+                    }
+                    if (activityScheduleIsPassthroughKind(kind))
+                    {
+                        ++currentPassthroughRun;
+                        ++stats.semanticPassthroughOps;
+                        passthroughSupernodes.insert(supernodeId);
+                        recordDebugLabel("passthrough_chain");
+                    }
+                    else
+                    {
+                        if (currentPassthroughRun >= 2)
+                        {
+                            ++stats.semanticPassthroughChains;
+                            recordSeedGroup("passthrough_chain", currentPassthroughRun);
+                        }
+                        currentPassthroughRun = 0;
+                    }
+                    if (isHierLikeOpKind(kind))
+                    {
+                        ++stats.semanticHierarchyDebugLabels;
+                        recordDebugLabel("hierarchy_info");
+                    }
+                }
+                if (currentPassthroughRun >= 2)
+                {
+                    ++stats.semanticPassthroughChains;
+                    recordSeedGroup("passthrough_chain", currentPassthroughRun);
+                }
+            }
+
+            stats.semanticRtmIntentGroups = rtmGroups.size();
+            for (const auto &group : rtmGroups)
+            {
+                (void)group;
+                recordSeedGroup("rtm_intent", 1);
+                recordMergeHintGroup("aggregate_array", 1);
+            }
+            stats.semanticAggregateFamilies = aggregateFamilies.size();
+            for (const auto &family : aggregateFamilies)
+            {
+                (void)family;
+                ++stats.semanticAggregateMergeHintGroups;
+                recordMergeHintGroup("aggregate_family", 1);
+            }
+            stats.semanticAggregateSeedGroups = stats.semanticRtmIntentGroups;
+
+            for (const auto &node : rewrite.computeNodes)
+            {
+                if (node.ops.empty())
+                {
+                    continue;
+                }
+                ++stats.semanticMffcGroups;
+                stats.semanticMffcCoveredOps += node.ops.size();
+                if (node.boundaryInputs.size() > 1 || node.commonExpr)
+                {
+                    ++stats.semanticMffcSplitGroups;
+                }
+            }
+            if (stats.semanticMffcGroups != 0)
+            {
+                stats.semanticRuleSeedGroups["mffc"] += stats.semanticMffcGroups;
+                stats.semanticSeedGroups += stats.semanticMffcGroups;
+            }
+            if (stats.semanticMffcSplitGroups != 0)
+            {
+                stats.semanticRuleMergeHintGroups["mffc_split"] += stats.semanticMffcSplitGroups;
+                stats.semanticMergeHintGroups += stats.semanticMffcSplitGroups;
+            }
+
+            for (const auto &[key, members] : guardDomainMembers)
+            {
+                (void)key;
+                if (members == 0)
+                {
+                    continue;
+                }
+                ++stats.semanticGuardDomains;
+                stats.semanticGuardDomainMembers += members;
+                if (members > 1)
+                {
+                    recordMergeHintGroup("guard_domain", members);
+                }
+            }
+
+            for (uint32_t supernodeId = 0; supernodeId < build.supernodeToOps.size(); ++supernodeId)
+            {
+                if (supernodeId >= build.supernodeKinds.size() ||
+                    build.supernodeKinds[supernodeId] != ActivityScheduleSupernodeKind::Compute)
+                {
+                    continue;
+                }
+                constexpr std::size_t kMaxSinkLabelsPerSupernode = 8;
+                std::unordered_set<std::string> localSinkLabels;
+                for (const auto opId : build.supernodeToOps[supernodeId])
+                {
+                    if (localSinkLabels.size() >= kMaxSinkLabelsPerSupernode)
+                    {
+                        break;
+                    }
+                    const auto op = graph.getOperation(opId);
+                    for (const auto result : op.results())
+                    {
+                        if (!result.valid())
+                        {
+                            continue;
+                        }
+                        const auto value = graph.getValue(result);
+                        for (const auto &user : value.users())
+                        {
+                            const auto userOp = graph.getOperation(user.operation);
+                            if (!isSinkPartitionOp(userOp))
+                            {
+                                continue;
+                            }
+                            std::string label =
+                                std::string(wolvrix::lib::grh::toString(userOp.kind()));
+                            if (const auto reg = getAttrString(userOp, "regSymbol"))
+                            {
+                                label += ":" + *reg;
+                            }
+                            else if (const auto latch = getAttrString(userOp, "latchSymbol"))
+                            {
+                                label += ":" + *latch;
+                            }
+                            else if (const auto mem = getAttrString(userOp, "memSymbol"))
+                            {
+                                label += ":" + *mem;
+                            }
+                            label += ":operand" + std::to_string(user.operandIndex);
+                            localSinkLabels.insert(label);
+                            sinkConeLabels.insert(label);
+                            if (localSinkLabels.size() >= kMaxSinkLabelsPerSupernode)
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (localSinkLabels.size() > 1)
+                {
+                    ++stats.semanticSinkConeMultiSinkOps;
+                    recordDebugLabel("sink_cone_multi_sink");
+                }
+                for (const auto &label : localSinkLabels)
+                {
+                    ++sinkConeMembers[label];
+                    sinkSupernodes.insert(supernodeId);
+                    recordDebugLabel("sink_cone_exact");
+                }
+            }
+            stats.semanticSinkConeLabels = sinkConeLabels.size();
+            for (const auto &[label, members] : sinkConeMembers)
+            {
+                (void)label;
+                stats.semanticSinkConeMembers += members;
+                if (members > 1)
+                {
+                    recordMergeHintGroup("sink_cone", members);
+                }
+            }
+
+            struct CbawAtom
+            {
+                std::vector<wolvrix::lib::grh::OperationId> ops;
+                std::vector<uint32_t> computeNodes;
+                uint32_t plainSupernode = kInvalidActivitySupernodeId;
+                bool rtmIntent = false;
+                bool mffc = false;
+                bool passthrough = false;
+                bool aggregate = false;
+                bool guard = false;
+            };
+
+            std::size_t maxOpIndex = build.opToSupernode.size();
+            for (const auto opId : graph.operations())
+            {
+                maxOpIndex = std::max<std::size_t>(maxOpIndex, opId.index);
+            }
+            std::vector<uint32_t> opToCbawAtom(maxOpIndex + 1, kInvalidActivitySupernodeId);
+            std::vector<CbawAtom> cbawAtoms;
+            cbawAtoms.reserve(stats.computeSupernodes);
+
+            std::vector<uint32_t> computeNodeMaterializedUses(rewrite.computeNodes.size(), 0);
+            for (uint32_t supernodeId = 0; supernodeId < build.computeNodesBySupernode.size(); ++supernodeId)
+            {
+                if (supernodeId >= build.supernodeKinds.size() ||
+                    build.supernodeKinds[supernodeId] != ActivityScheduleSupernodeKind::Compute)
+                {
+                    continue;
+                }
+                for (const uint32_t computeNodeId : build.computeNodesBySupernode[supernodeId])
+                {
+                    if (computeNodeId < computeNodeMaterializedUses.size())
+                    {
+                        ++computeNodeMaterializedUses[computeNodeId];
+                    }
+                }
+            }
+
+            const auto addCbawAtom = [&](uint32_t plainSupernode,
+                                         std::vector<wolvrix::lib::grh::OperationId> ops,
+                                         std::vector<uint32_t> computeNodes)
+            {
+                if (ops.empty())
+                {
+                    return;
+                }
+                CbawAtom atom;
+                atom.ops = std::move(ops);
+                atom.computeNodes = std::move(computeNodes);
+                atom.plainSupernode = plainSupernode;
+                atom.mffc = atom.computeNodes.size() == 1;
+                bool allPassthrough = true;
+                for (const auto opId : atom.ops)
+                {
+                    const auto op = graph.getOperation(opId);
+                    const auto kind = op.kind();
+                    atom.rtmIntent = atom.rtmIntent || activityScheduleHasRegToMemIntent(op);
+                    atom.aggregate = atom.aggregate || activityScheduleIsAggregateShapeKind(kind);
+                    atom.guard = atom.guard || activityScheduleIsGuardLikeKind(kind);
+                    allPassthrough = allPassthrough && activityScheduleIsPassthroughKind(kind);
+                }
+                atom.passthrough = allPassthrough;
+
+                const uint32_t atomId = static_cast<uint32_t>(cbawAtoms.size());
+                for (const auto opId : atom.ops)
+                {
+                    if (opId.index < opToCbawAtom.size())
+                    {
+                        opToCbawAtom[opId.index] = atomId;
+                    }
+                }
+                if (atom.rtmIntent)
+                {
+                    ++stats.cbawAtomRtmIntentAtoms;
+                }
+                if (atom.mffc)
+                {
+                    ++stats.cbawAtomMffcAtoms;
+                }
+                if (atom.passthrough)
+                {
+                    ++stats.cbawAtomPassthroughAtoms;
+                }
+                if (atom.aggregate)
+                {
+                    ++stats.cbawAtomAggregateAtoms;
+                }
+                if (atom.guard)
+                {
+                    ++stats.cbawAtomGuardAtoms;
+                }
+                if (atom.rtmIntent)
+                {
+                    ++stats.cbawAtomKindCounts["rtm_intent"];
+                }
+                else if (atom.passthrough)
+                {
+                    ++stats.cbawAtomKindCounts["passthrough"];
+                }
+                else if (atom.aggregate)
+                {
+                    ++stats.cbawAtomKindCounts["aggregate"];
+                }
+                else if (atom.guard)
+                {
+                    ++stats.cbawAtomKindCounts["guard"];
+                }
+                else if (atom.mffc)
+                {
+                    ++stats.cbawAtomKindCounts["mffc"];
+                }
+                else
+                {
+                    ++stats.cbawAtomKindCounts["plain_chunk"];
+                }
+                cbawAtoms.push_back(std::move(atom));
+            };
+
+            for (uint32_t supernodeId = 0; supernodeId < build.supernodeToOps.size(); ++supernodeId)
+            {
+                if (supernodeId >= build.supernodeKinds.size() ||
+                    build.supernodeKinds[supernodeId] != ActivityScheduleSupernodeKind::Compute)
+                {
+                    continue;
+                }
+                std::vector<uint8_t> assigned(build.supernodeToOps[supernodeId].size(), 0);
+                const auto &memberComputeNodes =
+                    supernodeId < build.computeNodesBySupernode.size()
+                        ? build.computeNodesBySupernode[supernodeId]
+                        : std::vector<uint32_t>{};
+                if (memberComputeNodes.empty())
+                {
+                    addCbawAtom(supernodeId, build.supernodeToOps[supernodeId], {});
+                    continue;
+                }
+                for (const uint32_t computeNodeId : memberComputeNodes)
+                {
+                    if (computeNodeId >= rewrite.computeNodes.size())
+                    {
+                        continue;
+                    }
+                    std::vector<wolvrix::lib::grh::OperationId> atomOps;
+                    for (const auto opId : rewrite.computeNodes[computeNodeId].ops)
+                    {
+                        if (opId.index == 0 || opId.index - 1 >= build.opToSupernode.size() ||
+                            build.opToSupernode[opId.index - 1] != supernodeId)
+                        {
+                            continue;
+                        }
+                        atomOps.push_back(opId);
+                        const auto posIt = std::find(build.supernodeToOps[supernodeId].begin(),
+                                                     build.supernodeToOps[supernodeId].end(),
+                                                     opId);
+                        if (posIt != build.supernodeToOps[supernodeId].end())
+                        {
+                            assigned[static_cast<std::size_t>(
+                                std::distance(build.supernodeToOps[supernodeId].begin(), posIt))] = 1;
+                        }
+                    }
+                    addCbawAtom(supernodeId, std::move(atomOps), {computeNodeId});
+                }
+                std::vector<wolvrix::lib::grh::OperationId> residualOps;
+                for (std::size_t i = 0; i < build.supernodeToOps[supernodeId].size(); ++i)
+                {
+                    if (assigned[i] == 0)
+                    {
+                        residualOps.push_back(build.supernodeToOps[supernodeId][i]);
+                    }
+                }
+                addCbawAtom(supernodeId, std::move(residualOps), {});
+            }
+
+            stats.cbawAtomCount = cbawAtoms.size();
+            std::vector<std::size_t> atomOpCounts;
+            std::vector<std::size_t> atomLiveValueBytes;
+            std::vector<std::size_t> atomTemporaryBytes;
+            std::vector<std::size_t> atomEmittedCodeUnits;
+            std::vector<std::size_t> atomHelperCallCounts;
+            std::vector<std::size_t> atomBranchCounts;
+            atomOpCounts.reserve(cbawAtoms.size());
+            atomLiveValueBytes.reserve(cbawAtoms.size());
+            atomTemporaryBytes.reserve(cbawAtoms.size());
+            atomEmittedCodeUnits.reserve(cbawAtoms.size());
+            atomHelperCallCounts.reserve(cbawAtoms.size());
+            atomBranchCounts.reserve(cbawAtoms.size());
+            for (const auto &atom : cbawAtoms)
+            {
+                atomOpCounts.push_back(atom.ops.size());
+                std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash>
+                    liveValues;
+                std::size_t liveBytes = 0;
+                std::size_t tempBytes = 0;
+                std::size_t codeUnits = 0;
+                std::size_t helperCalls = 0;
+                std::size_t branches = 0;
+                for (const auto opId : atom.ops)
+                {
+                    const auto op = graph.getOperation(opId);
+                    const auto canonicalDataOp = activityCanonicalDataOpForOp(graph, opId, rewrite.canonicalValues);
+                    const auto dataOp = canonicalDataOp.valid() ? graph.getOperation(canonicalDataOp) : op;
+                    const auto kind = dataOp.kind();
+                    const int32_t width = activityOpResultWidth(graph, canonicalDataOp.valid() ? canonicalDataOp
+                                                                                               : opId);
+                    codeUnits += static_cast<std::size_t>(activityComputeUnitsForWidth(width));
+                    helperCalls += activityScheduleHelperCallEstimate(kind, width);
+                    branches += activityScheduleBranchEstimate(kind);
+                    for (const auto result : op.results())
+                    {
+                        const auto canonical = canonicalActivityValue(result, &rewrite.canonicalValues);
+                        if (canonical.valid() && liveValues.insert(canonical).second)
+                        {
+                            const std::size_t bytes = activityScheduleValueByteCost(graph, canonical.index);
+                            liveBytes += bytes;
+                            tempBytes += bytes;
+                        }
+                    }
+                    for (const auto operand : op.operands())
+                    {
+                        const auto canonical = canonicalActivityValue(operand, &rewrite.canonicalValues);
+                        if (canonical.valid() && liveValues.insert(canonical).second)
+                        {
+                            liveBytes += activityScheduleValueByteCost(graph, canonical.index);
+                        }
+                    }
+                    if (isRegToMemIntentSlice(op))
+                    {
+                        if (const auto indexValue = regToMemIntentSliceIndexValue(graph, op))
+                        {
+                            const auto canonical = canonicalActivityValue(*indexValue, &rewrite.canonicalValues);
+                            if (canonical.valid() && liveValues.insert(canonical).second)
+                            {
+                                liveBytes += activityScheduleValueByteCost(graph, canonical.index);
+                            }
+                        }
+                    }
+                }
+                atomLiveValueBytes.push_back(liveBytes);
+                atomTemporaryBytes.push_back(tempBytes);
+                atomEmittedCodeUnits.push_back(codeUnits);
+                atomHelperCallCounts.push_back(helperCalls);
+                atomBranchCounts.push_back(branches);
+            }
+
+            recordActivityScheduleResourceDistribution(stats.cbawAtomResourceP50,
+                                                       stats.cbawAtomResourceP90,
+                                                       stats.cbawAtomResourceP99,
+                                                       stats.cbawAtomResourceP995,
+                                                       stats.cbawAtomResourceMax,
+                                                       stats.cbawAtomResourceCap,
+                                                       stats.cbawAtomResourceBaselineExceptions,
+                                                       "op_count",
+                                                       atomOpCounts);
+            recordActivityScheduleResourceDistribution(stats.cbawAtomResourceP50,
+                                                       stats.cbawAtomResourceP90,
+                                                       stats.cbawAtomResourceP99,
+                                                       stats.cbawAtomResourceP995,
+                                                       stats.cbawAtomResourceMax,
+                                                       stats.cbawAtomResourceCap,
+                                                       stats.cbawAtomResourceBaselineExceptions,
+                                                       "live_value_bytes",
+                                                       atomLiveValueBytes);
+            recordActivityScheduleResourceDistribution(stats.cbawAtomResourceP50,
+                                                       stats.cbawAtomResourceP90,
+                                                       stats.cbawAtomResourceP99,
+                                                       stats.cbawAtomResourceP995,
+                                                       stats.cbawAtomResourceMax,
+                                                       stats.cbawAtomResourceCap,
+                                                       stats.cbawAtomResourceBaselineExceptions,
+                                                       "temporary_bytes",
+                                                       atomTemporaryBytes);
+            recordActivityScheduleResourceDistribution(stats.cbawAtomResourceP50,
+                                                       stats.cbawAtomResourceP90,
+                                                       stats.cbawAtomResourceP99,
+                                                       stats.cbawAtomResourceP995,
+                                                       stats.cbawAtomResourceMax,
+                                                       stats.cbawAtomResourceCap,
+                                                       stats.cbawAtomResourceBaselineExceptions,
+                                                       "emitted_code_units",
+                                                       atomEmittedCodeUnits);
+            recordActivityScheduleResourceDistribution(stats.cbawAtomResourceP50,
+                                                       stats.cbawAtomResourceP90,
+                                                       stats.cbawAtomResourceP99,
+                                                       stats.cbawAtomResourceP995,
+                                                       stats.cbawAtomResourceMax,
+                                                       stats.cbawAtomResourceCap,
+                                                       stats.cbawAtomResourceBaselineExceptions,
+                                                       "helper_call_count",
+                                                       atomHelperCallCounts);
+            recordActivityScheduleResourceDistribution(stats.cbawAtomResourceP50,
+                                                       stats.cbawAtomResourceP90,
+                                                       stats.cbawAtomResourceP99,
+                                                       stats.cbawAtomResourceP995,
+                                                       stats.cbawAtomResourceMax,
+                                                       stats.cbawAtomResourceCap,
+                                                       stats.cbawAtomResourceBaselineExceptions,
+                                                       "branch_count",
+                                                       atomBranchCounts);
+            stats.cbawAtomOpCountP50 = stats.cbawAtomResourceP50["op_count"];
+            stats.cbawAtomOpCountP90 = stats.cbawAtomResourceP90["op_count"];
+            stats.cbawAtomOpCountP99 = stats.cbawAtomResourceP99["op_count"];
+            stats.cbawAtomOpCountP995 = stats.cbawAtomResourceP995["op_count"];
+            stats.cbawAtomOpCountMax = stats.cbawAtomResourceMax["op_count"];
+            stats.cbawAtomResourceOpCountCap = stats.cbawAtomResourceCap["op_count"];
+            stats.cbawAtomResourceOpCountBaselineExceptions =
+                stats.cbawAtomResourceBaselineExceptions["op_count"];
+
+            ActivityScheduleDag atomDag(cbawAtoms.size());
+            std::unordered_set<std::uint64_t> atomEdges;
+            const auto addAtomDependency = [&](wolvrix::lib::grh::ValueId value, uint32_t toAtom)
+            {
+                if (!value.valid() || toAtom >= cbawAtoms.size())
+                {
+                    return;
+                }
+                const auto defOp = graph.valueDef(value);
+                if (!defOp.valid() || defOp.index >= opToCbawAtom.size())
+                {
+                    return;
+                }
+                const uint32_t fromAtom = opToCbawAtom[defOp.index];
+                if (fromAtom == kInvalidActivitySupernodeId || fromAtom == toAtom)
+                {
+                    return;
+                }
+                const auto packed = packActivitySchedulePair(fromAtom, toAtom);
+                if (atomEdges.insert(packed).second)
+                {
+                    atomDag[fromAtom].push_back(toAtom);
+                }
+            };
+            for (uint32_t atomId = 0; atomId < cbawAtoms.size(); ++atomId)
+            {
+                for (const auto opId : cbawAtoms[atomId].ops)
+                {
+                    const auto op = graph.getOperation(opId);
+                    for (const auto operand : op.operands())
+                    {
+                        addAtomDependency(operand, atomId);
+                    }
+                    if (isRegToMemIntentSlice(op))
+                    {
+                        if (const auto indexValue = regToMemIntentSliceIndexValue(graph, op))
+                        {
+                            addAtomDependency(*indexValue, atomId);
+                        }
+                    }
+                }
+            }
+            for (auto &succs : atomDag)
+            {
+                std::sort(succs.begin(), succs.end());
+                succs.erase(std::unique(succs.begin(), succs.end()), succs.end());
+            }
+            stats.cbawAtomQuotientEdges = atomEdges.size();
+            stats.cbawAtomQuotientCycleDetected = activityScheduleDagHasCycle(atomDag) ? 1 : 0;
+
+            std::vector<uint32_t> cbawAtomPlainPartition(cbawAtoms.size(), kInvalidActivitySupernodeId);
+            std::unordered_set<uint32_t> plainReplayComputeSupernodes;
+            for (uint32_t atomId = 0; atomId < cbawAtoms.size(); ++atomId)
+            {
+                cbawAtomPlainPartition[atomId] = cbawAtoms[atomId].plainSupernode;
+                if (cbawAtoms[atomId].plainSupernode != kInvalidActivitySupernodeId)
+                {
+                    plainReplayComputeSupernodes.insert(cbawAtoms[atomId].plainSupernode);
+                }
+            }
+            stats.cbawAtomPlainReplaySupernodes = plainReplayComputeSupernodes.size();
+
+            std::vector<uint32_t> splitOwnerComputeNodeBySupernode(build.supernodeToOps.size(),
+                                                                   kInvalidActivitySupernodeId);
+            std::vector<uint32_t> splitOrdinalBySupernode(build.supernodeToOps.size(),
+                                                          kInvalidActivitySupernodeId);
+            std::vector<uint32_t> splitOrdinalByComputeNode(rewrite.computeNodes.size(), 0);
+            for (uint32_t supernodeId = 0; supernodeId < build.computeNodesBySupernode.size(); ++supernodeId)
+            {
+                if (supernodeId >= build.supernodeKinds.size() ||
+                    build.supernodeKinds[supernodeId] != ActivityScheduleSupernodeKind::Compute ||
+                    build.computeNodesBySupernode[supernodeId].size() != 1)
+                {
+                    continue;
+                }
+                const uint32_t computeNodeId = build.computeNodesBySupernode[supernodeId].front();
+                if (computeNodeId >= computeNodeMaterializedUses.size() ||
+                    computeNodeMaterializedUses[computeNodeId] <= 1)
+                {
+                    continue;
+                }
+                splitOwnerComputeNodeBySupernode[supernodeId] = computeNodeId;
+                splitOrdinalBySupernode[supernodeId] = splitOrdinalByComputeNode[computeNodeId]++;
+            }
+
+            ActivityScheduleValueFanout atomPlainReplayFanout;
+            if (!graph.values().empty())
+            {
+                atomPlainReplayFanout.assign(graph.values().back().index, {});
+            }
+            std::unordered_set<std::uint64_t> atomPlainReplayDependencyEdges;
+            const auto plainReplaySupernodeForOp = [&](wolvrix::lib::grh::OperationId opId)
+            {
+                if (opId.valid() && opId.index < opToCbawAtom.size())
+                {
+                    const uint32_t atomId = opToCbawAtom[opId.index];
+                    if (atomId != kInvalidActivitySupernodeId &&
+                        atomId < cbawAtomPlainPartition.size())
+                    {
+                        return cbawAtomPlainPartition[atomId];
+                    }
+                }
+                if (opId.valid() && opId.index > 0 && opId.index - 1 < build.opToSupernode.size())
+                {
+                    return build.opToSupernode[opId.index - 1];
+                }
+                return kInvalidActivitySupernodeId;
+            };
+            const auto addAtomPlainReplayDependency = [&](wolvrix::lib::grh::ValueId value,
+                                                          uint32_t to,
+                                                          bool skipDagEdge = false)
+            {
+                if (!value.valid() || to >= build.supernodeKinds.size())
+                {
+                    return;
+                }
+                const auto defOp = graph.valueDef(value);
+                if (!defOp.valid())
+                {
+                    if (!skipDagEdge && value.index > 0 && value.index <= atomPlainReplayFanout.size())
+                    {
+                        atomPlainReplayFanout[value.index - 1].push_back(to);
+                    }
+                    return;
+                }
+                const uint32_t from = plainReplaySupernodeForOp(defOp);
+                if (from == kInvalidActivitySupernodeId || from == to)
+                {
+                    return;
+                }
+                if (from < build.supernodeKinds.size() &&
+                    build.supernodeKinds[from] == ActivityScheduleSupernodeKind::Commit)
+                {
+                    return;
+                }
+                if (!skipDagEdge)
+                {
+                    atomPlainReplayDependencyEdges.insert(packActivitySchedulePair(from, to));
+                    if (value.index > 0 && value.index <= atomPlainReplayFanout.size())
+                    {
+                        atomPlainReplayFanout[value.index - 1].push_back(to);
+                    }
+                }
+            };
+
+            for (uint32_t supernodeId = 0; supernodeId < build.supernodeToOps.size(); ++supernodeId)
+            {
+                for (const auto toOpId : build.supernodeToOps[supernodeId])
+                {
+                    const auto toOp = graph.getOperation(toOpId);
+                    const uint32_t to = plainReplaySupernodeForOp(toOpId);
+                    if (to == kInvalidActivitySupernodeId)
+                    {
+                        continue;
+                    }
+                    for (const auto operand : toOp.operands())
+                    {
+                        const auto defOp = graph.valueDef(operand);
+                        if (!defOp.valid())
+                        {
+                            continue;
+                        }
+                        const uint32_t from = plainReplaySupernodeForOp(defOp);
+                        bool skipDagEdge = false;
+                        if (defOp.index < rewrite.computeNodeOfOp.size() &&
+                            toOpId.index < rewrite.computeNodeOfOp.size())
+                        {
+                            const uint32_t defComputeNode = rewrite.computeNodeOfOp[defOp.index];
+                            const uint32_t useComputeNode = rewrite.computeNodeOfOp[toOpId.index];
+                            if (defComputeNode != kInvalidActivitySupernodeId &&
+                                defComputeNode == useComputeNode &&
+                                from != to)
+                            {
+                                const bool splitForward =
+                                    from < splitOwnerComputeNodeBySupernode.size() &&
+                                    to < splitOwnerComputeNodeBySupernode.size() &&
+                                    splitOwnerComputeNodeBySupernode[from] == defComputeNode &&
+                                    splitOwnerComputeNodeBySupernode[to] == defComputeNode &&
+                                    from < splitOrdinalBySupernode.size() &&
+                                    to < splitOrdinalBySupernode.size() &&
+                                    splitOrdinalBySupernode[from] < splitOrdinalBySupernode[to];
+                                skipDagEdge = !splitForward;
+                            }
+                        }
+                        addAtomPlainReplayDependency(operand, to, skipDagEdge);
+                    }
+                    if (isRegToMemIntentSlice(toOp))
+                    {
+                        if (const auto indexValue = regToMemIntentSliceIndexValue(graph, toOp))
+                        {
+                            addAtomPlainReplayDependency(*indexValue, to);
+                        }
+                    }
+                }
+            }
+            for (auto &fanout : atomPlainReplayFanout)
+            {
+                std::sort(fanout.begin(), fanout.end());
+                fanout.erase(std::unique(fanout.begin(), fanout.end()), fanout.end());
+            }
+            for (const auto &targets : atomPlainReplayFanout)
+            {
+                if (targets.empty())
+                {
+                    continue;
+                }
+                stats.cbawAtomPlainReplayCrossBoundaryTargetCount += targets.size();
+                for (const uint32_t target : targets)
+                {
+                    if (target < build.supernodeKinds.size() &&
+                        build.supernodeKinds[target] == ActivityScheduleSupernodeKind::Compute)
+                    {
+                        ++stats.cbawAtomPlainReplayComputeMaterializedValueTargetCount;
+                    }
+                }
+            }
+            stats.cbawAtomPlainReplaySupernodeDependencyEdgeCount =
+                atomPlainReplayDependencyEdges.size();
+            stats.cbawAtomPlainReplayBoundaryDelta =
+                stats.cbawAtomPlainReplayCrossBoundaryTargetCount > summaryStats.boundaryActivationEdges
+                    ? stats.cbawAtomPlainReplayCrossBoundaryTargetCount - summaryStats.boundaryActivationEdges
+                    : summaryStats.boundaryActivationEdges - stats.cbawAtomPlainReplayCrossBoundaryTargetCount;
+            stats.cbawAtomPlainReplayDagDelta =
+                stats.cbawAtomPlainReplaySupernodeDependencyEdgeCount > summaryStats.dagEdges
+                    ? stats.cbawAtomPlainReplaySupernodeDependencyEdgeCount - summaryStats.dagEdges
+                    : summaryStats.dagEdges - stats.cbawAtomPlainReplaySupernodeDependencyEdgeCount;
+            stats.cbawAtomPlainReplayComputeComputeDelta =
+                stats.cbawAtomPlainReplayComputeMaterializedValueTargetCount >
+                        summaryStats.computeComputeValuePairs
+                    ? stats.cbawAtomPlainReplayComputeMaterializedValueTargetCount -
+                          summaryStats.computeComputeValuePairs
+                    : summaryStats.computeComputeValuePairs -
+                          stats.cbawAtomPlainReplayComputeMaterializedValueTargetCount;
+
+            std::sort(topRoots.begin(),
+                      topRoots.end(),
+                      [](const auto &lhs, const auto &rhs)
+                      {
+                          if (lhs.targetCount != rhs.targetCount)
+                          {
+                              return lhs.targetCount > rhs.targetCount;
+                          }
+                          if (lhs.consumerUseCount != rhs.consumerUseCount)
+                          {
+                              return lhs.consumerUseCount > rhs.consumerUseCount;
+                          }
+                          if (lhs.valueBytes != rhs.valueBytes)
+                          {
+                              return lhs.valueBytes > rhs.valueBytes;
+                          }
+                          return lhs.valueIndex < rhs.valueIndex;
+                      });
+            if (topRoots.size() > 16)
+            {
+                topRoots.resize(16);
+            }
+            const auto noteTopRootAttribution = [&](std::string_view rule)
+            {
+                stats.semanticTopRootAttribution[std::string(rule)] += 1;
+                ++stats.semanticTopRootAttributedCount;
+            };
+            for (const auto &root : topRoots)
+            {
+                if (root.valueIndex == 0 || root.valueIndex > graph.values().size())
+                {
+                    continue;
+                }
+                wolvrix::lib::grh::ValueId value;
+                value.graph = graph.id();
+                value.index = static_cast<uint32_t>(root.valueIndex);
+                const auto defOp = graph.valueDef(value);
+                if (!defOp.valid() || defOp.index == 0 || defOp.index > build.opToSupernode.size())
+                {
+                    continue;
+                }
+                const uint32_t owner = build.opToSupernode[defOp.index - 1];
+                if (owner == kInvalidActivitySupernodeId)
+                {
+                    continue;
+                }
+                if (rtmSupernodes.find(owner) != rtmSupernodes.end())
+                {
+                    ++stats.semanticTopRootRtmCount;
+                    noteTopRootAttribution("rtm_intent");
+                }
+                if (aggregateSupernodes.find(owner) != aggregateSupernodes.end())
+                {
+                    ++stats.semanticTopRootAggregateCount;
+                    noteTopRootAttribution("aggregate_family");
+                }
+                if (guardSupernodes.find(owner) != guardSupernodes.end())
+                {
+                    ++stats.semanticTopRootGuardCount;
+                    noteTopRootAttribution("guard_domain");
+                }
+                if (sinkSupernodes.find(owner) != sinkSupernodes.end())
+                {
+                    ++stats.semanticTopRootSinkCount;
+                    noteTopRootAttribution("sink_cone");
+                }
+                if (passthroughSupernodes.find(owner) != passthroughSupernodes.end())
+                {
+                    ++stats.semanticTopRootPassthroughCount;
+                    noteTopRootAttribution("passthrough_chain");
+                }
+            }
+            stats.topRoots = std::move(topRoots);
+            stats.crossBoundaryConsumerUseCount = stats.canonicalCrossBoundaryConsumerUseCount;
+
+            stats.quotientDagCycleDetected = activityScheduleDagHasCycle(build.dag) ? 1 : 0;
+            stats.replayBoundaryActivationDelta =
+                stats.crossBoundaryTargetCount > summaryStats.boundaryActivationEdges
+                    ? stats.crossBoundaryTargetCount - summaryStats.boundaryActivationEdges
+                    : summaryStats.boundaryActivationEdges - stats.crossBoundaryTargetCount;
+            stats.replayDagEdgeDelta =
+                stats.supernodeDependencyEdgeCount > summaryStats.dagEdges
+                    ? stats.supernodeDependencyEdgeCount - summaryStats.dagEdges
+                    : summaryStats.dagEdges - stats.supernodeDependencyEdgeCount;
+            stats.replayComputeComputeDelta =
+                stats.computeMaterializedValueTargetCount > summaryStats.computeComputeValuePairs
+                    ? stats.computeMaterializedValueTargetCount - summaryStats.computeComputeValuePairs
+                    : summaryStats.computeComputeValuePairs - stats.computeMaterializedValueTargetCount;
+            stats.canonicalBoundaryActivationDelta =
+                stats.canonicalCrossBoundaryTargetCount > summaryStats.boundaryActivationEdges
+                    ? stats.canonicalCrossBoundaryTargetCount - summaryStats.boundaryActivationEdges
+                    : summaryStats.boundaryActivationEdges - stats.canonicalCrossBoundaryTargetCount;
+            stats.canonicalDagEdgeDelta =
+                stats.canonicalSupernodeDependencyEdgeCount > summaryStats.dagEdges
+                    ? stats.canonicalSupernodeDependencyEdgeCount - summaryStats.dagEdges
+                    : summaryStats.dagEdges - stats.canonicalSupernodeDependencyEdgeCount;
+            stats.canonicalComputeComputeDelta =
+                stats.canonicalComputeMaterializedValueTargetCount > summaryStats.computeComputeValuePairs
+                    ? stats.canonicalComputeMaterializedValueTargetCount - summaryStats.computeComputeValuePairs
+                    : summaryStats.computeComputeValuePairs - stats.canonicalComputeMaterializedValueTargetCount;
+            return stats;
+        }
+
+        struct CbawStructureGateReport
+        {
+            bool hasPlainBaseline = false;
+            bool structuralPass = false;
+            bool triggerPass = false;
+            bool resourcePass = false;
+            bool dagPass = false;
+            bool runtimeAllowed = false;
+            std::string reason;
+            std::size_t plainCrossBoundaryTargets = 0;
+            std::size_t plainDagEdges = 0;
+            std::size_t plainComputeMaterializedTargets = 0;
+            std::size_t cbawCrossBoundaryTargets = 0;
+            std::size_t cbawDagEdges = 0;
+            std::size_t cbawComputeMaterializedTargets = 0;
+            std::size_t cbawTriggerEstimatedP99 = 0;
+            std::size_t cbawResourceOpCountExceptions = 0;
+        };
+
+        CbawStructureGateReport buildCbawStructureGateReport(
+            const ActivityScheduleSummaryStats *plainStats,
+            const ActivityScheduleCbawStats &cbawStats)
+        {
+            CbawStructureGateReport report;
+            report.cbawCrossBoundaryTargets = cbawStats.crossBoundaryTargetCount;
+            report.cbawDagEdges = cbawStats.supernodeDependencyEdgeCount;
+            report.cbawComputeMaterializedTargets =
+                cbawStats.computeMaterializedValueTargetCount;
+            report.cbawTriggerEstimatedP99 = cbawStats.triggerEstimatedCountP99;
+            report.cbawResourceOpCountExceptions =
+                cbawStats.resourceOpCountBaselineExceptions;
+            report.dagPass = cbawStats.quotientDagCycleDetected == 0;
+            report.resourcePass = cbawStats.resourceOpCountBaselineExceptions == 0;
+
+            if (plainStats == nullptr)
+            {
+                report.reason = "missing_plain_baseline";
+                return report;
+            }
+            report.hasPlainBaseline = true;
+            report.plainCrossBoundaryTargets = plainStats->boundaryActivationEdges;
+            report.plainDagEdges = plainStats->dagEdges;
+            report.plainComputeMaterializedTargets =
+                plainStats->computeComputeValuePairs;
+
+            report.structuralPass =
+                cbawStats.crossBoundaryTargetCount <= plainStats->boundaryActivationEdges &&
+                cbawStats.supernodeDependencyEdgeCount <=
+                    plainStats->dagEdges &&
+                cbawStats.computeMaterializedValueTargetCount <=
+                    plainStats->computeComputeValuePairs;
+            report.triggerPass = cbawStats.triggerAteEqualMergeRecommended == 0 ||
+                                 cbawStats.triggerAteNoGoReason != "trigger_regression";
+            report.runtimeAllowed =
+                report.structuralPass && report.triggerPass && report.resourcePass && report.dagPass;
+            if (report.runtimeAllowed)
+            {
+                report.reason = "pass";
+            }
+            else if (!report.structuralPass)
+            {
+                report.reason = "structure_regression";
+            }
+            else if (!report.triggerPass)
+            {
+                report.reason = "trigger_regression";
+            }
+            else if (!report.resourcePass)
+            {
+                report.reason = "resource_exception";
+            }
+            else
+            {
+                report.reason = "quotient_cycle";
+            }
+            return report;
+        }
+
+        std::string encodeActivityScheduleCbawStatsJson(const ActivityScheduleCbawStats &stats)
+        {
+            const auto emitCountMap = [](std::ostringstream &out,
+                                         std::string_view key,
+                                         const ActivityScheduleCbawStats::KindCountMap &counts)
+            {
+                out << ",\"" << key << "\":{";
+                bool first = true;
+                for (const auto &[name, count] : counts)
+                {
+                    if (!first)
+                    {
+                        out << ",";
+                    }
+                    first = false;
+                    out << "\"" << name << "\":" << count;
+                }
+                out << "}";
+            };
+            const auto emitTopRoots = [](std::ostringstream &out,
+                                         const std::vector<ActivityScheduleCbawStats::TopRoot> &roots)
+            {
+                out << ",\"top_roots\":[";
+                bool first = true;
+                for (const auto &root : roots)
+                {
+                    if (!first)
+                    {
+                        out << ",";
+                    }
+                    first = false;
+                    out << "{";
+                    out << "\"value_index\":" << root.valueIndex;
+                    out << ",\"target_count\":" << root.targetCount;
+                    out << ",\"compute_target_count\":" << root.computeTargetCount;
+                    out << ",\"commit_target_count\":" << root.commitTargetCount;
+                    out << ",\"consumer_use_count\":" << root.consumerUseCount;
+                    out << ",\"value_bytes\":" << root.valueBytes;
+                    out << ",\"source_kind\":\"" << root.sourceKind << "\"";
+                    out << "}";
+                }
+                out << "]";
+            };
+            std::ostringstream out;
+            out << "{";
+            out << "\"value_use_groups\":" << stats.valueUseGroups;
+            out << ",\"cross_boundary_target_count\":" << stats.crossBoundaryTargetCount;
+            out << ",\"supernode_dependency_edge_count\":" << stats.supernodeDependencyEdgeCount;
+            out << ",\"compute_materialized_value_target_count\":"
+                << stats.computeMaterializedValueTargetCount;
+            out << ",\"compute_commit_value_target_count\":" << stats.computeCommitValueTargetCount;
+            out << ",\"cross_boundary_value_bytes\":" << stats.crossBoundaryValueBytes;
+            out << ",\"cross_boundary_consumer_use_count\":" << stats.crossBoundaryConsumerUseCount;
+            out << ",\"source_clone_canonicalized_groups\":" << stats.sourceCloneCanonicalizedGroups;
+            out << ",\"clone_width_mismatch_groups\":" << stats.cloneWidthMismatchGroups;
+            out << ",\"canonical_value_use_groups\":" << stats.canonicalValueUseGroups;
+            out << ",\"canonical_cross_boundary_target_count\":"
+                << stats.canonicalCrossBoundaryTargetCount;
+            out << ",\"canonical_supernode_dependency_edge_count\":"
+                << stats.canonicalSupernodeDependencyEdgeCount;
+            out << ",\"canonical_compute_materialized_value_target_count\":"
+                << stats.canonicalComputeMaterializedValueTargetCount;
+            out << ",\"canonical_compute_commit_value_target_count\":"
+                << stats.canonicalComputeCommitValueTargetCount;
+            out << ",\"canonical_cross_boundary_consumer_use_count\":"
+                << stats.canonicalCrossBoundaryConsumerUseCount;
+            out << ",\"canonical_boundary_activation_delta\":"
+                << stats.canonicalBoundaryActivationDelta;
+            out << ",\"canonical_dag_edge_delta\":" << stats.canonicalDagEdgeDelta;
+            out << ",\"canonical_compute_compute_delta\":"
+                << stats.canonicalComputeComputeDelta;
+            out << ",\"quotient_dag_cycle_detected\":" << stats.quotientDagCycleDetected;
+            out << ",\"replay_boundary_activation_delta\":" << stats.replayBoundaryActivationDelta;
+            out << ",\"replay_dag_edge_delta\":" << stats.replayDagEdgeDelta;
+            out << ",\"replay_compute_compute_delta\":" << stats.replayComputeComputeDelta;
+            out << ",\"compute_supernodes\":" << stats.computeSupernodes;
+            out << ",\"compute_supernode_op_count_p50\":" << stats.computeSupernodeOpCountP50;
+            out << ",\"compute_supernode_op_count_p90\":" << stats.computeSupernodeOpCountP90;
+            out << ",\"compute_supernode_op_count_p99\":" << stats.computeSupernodeOpCountP99;
+            out << ",\"compute_supernode_op_count_p995\":" << stats.computeSupernodeOpCountP995;
+            out << ",\"compute_supernode_op_count_max\":" << stats.computeSupernodeOpCountMax;
+            out << ",\"resource_op_count_cap\":" << stats.resourceOpCountCap;
+            out << ",\"resource_op_count_baseline_exceptions\":"
+                << stats.resourceOpCountBaselineExceptions;
+            out << ",\"trigger_signature_bits\":" << stats.triggerSignatureBits;
+            out << ",\"trigger_signature_hash_functions\":"
+                << stats.triggerSignatureHashFunctions;
+            out << ",\"trigger_saturation_threshold_bits\":"
+                << stats.triggerSaturationThresholdBits;
+            out << ",\"trigger_volatile_source_values\":"
+                << stats.triggerVolatileSourceValues;
+            out << ",\"trigger_compute_supernodes_with_trigger\":"
+                << stats.triggerComputeSupernodesWithTrigger;
+            out << ",\"trigger_empty_compute_supernodes\":"
+                << stats.triggerEmptyComputeSupernodes;
+            out << ",\"trigger_signature_popcount_p50\":"
+                << stats.triggerSignaturePopcountP50;
+            out << ",\"trigger_signature_popcount_p90\":"
+                << stats.triggerSignaturePopcountP90;
+            out << ",\"trigger_signature_popcount_p99\":"
+                << stats.triggerSignaturePopcountP99;
+            out << ",\"trigger_signature_popcount_p995\":"
+                << stats.triggerSignaturePopcountP995;
+            out << ",\"trigger_signature_popcount_max\":"
+                << stats.triggerSignaturePopcountMax;
+            out << ",\"trigger_estimated_count_p50\":"
+                << stats.triggerEstimatedCountP50;
+            out << ",\"trigger_estimated_count_p90\":"
+                << stats.triggerEstimatedCountP90;
+            out << ",\"trigger_estimated_count_p99\":"
+                << stats.triggerEstimatedCountP99;
+            out << ",\"trigger_estimated_count_p995\":"
+                << stats.triggerEstimatedCountP995;
+            out << ",\"trigger_estimated_count_max\":"
+                << stats.triggerEstimatedCountMax;
+            out << ",\"trigger_signature_saturated_compute_supernodes\":"
+                << stats.triggerSignatureSaturatedComputeSupernodes;
+            out << ",\"trigger_signature_saturated_ratio_ppm\":"
+                << stats.triggerSignatureSaturatedRatioPpm;
+            out << ",\"trigger_equal_bucket_count\":"
+                << stats.triggerEqualBucketCount;
+            out << ",\"trigger_equal_bucket_multi_count\":"
+                << stats.triggerEqualBucketMultiCount;
+            out << ",\"trigger_equal_bucket_covered_supernodes\":"
+                << stats.triggerEqualBucketCoveredSupernodes;
+            out << ",\"trigger_equal_bucket_covered_supernode_ratio_ppm\":"
+                << stats.triggerEqualBucketCoveredSupernodeRatioPpm;
+            out << ",\"trigger_equal_bucket_largest\":"
+                << stats.triggerEqualBucketLargest;
+            out << ",\"trigger_non_empty_equal_bucket_count\":"
+                << stats.triggerNonEmptyEqualBucketCount;
+            out << ",\"trigger_non_empty_equal_bucket_multi_count\":"
+                << stats.triggerNonEmptyEqualBucketMultiCount;
+            out << ",\"trigger_non_empty_equal_bucket_covered_supernodes\":"
+                << stats.triggerNonEmptyEqualBucketCoveredSupernodes;
+            out << ",\"trigger_non_empty_equal_bucket_covered_supernode_ratio_ppm\":"
+                << stats.triggerNonEmptyEqualBucketCoveredSupernodeRatioPpm;
+            out << ",\"trigger_non_empty_equal_bucket_largest\":"
+                << stats.triggerNonEmptyEqualBucketLargest;
+            out << ",\"trigger_equal_bucket_internalizable_boundary_targets\":"
+                << stats.triggerEqualBucketInternalizableBoundaryTargets;
+            out << ",\"trigger_non_empty_equal_bucket_internalizable_boundary_targets\":"
+                << stats.triggerNonEmptyEqualBucketInternalizableBoundaryTargets;
+            out << ",\"trigger_equal_bucket_internalizable_compute_targets\":"
+                << stats.triggerEqualBucketInternalizableComputeTargets;
+            out << ",\"trigger_non_empty_equal_bucket_internalizable_compute_targets\":"
+                << stats.triggerNonEmptyEqualBucketInternalizableComputeTargets;
+            out << ",\"trigger_equal_bucket_internalizable_dependency_edges\":"
+                << stats.triggerEqualBucketInternalizableDependencyEdges;
+            out << ",\"trigger_non_empty_equal_bucket_internalizable_dependency_edges\":"
+                << stats.triggerNonEmptyEqualBucketInternalizableDependencyEdges;
+            out << ",\"trigger_ate_equal_merge_recommended\":"
+                << stats.triggerAteEqualMergeRecommended;
+            out << ",\"trigger_ate_no_go_reason\":\""
+                << escapeJsonString(stats.triggerAteNoGoReason) << "\"";
+            out << ",\"semantic_seed_groups\":" << stats.semanticSeedGroups;
+            out << ",\"semantic_merge_hint_groups\":" << stats.semanticMergeHintGroups;
+            out << ",\"semantic_debug_labels\":" << stats.semanticDebugLabels;
+            out << ",\"semantic_rtm_intent_groups\":" << stats.semanticRtmIntentGroups;
+            out << ",\"semantic_rtm_intent_ops\":" << stats.semanticRtmIntentOps;
+            out << ",\"semantic_mffc_groups\":" << stats.semanticMffcGroups;
+            out << ",\"semantic_mffc_covered_ops\":" << stats.semanticMffcCoveredOps;
+            out << ",\"semantic_mffc_split_groups\":" << stats.semanticMffcSplitGroups;
+            out << ",\"semantic_plain_out1_hints\":" << stats.semanticPlainOut1Hints;
+            out << ",\"semantic_plain_in1_hints\":" << stats.semanticPlainIn1Hints;
+            out << ",\"semantic_plain_sibling_groups\":" << stats.semanticPlainSiblingGroups;
+            out << ",\"semantic_plain_sibling_members\":" << stats.semanticPlainSiblingMembers;
+            out << ",\"semantic_aggregate_families\":" << stats.semanticAggregateFamilies;
+            out << ",\"semantic_aggregate_seed_groups\":" << stats.semanticAggregateSeedGroups;
+            out << ",\"semantic_aggregate_merge_hint_groups\":"
+                << stats.semanticAggregateMergeHintGroups;
+            out << ",\"semantic_guard_domains\":" << stats.semanticGuardDomains;
+            out << ",\"semantic_guard_domain_members\":" << stats.semanticGuardDomainMembers;
+            out << ",\"semantic_guard_unknown_ops\":" << stats.semanticGuardUnknownOps;
+            out << ",\"semantic_sink_cone_labels\":" << stats.semanticSinkConeLabels;
+            out << ",\"semantic_sink_cone_members\":" << stats.semanticSinkConeMembers;
+            out << ",\"semantic_sink_cone_multi_sink_ops\":"
+                << stats.semanticSinkConeMultiSinkOps;
+            out << ",\"semantic_passthrough_chains\":" << stats.semanticPassthroughChains;
+            out << ",\"semantic_passthrough_ops\":" << stats.semanticPassthroughOps;
+            out << ",\"semantic_hierarchy_debug_labels\":"
+                << stats.semanticHierarchyDebugLabels;
+            out << ",\"semantic_top_root_attributed_count\":"
+                << stats.semanticTopRootAttributedCount;
+            out << ",\"semantic_top_root_rtm_count\":" << stats.semanticTopRootRtmCount;
+            out << ",\"semantic_top_root_aggregate_count\":"
+                << stats.semanticTopRootAggregateCount;
+            out << ",\"semantic_top_root_guard_count\":" << stats.semanticTopRootGuardCount;
+            out << ",\"semantic_top_root_sink_count\":" << stats.semanticTopRootSinkCount;
+            out << ",\"semantic_top_root_passthrough_count\":"
+                << stats.semanticTopRootPassthroughCount;
+            out << ",\"cbaw_atom_count\":" << stats.cbawAtomCount;
+            out << ",\"cbaw_atom_op_count_p50\":" << stats.cbawAtomOpCountP50;
+            out << ",\"cbaw_atom_op_count_p90\":" << stats.cbawAtomOpCountP90;
+            out << ",\"cbaw_atom_op_count_p99\":" << stats.cbawAtomOpCountP99;
+            out << ",\"cbaw_atom_op_count_p995\":" << stats.cbawAtomOpCountP995;
+            out << ",\"cbaw_atom_op_count_max\":" << stats.cbawAtomOpCountMax;
+            out << ",\"cbaw_atom_quotient_edges\":" << stats.cbawAtomQuotientEdges;
+            out << ",\"cbaw_atom_quotient_cycle_detected\":"
+                << stats.cbawAtomQuotientCycleDetected;
+            out << ",\"cbaw_atom_resource_op_count_cap\":"
+                << stats.cbawAtomResourceOpCountCap;
+            out << ",\"cbaw_atom_resource_op_count_baseline_exceptions\":"
+                << stats.cbawAtomResourceOpCountBaselineExceptions;
+            out << ",\"cbaw_atom_rtm_intent_atoms\":" << stats.cbawAtomRtmIntentAtoms;
+            out << ",\"cbaw_atom_mffc_atoms\":" << stats.cbawAtomMffcAtoms;
+            out << ",\"cbaw_atom_passthrough_atoms\":" << stats.cbawAtomPassthroughAtoms;
+            out << ",\"cbaw_atom_aggregate_atoms\":" << stats.cbawAtomAggregateAtoms;
+            out << ",\"cbaw_atom_guard_atoms\":" << stats.cbawAtomGuardAtoms;
+            out << ",\"cbaw_atom_plain_replay_supernodes\":"
+                << stats.cbawAtomPlainReplaySupernodes;
+            out << ",\"cbaw_atom_plain_replay_cross_boundary_target_count\":"
+                << stats.cbawAtomPlainReplayCrossBoundaryTargetCount;
+            out << ",\"cbaw_atom_plain_replay_supernode_dependency_edge_count\":"
+                << stats.cbawAtomPlainReplaySupernodeDependencyEdgeCount;
+            out << ",\"cbaw_atom_plain_replay_compute_materialized_value_target_count\":"
+                << stats.cbawAtomPlainReplayComputeMaterializedValueTargetCount;
+            out << ",\"cbaw_atom_plain_replay_boundary_delta\":"
+                << stats.cbawAtomPlainReplayBoundaryDelta;
+            out << ",\"cbaw_atom_plain_replay_dag_delta\":"
+                << stats.cbawAtomPlainReplayDagDelta;
+            out << ",\"cbaw_atom_plain_replay_compute_compute_delta\":"
+                << stats.cbawAtomPlainReplayComputeComputeDelta;
+            emitCountMap(out, "target_kind_matrix", stats.targetKindMatrix);
+            emitCountMap(out, "source_kind_matrix", stats.sourceKindMatrix);
+            emitCountMap(out, "source_target_kind_matrix", stats.sourceTargetKindMatrix);
+            emitCountMap(out, "resource_p50", stats.resourceP50);
+            emitCountMap(out, "resource_p90", stats.resourceP90);
+            emitCountMap(out, "resource_p99", stats.resourceP99);
+            emitCountMap(out, "resource_p995", stats.resourceP995);
+            emitCountMap(out, "resource_max", stats.resourceMax);
+            emitCountMap(out, "resource_cap", stats.resourceCap);
+            emitCountMap(out, "resource_baseline_exceptions", stats.resourceBaselineExceptions);
+            emitCountMap(out, "semantic_rule_seed_groups", stats.semanticRuleSeedGroups);
+            emitCountMap(out, "semantic_rule_merge_hint_groups", stats.semanticRuleMergeHintGroups);
+            emitCountMap(out, "semantic_rule_debug_labels", stats.semanticRuleDebugLabels);
+            emitCountMap(out, "semantic_top_root_attribution", stats.semanticTopRootAttribution);
+            emitCountMap(out, "cbaw_atom_resource_p50", stats.cbawAtomResourceP50);
+            emitCountMap(out, "cbaw_atom_resource_p90", stats.cbawAtomResourceP90);
+            emitCountMap(out, "cbaw_atom_resource_p99", stats.cbawAtomResourceP99);
+            emitCountMap(out, "cbaw_atom_resource_p995", stats.cbawAtomResourceP995);
+            emitCountMap(out, "cbaw_atom_resource_max", stats.cbawAtomResourceMax);
+            emitCountMap(out, "cbaw_atom_resource_cap", stats.cbawAtomResourceCap);
+            emitCountMap(out,
+                         "cbaw_atom_resource_baseline_exceptions",
+                         stats.cbawAtomResourceBaselineExceptions);
+            emitCountMap(out, "cbaw_atom_kind_counts", stats.cbawAtomKindCounts);
+            emitTopRoots(out, stats.topRoots);
+            out << "}";
+            return out.str();
         }
 
         std::string encodeActivityScheduleSummaryStatsJson(const ActivityScheduleSummaryStats &stats)
@@ -438,6 +2733,10 @@ namespace wolvrix::lib::transform
             out << ",\"initial_boundary_values\":" << stats.initialBoundaryValues;
             out << ",\"initial_boundary_activation_edges\":"
                 << stats.initialBoundaryActivationEdges;
+            out << ",\"initial_compute_compute_value_pairs\":"
+                << stats.initialComputeComputeValuePairs;
+            out << ",\"initial_compute_commit_value_pairs\":"
+                << stats.initialComputeCommitValuePairs;
             out << ",\"source_clones_in_compute_nodes\":" << stats.sourceClonesInComputeNodes;
             out << ",\"local_shared_compute_clones_in_compute_nodes\":"
                 << stats.localSharedComputeClonesInComputeNodes;
@@ -507,6 +2806,10 @@ namespace wolvrix::lib::transform
             stats.initialBoundaryValues = rewrite.stats.initialBoundaryValues;
             stats.initialBoundaryActivationEdges =
                 rewrite.stats.initialBoundaryActivationEdges;
+            stats.initialComputeComputeValuePairs =
+                rewrite.stats.initialComputeComputeValuePairs;
+            stats.initialComputeCommitValuePairs =
+                rewrite.stats.initialComputeCommitValuePairs;
             stats.sourceClonesInComputeNodes = rewrite.stats.sourceClonesInComputeNodes;
             stats.localSharedComputeClonesInComputeNodes =
                 rewrite.stats.localSharedComputeClonesInComputeNodes;
@@ -722,6 +3025,22 @@ namespace wolvrix::lib::transform
 
         struct ComputeNodeMaterializePerfStats
         {
+            using KindCountMap = std::map<std::string, std::size_t>;
+
+            struct CbawStageStats
+            {
+                std::size_t boundaryActivationEdges = 0;
+                std::size_t dagEdges = 0;
+                std::size_t computeComputeValuePairs = 0;
+                std::size_t clusterCount = 0;
+                std::size_t segmentCount = 0;
+                std::size_t computeSupernodeCount = 0;
+                std::size_t opCountP50 = 0;
+                std::size_t opCountP90 = 0;
+                std::size_t opCountP99 = 0;
+                std::size_t opCountMax = 0;
+            };
+
             struct CoarsenIteration
             {
                 std::size_t iteration = 0;
@@ -765,6 +3084,33 @@ namespace wolvrix::lib::transform
             std::size_t probCoarsenFullAggregates = 0;
             std::uint64_t probCoarsenAggregateMs = 0;
             double probCoarsenTotalGain = 0.0;
+            std::size_t cbawCoarsenCandidates = 0;
+            std::size_t cbawCoarsenEvaluated = 0;
+            std::size_t cbawCoarsenMerges = 0;
+            std::size_t cbawCoarsenRejectedNoGain = 0;
+            std::size_t cbawCoarsenRejectedCycle = 0;
+            std::size_t cbawCoarsenRejectedResource = 0;
+            std::size_t cbawCoarsenStale = 0;
+            std::uint64_t cbawCoarsenEvaluateMs = 0;
+            std::uint64_t cbawCoarsenTopoMs = 0;
+            KindCountMap cbawCoarsenGeneratedByKind;
+            KindCountMap cbawCoarsenDedupSelectedByKind;
+            KindCountMap cbawCoarsenDedupLostTagByKind;
+            KindCountMap cbawCoarsenSelectedReason;
+            KindCountMap cbawCoarsenEvaluatedByKind;
+            KindCountMap cbawCoarsenAcceptedByKind;
+            KindCountMap cbawCoarsenAcceptedByTag;
+            KindCountMap cbawCoarsenRejectedNoGainByKind;
+            KindCountMap cbawCoarsenRejectedNoGainByTag;
+            KindCountMap cbawCoarsenRejectedCycleByKind;
+            KindCountMap cbawCoarsenRejectedCycleByTag;
+            KindCountMap cbawCoarsenRejectedResourceByKind;
+            KindCountMap cbawCoarsenRejectedResourceByTag;
+            KindCountMap cbawCoarsenStaleByKind;
+            KindCountMap cbawCoarsenStaleByTag;
+            CbawStageStats cbawAfterCoarsen;
+            CbawStageStats cbawAfterDp;
+            CbawStageStats cbawAfterFm;
             std::size_t fmRefineRounds = 0;
             std::size_t fmRefineCandidates = 0;
             std::size_t fmRefineMoves = 0;
@@ -773,6 +3119,8 @@ namespace wolvrix::lib::transform
             std::size_t fmRefineRejectedWeight = 0;
             std::size_t fmRefineRejectedSize = 0;
             std::size_t fmRefineRejectedCycle = 0;
+            KindCountMap fmRefineRejectedSizeFillBucket;
+            KindCountMap fmRefineRejectedCycleRelation;
             double fmRefineTotalGain = 0.0;
             std::size_t segments = 0;
             std::size_t computeSupernodes = 0;
@@ -793,6 +3141,7 @@ namespace wolvrix::lib::transform
         };
 
         ClusterView buildClusterView(const WorkingPartition &partition, const ActivityOpData &opData);
+        std::vector<uint32_t> computeMffcRep(const ActivityOpData &data);
 
         std::vector<uint32_t> buildTopoOrderedClusterIds(const ClusterView &view)
         {
@@ -2960,6 +5309,8 @@ namespace wolvrix::lib::transform
             std::size_t initialComputeSupernodeDagEdges = 0;
             std::size_t initialBoundaryValues = 0;
             std::size_t initialBoundaryActivationEdges = 0;
+            std::size_t initialComputeComputeValuePairs = 0;
+            std::size_t initialComputeCommitValuePairs = 0;
             std::size_t sourceClonesInComputeNodes = 0;
             std::size_t localSharedComputeClonesInComputeNodes = 0;
             std::size_t directSourceInputsToCommitSupernodes = 0;
@@ -5301,6 +7652,7 @@ namespace wolvrix::lib::transform
             std::vector<wolvrix::lib::grh::ValueId> fanoutValues;
             std::vector<std::vector<uint32_t>> sourceValuesByCluster;
             std::vector<std::vector<uint32_t>> targetValuesByCluster;
+            std::vector<std::vector<uint32_t>> commitSuccsByCluster;
         };
 
         uint64_t packClusterPair(uint32_t from, uint32_t to) noexcept
@@ -5826,6 +8178,7 @@ namespace wolvrix::lib::transform
             out.outgoing.resize(view.members.size());
             out.sourceValuesByCluster.resize(view.members.size());
             out.targetValuesByCluster.resize(view.members.size());
+            out.commitSuccsByCluster.resize(view.members.size());
             std::unordered_map<wolvrix::lib::grh::ValueId,
                                uint32_t,
                                wolvrix::lib::grh::ValueIdHash>
@@ -5881,9 +8234,50 @@ namespace wolvrix::lib::transform
                     }
                 }
             }
+            const uint32_t commitBase = static_cast<uint32_t>(view.members.size());
+            for (uint32_t commitId = 0; commitId < rewrite.commitNodes.size(); ++commitId)
+            {
+                const auto &commit = rewrite.commitNodes[commitId];
+                for (const auto input : commit.inputValues)
+                {
+                    const auto defOp = graph.valueDef(input);
+                    if (!defOp.valid() || defOp.index >= rewrite.computeNodeOfOp.size())
+                    {
+                        continue;
+                    }
+                    const uint32_t predNode = rewrite.computeNodeOfOp[defOp.index];
+                    if (predNode == kInvalidActivitySupernodeId ||
+                        predNode >= view.clusterOfNode.size())
+                    {
+                        continue;
+                    }
+                    const uint32_t fromCluster = view.clusterOfNode[predNode];
+                    if (fromCluster == kInvalidActivitySupernodeId ||
+                        fromCluster >= out.commitSuccsByCluster.size())
+                    {
+                        continue;
+                    }
+                    out.commitSuccsByCluster[fromCluster].push_back(commitBase + commitId);
+                }
+            }
             for (auto &fanout : out.valueFanouts)
             {
                 std::sort(fanout.targetClusters.begin(), fanout.targetClusters.end());
+            }
+            for (auto &values : out.sourceValuesByCluster)
+            {
+                std::sort(values.begin(), values.end());
+                values.erase(std::unique(values.begin(), values.end()), values.end());
+            }
+            for (auto &values : out.targetValuesByCluster)
+            {
+                std::sort(values.begin(), values.end());
+                values.erase(std::unique(values.begin(), values.end()), values.end());
+            }
+            for (auto &succs : out.commitSuccsByCluster)
+            {
+                std::sort(succs.begin(), succs.end());
+                succs.erase(std::unique(succs.begin(), succs.end()), succs.end());
             }
             for (const auto &[packed, weight] : out.weights)
             {
@@ -5908,6 +8302,183 @@ namespace wolvrix::lib::transform
                           });
             }
             return out;
+        }
+
+        void recordInitialComputeSupernodeStats(const NodeClusterView &view,
+                                                const ClusterValueEdges &valueEdges,
+                                                ComputeRewriteBuild &rewrite,
+                                                const wolvrix::lib::grh::Graph &graph,
+                                                const std::vector<uint32_t> &nodeOpSizes)
+        {
+            auto &stats = rewrite.stats;
+            stats.initialComputeSupernodes = view.members.size();
+            stats.initialComputeSupernodeOpsTotal = 0;
+            stats.initialComputeSupernodeDagEdges = 0;
+            stats.initialBoundaryValues = 0;
+            stats.initialBoundaryActivationEdges = 0;
+            stats.initialComputeComputeValuePairs = 0;
+            stats.initialComputeCommitValuePairs = 0;
+            for (const auto &members : view.members)
+            {
+                stats.initialComputeSupernodeOpsTotal += clusterOpSize(members, nodeOpSizes);
+            }
+
+            std::unordered_set<uint64_t> dagEdges;
+            dagEdges.reserve(valueEdges.weights.size() + rewrite.commitNodes.size());
+            std::unordered_set<std::size_t> boundaryValues;
+            boundaryValues.reserve(valueEdges.valueFanouts.size() + rewrite.commitNodes.size());
+
+            auto noteComputeFanout = [&](wolvrix::lib::grh::ValueId value, uint32_t from, uint32_t to) {
+                if (!value.valid() || from == kInvalidActivitySupernodeId ||
+                    to == kInvalidActivitySupernodeId || from == to)
+                {
+                    return;
+                }
+                boundaryValues.insert(value.index);
+                dagEdges.insert(packClusterPair(from, to));
+                ++stats.initialBoundaryActivationEdges;
+                ++stats.initialComputeComputeValuePairs;
+            };
+
+            for (std::size_t valueFanoutId = 0; valueFanoutId < valueEdges.valueFanouts.size(); ++valueFanoutId)
+            {
+                if (valueFanoutId >= valueEdges.fanoutValues.size())
+                {
+                    continue;
+                }
+                const auto value = valueEdges.fanoutValues[valueFanoutId];
+                const auto &fanout = valueEdges.valueFanouts[valueFanoutId];
+                for (const uint32_t to : fanout.targetClusters)
+                {
+                    noteComputeFanout(value, fanout.sourceCluster, to);
+                }
+            }
+
+            const uint32_t commitBase = static_cast<uint32_t>(view.members.size());
+            for (uint32_t commitId = 0; commitId < rewrite.commitNodes.size(); ++commitId)
+            {
+                const auto &commit = rewrite.commitNodes[commitId];
+                for (const auto input : commit.inputValues)
+                {
+                    const auto defOp = graph.valueDef(input);
+                    if (!defOp.valid() || defOp.index >= rewrite.computeNodeOfOp.size())
+                    {
+                        continue;
+                    }
+                    const uint32_t predNode = rewrite.computeNodeOfOp[defOp.index];
+                    if (predNode == kInvalidActivitySupernodeId ||
+                        predNode >= view.clusterOfNode.size())
+                    {
+                        continue;
+                    }
+                    const uint32_t from = view.clusterOfNode[predNode];
+                    if (from == kInvalidActivitySupernodeId)
+                    {
+                        continue;
+                    }
+                    boundaryValues.insert(input.index);
+                    dagEdges.insert(packClusterPair(from, commitBase + commitId));
+                    ++stats.initialBoundaryActivationEdges;
+                    ++stats.initialComputeCommitValuePairs;
+                }
+            }
+
+            stats.initialComputeSupernodeDagEdges = dagEdges.size();
+            stats.initialBoundaryValues = boundaryValues.size();
+        }
+
+        ComputeNodeMaterializePerfStats::CbawStageStats
+        buildCbawStageStatsForView(const NodeClusterView &view,
+                                   const ClusterValueEdges &valueEdges,
+                                   const ComputeRewriteBuild &rewrite,
+                                   const wolvrix::lib::grh::Graph &graph,
+                                   const std::vector<uint32_t> &nodeOpSizes,
+                                   std::size_t segmentCount)
+        {
+            ComputeNodeMaterializePerfStats::CbawStageStats stats;
+            stats.clusterCount = view.members.size();
+            stats.segmentCount = segmentCount;
+            stats.computeSupernodeCount = view.members.size();
+
+            std::vector<std::size_t> opCounts;
+            opCounts.reserve(view.members.size());
+            for (const auto &members : view.members)
+            {
+                opCounts.push_back(clusterOpSize(members, nodeOpSizes));
+            }
+            std::sort(opCounts.begin(), opCounts.end());
+            stats.opCountP50 = percentileFromSorted(opCounts, 50, 100);
+            stats.opCountP90 = percentileFromSorted(opCounts, 90, 100);
+            stats.opCountP99 = percentileFromSorted(opCounts, 99, 100);
+            stats.opCountMax = opCounts.empty() ? 0 : opCounts.back();
+
+            std::unordered_set<std::uint64_t> dagEdges;
+            dagEdges.reserve(valueEdges.weights.size() + rewrite.commitNodes.size());
+            for (const auto &[packed, weight] : valueEdges.weights)
+            {
+                if (weight == 0)
+                {
+                    continue;
+                }
+                dagEdges.insert(packed);
+                stats.boundaryActivationEdges += weight;
+                stats.computeComputeValuePairs += weight;
+            }
+
+            const uint32_t commitBase = static_cast<uint32_t>(view.members.size());
+            for (uint32_t commitId = 0; commitId < rewrite.commitNodes.size(); ++commitId)
+            {
+                const auto &commit = rewrite.commitNodes[commitId];
+                for (const auto input : commit.inputValues)
+                {
+                    const auto defOp = graph.valueDef(input);
+                    if (!defOp.valid() || defOp.index >= rewrite.computeNodeOfOp.size())
+                    {
+                        continue;
+                    }
+                    const uint32_t predNode = rewrite.computeNodeOfOp[defOp.index];
+                    if (predNode == kInvalidActivitySupernodeId ||
+                        predNode >= view.clusterOfNode.size())
+                    {
+                        continue;
+                    }
+                    const uint32_t from = view.clusterOfNode[predNode];
+                    if (from == kInvalidActivitySupernodeId)
+                    {
+                        continue;
+                    }
+                    dagEdges.insert(packClusterPair(from, commitBase + commitId));
+                    ++stats.boundaryActivationEdges;
+                }
+            }
+            stats.dagEdges = dagEdges.size();
+            return stats;
+        }
+
+        ComputeNodeMaterializePerfStats::CbawStageStats
+        buildCbawStageStatsForComputeSupernodes(
+            const std::vector<std::vector<uint32_t>> &computeSupernodes,
+            const std::vector<std::vector<uint32_t>> &nodeDag,
+            std::size_t nodeCount,
+            const ComputeRewriteBuild &rewrite,
+            const wolvrix::lib::grh::Graph &graph,
+            const std::vector<uint32_t> &nodeOpSizes,
+            std::size_t clusterCount,
+            std::size_t segmentCount)
+        {
+            const NodeClusterView stageView =
+                buildNodeClusterView(computeSupernodes, nodeDag, nodeCount);
+            const ClusterValueEdges stageValueEdges =
+                buildClusterValueEdges(stageView, rewrite, graph);
+            auto stats = buildCbawStageStatsForView(stageView,
+                                                    stageValueEdges,
+                                                    rewrite,
+                                                    graph,
+                                                    nodeOpSizes,
+                                                    segmentCount);
+            stats.clusterCount = clusterCount;
+            stats.computeSupernodeCount = computeSupernodes.size();
+            return stats;
         }
 
         // NO0207 Phase C：computeNode/cluster 层的概率超图聚合。这里只构建只读分析结构，
@@ -7124,6 +9695,936 @@ namespace wolvrix::lib::transform
             return true;
         }
 
+        constexpr uint32_t kCbawTagHeavyValueUse = 1u << 0;
+        constexpr uint32_t kCbawTagPlainOut1 = 1u << 1;
+        constexpr uint32_t kCbawTagPlainIn1 = 1u << 2;
+        constexpr uint32_t kCbawTagPlainSiblings = 1u << 3;
+        constexpr uint32_t kCbawTagAggregateHint = 1u << 4;
+        constexpr uint32_t kCbawTagMffcDominance = 1u << 5;
+        constexpr uint32_t kCbawTagGuardHint = 1u << 6;
+        constexpr uint32_t kCbawTagSinkCone = 1u << 7;
+        constexpr uint32_t kCbawTagPassthrough = 1u << 8;
+
+        std::string_view cbawTagName(uint32_t tag) noexcept
+        {
+            switch (tag)
+            {
+            case kCbawTagHeavyValueUse: return "heavy_value_use";
+            case kCbawTagPlainOut1: return "plain_out1";
+            case kCbawTagPlainIn1: return "plain_in1";
+            case kCbawTagPlainSiblings: return "plain_siblings";
+            case kCbawTagAggregateHint: return "aggregate_hint";
+            case kCbawTagMffcDominance: return "mffc_dominance";
+            case kCbawTagGuardHint: return "guard_hint";
+            case kCbawTagSinkCone: return "sink_cone";
+            case kCbawTagPassthrough: return "passthrough";
+            default: return "unknown";
+            }
+        }
+
+        template <typename Fn>
+        void forEachCbawTag(uint32_t tags, Fn &&fn)
+        {
+            constexpr std::array<uint32_t, 9> kTags = {
+                kCbawTagHeavyValueUse,
+                kCbawTagPlainOut1,
+                kCbawTagPlainIn1,
+                kCbawTagPlainSiblings,
+                kCbawTagAggregateHint,
+                kCbawTagMffcDominance,
+                kCbawTagGuardHint,
+                kCbawTagSinkCone,
+                kCbawTagPassthrough,
+            };
+            for (const uint32_t tag : kTags)
+            {
+                if ((tags & tag) != 0)
+                {
+                    fn(tag);
+                }
+            }
+        }
+
+        int cbawPrimaryKindPriority(uint32_t tag) noexcept
+        {
+            switch (tag)
+            {
+            case kCbawTagPlainOut1:
+            case kCbawTagPlainIn1:
+                return 0;
+            case kCbawTagPlainSiblings:
+                return 1;
+            case kCbawTagAggregateHint:
+            case kCbawTagMffcDominance:
+            case kCbawTagPassthrough:
+                return 2;
+            case kCbawTagGuardHint:
+            case kCbawTagSinkCone:
+                return 3;
+            case kCbawTagHeavyValueUse:
+            default:
+                return 4;
+            }
+        }
+
+        uint32_t cbawChoosePrimaryTag(uint32_t tags) noexcept
+        {
+            uint32_t best = kCbawTagHeavyValueUse;
+            int bestPriority = std::numeric_limits<int>::max();
+            forEachCbawTag(tags,
+                           [&](uint32_t tag)
+                           {
+                               const int priority = cbawPrimaryKindPriority(tag);
+                               if (priority < bestPriority ||
+                                   (priority == bestPriority && tag < best))
+                               {
+                                   best = tag;
+                                   bestPriority = priority;
+                               }
+                           });
+            return best;
+        }
+
+        int cbawSemanticTieBreakScore(uint32_t tags) noexcept
+        {
+            int score = 0;
+            if ((tags & kCbawTagAggregateHint) != 0)
+            {
+                score += 8;
+            }
+            if ((tags & kCbawTagMffcDominance) != 0)
+            {
+                score += 8;
+            }
+            if ((tags & kCbawTagPassthrough) != 0)
+            {
+                score += 4;
+            }
+            if ((tags & kCbawTagGuardHint) != 0)
+            {
+                score += 2;
+            }
+            if ((tags & kCbawTagSinkCone) != 0)
+            {
+                score += 2;
+            }
+            if ((tags & kCbawTagPlainSiblings) != 0)
+            {
+                score += 1;
+            }
+            return score;
+        }
+
+        bool sortedStringVectorsIntersect(const std::vector<std::string> &lhs,
+                                          const std::vector<std::string> &rhs)
+        {
+            auto l = lhs.begin();
+            auto r = rhs.begin();
+            while (l != lhs.end() && r != rhs.end())
+            {
+                if (*l == *r)
+                {
+                    return true;
+                }
+                if (*l < *r)
+                {
+                    ++l;
+                }
+                else
+                {
+                    ++r;
+                }
+            }
+            return false;
+        }
+
+        std::size_t countSortedIntersection(const std::vector<uint32_t> &lhs,
+                                            const std::vector<uint32_t> &rhs,
+                                            uint32_t excludedA = kInvalidActivitySupernodeId,
+                                            uint32_t excludedB = kInvalidActivitySupernodeId)
+        {
+            std::size_t count = 0;
+            auto l = lhs.begin();
+            auto r = rhs.begin();
+            while (l != lhs.end() && r != rhs.end())
+            {
+                if (*l == *r)
+                {
+                    if (*l != excludedA && *l != excludedB)
+                    {
+                        ++count;
+                    }
+                    ++l;
+                    ++r;
+                }
+                else if (*l < *r)
+                {
+                    ++l;
+                }
+                else
+                {
+                    ++r;
+                }
+            }
+            return count;
+        }
+
+        struct CbawExactDelta
+        {
+            std::size_t boundaryTargets = 0;
+            std::size_t dagEdges = 0;
+            std::size_t computeComputePairs = 0;
+            std::size_t directValueTargets = 0;
+            std::size_t sharedIncomingFanouts = 0;
+        };
+
+        CbawExactDelta computeCbawExactDelta(const NodeClusterView &view,
+                                             const ClusterValueEdges &valueEdges,
+                                             uint32_t lhs,
+                                             uint32_t rhs)
+        {
+            CbawExactDelta delta;
+            if (lhs == rhs ||
+                lhs >= view.members.size() ||
+                rhs >= view.members.size())
+            {
+                return delta;
+            }
+            const std::size_t lhsToRhs = clusterEdgeWeight(valueEdges, lhs, rhs);
+            const std::size_t rhsToLhs = clusterEdgeWeight(valueEdges, rhs, lhs);
+            delta.directValueTargets = lhsToRhs + rhsToLhs;
+
+            if (lhs < valueEdges.targetValuesByCluster.size() &&
+                rhs < valueEdges.targetValuesByCluster.size())
+            {
+                const auto &lhsTargets = valueEdges.targetValuesByCluster[lhs];
+                const auto &rhsTargets = valueEdges.targetValuesByCluster[rhs];
+                auto l = lhsTargets.begin();
+                auto r = rhsTargets.begin();
+                while (l != lhsTargets.end() && r != rhsTargets.end())
+                {
+                    if (*l == *r)
+                    {
+                        const uint32_t valueFanoutId = *l;
+                        if (valueFanoutId < valueEdges.valueFanouts.size())
+                        {
+                            const uint32_t source = valueEdges.valueFanouts[valueFanoutId].sourceCluster;
+                            if (source != lhs && source != rhs)
+                            {
+                                ++delta.sharedIncomingFanouts;
+                            }
+                        }
+                        ++l;
+                        ++r;
+                    }
+                    else if (*l < *r)
+                    {
+                        ++l;
+                    }
+                    else
+                    {
+                        ++r;
+                    }
+                }
+            }
+
+            delta.computeComputePairs = delta.directValueTargets + delta.sharedIncomingFanouts;
+            delta.boundaryTargets = delta.computeComputePairs;
+
+            const auto hasDagEdge = [&](uint32_t from, uint32_t to)
+            {
+                return from < view.succs.size() &&
+                       std::binary_search(view.succs[from].begin(), view.succs[from].end(), to);
+            };
+            if (hasDagEdge(lhs, rhs))
+            {
+                ++delta.dagEdges;
+            }
+            if (hasDagEdge(rhs, lhs))
+            {
+                ++delta.dagEdges;
+            }
+            if (lhs < view.preds.size() && rhs < view.preds.size())
+            {
+                delta.dagEdges += countSortedIntersection(view.preds[lhs],
+                                                          view.preds[rhs],
+                                                          lhs,
+                                                          rhs);
+            }
+            if (lhs < view.succs.size() && rhs < view.succs.size())
+            {
+                delta.dagEdges += countSortedIntersection(view.succs[lhs],
+                                                          view.succs[rhs],
+                                                          lhs,
+                                                          rhs);
+            }
+            if (lhs < valueEdges.commitSuccsByCluster.size() &&
+                rhs < valueEdges.commitSuccsByCluster.size())
+            {
+                delta.dagEdges += countSortedIntersection(valueEdges.commitSuccsByCluster[lhs],
+                                                          valueEdges.commitSuccsByCluster[rhs]);
+            }
+            return delta;
+        }
+
+        bool tryMergeNodeCbaw(std::vector<std::vector<uint32_t>> &clusters,
+                              const std::vector<std::vector<uint32_t>> &nodeDag,
+                              std::size_t nodeCount,
+                              const std::vector<uint32_t> &nodeTopoPos,
+                              const std::vector<uint32_t> &nodeOpSizes,
+                              std::size_t maxOps,
+                              const ComputeRewriteBuild &rewrite,
+                              const wolvrix::lib::grh::Graph &graph,
+                              const ActivityOpData *opData,
+                              ComputeNodeMaterializePerfStats *perf)
+        {
+            const auto evaluateStart = std::chrono::steady_clock::now();
+            const auto view = buildNodeClusterView(clusters, nodeDag, nodeCount);
+            if (view.members.size() < 2)
+            {
+                return false;
+            }
+            const auto valueEdges = buildClusterValueEdges(view, rewrite, graph);
+
+            struct ClusterLabels
+            {
+                std::vector<std::string> aggregateFamilies;
+                std::vector<std::string> guardDomains;
+                std::vector<std::string> sinkLabels;
+                uint32_t mffcRep = kInvalidActivitySupernodeId;
+                bool passthrough = false;
+                bool multiSink = false;
+            };
+            std::vector<ClusterLabels> labels(view.members.size());
+            std::vector<uint32_t> mffcRepByTopo;
+            if (opData != nullptr)
+            {
+                mffcRepByTopo = computeMffcRep(*opData);
+            }
+            const auto addUniqueString = [](std::vector<std::string> &values, std::string value)
+            {
+                if (!value.empty())
+                {
+                    values.push_back(std::move(value));
+                }
+            };
+            for (uint32_t clusterId = 0; clusterId < view.members.size(); ++clusterId)
+            {
+                bool anyOp = false;
+                bool allPassthrough = true;
+                uint32_t clusterMffcRep = kInvalidActivitySupernodeId;
+                bool haveMffcRep = false;
+                bool splitMffcRep = false;
+                for (const uint32_t nodeId : view.members[clusterId])
+                {
+                    if (nodeId >= rewrite.computeNodes.size())
+                    {
+                        continue;
+                    }
+                    if (!rewrite.computeNodes[nodeId].intentGroup.empty())
+                    {
+                        addUniqueString(labels[clusterId].aggregateFamilies,
+                                        "rtm:" + rewrite.computeNodes[nodeId].intentGroup);
+                    }
+                    for (const auto opId : rewrite.computeNodes[nodeId].ops)
+                    {
+                        anyOp = true;
+                        const auto op = graph.getOperation(opId);
+                        const auto kind = op.kind();
+                        if (opData != nullptr &&
+                            opId.index < opData->topoPosByOpIndex.size())
+                        {
+                            const uint32_t topoPos = opData->topoPosByOpIndex[opId.index];
+                            if (topoPos != kInvalidActivitySupernodeId &&
+                                topoPos < mffcRepByTopo.size() &&
+                                mffcRepByTopo[topoPos] != kInvalidActivitySupernodeId)
+                            {
+                                if (!haveMffcRep)
+                                {
+                                    clusterMffcRep = mffcRepByTopo[topoPos];
+                                    haveMffcRep = true;
+                                }
+                                else if (clusterMffcRep != mffcRepByTopo[topoPos])
+                                {
+                                    splitMffcRep = true;
+                                }
+                            }
+                        }
+                        if (activityScheduleHasRegToMemIntent(op))
+                        {
+                            if (const auto group = getAttrString(op, "regToMem.intent.group"))
+                            {
+                                addUniqueString(labels[clusterId].aggregateFamilies, "rtm:" + *group);
+                            }
+                        }
+                        if (activityScheduleIsAggregateShapeKind(kind))
+                        {
+                            if (const auto group = getAttrString(op, "regToMem.intent.group"))
+                            {
+                                addUniqueString(labels[clusterId].aggregateFamilies, "rtm:" + *group);
+                            }
+                            else if (!op.operands().empty())
+                            {
+                                const auto canonical = canonicalActivityValue(op.operands().front(),
+                                                                              &rewrite.canonicalValues);
+                                addUniqueString(labels[clusterId].aggregateFamilies,
+                                                canonical.valid()
+                                                    ? "value:" + std::to_string(canonical.index)
+                                                    : "op:" + std::to_string(opId.index));
+                            }
+                            else
+                            {
+                                addUniqueString(labels[clusterId].aggregateFamilies,
+                                                "op:" + std::to_string(opId.index));
+                            }
+                        }
+                        if (activityScheduleIsGuardLikeKind(kind))
+                        {
+                            std::string guardKey;
+                            if (kind == wolvrix::lib::grh::OperationKind::kMux &&
+                                !op.operands().empty())
+                            {
+                                const auto canonical = canonicalActivityValue(op.operands().front(),
+                                                                              &rewrite.canonicalValues);
+                                guardKey = canonical.valid() ? "mux:" + std::to_string(canonical.index)
+                                                             : std::string();
+                            }
+                            else if ((kind == wolvrix::lib::grh::OperationKind::kAnd ||
+                                      kind == wolvrix::lib::grh::OperationKind::kLogicAnd ||
+                                      kind == wolvrix::lib::grh::OperationKind::kOr ||
+                                      kind == wolvrix::lib::grh::OperationKind::kLogicOr) &&
+                                     !op.operands().empty())
+                            {
+                                std::vector<std::size_t> oneBitInputs;
+                                for (const auto operand : op.operands())
+                                {
+                                    const auto canonical = canonicalActivityValue(operand,
+                                                                                  &rewrite.canonicalValues);
+                                    if (canonical.valid() && graph.valueWidth(canonical) == 1)
+                                    {
+                                        oneBitInputs.push_back(canonical.index);
+                                    }
+                                }
+                                if (!oneBitInputs.empty())
+                                {
+                                    std::sort(oneBitInputs.begin(), oneBitInputs.end());
+                                    guardKey = "logic:" + std::to_string(oneBitInputs.front());
+                                }
+                            }
+                            addUniqueString(labels[clusterId].guardDomains, std::move(guardKey));
+                        }
+                        std::unordered_set<std::string> opSinkLabels;
+                        for (const auto result : op.results())
+                        {
+                            if (!result.valid())
+                            {
+                                continue;
+                            }
+                            const auto value = graph.getValue(result);
+                            for (const auto &user : value.users())
+                            {
+                                const auto userOp = graph.getOperation(user.operation);
+                                if (!isSinkPartitionOp(userOp))
+                                {
+                                    continue;
+                                }
+                                std::string label =
+                                    std::string(wolvrix::lib::grh::toString(userOp.kind()));
+                                if (const auto reg = getAttrString(userOp, "regSymbol"))
+                                {
+                                    label += ":" + *reg;
+                                }
+                                else if (const auto latch = getAttrString(userOp, "latchSymbol"))
+                                {
+                                    label += ":" + *latch;
+                                }
+                                else if (const auto mem = getAttrString(userOp, "memSymbol"))
+                                {
+                                    label += ":" + *mem;
+                                }
+                                label += ":operand" + std::to_string(user.operandIndex);
+                                opSinkLabels.insert(std::move(label));
+                            }
+                        }
+                        if (opSinkLabels.size() > 1)
+                        {
+                            labels[clusterId].multiSink = true;
+                        }
+                        for (auto &label : opSinkLabels)
+                        {
+                            addUniqueString(labels[clusterId].sinkLabels, std::move(label));
+                        }
+                        allPassthrough = allPassthrough && activityScheduleIsPassthroughKind(kind);
+                    }
+                }
+                labels[clusterId].passthrough = anyOp && allPassthrough;
+                if (haveMffcRep && !splitMffcRep)
+                {
+                    labels[clusterId].mffcRep = clusterMffcRep;
+                }
+                auto normalizeStrings = [](std::vector<std::string> &values)
+                {
+                    std::sort(values.begin(), values.end());
+                    values.erase(std::unique(values.begin(), values.end()), values.end());
+                };
+                normalizeStrings(labels[clusterId].aggregateFamilies);
+                normalizeStrings(labels[clusterId].guardDomains);
+                normalizeStrings(labels[clusterId].sinkLabels);
+            }
+
+            struct Candidate
+            {
+                uint32_t lhs = 0;
+                uint32_t rhs = 0;
+                CbawExactDelta delta;
+                std::size_t directWeight = 0;
+                std::size_t mergedOps = 0;
+                std::size_t resourceSlack = 0;
+                uint32_t tags = 0;
+                uint32_t primaryTag = kCbawTagHeavyValueUse;
+                const char *selectedReason = "exact_delta";
+            };
+            std::map<std::uint64_t, Candidate> bestByPair;
+            std::vector<std::size_t> sizes(view.members.size(), 0);
+            for (uint32_t clusterId = 0; clusterId < view.members.size(); ++clusterId)
+            {
+                sizes[clusterId] = clusterOpSize(view.members[clusterId], nodeOpSizes);
+            }
+            const auto betterCandidate = [](const Candidate &lhs, const Candidate &rhs) {
+                if (lhs.delta.boundaryTargets != rhs.delta.boundaryTargets)
+                {
+                    return lhs.delta.boundaryTargets > rhs.delta.boundaryTargets;
+                }
+                if (lhs.delta.dagEdges != rhs.delta.dagEdges)
+                {
+                    return lhs.delta.dagEdges > rhs.delta.dagEdges;
+                }
+                if (lhs.delta.computeComputePairs != rhs.delta.computeComputePairs)
+                {
+                    return lhs.delta.computeComputePairs > rhs.delta.computeComputePairs;
+                }
+                const int lhsSemantic = cbawSemanticTieBreakScore(lhs.tags);
+                const int rhsSemantic = cbawSemanticTieBreakScore(rhs.tags);
+                if (lhsSemantic != rhsSemantic)
+                {
+                    return lhsSemantic > rhsSemantic;
+                }
+                if (lhs.directWeight != rhs.directWeight)
+                {
+                    return lhs.directWeight > rhs.directWeight;
+                }
+                if (lhs.resourceSlack != rhs.resourceSlack)
+                {
+                    return lhs.resourceSlack > rhs.resourceSlack;
+                }
+                if (lhs.lhs != rhs.lhs)
+                {
+                    return lhs.lhs < rhs.lhs;
+                }
+                return lhs.rhs < rhs.rhs;
+            };
+            const auto noteMap = [&](auto &map, uint32_t tag)
+            {
+                ++map[std::string(cbawTagName(tag))];
+            };
+            const auto addCandidateTag = [&](uint32_t lhs, uint32_t rhs, uint32_t tag)
+            {
+                if (perf != nullptr)
+                {
+                    noteMap(perf->cbawCoarsenGeneratedByKind, tag);
+                    ++perf->cbawCoarsenCandidates;
+                }
+                if (lhs == rhs ||
+                    lhs >= view.members.size() ||
+                    rhs >= view.members.size())
+                {
+                    if (perf != nullptr)
+                    {
+                        ++perf->cbawCoarsenRejectedNoGain;
+                        noteMap(perf->cbawCoarsenRejectedNoGainByKind, tag);
+                        noteMap(perf->cbawCoarsenRejectedNoGainByTag, tag);
+                    }
+                    return;
+                }
+                if (rhs < lhs)
+                {
+                    std::swap(lhs, rhs);
+                }
+                const CbawExactDelta delta = computeCbawExactDelta(view, valueEdges, lhs, rhs);
+                if (delta.boundaryTargets == 0 &&
+                    delta.dagEdges == 0 &&
+                    delta.computeComputePairs == 0)
+                {
+                    if (perf != nullptr)
+                    {
+                        ++perf->cbawCoarsenRejectedNoGain;
+                        noteMap(perf->cbawCoarsenRejectedNoGainByKind, tag);
+                        noteMap(perf->cbawCoarsenRejectedNoGainByTag, tag);
+                    }
+                    return;
+                }
+                const std::size_t lhsSize = lhs < sizes.size() ? sizes[lhs] : 0;
+                const std::size_t rhsSize = rhs < sizes.size() ? sizes[rhs] : 0;
+                const std::size_t mergedOps = lhsSize + rhsSize;
+                Candidate candidate{
+                    lhs,
+                    rhs,
+                    delta,
+                    clusterEdgeWeight(valueEdges, lhs, rhs) + clusterEdgeWeight(valueEdges, rhs, lhs),
+                    mergedOps,
+                    maxOps == std::numeric_limits<std::size_t>::max() || mergedOps >= maxOps
+                        ? std::size_t{0}
+                        : maxOps - mergedOps,
+                    tag,
+                    cbawChoosePrimaryTag(tag),
+                    "exact_delta",
+                };
+                const std::uint64_t packed = packClusterPair(lhs, rhs);
+                auto it = bestByPair.find(packed);
+                if (it == bestByPair.end())
+                {
+                    bestByPair[packed] = candidate;
+                    return;
+                }
+                it->second.tags |= tag;
+                it->second.primaryTag = cbawChoosePrimaryTag(it->second.tags);
+                it->second.selectedReason =
+                    cbawSemanticTieBreakScore(it->second.tags) != 0 ? "exact_delta_semantic_tie"
+                                                                    : "exact_delta";
+            };
+
+            for (const auto &[packed, weight] : valueEdges.weights)
+            {
+                const uint32_t from = static_cast<uint32_t>(packed >> 32);
+                const uint32_t to = static_cast<uint32_t>(packed & 0xffffffffu);
+                if (weight == 0)
+                {
+                    continue;
+                }
+                addCandidateTag(from, to, kCbawTagHeavyValueUse);
+                if (from < view.succs.size() && view.succs[from].size() == 1)
+                {
+                    addCandidateTag(from, to, kCbawTagPlainOut1);
+                }
+                if (to < view.preds.size() && view.preds[to].size() == 1)
+                {
+                    addCandidateTag(from, to, kCbawTagPlainIn1);
+                }
+                if (from < labels.size() && to < labels.size())
+                {
+                    if (sortedStringVectorsIntersect(labels[from].aggregateFamilies,
+                                                     labels[to].aggregateFamilies))
+                    {
+                        addCandidateTag(from, to, kCbawTagAggregateHint);
+                    }
+                    if (labels[from].mffcRep != kInvalidActivitySupernodeId &&
+                        labels[from].mffcRep == labels[to].mffcRep)
+                    {
+                        addCandidateTag(from, to, kCbawTagMffcDominance);
+                    }
+                    if (sortedStringVectorsIntersect(labels[from].guardDomains,
+                                                     labels[to].guardDomains))
+                    {
+                        addCandidateTag(from, to, kCbawTagGuardHint);
+                    }
+                    if (!labels[from].multiSink &&
+                        !labels[to].multiSink &&
+                        sortedStringVectorsIntersect(labels[from].sinkLabels,
+                                                     labels[to].sinkLabels))
+                    {
+                        addCandidateTag(from, to, kCbawTagSinkCone);
+                    }
+                    if (labels[from].passthrough && labels[to].passthrough)
+                    {
+                        addCandidateTag(from, to, kCbawTagPassthrough);
+                    }
+                }
+            }
+
+            std::unordered_map<std::uint64_t, std::vector<std::vector<uint32_t>>> siblingBuckets;
+            siblingBuckets.reserve(view.members.size());
+            for (uint32_t clusterId = 0; clusterId < view.members.size(); ++clusterId)
+            {
+                if (clusterId >= view.preds.size() || view.preds[clusterId].empty())
+                {
+                    continue;
+                }
+                auto &bucket = siblingBuckets[nodeSiblingPredHash(view.preds[clusterId])];
+                auto groupIt = std::find_if(bucket.begin(),
+                                            bucket.end(),
+                                            [&](const auto &group)
+                                            {
+                                                return !group.empty() &&
+                                                       view.preds[group.front()] == view.preds[clusterId];
+                                            });
+                if (groupIt == bucket.end())
+                {
+                    bucket.push_back(std::vector<uint32_t>{clusterId});
+                }
+                else
+                {
+                    groupIt->push_back(clusterId);
+                }
+            }
+            for (auto &[_, bucket] : siblingBuckets)
+            {
+                for (auto &siblings : bucket)
+                {
+                    if (siblings.size() < 2)
+                    {
+                        continue;
+                    }
+                    std::sort(siblings.begin(), siblings.end());
+                    for (std::size_t i = 1; i < siblings.size(); ++i)
+                    {
+                        addCandidateTag(siblings[i - 1], siblings[i], kCbawTagPlainSiblings);
+                    }
+                }
+            }
+
+            std::vector<Candidate> candidates;
+            candidates.reserve(bestByPair.size());
+            for (auto &[_, candidate] : bestByPair)
+            {
+                candidate.primaryTag = cbawChoosePrimaryTag(candidate.tags);
+                if (perf != nullptr)
+                {
+                    noteMap(perf->cbawCoarsenDedupSelectedByKind, candidate.primaryTag);
+                    ++perf->cbawCoarsenSelectedReason[std::string(candidate.selectedReason)];
+                    forEachCbawTag(candidate.tags,
+                                   [&](uint32_t tag)
+                                   {
+                                       if (tag != candidate.primaryTag)
+                                       {
+                                           noteMap(perf->cbawCoarsenDedupLostTagByKind, tag);
+                                       }
+                                   });
+                }
+                candidates.push_back(candidate);
+            }
+            std::sort(candidates.begin(),
+                      candidates.end(),
+                      [&](const Candidate &lhs, const Candidate &rhs)
+                      {
+                          return betterCandidate(lhs, rhs);
+                      });
+            if (perf != nullptr)
+            {
+                perf->cbawCoarsenEvaluateMs += elapsedMs(evaluateStart);
+            }
+            if (candidates.empty())
+            {
+                return false;
+            }
+
+            std::vector<uint8_t> used(view.members.size(), 0);
+            std::vector<Candidate> acceptedCandidates;
+            acceptedCandidates.reserve(candidates.size());
+            constexpr std::size_t kMaxCbawMergesPerRound = 65536;
+            std::vector<uint32_t> clusterRank(view.members.size(), kInvalidActivitySupernodeId);
+            for (uint32_t rank = 0; rank < view.members.size(); ++rank)
+            {
+                clusterRank[rank] = rank;
+            }
+            struct DirectEdgeInfo
+            {
+                bool oneWay = false;
+                uint32_t source = kInvalidActivitySupernodeId;
+                uint32_t target = kInvalidActivitySupernodeId;
+            };
+            const auto directEdgeInfo = [&](uint32_t lhs, uint32_t rhs) {
+                const bool lhsToRhs = lhs < view.succs.size() &&
+                                      std::binary_search(view.succs[lhs].begin(),
+                                                         view.succs[lhs].end(),
+                                                         rhs);
+                const bool rhsToLhs = rhs < view.succs.size() &&
+                                      std::binary_search(view.succs[rhs].begin(),
+                                                         view.succs[rhs].end(),
+                                                         lhs);
+                if (lhsToRhs == rhsToLhs)
+                {
+                    return DirectEdgeInfo{};
+                }
+                return DirectEdgeInfo{
+                    .oneWay = true,
+                    .source = lhsToRhs ? lhs : rhs,
+                    .target = lhsToRhs ? rhs : lhs,
+                };
+            };
+            const auto adjacentInClusterTopo = [&](uint32_t lhs, uint32_t rhs) {
+                if (lhs >= clusterRank.size() || rhs >= clusterRank.size())
+                {
+                    return false;
+                }
+                const uint32_t lhsRank = clusterRank[lhs];
+                const uint32_t rhsRank = clusterRank[rhs];
+                if (lhsRank == kInvalidActivitySupernodeId ||
+                    rhsRank == kInvalidActivitySupernodeId)
+                {
+                    return false;
+                }
+                return lhsRank + 1 == rhsRank || rhsRank + 1 == lhsRank;
+            };
+            const auto locallySafeDirectContraction = [&](const DirectEdgeInfo &edge) {
+                if (!edge.oneWay ||
+                    edge.source >= view.succs.size() ||
+                    edge.target >= view.preds.size())
+                {
+                    return false;
+                }
+                return view.succs[edge.source].size() == 1 ||
+                       view.preds[edge.target].size() == 1;
+            };
+            const auto locallySafeNonDirectContraction = [&](const Candidate &candidate) {
+                const uint32_t lhs = candidate.lhs;
+                const uint32_t rhs = candidate.rhs;
+                if ((candidate.tags & kCbawTagPlainSiblings) == 0 ||
+                    lhs >= view.preds.size() ||
+                    rhs >= view.preds.size())
+                {
+                    return false;
+                }
+                return view.preds[lhs] == view.preds[rhs];
+            };
+            const auto noteCandidateTags = [&](auto &map, const Candidate &candidate)
+            {
+                forEachCbawTag(candidate.tags, [&](uint32_t tag) { noteMap(map, tag); });
+            };
+            for (const auto &candidate : candidates)
+            {
+                if (perf != nullptr)
+                {
+                    ++perf->cbawCoarsenEvaluated;
+                    noteMap(perf->cbawCoarsenEvaluatedByKind, candidate.primaryTag);
+                }
+                const uint32_t lhs = candidate.lhs;
+                const uint32_t rhs = candidate.rhs;
+                if (lhs >= view.members.size() ||
+                    rhs >= view.members.size() ||
+                    used[lhs] != 0 ||
+                    used[rhs] != 0)
+                {
+                    if (perf != nullptr)
+                    {
+                        ++perf->cbawCoarsenStale;
+                        noteMap(perf->cbawCoarsenStaleByKind, candidate.primaryTag);
+                        noteCandidateTags(perf->cbawCoarsenStaleByTag, candidate);
+                    }
+                    continue;
+                }
+                const std::size_t lhsSize = lhs < sizes.size() ? sizes[lhs] : 0;
+                const std::size_t rhsSize = rhs < sizes.size() ? sizes[rhs] : 0;
+                if (maxOps != std::numeric_limits<std::size_t>::max() &&
+                    lhsSize + rhsSize > maxOps)
+                {
+                    if (perf != nullptr)
+                    {
+                        ++perf->cbawCoarsenRejectedResource;
+                        noteMap(perf->cbawCoarsenRejectedResourceByKind, candidate.primaryTag);
+                        noteCandidateTags(perf->cbawCoarsenRejectedResourceByTag, candidate);
+                    }
+                    continue;
+                }
+                const DirectEdgeInfo edge = directEdgeInfo(lhs, rhs);
+                const bool locallyCycleSafe =
+                    edge.oneWay
+                        ? (locallySafeDirectContraction(edge) || adjacentInClusterTopo(lhs, rhs))
+                        : locallySafeNonDirectContraction(candidate);
+                if (!locallyCycleSafe)
+                {
+                    if (perf != nullptr)
+                    {
+                        ++perf->cbawCoarsenRejectedCycle;
+                        noteMap(perf->cbawCoarsenRejectedCycleByKind, candidate.primaryTag);
+                        noteCandidateTags(perf->cbawCoarsenRejectedCycleByTag, candidate);
+                    }
+                    continue;
+                }
+                used[lhs] = 1;
+                used[rhs] = 1;
+                acceptedCandidates.push_back(candidate);
+                if (acceptedCandidates.size() >= kMaxCbawMergesPerRound)
+                {
+                    break;
+                }
+            }
+            if (acceptedCandidates.empty())
+            {
+                return false;
+            }
+
+            const auto buildTrialForPrefix = [&](std::size_t acceptedCount) {
+                DisjointSet dsu(view.members.size());
+                for (std::size_t i = 0; i < acceptedCount; ++i)
+                {
+                    dsu.unite(acceptedCandidates[i].lhs, acceptedCandidates[i].rhs);
+                }
+
+                std::unordered_map<uint32_t, uint32_t> rootToCluster;
+                std::vector<std::vector<uint32_t>> trial;
+                trial.reserve(view.members.size() - acceptedCount);
+                for (uint32_t clusterId = 0; clusterId < view.members.size(); ++clusterId)
+                {
+                    const uint32_t root = dsu.find(clusterId);
+                    auto [it, inserted] = rootToCluster.emplace(root, static_cast<uint32_t>(trial.size()));
+                    if (inserted)
+                    {
+                        trial.push_back({});
+                    }
+                    trial[it->second].insert(trial[it->second].end(),
+                                             view.members[clusterId].begin(),
+                                             view.members[clusterId].end());
+                }
+                return canonicalizeNodeClusters(std::move(trial), nodeTopoPos);
+            };
+
+            const auto topoStart = std::chrono::steady_clock::now();
+            std::vector<std::vector<uint32_t>> trial;
+            std::size_t acceptedCount = acceptedCandidates.size();
+            while (acceptedCount != 0)
+            {
+                trial = buildTrialForPrefix(acceptedCount);
+                if (orderNodeClustersTopologically(trial, nodeDag, nodeCount, &rewrite, &graph))
+                {
+                    break;
+                }
+                if (perf != nullptr)
+                {
+                    for (std::size_t i = acceptedCount / 2; i < acceptedCount; ++i)
+                    {
+                        ++perf->cbawCoarsenRejectedCycle;
+                        noteMap(perf->cbawCoarsenRejectedCycleByKind,
+                                acceptedCandidates[i].primaryTag);
+                        noteCandidateTags(perf->cbawCoarsenRejectedCycleByTag,
+                                          acceptedCandidates[i]);
+                    }
+                }
+                acceptedCount /= 2;
+            }
+            if (acceptedCount == 0)
+            {
+                if (perf != nullptr)
+                {
+                    perf->cbawCoarsenTopoMs += elapsedMs(topoStart);
+                }
+                return false;
+            }
+            if (perf != nullptr)
+            {
+                perf->cbawCoarsenTopoMs += elapsedMs(topoStart);
+                for (std::size_t i = 0; i < acceptedCount; ++i)
+                {
+                    ++perf->cbawCoarsenMerges;
+                    noteMap(perf->cbawCoarsenAcceptedByKind,
+                            acceptedCandidates[i].primaryTag);
+                    noteCandidateTags(perf->cbawCoarsenAcceptedByTag,
+                                      acceptedCandidates[i]);
+                }
+            }
+            clusters = std::move(trial);
+            return true;
+        }
+
         double probCoarsenCheckCost(double activeProb, const ActivityScheduleOptions &options)
         {
             const double p = std::clamp(activeProb, 0.0, 1.0);
@@ -8078,6 +11579,978 @@ namespace wolvrix::lib::transform
             return segments;
         }
 
+        std::vector<std::vector<uint32_t>> refineComputeSupernodeSegmentsCbaw(
+            const NodeClusterView &view,
+            const ClusterValueEdges &valueEdges,
+            const std::vector<uint32_t> &nodeOpSizes,
+            std::vector<std::vector<uint32_t>> segments,
+            const ActivityScheduleOptions &options,
+            std::size_t maxOps,
+            ComputeNodeMaterializePerfStats *perf)
+        {
+            if (segments.size() < 2 || options.fmRefineMaxRounds == 0)
+            {
+                return segments;
+            }
+
+            std::vector<uint32_t> ownerByCluster(view.members.size(), kInvalidActivitySupernodeId);
+            auto rebuildOwners = [&]() {
+                std::fill(ownerByCluster.begin(), ownerByCluster.end(), kInvalidActivitySupernodeId);
+                for (uint32_t segmentId = 0; segmentId < segments.size(); ++segmentId)
+                {
+                    for (const uint32_t clusterId : segments[segmentId])
+                    {
+                        if (clusterId < ownerByCluster.size())
+                        {
+                            ownerByCluster[clusterId] = segmentId;
+                        }
+                    }
+                }
+            };
+            rebuildOwners();
+
+            std::vector<std::size_t> clusterOps(view.members.size(), 0);
+            for (uint32_t clusterId = 0; clusterId < view.members.size(); ++clusterId)
+            {
+                clusterOps[clusterId] = clusterOpSize(view.members[clusterId], nodeOpSizes);
+            }
+            std::vector<std::size_t> segmentOps(segments.size(), 0);
+            for (uint32_t segmentId = 0; segmentId < segments.size(); ++segmentId)
+            {
+                for (const uint32_t clusterId : segments[segmentId])
+                {
+                    if (clusterId < clusterOps.size())
+                    {
+                        segmentOps[segmentId] += clusterOps[clusterId];
+                    }
+                }
+            }
+
+            std::vector<uint32_t> segmentSeen(segments.size(), 0);
+            std::vector<uint32_t> valueSeen(valueEdges.valueFanouts.size(), 0);
+            uint32_t segmentStamp = 1;
+            uint32_t valueStamp = 1;
+            const auto nextStamp = [](std::vector<uint32_t> &seen, uint32_t &stamp) {
+                ++stamp;
+                if (stamp == 0)
+                {
+                    std::fill(seen.begin(), seen.end(), 0);
+                    stamp = 1;
+                }
+                return stamp;
+            };
+            const auto ownerWithMove = [&](uint32_t clusterId,
+                                           uint32_t movingCluster,
+                                           uint32_t movingTo) {
+                if (clusterId == movingCluster)
+                {
+                    return movingTo;
+                }
+                return clusterId < ownerByCluster.size() ? ownerByCluster[clusterId]
+                                                         : kInvalidActivitySupernodeId;
+            };
+            const auto valueTargetCountWithMove = [&](uint32_t valueId,
+                                                      uint32_t movingCluster,
+                                                      uint32_t movingTo) {
+                if (valueId >= valueEdges.valueFanouts.size())
+                {
+                    return std::size_t{0};
+                }
+                const auto &fanout = valueEdges.valueFanouts[valueId];
+                const uint32_t sourceSegment =
+                    ownerWithMove(fanout.sourceCluster, movingCluster, movingTo);
+                if (sourceSegment == kInvalidActivitySupernodeId)
+                {
+                    return std::size_t{0};
+                }
+                const uint32_t stamp = nextStamp(segmentSeen, segmentStamp);
+                std::size_t count = 0;
+                for (const uint32_t targetCluster : fanout.targetClusters)
+                {
+                    const uint32_t targetSegment =
+                        ownerWithMove(targetCluster, movingCluster, movingTo);
+                    if (targetSegment == kInvalidActivitySupernodeId ||
+                        targetSegment == sourceSegment ||
+                        targetSegment >= segmentSeen.size())
+                    {
+                        continue;
+                    }
+                    if (segmentSeen[targetSegment] == stamp)
+                    {
+                        continue;
+                    }
+                    segmentSeen[targetSegment] = stamp;
+                    ++count;
+                }
+                return count;
+            };
+            const auto moveGain = [&](uint32_t clusterId, uint32_t from, uint32_t to) {
+                if (clusterId >= ownerByCluster.size() ||
+                    from == to ||
+                    ownerByCluster[clusterId] != from ||
+                    to >= segments.size())
+                {
+                    return std::int64_t{0};
+                }
+                const uint32_t stamp = nextStamp(valueSeen, valueStamp);
+                std::int64_t gain = 0;
+                const auto visitValue = [&](uint32_t valueId) {
+                    if (valueId >= valueSeen.size() || valueSeen[valueId] == stamp)
+                    {
+                        return;
+                    }
+                    valueSeen[valueId] = stamp;
+                    const std::size_t before =
+                        valueTargetCountWithMove(valueId,
+                                                 kInvalidActivitySupernodeId,
+                                                 kInvalidActivitySupernodeId);
+                    const std::size_t after =
+                        valueTargetCountWithMove(valueId, clusterId, to);
+                    gain += static_cast<std::int64_t>(before) -
+                            static_cast<std::int64_t>(after);
+                };
+                if (clusterId < valueEdges.sourceValuesByCluster.size())
+                {
+                    for (const uint32_t valueId : valueEdges.sourceValuesByCluster[clusterId])
+                    {
+                        visitValue(valueId);
+                    }
+                }
+                if (clusterId < valueEdges.targetValuesByCluster.size())
+                {
+                    for (const uint32_t valueId : valueEdges.targetValuesByCluster[clusterId])
+                    {
+                        visitValue(valueId);
+                    }
+                }
+                return gain;
+            };
+            const auto ownerWithSwap = [&](uint32_t clusterId,
+                                           uint32_t lhs,
+                                           uint32_t lhsTo,
+                                           uint32_t rhs,
+                                           uint32_t rhsTo) {
+                if (clusterId == lhs)
+                {
+                    return lhsTo;
+                }
+                if (clusterId == rhs)
+                {
+                    return rhsTo;
+                }
+                return clusterId < ownerByCluster.size() ? ownerByCluster[clusterId]
+                                                         : kInvalidActivitySupernodeId;
+            };
+            const auto valueTargetCountWithSwap = [&](uint32_t valueId,
+                                                      uint32_t lhs,
+                                                      uint32_t lhsTo,
+                                                      uint32_t rhs,
+                                                      uint32_t rhsTo) {
+                if (valueId >= valueEdges.valueFanouts.size())
+                {
+                    return std::size_t{0};
+                }
+                const auto &fanout = valueEdges.valueFanouts[valueId];
+                const uint32_t sourceSegment =
+                    ownerWithSwap(fanout.sourceCluster, lhs, lhsTo, rhs, rhsTo);
+                if (sourceSegment == kInvalidActivitySupernodeId)
+                {
+                    return std::size_t{0};
+                }
+                const uint32_t stamp = nextStamp(segmentSeen, segmentStamp);
+                std::size_t count = 0;
+                for (const uint32_t targetCluster : fanout.targetClusters)
+                {
+                    const uint32_t targetSegment =
+                        ownerWithSwap(targetCluster, lhs, lhsTo, rhs, rhsTo);
+                    if (targetSegment == kInvalidActivitySupernodeId ||
+                        targetSegment == sourceSegment ||
+                        targetSegment >= segmentSeen.size())
+                    {
+                        continue;
+                    }
+                    if (segmentSeen[targetSegment] == stamp)
+                    {
+                        continue;
+                    }
+                    segmentSeen[targetSegment] = stamp;
+                    ++count;
+                }
+                return count;
+            };
+            const auto swapPreservesSegmentTopo = [&](uint32_t lhs,
+                                                      uint32_t lhsFrom,
+                                                      uint32_t lhsTo,
+                                                      uint32_t rhs,
+                                                      uint32_t rhsFrom,
+                                                      uint32_t rhsTo) {
+                const auto clusterOk = [&](uint32_t clusterId) {
+                    const uint32_t clusterSegment =
+                        ownerWithSwap(clusterId, lhs, lhsTo, rhs, rhsTo);
+                    if (clusterSegment == kInvalidActivitySupernodeId)
+                    {
+                        return false;
+                    }
+                    if (clusterId >= view.preds.size() || clusterId >= view.succs.size())
+                    {
+                        return false;
+                    }
+                    for (const uint32_t pred : view.preds[clusterId])
+                    {
+                        const uint32_t predSegment =
+                            ownerWithSwap(pred, lhs, lhsTo, rhs, rhsTo);
+                        if (predSegment == kInvalidActivitySupernodeId ||
+                            predSegment == clusterSegment)
+                        {
+                            continue;
+                        }
+                        if (predSegment >= clusterSegment)
+                        {
+                            return false;
+                        }
+                    }
+                    for (const uint32_t succ : view.succs[clusterId])
+                    {
+                        const uint32_t succSegment =
+                            ownerWithSwap(succ, lhs, lhsTo, rhs, rhsTo);
+                        if (succSegment == kInvalidActivitySupernodeId ||
+                            succSegment == clusterSegment)
+                        {
+                            continue;
+                        }
+                        if (clusterSegment >= succSegment)
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                return lhs != rhs &&
+                       lhs < ownerByCluster.size() &&
+                       rhs < ownerByCluster.size() &&
+                       ownerByCluster[lhs] == lhsFrom &&
+                       ownerByCluster[rhs] == rhsFrom &&
+                       lhsFrom != lhsTo &&
+                       rhsFrom != rhsTo &&
+                       lhsFrom == rhsTo &&
+                       rhsFrom == lhsTo &&
+                       clusterOk(lhs) &&
+                       clusterOk(rhs);
+            };
+            const auto swapGain = [&](uint32_t lhs,
+                                      uint32_t lhsFrom,
+                                      uint32_t lhsTo,
+                                      uint32_t rhs,
+                                      uint32_t rhsFrom,
+                                      uint32_t rhsTo) {
+                if (lhs >= ownerByCluster.size() ||
+                    rhs >= ownerByCluster.size() ||
+                    lhs == rhs ||
+                    ownerByCluster[lhs] != lhsFrom ||
+                    ownerByCluster[rhs] != rhsFrom ||
+                    lhsFrom == lhsTo ||
+                    rhsFrom == rhsTo)
+                {
+                    return std::int64_t{0};
+                }
+                const uint32_t stamp = nextStamp(valueSeen, valueStamp);
+                std::int64_t gain = 0;
+                const auto visitValue = [&](uint32_t valueId) {
+                    if (valueId >= valueSeen.size() || valueSeen[valueId] == stamp)
+                    {
+                        return;
+                    }
+                    valueSeen[valueId] = stamp;
+                    const std::size_t before =
+                        valueTargetCountWithSwap(valueId,
+                                                 kInvalidActivitySupernodeId,
+                                                 kInvalidActivitySupernodeId,
+                                                 kInvalidActivitySupernodeId,
+                                                 kInvalidActivitySupernodeId);
+                    const std::size_t after =
+                        valueTargetCountWithSwap(valueId, lhs, lhsTo, rhs, rhsTo);
+                    gain += static_cast<std::int64_t>(before) -
+                            static_cast<std::int64_t>(after);
+                };
+                const auto visitClusterValues = [&](uint32_t clusterId) {
+                    if (clusterId < valueEdges.sourceValuesByCluster.size())
+                    {
+                        for (const uint32_t valueId : valueEdges.sourceValuesByCluster[clusterId])
+                        {
+                            visitValue(valueId);
+                        }
+                    }
+                    if (clusterId < valueEdges.targetValuesByCluster.size())
+                    {
+                        for (const uint32_t valueId : valueEdges.targetValuesByCluster[clusterId])
+                        {
+                            visitValue(valueId);
+                        }
+                    }
+                };
+                visitClusterValues(lhs);
+                visitClusterValues(rhs);
+                return gain;
+            };
+
+            struct ScoredDests
+            {
+                std::vector<std::pair<uint32_t, std::size_t>> small;
+                std::unordered_map<uint32_t, std::size_t> large;
+
+                void add(uint32_t dest, std::size_t amount)
+                {
+                    if (dest == kInvalidActivitySupernodeId || amount == 0)
+                    {
+                        return;
+                    }
+                    if (large.empty() && small.size() < 64)
+                    {
+                        for (auto &entry : small)
+                        {
+                            if (entry.first == dest)
+                            {
+                                entry.second += amount;
+                                return;
+                            }
+                        }
+                        small.push_back({dest, amount});
+                        return;
+                    }
+                    if (large.empty())
+                    {
+                        large.reserve(small.size() * 2 + 1);
+                        for (const auto &[key, value] : small)
+                        {
+                            large[key] += value;
+                        }
+                        small.clear();
+                    }
+                    large[dest] += amount;
+                }
+
+                std::vector<std::pair<uint32_t, std::size_t>> take()
+                {
+                    if (!large.empty())
+                    {
+                        std::vector<std::pair<uint32_t, std::size_t>> out;
+                        out.reserve(large.size());
+                        for (const auto &[key, value] : large)
+                        {
+                            out.push_back({key, value});
+                        }
+                        return out;
+                    }
+                    return small;
+                }
+            };
+
+            struct Candidate
+            {
+                uint32_t cluster = 0;
+                uint32_t from = 0;
+                uint32_t to = 0;
+                std::size_t gain = 0;
+                std::size_t approximateGain = 0;
+            };
+            struct BlockedMove
+            {
+                uint32_t cluster = 0;
+                uint32_t from = 0;
+                uint32_t to = 0;
+                std::size_t approximateGain = 0;
+            };
+            struct SwapCandidate
+            {
+                uint32_t lhs = 0;
+                uint32_t rhs = 0;
+                uint32_t lhsFrom = 0;
+                uint32_t lhsTo = 0;
+                std::size_t gain = 0;
+                std::size_t approximateGain = 0;
+            };
+
+            constexpr std::size_t kTopDestsPerCluster = 32;
+            constexpr std::size_t kMaxMovesPerRound = 65536;
+            constexpr std::size_t kMaxBlockedMovesPerRound = 32768;
+            constexpr std::size_t kMaxSwapCandidatesPerRound = 65536;
+            constexpr std::size_t kBlockedMoveTrimMultiple = 4;
+            const auto trimBlockedMoves = [](std::vector<BlockedMove> &blockedMoves) {
+                if (blockedMoves.size() <= kMaxBlockedMovesPerRound)
+                {
+                    return;
+                }
+                std::nth_element(blockedMoves.begin(),
+                                 blockedMoves.begin() + kMaxBlockedMovesPerRound,
+                                 blockedMoves.end(),
+                                 [](const BlockedMove &lhs, const BlockedMove &rhs)
+                                 {
+                                     if (lhs.approximateGain != rhs.approximateGain)
+                                     {
+                                         return lhs.approximateGain > rhs.approximateGain;
+                                     }
+                                     if (lhs.cluster != rhs.cluster)
+                                     {
+                                         return lhs.cluster < rhs.cluster;
+                                     }
+                                     return lhs.to < rhs.to;
+                                 });
+                blockedMoves.resize(kMaxBlockedMovesPerRound);
+            };
+            const auto trimSwapCandidates = [](std::vector<SwapCandidate> &swapCandidates) {
+                if (swapCandidates.size() <= kMaxSwapCandidatesPerRound)
+                {
+                    return;
+                }
+                std::nth_element(swapCandidates.begin(),
+                                 swapCandidates.begin() + kMaxSwapCandidatesPerRound,
+                                 swapCandidates.end(),
+                                 [](const SwapCandidate &lhs, const SwapCandidate &rhs)
+                                 {
+                                     if (lhs.gain != rhs.gain)
+                                     {
+                                         return lhs.gain > rhs.gain;
+                                     }
+                                     if (lhs.approximateGain != rhs.approximateGain)
+                                     {
+                                         return lhs.approximateGain > rhs.approximateGain;
+                                     }
+                                     if (lhs.lhs != rhs.lhs)
+                                     {
+                                         return lhs.lhs < rhs.lhs;
+                                     }
+                                     return lhs.rhs < rhs.rhs;
+                                 });
+                swapCandidates.resize(kMaxSwapCandidatesPerRound);
+            };
+            const auto recordSizeBlock = [&](uint32_t targetSegment)
+            {
+                if (perf == nullptr || maxOps == 0 || targetSegment >= segmentOps.size())
+                {
+                    return;
+                }
+                const std::size_t fillPpm =
+                    static_cast<std::size_t>(
+                        (static_cast<std::uint64_t>(segmentOps[targetSegment]) * 1000000ull) /
+                        static_cast<std::uint64_t>(maxOps));
+                const char *bucket = "lt50";
+                if (fillPpm >= 1000000)
+                {
+                    bucket = "ge100";
+                }
+                else if (fillPpm >= 950000)
+                {
+                    bucket = "95_100";
+                }
+                else if (fillPpm >= 900000)
+                {
+                    bucket = "90_95";
+                }
+                else if (fillPpm >= 750000)
+                {
+                    bucket = "75_90";
+                }
+                else if (fillPpm >= 500000)
+                {
+                    bucket = "50_75";
+                }
+                ++perf->fmRefineRejectedSizeFillBucket[bucket];
+            };
+            const auto recordCycleBlock = [&](uint32_t clusterId, uint32_t targetSegment)
+            {
+                if (perf == nullptr ||
+                    clusterId >= view.preds.size() ||
+                    clusterId >= view.succs.size() ||
+                    targetSegment == kInvalidActivitySupernodeId)
+                {
+                    return;
+                }
+                bool predAfterOrSame = false;
+                bool succBeforeOrSame = false;
+                for (const uint32_t pred : view.preds[clusterId])
+                {
+                    const uint32_t predSegment =
+                        pred < ownerByCluster.size() ? ownerByCluster[pred]
+                                                     : kInvalidActivitySupernodeId;
+                    if (predSegment != kInvalidActivitySupernodeId &&
+                        predSegment != targetSegment &&
+                        predSegment >= targetSegment)
+                    {
+                        predAfterOrSame = true;
+                        break;
+                    }
+                }
+                for (const uint32_t succ : view.succs[clusterId])
+                {
+                    const uint32_t succSegment =
+                        succ < ownerByCluster.size() ? ownerByCluster[succ]
+                                                     : kInvalidActivitySupernodeId;
+                    if (succSegment != kInvalidActivitySupernodeId &&
+                        succSegment != targetSegment &&
+                        targetSegment >= succSegment)
+                    {
+                        succBeforeOrSame = true;
+                        break;
+                    }
+                }
+                const char *relation = "unknown";
+                if (predAfterOrSame && succBeforeOrSame)
+                {
+                    relation = "pred_after_and_succ_before";
+                }
+                else if (predAfterOrSame)
+                {
+                    relation = "pred_after";
+                }
+                else if (succBeforeOrSame)
+                {
+                    relation = "succ_before";
+                }
+                ++perf->fmRefineRejectedCycleRelation[relation];
+            };
+            for (std::size_t round = 0; round < options.fmRefineMaxRounds; ++round)
+            {
+                std::vector<Candidate> candidates;
+                std::vector<BlockedMove> blockedMoves;
+                std::size_t boundaryClusters = 0;
+                for (uint32_t clusterId = 0; clusterId < view.members.size(); ++clusterId)
+                {
+                    const uint32_t from = clusterId < ownerByCluster.size()
+                                              ? ownerByCluster[clusterId]
+                                              : kInvalidActivitySupernodeId;
+                    if (from == kInvalidActivitySupernodeId || from >= segments.size())
+                    {
+                        continue;
+                    }
+                    ScoredDests scoredDests;
+                    if (clusterId < valueEdges.sourceValuesByCluster.size())
+                    {
+                        for (const uint32_t valueId : valueEdges.sourceValuesByCluster[clusterId])
+                        {
+                            if (valueId >= valueEdges.valueFanouts.size())
+                            {
+                                continue;
+                            }
+                            for (const uint32_t targetCluster :
+                                 valueEdges.valueFanouts[valueId].targetClusters)
+                            {
+                                const uint32_t targetSegment =
+                                    targetCluster < ownerByCluster.size()
+                                        ? ownerByCluster[targetCluster]
+                                        : kInvalidActivitySupernodeId;
+                                if (targetSegment != from)
+                                {
+                                    scoredDests.add(targetSegment, 1);
+                                }
+                            }
+                        }
+                    }
+                    if (clusterId < valueEdges.targetValuesByCluster.size())
+                    {
+                        for (const uint32_t valueId : valueEdges.targetValuesByCluster[clusterId])
+                        {
+                            if (valueId >= valueEdges.valueFanouts.size())
+                            {
+                                continue;
+                            }
+                            const uint32_t sourceSegment =
+                                valueEdges.valueFanouts[valueId].sourceCluster < ownerByCluster.size()
+                                    ? ownerByCluster[valueEdges.valueFanouts[valueId].sourceCluster]
+                                    : kInvalidActivitySupernodeId;
+                            if (sourceSegment != from)
+                            {
+                                scoredDests.add(sourceSegment, 4);
+                            }
+                        }
+                    }
+                    auto dests = scoredDests.take();
+                    if (dests.empty())
+                    {
+                        continue;
+                    }
+                    ++boundaryClusters;
+                    std::sort(dests.begin(),
+                              dests.end(),
+                              [](const auto &lhs, const auto &rhs)
+                              {
+                                  if (lhs.second != rhs.second)
+                                  {
+                                      return lhs.second > rhs.second;
+                                  }
+                                  return lhs.first < rhs.first;
+                              });
+                    if (dests.size() > kTopDestsPerCluster)
+                    {
+                        dests.resize(kTopDestsPerCluster);
+                    }
+                    for (const auto &[to, approximateGain] : dests)
+                    {
+                        if (to == from ||
+                            to >= segments.size() ||
+                            segments[from].size() <= 1)
+                        {
+                            continue;
+                        }
+                        const std::size_t ops = clusterId < clusterOps.size() ? clusterOps[clusterId] : 0;
+                        if (maxOps != 0 && segmentOps[to] + ops > maxOps)
+                        {
+                            if (perf)
+                            {
+                                ++perf->fmRefineRejectedSize;
+                                recordSizeBlock(to);
+                            }
+                            if (approximateGain != 0)
+                            {
+                                blockedMoves.push_back(BlockedMove{
+                                    clusterId,
+                                    from,
+                                    to,
+                                    approximateGain,
+                                });
+                                if (blockedMoves.size() >
+                                    kMaxBlockedMovesPerRound * kBlockedMoveTrimMultiple)
+                                {
+                                    trimBlockedMoves(blockedMoves);
+                                }
+                            }
+                            continue;
+                        }
+                        if (!probFmMovePreservesSegmentTopo(view, ownerByCluster, clusterId, to))
+                        {
+                            if (perf)
+                            {
+                                ++perf->fmRefineRejectedCycle;
+                                recordCycleBlock(clusterId, to);
+                            }
+                            continue;
+                        }
+                        const std::int64_t gain = moveGain(clusterId, from, to);
+                        if (gain <= 0)
+                        {
+                            continue;
+                        }
+                        candidates.push_back(Candidate{
+                            clusterId,
+                            from,
+                            to,
+                            static_cast<std::size_t>(gain),
+                            approximateGain,
+                        });
+                    }
+                }
+                if (perf)
+                {
+                    perf->fmRefineCandidates += candidates.size();
+                }
+                if (candidates.empty())
+                {
+                    trimBlockedMoves(blockedMoves);
+                }
+                else
+                {
+                    std::sort(candidates.begin(),
+                              candidates.end(),
+                              [](const Candidate &lhs, const Candidate &rhs)
+                              {
+                                  if (lhs.gain != rhs.gain)
+                                  {
+                                      return lhs.gain > rhs.gain;
+                                  }
+                                  if (lhs.approximateGain != rhs.approximateGain)
+                                  {
+                                      return lhs.approximateGain > rhs.approximateGain;
+                                  }
+                                  if (lhs.cluster != rhs.cluster)
+                                  {
+                                      return lhs.cluster < rhs.cluster;
+                                  }
+                                  return lhs.to < rhs.to;
+                              });
+                    trimBlockedMoves(blockedMoves);
+                }
+                if (candidates.empty() && blockedMoves.empty())
+                {
+                    break;
+                }
+                std::sort(blockedMoves.begin(),
+                          blockedMoves.end(),
+                          [](const BlockedMove &lhs, const BlockedMove &rhs)
+                          {
+                              if (lhs.approximateGain != rhs.approximateGain)
+                              {
+                                  return lhs.approximateGain > rhs.approximateGain;
+                              }
+                              if (lhs.cluster != rhs.cluster)
+                              {
+                                  return lhs.cluster < rhs.cluster;
+                              }
+                              return lhs.to < rhs.to;
+                          });
+
+                std::vector<uint8_t> movedThisRound(view.members.size(), 0);
+                std::size_t roundMoves = 0;
+                std::uint64_t roundGain = 0;
+                for (const auto &candidate : candidates)
+                {
+                    const uint32_t clusterId = candidate.cluster;
+                    if (clusterId >= ownerByCluster.size() || movedThisRound[clusterId] != 0)
+                    {
+                        continue;
+                    }
+                    const uint32_t from = ownerByCluster[clusterId];
+                    const uint32_t to = candidate.to;
+                    if (from != candidate.from ||
+                        from == kInvalidActivitySupernodeId ||
+                        to == kInvalidActivitySupernodeId ||
+                        from == to ||
+                        from >= segments.size() ||
+                        to >= segments.size() ||
+                        segments[from].size() <= 1)
+                    {
+                        continue;
+                    }
+                    const std::size_t ops = clusterId < clusterOps.size() ? clusterOps[clusterId] : 0;
+                    if (maxOps != 0 && segmentOps[to] + ops > maxOps)
+                    {
+                        if (perf)
+                        {
+                            ++perf->fmRefineRejectedSize;
+                            recordSizeBlock(to);
+                        }
+                        continue;
+                    }
+                    if (!probFmMovePreservesSegmentTopo(view, ownerByCluster, clusterId, to))
+                    {
+                        if (perf)
+                        {
+                            ++perf->fmRefineRejectedCycle;
+                            recordCycleBlock(clusterId, to);
+                        }
+                        continue;
+                    }
+                    const std::int64_t gain = moveGain(clusterId, from, to);
+                    if (gain <= 0)
+                    {
+                        continue;
+                    }
+
+                    auto &fromMembers = segments[from];
+                    const auto eraseIt = std::find(fromMembers.begin(), fromMembers.end(), clusterId);
+                    if (eraseIt == fromMembers.end())
+                    {
+                        continue;
+                    }
+                    fromMembers.erase(eraseIt);
+                    segments[to].push_back(clusterId);
+                    std::sort(segments[to].begin(), segments[to].end());
+                    ownerByCluster[clusterId] = to;
+                    segmentOps[from] = segmentOps[from] >= ops ? segmentOps[from] - ops : 0;
+                    segmentOps[to] += ops;
+                    movedThisRound[clusterId] = 1;
+                    ++roundMoves;
+                    roundGain += static_cast<std::uint64_t>(gain);
+                    if (roundMoves >= kMaxMovesPerRound)
+                    {
+                        break;
+                    }
+                }
+                std::vector<SwapCandidate> swapCandidates;
+                for (const auto &blocked : blockedMoves)
+                {
+                    const uint32_t lhs = blocked.cluster;
+                    if (lhs >= ownerByCluster.size() ||
+                        movedThisRound[lhs] != 0 ||
+                        ownerByCluster[lhs] != blocked.from ||
+                        blocked.from == kInvalidActivitySupernodeId ||
+                        blocked.to == kInvalidActivitySupernodeId ||
+                        blocked.from == blocked.to ||
+                        blocked.from >= segments.size() ||
+                        blocked.to >= segments.size())
+                    {
+                        continue;
+                    }
+                    const std::size_t lhsOps = lhs < clusterOps.size() ? clusterOps[lhs] : 0;
+                    if (maxOps == 0 || segmentOps[blocked.to] + lhsOps <= maxOps)
+                    {
+                        continue;
+                    }
+                    if (!probFmMovePreservesSegmentTopo(view, ownerByCluster, lhs, blocked.to))
+                    {
+                        continue;
+                    }
+                    const std::size_t toOverflow = segmentOps[blocked.to] + lhsOps - maxOps;
+                    const std::size_t fromAfterLhs =
+                        segmentOps[blocked.from] >= lhsOps ? segmentOps[blocked.from] - lhsOps : 0;
+                    for (const uint32_t rhs : segments[blocked.to])
+                    {
+                        if (rhs >= ownerByCluster.size() ||
+                            rhs == lhs ||
+                            movedThisRound[rhs] != 0 ||
+                            ownerByCluster[rhs] != blocked.to)
+                        {
+                            continue;
+                        }
+                        const std::size_t rhsOps = rhs < clusterOps.size() ? clusterOps[rhs] : 0;
+                        if (rhsOps < toOverflow || fromAfterLhs + rhsOps > maxOps)
+                        {
+                            continue;
+                        }
+                        if (!swapPreservesSegmentTopo(lhs,
+                                                      blocked.from,
+                                                      blocked.to,
+                                                      rhs,
+                                                      blocked.to,
+                                                      blocked.from))
+                        {
+                            if (perf)
+                            {
+                                ++perf->fmRefineRejectedCycle;
+                                recordCycleBlock(lhs, blocked.to);
+                            }
+                            continue;
+                        }
+                        const std::int64_t gain =
+                            swapGain(lhs,
+                                     blocked.from,
+                                     blocked.to,
+                                     rhs,
+                                     blocked.to,
+                                     blocked.from);
+                        if (gain <= 0)
+                        {
+                            continue;
+                        }
+                        swapCandidates.push_back(SwapCandidate{
+                            lhs,
+                            rhs,
+                            blocked.from,
+                            blocked.to,
+                            static_cast<std::size_t>(gain),
+                            blocked.approximateGain,
+                        });
+                        if (swapCandidates.size() >
+                            kMaxSwapCandidatesPerRound * kBlockedMoveTrimMultiple)
+                        {
+                            trimSwapCandidates(swapCandidates);
+                        }
+                    }
+                }
+                trimSwapCandidates(swapCandidates);
+                std::sort(swapCandidates.begin(),
+                          swapCandidates.end(),
+                          [](const SwapCandidate &lhs, const SwapCandidate &rhs)
+                          {
+                              if (lhs.gain != rhs.gain)
+                              {
+                                  return lhs.gain > rhs.gain;
+                              }
+                              if (lhs.approximateGain != rhs.approximateGain)
+                              {
+                                  return lhs.approximateGain > rhs.approximateGain;
+                              }
+                              if (lhs.lhs != rhs.lhs)
+                              {
+                                  return lhs.lhs < rhs.lhs;
+                              }
+                              return lhs.rhs < rhs.rhs;
+                          });
+                for (const auto &candidate : swapCandidates)
+                {
+                    const uint32_t lhs = candidate.lhs;
+                    const uint32_t rhs = candidate.rhs;
+                    const uint32_t lhsFrom = candidate.lhsFrom;
+                    const uint32_t lhsTo = candidate.lhsTo;
+                    if (lhs >= ownerByCluster.size() ||
+                        rhs >= ownerByCluster.size() ||
+                        movedThisRound[lhs] != 0 ||
+                        movedThisRound[rhs] != 0 ||
+                        ownerByCluster[lhs] != lhsFrom ||
+                        ownerByCluster[rhs] != lhsTo ||
+                        lhsFrom == lhsTo ||
+                        lhsFrom >= segments.size() ||
+                        lhsTo >= segments.size())
+                    {
+                        continue;
+                    }
+                    const std::size_t lhsOps = lhs < clusterOps.size() ? clusterOps[lhs] : 0;
+                    const std::size_t rhsOps = rhs < clusterOps.size() ? clusterOps[rhs] : 0;
+                    if (maxOps != 0 &&
+                        (segmentOps[lhsTo] + lhsOps < rhsOps ||
+                         segmentOps[lhsTo] + lhsOps - rhsOps > maxOps ||
+                         segmentOps[lhsFrom] + rhsOps < lhsOps ||
+                         segmentOps[lhsFrom] + rhsOps - lhsOps > maxOps))
+                    {
+                        if (perf)
+                        {
+                            ++perf->fmRefineRejectedSize;
+                            recordSizeBlock(lhsTo);
+                        }
+                        continue;
+                    }
+                    if (!swapPreservesSegmentTopo(lhs, lhsFrom, lhsTo, rhs, lhsTo, lhsFrom))
+                    {
+                        if (perf)
+                        {
+                            ++perf->fmRefineRejectedCycle;
+                            recordCycleBlock(lhs, lhsTo);
+                            recordCycleBlock(rhs, lhsFrom);
+                        }
+                        continue;
+                    }
+                    const std::int64_t gain =
+                        swapGain(lhs, lhsFrom, lhsTo, rhs, lhsTo, lhsFrom);
+                    if (gain <= 0)
+                    {
+                        continue;
+                    }
+
+                    auto &fromMembers = segments[lhsFrom];
+                    auto &toMembers = segments[lhsTo];
+                    const auto lhsIt = std::find(fromMembers.begin(), fromMembers.end(), lhs);
+                    const auto rhsIt = std::find(toMembers.begin(), toMembers.end(), rhs);
+                    if (lhsIt == fromMembers.end() || rhsIt == toMembers.end())
+                    {
+                        continue;
+                    }
+                    fromMembers.erase(lhsIt);
+                    toMembers.erase(rhsIt);
+                    fromMembers.push_back(rhs);
+                    toMembers.push_back(lhs);
+                    std::sort(fromMembers.begin(), fromMembers.end());
+                    std::sort(toMembers.begin(), toMembers.end());
+                    ownerByCluster[lhs] = lhsTo;
+                    ownerByCluster[rhs] = lhsFrom;
+                    segmentOps[lhsFrom] = segmentOps[lhsFrom] >= lhsOps
+                                              ? segmentOps[lhsFrom] - lhsOps + rhsOps
+                                              : rhsOps;
+                    segmentOps[lhsTo] = segmentOps[lhsTo] >= rhsOps
+                                            ? segmentOps[lhsTo] - rhsOps + lhsOps
+                                            : lhsOps;
+                    movedThisRound[lhs] = 1;
+                    movedThisRound[rhs] = 1;
+                    roundMoves += 2;
+                    roundGain += static_cast<std::uint64_t>(gain);
+                    if (roundMoves >= kMaxMovesPerRound)
+                    {
+                        break;
+                    }
+                }
+                if (roundMoves == 0)
+                {
+                    break;
+                }
+                if (perf)
+                {
+                    ++perf->fmRefineRounds;
+                    perf->fmRefineMoves += roundMoves;
+                    perf->fmRefineTotalGain += static_cast<double>(roundGain);
+                }
+                (void)boundaryClusters;
+            }
+
+            return segments;
+        }
+
         std::vector<std::vector<uint32_t>> flattenNodeSegments(const NodeClusterView &view,
                                                                const std::vector<std::vector<uint32_t>> &segments,
                                                                const std::vector<uint32_t> &nodeTopoPos)
@@ -8582,8 +13055,8 @@ namespace wolvrix::lib::transform
                 }
             }
 
-            // NO0208 Phase D：把 over-split 的 computeNode 合并到理想 MFFC 锥（仅 prob）。放在
-            // cycle-split 循环之前，cap 可能引入的 quotient 环由下面的循环统一修复。
+            // NO0208 Phase D：把 over-split 的 computeNode 合并到理想 MFFC 锥（仅 prob）。CBAW
+            // 从 P3 atom 层开始，不能把 prob/plain 的预合并结果作为初始解。
             if (options.partitionPolicy == "prob")
             {
                 mergeComputeNodesToMffc(out, opData, graph, options.maxOpInComputeNode);
@@ -8956,6 +13429,8 @@ namespace wolvrix::lib::transform
                                                    : maxOpsPerComputeSupernode;
                 bool changed = true;
                 std::size_t tailIterations = 0;
+                std::size_t cbawIterations = 0;
+                constexpr std::size_t kMaxCbawCoarsenIterations = 8;
                 while (changed)
                 {
                     const auto iterStart = std::chrono::steady_clock::now();
@@ -8965,6 +13440,7 @@ namespace wolvrix::lib::transform
                     bool in1Changed = false;
                     bool siblingsChanged = false;
                     bool probChanged = false;
+                    bool cbawChanged = false;
                     if (options.partitionPolicy == "prob")
                     {
                         if (costModel == nullptr || piByOpIndex == nullptr)
@@ -8987,6 +13463,20 @@ namespace wolvrix::lib::transform
                                                        probSeedHypergraph,
                                                        perf);
                         changed = probChanged || changed;
+                    }
+                    else if (options.partitionPolicy == "cbaw")
+                    {
+                        cbawChanged = tryMergeNodeCbaw(clusters,
+                                                       rewrite.computeDag,
+                                                       rewrite.computeNodes.size(),
+                                                       nodeTopoPos,
+                                                       nodeOpSizes,
+                                                       coarsenMaxOps,
+                                                       rewrite,
+                                                       graph,
+                                                       &opData,
+                                                       perf);
+                        changed = cbawChanged || changed;
                     }
                     else
                     {
@@ -9048,6 +13538,14 @@ namespace wolvrix::lib::transform
                         const std::size_t clustersAfterIter = clusters.size();
                         const std::size_t clusterDelta =
                             clustersBeforeIter >= clustersAfterIter ? (clustersBeforeIter - clustersAfterIter) : 0;
+                        if (options.partitionPolicy == "cbaw")
+                        {
+                            ++cbawIterations;
+                        }
+                        const bool cbawRoundLimitStop =
+                            options.partitionPolicy == "cbaw" &&
+                            cbawIterations >= kMaxCbawCoarsenIterations &&
+                            changed;
                         const bool smallDeltaTail =
                             clustersBeforeIter >= kComputeNodeCoarsenTailLargeClusterThreshold &&
                             clusterDelta < kComputeNodeCoarsenTailMaxClusterDeltaExclusive;
@@ -9060,6 +13558,7 @@ namespace wolvrix::lib::transform
                             tailIterations = 0;
                         }
                         const bool tailStopped =
+                            cbawRoundLimitStop ||
                             tailIterations >= kComputeNodeCoarsenTailMaxConsecutiveIters;
                         if (tailStopped)
                         {
@@ -9076,7 +13575,7 @@ namespace wolvrix::lib::transform
                             .out1Changed = out1Changed,
                             .in1Changed = in1Changed,
                             .siblingsChanged = siblingsChanged,
-                            .probChanged = probChanged,
+                            .probChanged = probChanged || cbawChanged,
                             .tailStopped = tailStopped,
                             .elapsedMs = elapsedMs(iterStart),
                         });
@@ -9086,6 +13585,14 @@ namespace wolvrix::lib::transform
                         const std::size_t clustersAfterIter = clusters.size();
                         const std::size_t clusterDelta =
                             clustersBeforeIter >= clustersAfterIter ? (clustersBeforeIter - clustersAfterIter) : 0;
+                        if (options.partitionPolicy == "cbaw")
+                        {
+                            ++cbawIterations;
+                        }
+                        const bool cbawRoundLimitStop =
+                            options.partitionPolicy == "cbaw" &&
+                            cbawIterations >= kMaxCbawCoarsenIterations &&
+                            changed;
                         const bool smallDeltaTail =
                             clustersBeforeIter >= kComputeNodeCoarsenTailLargeClusterThreshold &&
                             clusterDelta < kComputeNodeCoarsenTailMaxClusterDeltaExclusive;
@@ -9097,7 +13604,8 @@ namespace wolvrix::lib::transform
                         {
                             tailIterations = 0;
                         }
-                        if (tailIterations >= kComputeNodeCoarsenTailMaxConsecutiveIters)
+                        if (cbawRoundLimitStop ||
+                            tailIterations >= kComputeNodeCoarsenTailMaxConsecutiveIters)
                         {
                             changed = false;
                         }
@@ -9136,6 +13644,21 @@ namespace wolvrix::lib::transform
 
             const auto dpSegmentStart = std::chrono::steady_clock::now();
             const auto clusterValueEdges = buildClusterValueEdges(clusterView, rewrite, graph);
+            recordInitialComputeSupernodeStats(clusterView,
+                                               clusterValueEdges,
+                                               rewrite,
+                                               graph,
+                                               nodeOpSizes);
+            if (perf && options.partitionPolicy == "cbaw")
+            {
+                perf->cbawAfterCoarsen =
+                    buildCbawStageStatsForView(clusterView,
+                                               clusterValueEdges,
+                                               rewrite,
+                                               graph,
+                                               nodeOpSizes,
+                                               0);
+            }
             std::vector<double> probSegmentValueWeights;
             const std::vector<double> *segmentValueWeights = nullptr;
             if (options.partitionPolicy == "prob" && options.probDpCost && piByOpIndex != nullptr)
@@ -9153,7 +13676,7 @@ namespace wolvrix::lib::transform
                 (options.partitionPolicy == "prob" && options.probDpCost)
                     ? std::max(0.0, options.probDpSegmentPenalty)
                     : 1.0;
-            auto segments =
+            std::vector<std::vector<uint32_t>> segments =
                 buildComputeSupernodeSegments(clusterView,
                                               clusterValueEdges,
                                               nodeOpSizes,
@@ -9164,6 +13687,20 @@ namespace wolvrix::lib::transform
             {
                 perf->dpSegmentMs = elapsedMs(dpSegmentStart);
                 perf->segments = segments.size();
+                if (options.partitionPolicy == "cbaw")
+                {
+                    const auto dpComputeSupernodes =
+                        flattenNodeSegments(clusterView, segments, nodeTopoPos);
+                    perf->cbawAfterDp =
+                        buildCbawStageStatsForComputeSupernodes(dpComputeSupernodes,
+                                                                rewrite.computeDag,
+                                                                rewrite.computeNodes.size(),
+                                                                rewrite,
+                                                                graph,
+                                                                nodeOpSizes,
+                                                                clusterView.members.size(),
+                                                                segments.size());
+                }
             }
 
             const auto fmRefineStart = std::chrono::steady_clock::now();
@@ -9208,10 +13745,35 @@ namespace wolvrix::lib::transform
                                                               maxOpsPerComputeSupernode,
                                                               perf);
             }
+            else if (options.partitionPolicy == "cbaw" &&
+                     options.fmRefineMaxRounds != 0)
+            {
+                segments = refineComputeSupernodeSegmentsCbaw(clusterView,
+                                                              clusterValueEdges,
+                                                              nodeOpSizes,
+                                                              std::move(segments),
+                                                              options,
+                                                              maxOpsPerComputeSupernode,
+                                                              perf);
+            }
             if (perf)
             {
                 perf->fmRefineMs = elapsedMs(fmRefineStart);
                 perf->segments = segments.size();
+                if (options.partitionPolicy == "cbaw")
+                {
+                    const auto fmComputeSupernodes =
+                        flattenNodeSegments(clusterView, segments, nodeTopoPos);
+                    perf->cbawAfterFm =
+                        buildCbawStageStatsForComputeSupernodes(fmComputeSupernodes,
+                                                                rewrite.computeDag,
+                                                                rewrite.computeNodes.size(),
+                                                                rewrite,
+                                                                graph,
+                                                                nodeOpSizes,
+                                                                clusterView.members.size(),
+                                                                segments.size());
+                }
             }
 
             const auto flattenSegmentsStart = std::chrono::steady_clock::now();
@@ -9601,9 +14163,11 @@ namespace wolvrix::lib::transform
             result.failed = true;
             return result;
         }
-        if (options_.partitionPolicy != "plain" && options_.partitionPolicy != "prob")
+        if (options_.partitionPolicy != "plain" &&
+            options_.partitionPolicy != "prob" &&
+            options_.partitionPolicy != "cbaw")
         {
-            error("activity-schedule -partition-policy must be \"plain\" or \"prob\"");
+            error("activity-schedule -partition-policy must be \"plain\", \"prob\", or \"cbaw\"");
             result.failed = true;
             return result;
         }
@@ -9907,6 +14471,72 @@ namespace wolvrix::lib::transform
 
         ActivityScheduleBuild build;
         ComputeNodeMaterializePerfStats materializePerf;
+        std::optional<ActivityScheduleSummaryStats> cbawPlainBaselineStats;
+        ComputeNodeMaterializePerfStats cbawPlainBaselinePerf;
+        const bool hasExternalCbawPlainBaseline =
+            options_.cbawPlainBoundaryBaseline != 0 &&
+            options_.cbawPlainDagBaseline != 0 &&
+            options_.cbawPlainComputeComputeBaseline != 0;
+        if (options_.partitionPolicy == "cbaw" && hasExternalCbawPlainBaseline)
+        {
+            ActivityScheduleSummaryStats externalBaseline;
+            externalBaseline.boundaryActivationEdges = options_.cbawPlainBoundaryBaseline;
+            externalBaseline.dagEdges = options_.cbawPlainDagBaseline;
+            externalBaseline.computeComputeValuePairs = options_.cbawPlainComputeComputeBaseline;
+            cbawPlainBaselineStats = externalBaseline;
+            logInfo("activity-schedule progress: cbaw_plain_gate_baseline external boundary=" +
+                    std::to_string(cbawPlainBaselineStats->boundaryActivationEdges) +
+                    " dag=" + std::to_string(cbawPlainBaselineStats->dagEdges) +
+                    " compute_compute=" +
+                    std::to_string(cbawPlainBaselineStats->computeComputeValuePairs));
+        }
+        constexpr std::size_t kCbawInternalPlainBaselineMaxOps = 200000;
+        if (options_.partitionPolicy == "cbaw" &&
+            !hasExternalCbawPlainBaseline &&
+            opData.topoOps.size() <= kCbawInternalPlainBaselineMaxOps)
+        {
+            ActivityScheduleOptions plainBaselineOptions = options_;
+            plainBaselineOptions.partitionPolicy = "plain";
+            ActivityScheduleBuild plainBaselineBuild;
+            logInfo("activity-schedule progress: cbaw_plain_gate_baseline start");
+            if (!materializeComputeNodeSchedule(*graph,
+                                                plainBaselineOptions,
+                                                opData,
+                                                nullptr,
+                                                nullptr,
+                                                nullptr,
+                                                rewrite,
+                                                plainBaselineBuild,
+                                                &cbawPlainBaselinePerf,
+                                                buildError))
+            {
+                error(*graph, buildError);
+                result.failed = true;
+                return result;
+            }
+            cbawPlainBaselineStats =
+                buildActivityScheduleSummaryStats(plainBaselineBuild,
+                                                  rewrite,
+                                                  opData,
+                                                  *graph,
+                                                  nullptr);
+            logInfo("activity-schedule progress: cbaw_plain_gate_baseline done supernodes=" +
+                    std::to_string(plainBaselineBuild.supernodeToOps.size()) +
+                    " boundary=" +
+                    std::to_string(cbawPlainBaselineStats->boundaryActivationEdges) +
+                    " dag=" +
+                    std::to_string(cbawPlainBaselineStats->dagEdges) +
+                    " compute_compute=" +
+                    std::to_string(
+                        cbawPlainBaselineStats->computeComputeValuePairs));
+        }
+        else if (options_.partitionPolicy == "cbaw" && !hasExternalCbawPlainBaseline)
+        {
+            logInfo("activity-schedule progress: cbaw_plain_gate_baseline skipped reason=large_graph ops=" +
+                    std::to_string(opData.topoOps.size()) +
+                    " max_internal_ops=" +
+                    std::to_string(kCbawInternalPlainBaselineMaxOps));
+        }
         const auto materializeStart = std::chrono::steady_clock::now();
         logInfo("activity-schedule progress: final_materialize start");
         if (options_.partitionPolicy == "prob")
@@ -10039,6 +14669,86 @@ namespace wolvrix::lib::transform
                             probStats.str(),
                             "activity-schedule.prob-coarsen-stats");
         }
+        if (options_.partitionPolicy == "cbaw")
+        {
+            const auto formatPerfCounts =
+                [](const ComputeNodeMaterializePerfStats::KindCountMap &counts)
+            {
+                std::ostringstream oss;
+                bool first = true;
+                for (const auto &[kind, count] : counts)
+                {
+                    if (!first)
+                    {
+                        oss << ",";
+                    }
+                    first = false;
+                    oss << kind << ":" << count;
+                }
+                return first ? std::string("-") : oss.str();
+            };
+            std::ostringstream cbawCoarsenStats;
+            cbawCoarsenStats
+                << "candidates=" << materializePerf.cbawCoarsenCandidates
+                << " evaluated=" << materializePerf.cbawCoarsenEvaluated
+                << " accepted=" << materializePerf.cbawCoarsenMerges
+                << " reject_no_gain=" << materializePerf.cbawCoarsenRejectedNoGain
+                << " reject_resource=" << materializePerf.cbawCoarsenRejectedResource
+                << " reject_cycle=" << materializePerf.cbawCoarsenRejectedCycle
+                << " stale=" << materializePerf.cbawCoarsenStale
+                << " generated_by_kind="
+                << formatPerfCounts(materializePerf.cbawCoarsenGeneratedByKind)
+                << " dedup_selected_by_kind="
+                << formatPerfCounts(materializePerf.cbawCoarsenDedupSelectedByKind)
+                << " dedup_lost_tag_by_kind="
+                << formatPerfCounts(materializePerf.cbawCoarsenDedupLostTagByKind)
+                << " selected_reason="
+                << formatPerfCounts(materializePerf.cbawCoarsenSelectedReason)
+                << " evaluated_by_kind="
+                << formatPerfCounts(materializePerf.cbawCoarsenEvaluatedByKind)
+                << " accepted_by_kind="
+                << formatPerfCounts(materializePerf.cbawCoarsenAcceptedByKind)
+                << " accepted_by_tag="
+                << formatPerfCounts(materializePerf.cbawCoarsenAcceptedByTag)
+                << " reject_no_gain_by_kind="
+                << formatPerfCounts(materializePerf.cbawCoarsenRejectedNoGainByKind)
+                << " reject_resource_by_kind="
+                << formatPerfCounts(materializePerf.cbawCoarsenRejectedResourceByKind)
+                << " reject_cycle_by_kind="
+                << formatPerfCounts(materializePerf.cbawCoarsenRejectedCycleByKind)
+                << " stale_by_kind="
+                << formatPerfCounts(materializePerf.cbawCoarsenStaleByKind)
+                << " reject_no_gain_by_tag="
+                << formatPerfCounts(materializePerf.cbawCoarsenRejectedNoGainByTag)
+                << " reject_resource_by_tag="
+                << formatPerfCounts(materializePerf.cbawCoarsenRejectedResourceByTag)
+                << " reject_cycle_by_tag="
+                << formatPerfCounts(materializePerf.cbawCoarsenRejectedCycleByTag)
+                << " stale_by_tag="
+                << formatPerfCounts(materializePerf.cbawCoarsenStaleByTag)
+                << " after_p5_boundary="
+                << materializePerf.cbawAfterCoarsen.boundaryActivationEdges
+                << " after_p5_dag=" << materializePerf.cbawAfterCoarsen.dagEdges
+                << " after_p5_compute_compute="
+                << materializePerf.cbawAfterCoarsen.computeComputeValuePairs
+                << " after_dp_boundary="
+                << materializePerf.cbawAfterDp.boundaryActivationEdges
+                << " after_dp_dag=" << materializePerf.cbawAfterDp.dagEdges
+                << " after_dp_compute_compute="
+                << materializePerf.cbawAfterDp.computeComputeValuePairs
+                << " after_fm_boundary="
+                << materializePerf.cbawAfterFm.boundaryActivationEdges
+                << " after_fm_dag=" << materializePerf.cbawAfterFm.dagEdges
+                << " after_fm_compute_compute="
+                << materializePerf.cbawAfterFm.computeComputeValuePairs
+                << " fm_reject_size_fill="
+                << formatPerfCounts(materializePerf.fmRefineRejectedSizeFillBucket)
+                << " fm_reject_cycle_relation="
+                << formatPerfCounts(materializePerf.fmRefineRejectedCycleRelation);
+            setSessionValue(keyPrefix + "cbaw_coarsen_stats",
+                            cbawCoarsenStats.str(),
+                            "activity-schedule.cbaw-coarsen-stats");
+        }
         ActivityScheduleValueWeightStats valueWeightStats;
         const ActivityScheduleValueWeightStats *summaryValueWeights = nullptr;
         if (options_.partitionPolicy == "prob" && !piByOpIndex.empty())
@@ -10055,9 +14765,319 @@ namespace wolvrix::lib::transform
         setSessionValue(keyPrefix + "summary_stats",
                         encodeActivityScheduleSummaryStatsJson(summaryStats),
                         "stats");
+        const ActivityScheduleCbawStats cbawStats =
+            buildActivityScheduleCbawStats(build, rewrite, opData, *graph, summaryStats);
+        setSessionValue(keyPrefix + "cbaw_stats",
+                        encodeActivityScheduleCbawStatsJson(cbawStats),
+                        "activity-schedule.cbaw-stats");
+        const CbawStructureGateReport cbawGate =
+            buildCbawStructureGateReport(cbawPlainBaselineStats ? &*cbawPlainBaselineStats : nullptr,
+                                         cbawStats);
+        if (options_.partitionPolicy == "cbaw")
+        {
+            std::ostringstream gateStats;
+            gateStats << "runtime_allowed=" << (cbawGate.runtimeAllowed ? 1 : 0)
+                      << " reason=" << cbawGate.reason
+                      << " structural_pass=" << (cbawGate.structuralPass ? 1 : 0)
+                      << " trigger_pass=" << (cbawGate.triggerPass ? 1 : 0)
+                      << " resource_pass=" << (cbawGate.resourcePass ? 1 : 0)
+                      << " dag_pass=" << (cbawGate.dagPass ? 1 : 0)
+                      << " plain_boundary=" << cbawGate.plainCrossBoundaryTargets
+                      << " cbaw_boundary=" << cbawGate.cbawCrossBoundaryTargets
+                      << " plain_dag=" << cbawGate.plainDagEdges
+                      << " cbaw_dag=" << cbawGate.cbawDagEdges
+                      << " plain_compute_compute="
+                      << cbawGate.plainComputeMaterializedTargets
+                      << " cbaw_compute_compute="
+                      << cbawGate.cbawComputeMaterializedTargets
+                      << " cbaw_trigger_p99="
+                      << cbawGate.cbawTriggerEstimatedP99
+                      << " resource_op_exceptions="
+                      << cbawGate.cbawResourceOpCountExceptions;
+            setSessionValue(keyPrefix + "cbaw_gate_stats",
+                            gateStats.str(),
+                            "activity-schedule.cbaw-gate-stats");
+        }
         const std::uint64_t exportMs = elapsedMs(exportStart);
         logInfo("activity-schedule progress: export_session done elapsed_ms=" +
                 std::to_string(exportMs));
+        logInfo("activity-schedule cbaw p0 replay: cross_boundary_target_count=" +
+                std::to_string(cbawStats.crossBoundaryTargetCount) +
+                " supernode_dependency_edge_count=" +
+                std::to_string(cbawStats.supernodeDependencyEdgeCount) +
+                " compute_materialized_value_target_count=" +
+                std::to_string(cbawStats.computeMaterializedValueTargetCount) +
+                " boundary_delta=" +
+                std::to_string(cbawStats.replayBoundaryActivationDelta) +
+                " dag_delta=" + std::to_string(cbawStats.replayDagEdgeDelta) +
+                " compute_compute_delta=" +
+                std::to_string(cbawStats.replayComputeComputeDelta) +
+                " op_count_p99=" +
+                std::to_string(cbawStats.computeSupernodeOpCountP99) +
+                " op_count_p995=" +
+                std::to_string(cbawStats.computeSupernodeOpCountP995) +
+                " op_count_cap=" + std::to_string(cbawStats.resourceOpCountCap) +
+                " op_count_exceptions=" +
+                std::to_string(cbawStats.resourceOpCountBaselineExceptions));
+        logInfo("activity-schedule cbaw p1 trigger: volatile_sources=" +
+                std::to_string(cbawStats.triggerVolatileSourceValues) +
+                " popcount_p50=" +
+                std::to_string(cbawStats.triggerSignaturePopcountP50) +
+                " popcount_p99=" +
+                std::to_string(cbawStats.triggerSignaturePopcountP99) +
+                " saturated_ratio_ppm=" +
+                std::to_string(cbawStats.triggerSignatureSaturatedRatioPpm) +
+                " non_empty_equal_bucket_covered_ppm=" +
+                std::to_string(cbawStats.triggerNonEmptyEqualBucketCoveredSupernodeRatioPpm) +
+                " non_empty_internalizable_compute_targets=" +
+                std::to_string(cbawStats.triggerNonEmptyEqualBucketInternalizableComputeTargets) +
+                " ate_equal_merge_recommended=" +
+                std::to_string(cbawStats.triggerAteEqualMergeRecommended) +
+                " no_go_reason=" + cbawStats.triggerAteNoGoReason);
+        logInfo("activity-schedule cbaw p2 semantic: seed_groups=" +
+                std::to_string(cbawStats.semanticSeedGroups) +
+                " merge_hint_groups=" + std::to_string(cbawStats.semanticMergeHintGroups) +
+                " debug_labels=" + std::to_string(cbawStats.semanticDebugLabels) +
+                " rtm_groups=" + std::to_string(cbawStats.semanticRtmIntentGroups) +
+                " mffc_groups=" + std::to_string(cbawStats.semanticMffcGroups) +
+                " plain_out1=" + std::to_string(cbawStats.semanticPlainOut1Hints) +
+                " plain_in1=" + std::to_string(cbawStats.semanticPlainIn1Hints) +
+                " aggregate_families=" + std::to_string(cbawStats.semanticAggregateFamilies) +
+                " guard_domains=" + std::to_string(cbawStats.semanticGuardDomains) +
+                " sink_labels=" + std::to_string(cbawStats.semanticSinkConeLabels) +
+                " passthrough_chains=" + std::to_string(cbawStats.semanticPassthroughChains) +
+                " top_root_attributed=" +
+                std::to_string(cbawStats.semanticTopRootAttributedCount));
+        logInfo("activity-schedule cbaw p3 atom: atom_count=" +
+                std::to_string(cbawStats.cbawAtomCount) +
+                " quotient_edges=" + std::to_string(cbawStats.cbawAtomQuotientEdges) +
+                " quotient_cycle=" + std::to_string(cbawStats.cbawAtomQuotientCycleDetected) +
+                " op_count_p99=" + std::to_string(cbawStats.cbawAtomOpCountP99) +
+                " op_count_p995=" + std::to_string(cbawStats.cbawAtomOpCountP995) +
+                " op_count_cap=" + std::to_string(cbawStats.cbawAtomResourceOpCountCap) +
+                " plain_replay_supernodes=" +
+                std::to_string(cbawStats.cbawAtomPlainReplaySupernodes) +
+                " plain_replay_boundary_delta=" +
+                std::to_string(cbawStats.cbawAtomPlainReplayBoundaryDelta) +
+                " plain_replay_dag_delta=" +
+                std::to_string(cbawStats.cbawAtomPlainReplayDagDelta) +
+                " plain_replay_compute_compute_delta=" +
+                std::to_string(cbawStats.cbawAtomPlainReplayComputeComputeDelta));
+        const std::string p4AteReason =
+            cbawStats.triggerAteNoGoReason.empty() ? "report_only_default_off"
+                                                   : cbawStats.triggerAteNoGoReason;
+        logInfo("activity-schedule cbaw p4 ate: enabled=0 reason=" +
+                p4AteReason +
+                " ate_equal_merge_recommended=" +
+                std::to_string(cbawStats.triggerAteEqualMergeRecommended) +
+                " saturated_ratio_ppm=" +
+                std::to_string(cbawStats.triggerSignatureSaturatedRatioPpm) +
+                " trigger_estimated_p99=" +
+                std::to_string(cbawStats.triggerEstimatedCountP99));
+        if (options_.partitionPolicy == "cbaw")
+        {
+            const auto cbawKindCount =
+                [](const ComputeNodeMaterializePerfStats::KindCountMap &counts,
+                   std::string_view kind)
+            {
+                const auto it = counts.find(std::string(kind));
+                return it == counts.end() ? std::size_t{0} : it->second;
+            };
+            const auto formatCounts =
+                [](const ComputeNodeMaterializePerfStats::KindCountMap &counts)
+            {
+                std::ostringstream oss;
+                bool first = true;
+                for (const auto &[kind, count] : counts)
+                {
+                    if (!first)
+                    {
+                        oss << ",";
+                    }
+                    first = false;
+                    oss << kind << ":" << count;
+                }
+                return first ? std::string("-") : oss.str();
+            };
+            const auto logStage =
+                [&](std::string_view stage,
+                    const ComputeNodeMaterializePerfStats::CbawStageStats &stats)
+            {
+                logInfo("activity-schedule cbaw stage stats: stage=" + std::string(stage) +
+                        " boundary_activation_edges=" +
+                        std::to_string(stats.boundaryActivationEdges) +
+                        " dag_edges=" + std::to_string(stats.dagEdges) +
+                        " compute_compute_value_pairs=" +
+                        std::to_string(stats.computeComputeValuePairs) +
+                        " cluster_count=" + std::to_string(stats.clusterCount) +
+                        " segment_count=" + std::to_string(stats.segmentCount) +
+                        " compute_supernode_count=" +
+                        std::to_string(stats.computeSupernodeCount) +
+                        " op_count_p50=" + std::to_string(stats.opCountP50) +
+                        " op_count_p90=" + std::to_string(stats.opCountP90) +
+                        " op_count_p99=" + std::to_string(stats.opCountP99) +
+                        " op_count_max=" + std::to_string(stats.opCountMax));
+            };
+            logStage("after_p5_coarsen", materializePerf.cbawAfterCoarsen);
+            logStage("after_dp_before_fm", materializePerf.cbawAfterDp);
+            logStage("after_fm", materializePerf.cbawAfterFm);
+            logInfo("activity-schedule cbaw p5 coarsen: candidates=" +
+                    std::to_string(materializePerf.cbawCoarsenCandidates) +
+                    " evaluated=" +
+                    std::to_string(materializePerf.cbawCoarsenEvaluated) +
+                    " accepted=" +
+                    std::to_string(materializePerf.cbawCoarsenMerges) +
+                    " reject_no_gain=" +
+                    std::to_string(materializePerf.cbawCoarsenRejectedNoGain) +
+                    " reject_resource=" +
+                    std::to_string(materializePerf.cbawCoarsenRejectedResource) +
+                    " reject_cycle=" +
+                    std::to_string(materializePerf.cbawCoarsenRejectedCycle) +
+                    " stale=" + std::to_string(materializePerf.cbawCoarsenStale) +
+                    " clusters_before=" +
+                    std::to_string(materializePerf.clustersBeforeCoarsen) +
+                    " clusters_after=" +
+                    std::to_string(materializePerf.clustersAfterCoarsen) +
+                    " quotient_cycle=" +
+                    std::to_string(cbawStats.quotientDagCycleDetected) +
+                    " generated_by_kind=" +
+                    formatCounts(materializePerf.cbawCoarsenGeneratedByKind) +
+                    " dedup_selected_by_kind=" +
+                    formatCounts(materializePerf.cbawCoarsenDedupSelectedByKind) +
+                    " dedup_lost_tag_by_kind=" +
+                    formatCounts(materializePerf.cbawCoarsenDedupLostTagByKind) +
+                    " selected_reason=" +
+                    formatCounts(materializePerf.cbawCoarsenSelectedReason) +
+                    " evaluated_by_kind=" +
+                    formatCounts(materializePerf.cbawCoarsenEvaluatedByKind) +
+                    " accepted_by_kind=" +
+                    formatCounts(materializePerf.cbawCoarsenAcceptedByKind) +
+                    " accepted_by_tag=" +
+                    formatCounts(materializePerf.cbawCoarsenAcceptedByTag) +
+                    " reject_no_gain_by_kind=" +
+                    formatCounts(materializePerf.cbawCoarsenRejectedNoGainByKind) +
+                    " reject_resource_by_kind=" +
+                    formatCounts(materializePerf.cbawCoarsenRejectedResourceByKind) +
+                    " reject_cycle_by_kind=" +
+                    formatCounts(materializePerf.cbawCoarsenRejectedCycleByKind) +
+                    " stale_by_kind=" +
+                    formatCounts(materializePerf.cbawCoarsenStaleByKind) +
+                    " reject_no_gain_by_tag=" +
+                    formatCounts(materializePerf.cbawCoarsenRejectedNoGainByTag) +
+                    " reject_resource_by_tag=" +
+                    formatCounts(materializePerf.cbawCoarsenRejectedResourceByTag) +
+                    " reject_cycle_by_tag=" +
+                    formatCounts(materializePerf.cbawCoarsenRejectedCycleByTag) +
+                    " stale_by_tag=" +
+                    formatCounts(materializePerf.cbawCoarsenStaleByTag));
+            logInfo("activity-schedule cbaw p6 guard-sink: guard_candidates=" +
+                    std::to_string(cbawKindCount(materializePerf.cbawCoarsenGeneratedByKind,
+                                                "guard_hint")) +
+                    " guard_accepted=" +
+                    std::to_string(cbawKindCount(materializePerf.cbawCoarsenAcceptedByTag,
+                                                "guard_hint")) +
+                    " guard_reject_no_gain=" +
+                    std::to_string(cbawKindCount(materializePerf.cbawCoarsenRejectedNoGainByTag,
+                                                "guard_hint")) +
+                    " guard_reject_resource=" +
+                    std::to_string(cbawKindCount(materializePerf.cbawCoarsenRejectedResourceByTag,
+                                                "guard_hint")) +
+                    " guard_reject_cycle=" +
+                    std::to_string(cbawKindCount(materializePerf.cbawCoarsenRejectedCycleByTag,
+                                                "guard_hint")) +
+                    " guard_stale=" +
+                    std::to_string(cbawKindCount(materializePerf.cbawCoarsenStaleByTag,
+                                                "guard_hint")) +
+                    " sink_candidates=" +
+                    std::to_string(cbawKindCount(materializePerf.cbawCoarsenGeneratedByKind,
+                                                "sink_cone")) +
+                    " sink_accepted=" +
+                    std::to_string(cbawKindCount(materializePerf.cbawCoarsenAcceptedByTag,
+                                                "sink_cone")) +
+                    " sink_reject_no_gain=" +
+                    std::to_string(cbawKindCount(materializePerf.cbawCoarsenRejectedNoGainByTag,
+                                                "sink_cone")) +
+                    " sink_reject_resource=" +
+                    std::to_string(cbawKindCount(materializePerf.cbawCoarsenRejectedResourceByTag,
+                                                "sink_cone")) +
+                    " sink_reject_cycle=" +
+                    std::to_string(cbawKindCount(materializePerf.cbawCoarsenRejectedCycleByTag,
+                                                "sink_cone")) +
+                    " sink_stale=" +
+                    std::to_string(cbawKindCount(materializePerf.cbawCoarsenStaleByTag,
+                                                "sink_cone")) +
+                    " semantic_guard_domains=" +
+                    std::to_string(cbawStats.semanticGuardDomains) +
+                    " semantic_sink_labels=" +
+                    std::to_string(cbawStats.semanticSinkConeLabels));
+            logInfo("activity-schedule cbaw p7 refine: enabled=1 mode=cbaw_boundary_fm fm_moves=" +
+                    std::to_string(materializePerf.fmRefineMoves) +
+                    " fm_rounds=" + std::to_string(materializePerf.fmRefineRounds) +
+                    " fm_gain=" + std::to_string(materializePerf.fmRefineTotalGain) +
+                    " fm_candidates=" + std::to_string(materializePerf.fmRefineCandidates) +
+                    " fm_reject_size=" + std::to_string(materializePerf.fmRefineRejectedSize) +
+                    " fm_reject_cycle=" + std::to_string(materializePerf.fmRefineRejectedCycle) +
+                    " fm_reject_size_fill=" +
+                    formatCounts(materializePerf.fmRefineRejectedSizeFillBucket) +
+                    " fm_reject_cycle_relation=" +
+                    formatCounts(materializePerf.fmRefineRejectedCycleRelation) +
+                    " local_exact_rois=0");
+            if (cbawPlainBaselineStats)
+            {
+                const auto signedDiff = [](std::size_t lhs, std::size_t rhs)
+                {
+                    return static_cast<std::int64_t>(lhs) -
+                           static_cast<std::int64_t>(rhs);
+                };
+                const auto absI64 = [](std::int64_t value)
+                {
+                    return value < 0 ? -value : value;
+                };
+                logInfo("activity-schedule cbaw p7 fm_required_estimate: after_dp_boundary_gap=" +
+                        std::to_string(signedDiff(materializePerf.cbawAfterDp.boundaryActivationEdges,
+                                                  cbawPlainBaselineStats->boundaryActivationEdges)) +
+                        " p7_actual_boundary_gain=" +
+                        std::to_string(signedDiff(materializePerf.cbawAfterDp.boundaryActivationEdges,
+                                                  materializePerf.cbawAfterFm.boundaryActivationEdges)) +
+                        " final_margin=" +
+                        std::to_string(signedDiff(cbawPlainBaselineStats->boundaryActivationEdges,
+                                                  materializePerf.cbawAfterFm.boundaryActivationEdges)) +
+                        " final_margin_ppm_of_p7_gain=" +
+                        std::to_string(
+                            materializePerf.cbawAfterDp.boundaryActivationEdges >
+                                    materializePerf.cbawAfterFm.boundaryActivationEdges
+                                ? (absI64(signedDiff(cbawPlainBaselineStats->boundaryActivationEdges,
+                                                     materializePerf.cbawAfterFm.boundaryActivationEdges)) *
+                                   1000000ll) /
+                                      std::max<std::int64_t>(
+                                          1,
+                                          signedDiff(materializePerf.cbawAfterDp.boundaryActivationEdges,
+                                                     materializePerf.cbawAfterFm.boundaryActivationEdges))
+                                : 0));
+            }
+            logInfo("activity-schedule cbaw p8 gate: runtime_allowed=" +
+                    std::to_string(cbawGate.runtimeAllowed ? 1 : 0) +
+                    " reason=" + cbawGate.reason +
+                    " structural_pass=" +
+                    std::to_string(cbawGate.structuralPass ? 1 : 0) +
+                    " trigger_pass=" +
+                    std::to_string(cbawGate.triggerPass ? 1 : 0) +
+                    " resource_pass=" +
+                    std::to_string(cbawGate.resourcePass ? 1 : 0) +
+                    " dag_pass=" + std::to_string(cbawGate.dagPass ? 1 : 0) +
+                    " plain_boundary=" +
+                    std::to_string(cbawGate.plainCrossBoundaryTargets) +
+                    " cbaw_boundary=" +
+                    std::to_string(cbawGate.cbawCrossBoundaryTargets) +
+                    " plain_dag=" + std::to_string(cbawGate.plainDagEdges) +
+                    " cbaw_dag=" + std::to_string(cbawGate.cbawDagEdges) +
+                    " plain_compute_compute=" +
+                    std::to_string(cbawGate.plainComputeMaterializedTargets) +
+                    " cbaw_compute_compute=" +
+                    std::to_string(cbawGate.cbawComputeMaterializedTargets) +
+                    " cbaw_trigger_p99=" +
+                    std::to_string(cbawGate.cbawTriggerEstimatedP99));
+        }
 
         const std::size_t computeSupernodes =
             std::count(build.supernodeKinds.begin(),
@@ -10091,6 +15111,22 @@ namespace wolvrix::lib::transform
                 std::to_string(materializePerf.splitOversizeComputeNodes) +
                 " split_supernodes=" +
                 std::to_string(materializePerf.splitOversizeComputeNodeSupernodes));
+        const auto formatKindCounts =
+            [](const ComputeNodeMaterializePerfStats::KindCountMap &counts)
+        {
+            std::ostringstream oss;
+            bool first = true;
+            for (const auto &[kind, count] : counts)
+            {
+                if (!first)
+                {
+                    oss << ",";
+                }
+                first = false;
+                oss << kind << ":" << count;
+            }
+            return first ? std::string("-") : oss.str();
+        };
         logInfo("activity-schedule compute-node coarsen detail: enabled=" +
                 std::string(options_.enableCoarsen ? "true" : "false") +
                 " chain_merge=" + std::string(options_.enableChainMerge ? "true" : "false") +
@@ -10109,6 +15145,47 @@ namespace wolvrix::lib::transform
                 " prob_seed_aggregates=" + std::to_string(materializePerf.probCoarsenSeedAggregates) +
                 " prob_full_aggregates=" + std::to_string(materializePerf.probCoarsenFullAggregates) +
                 " prob_aggregate_ms=" + std::to_string(materializePerf.probCoarsenAggregateMs) +
+                " cbaw_candidates=" + std::to_string(materializePerf.cbawCoarsenCandidates) +
+                " cbaw_evaluated=" + std::to_string(materializePerf.cbawCoarsenEvaluated) +
+                " cbaw_merges=" + std::to_string(materializePerf.cbawCoarsenMerges) +
+                " cbaw_reject_no_gain=" +
+                std::to_string(materializePerf.cbawCoarsenRejectedNoGain) +
+                " cbaw_reject_resource=" +
+                std::to_string(materializePerf.cbawCoarsenRejectedResource) +
+                " cbaw_reject_cycle=" + std::to_string(materializePerf.cbawCoarsenRejectedCycle) +
+                " cbaw_stale=" + std::to_string(materializePerf.cbawCoarsenStale) +
+                " cbaw_eval_ms=" + std::to_string(materializePerf.cbawCoarsenEvaluateMs) +
+                " cbaw_topo_ms=" + std::to_string(materializePerf.cbawCoarsenTopoMs) +
+                " cbaw_generated_by_kind=" +
+                formatKindCounts(materializePerf.cbawCoarsenGeneratedByKind) +
+                " cbaw_dedup_selected_by_kind=" +
+                formatKindCounts(materializePerf.cbawCoarsenDedupSelectedByKind) +
+                " cbaw_dedup_lost_tag_by_kind=" +
+                formatKindCounts(materializePerf.cbawCoarsenDedupLostTagByKind) +
+                " cbaw_selected_reason=" +
+                formatKindCounts(materializePerf.cbawCoarsenSelectedReason) +
+                " cbaw_evaluated_by_kind=" +
+                formatKindCounts(materializePerf.cbawCoarsenEvaluatedByKind) +
+                " cbaw_accepted_by_kind=" +
+                formatKindCounts(materializePerf.cbawCoarsenAcceptedByKind) +
+                " cbaw_accepted_by_tag=" +
+                formatKindCounts(materializePerf.cbawCoarsenAcceptedByTag) +
+                " cbaw_reject_no_gain_by_kind=" +
+                formatKindCounts(materializePerf.cbawCoarsenRejectedNoGainByKind) +
+                " cbaw_reject_resource_by_kind=" +
+                formatKindCounts(materializePerf.cbawCoarsenRejectedResourceByKind) +
+                " cbaw_reject_cycle_by_kind=" +
+                formatKindCounts(materializePerf.cbawCoarsenRejectedCycleByKind) +
+                " cbaw_stale_by_kind=" +
+                formatKindCounts(materializePerf.cbawCoarsenStaleByKind) +
+                " cbaw_reject_no_gain_by_tag=" +
+                formatKindCounts(materializePerf.cbawCoarsenRejectedNoGainByTag) +
+                " cbaw_reject_resource_by_tag=" +
+                formatKindCounts(materializePerf.cbawCoarsenRejectedResourceByTag) +
+                " cbaw_reject_cycle_by_tag=" +
+                formatKindCounts(materializePerf.cbawCoarsenRejectedCycleByTag) +
+                " cbaw_stale_by_tag=" +
+                formatKindCounts(materializePerf.cbawCoarsenStaleByTag) +
                 " fm_rounds=" + std::to_string(materializePerf.fmRefineRounds) +
                 " fm_candidates=" + std::to_string(materializePerf.fmRefineCandidates) +
                 " fm_moves=" + std::to_string(materializePerf.fmRefineMoves) +
@@ -10118,6 +15195,28 @@ namespace wolvrix::lib::transform
                 " fm_reject_phi=" + std::to_string(materializePerf.fmRefineRejectedPhi) +
                 " fm_reject_weight=" + std::to_string(materializePerf.fmRefineRejectedWeight) +
                 " fm_reject_cycle=" + std::to_string(materializePerf.fmRefineRejectedCycle) +
+                " fm_reject_size_fill=" +
+                formatKindCounts(materializePerf.fmRefineRejectedSizeFillBucket) +
+                " fm_reject_cycle_relation=" +
+                formatKindCounts(materializePerf.fmRefineRejectedCycleRelation) +
+                " cbaw_after_p5_boundary=" +
+                std::to_string(materializePerf.cbawAfterCoarsen.boundaryActivationEdges) +
+                " cbaw_after_p5_dag=" +
+                std::to_string(materializePerf.cbawAfterCoarsen.dagEdges) +
+                " cbaw_after_p5_compute_compute=" +
+                std::to_string(materializePerf.cbawAfterCoarsen.computeComputeValuePairs) +
+                " cbaw_after_dp_boundary=" +
+                std::to_string(materializePerf.cbawAfterDp.boundaryActivationEdges) +
+                " cbaw_after_dp_dag=" +
+                std::to_string(materializePerf.cbawAfterDp.dagEdges) +
+                " cbaw_after_dp_compute_compute=" +
+                std::to_string(materializePerf.cbawAfterDp.computeComputeValuePairs) +
+                " cbaw_after_fm_boundary=" +
+                std::to_string(materializePerf.cbawAfterFm.boundaryActivationEdges) +
+                " cbaw_after_fm_dag=" +
+                std::to_string(materializePerf.cbawAfterFm.dagEdges) +
+                " cbaw_after_fm_compute_compute=" +
+                std::to_string(materializePerf.cbawAfterFm.computeComputeValuePairs) +
                 " clusters_before=" + std::to_string(materializePerf.clustersBeforeCoarsen) +
                 " clusters_after=" + std::to_string(materializePerf.clustersAfterCoarsen) +
                 " tail_stopped=" + std::string(materializePerf.coarsenTailStopped ? "true" : "false") +
@@ -10152,6 +15251,10 @@ namespace wolvrix::lib::transform
                 " initial_boundary_values=" + std::to_string(rewrite.stats.initialBoundaryValues) +
                 " initial_boundary_activation_edges=" +
                 std::to_string(rewrite.stats.initialBoundaryActivationEdges) +
+                " initial_compute_compute_value_pairs=" +
+                std::to_string(rewrite.stats.initialComputeComputeValuePairs) +
+                " initial_compute_commit_value_pairs=" +
+                std::to_string(rewrite.stats.initialComputeCommitValuePairs) +
                 " source_clones_in_compute_nodes=" +
                 std::to_string(rewrite.stats.sourceClonesInComputeNodes) +
                 " local_shared_compute_clones_in_compute_nodes=" +

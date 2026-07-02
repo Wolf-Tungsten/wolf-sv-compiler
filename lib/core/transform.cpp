@@ -1207,6 +1207,68 @@ namespace wolvrix::lib::transform
                     options.partitionPolicy =
                         std::string(arg.substr(std::string_view("-partition-policy=").size()));
                 }
+                else if (arg == "-cbaw-plain-boundary-baseline")
+                {
+                    if (!parseSizeArg("-cbaw-plain-boundary-baseline",
+                                      options.cbawPlainBoundaryBaseline))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-cbaw-plain-boundary-baseline="))
+                {
+                    try
+                    {
+                        options.cbawPlainBoundaryBaseline = static_cast<std::size_t>(std::stoull(std::string(
+                            arg.substr(std::string_view("-cbaw-plain-boundary-baseline=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -cbaw-plain-boundary-baseline value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-cbaw-plain-dag-baseline")
+                {
+                    if (!parseSizeArg("-cbaw-plain-dag-baseline", options.cbawPlainDagBaseline))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-cbaw-plain-dag-baseline="))
+                {
+                    try
+                    {
+                        options.cbawPlainDagBaseline = static_cast<std::size_t>(std::stoull(std::string(
+                            arg.substr(std::string_view("-cbaw-plain-dag-baseline=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -cbaw-plain-dag-baseline value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-cbaw-plain-compute-compute-baseline")
+                {
+                    if (!parseSizeArg("-cbaw-plain-compute-compute-baseline",
+                                      options.cbawPlainComputeComputeBaseline))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-cbaw-plain-compute-compute-baseline="))
+                {
+                    try
+                    {
+                        options.cbawPlainComputeComputeBaseline = static_cast<std::size_t>(std::stoull(std::string(
+                            arg.substr(std::string_view("-cbaw-plain-compute-compute-baseline=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -cbaw-plain-compute-compute-baseline value";
+                        return nullptr;
+                    }
+                }
                 else if (arg == "-pi-data-input")
                 {
                     if (!parseDoubleArg("-pi-data-input", options.piDataInput))

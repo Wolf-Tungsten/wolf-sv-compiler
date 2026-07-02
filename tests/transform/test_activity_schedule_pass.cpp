@@ -84,6 +84,9 @@ namespace
         const ActivityScheduleSupernodeKinds *supernodeKinds = nullptr;
         const ActivityScheduleComputeNodesBySupernode *computeNodesBySupernode = nullptr;
         const std::string *summaryStats = nullptr;
+        const std::string *cbawStats = nullptr;
+        const std::string *cbawGateStats = nullptr;
+        const std::string *cbawCoarsenStats = nullptr;
     };
 
     ScheduleView loadSchedule(const SessionStore &session, const std::string &graphName)
@@ -99,6 +102,9 @@ namespace
             getSessionValue<ActivityScheduleSupernodeKinds>(session, prefix + "supernode_kind"),
             getSessionValue<ActivityScheduleComputeNodesBySupernode>(session, prefix + "compute_nodes_by_supernode"),
             getSessionValue<std::string>(session, prefix + "summary_stats"),
+            getSessionValue<std::string>(session, prefix + "cbaw_stats"),
+            getSessionValue<std::string>(session, prefix + "cbaw_gate_stats"),
+            getSessionValue<std::string>(session, prefix + "cbaw_coarsen_stats"),
         };
     }
 
@@ -195,7 +201,7 @@ namespace
             schedule.dag == nullptr || schedule.valueFanout == nullptr ||
             schedule.topoOrder == nullptr || schedule.stateReadSupernodes == nullptr ||
             schedule.supernodeKinds == nullptr || schedule.computeNodesBySupernode == nullptr ||
-            schedule.summaryStats == nullptr)
+            schedule.summaryStats == nullptr || schedule.cbawStats == nullptr)
         {
             return fail("Expected all activity-schedule session outputs to exist");
         }
@@ -402,6 +408,15 @@ int main()
             {
                 return fail("reg-to-mem intent slice missing storage-register activation mapping");
             }
+        }
+        if (parseJsonDoubleField(*schedule.cbawStats, "semantic_rtm_intent_groups") < 1.0 ||
+            parseJsonDoubleField(*schedule.cbawStats, "semantic_aggregate_families") < 1.0 ||
+            schedule.cbawStats->find("\"semantic_rule_seed_groups\"") == std::string::npos ||
+            schedule.cbawStats->find("\"rtm_intent\"") == std::string::npos ||
+            schedule.cbawStats->find("\"aggregate_family\"") == std::string::npos)
+        {
+            return fail("Expected P2 semantic stats to report rtm and aggregate annotations: " +
+                        *schedule.cbawStats);
         }
     }
 
@@ -750,6 +765,90 @@ int main()
         {
             return fail("Expected summary_stats to report two compute->commit value pairs in top case");
         }
+        if (schedule.cbawStats->find("\"cross_boundary_target_count\":2") == std::string::npos)
+        {
+            return fail("Expected cbaw_stats to replay two cross-boundary targets in top case: " +
+                        *schedule.cbawStats);
+        }
+        if (schedule.cbawStats->find("\"supernode_dependency_edge_count\":1") == std::string::npos)
+        {
+            return fail("Expected cbaw_stats to replay one quotient DAG edge in top case");
+        }
+        if (schedule.cbawStats->find("\"compute_materialized_value_target_count\":0") == std::string::npos)
+        {
+            return fail("Expected cbaw_stats to replay zero compute materialized targets in top case");
+        }
+        if (schedule.cbawStats->find("\"compute_commit_value_target_count\":2") == std::string::npos)
+        {
+            return fail("Expected cbaw_stats to replay two commit value targets in top case");
+        }
+        if (schedule.cbawStats->find("\"replay_boundary_activation_delta\":0") == std::string::npos ||
+            schedule.cbawStats->find("\"replay_dag_edge_delta\":0") == std::string::npos ||
+            schedule.cbawStats->find("\"replay_compute_compute_delta\":0") == std::string::npos)
+        {
+            return fail("Expected cbaw_stats replay deltas to be zero in top case");
+        }
+        if (schedule.cbawStats->find("\"target_kind_matrix\":{\"commit\":2}") == std::string::npos)
+        {
+            return fail("Expected cbaw_stats target-kind matrix to report two commit targets");
+        }
+        if (schedule.cbawStats->find("\"compute_supernode_op_count_p995\":") == std::string::npos ||
+            schedule.cbawStats->find("\"resource_op_count_cap\":") == std::string::npos)
+        {
+            return fail("Expected cbaw_stats to include plain op-count resource distribution");
+        }
+        if (schedule.cbawStats->find("\"source_clone_canonicalized_groups\":1") == std::string::npos ||
+            schedule.cbawStats->find("\"clone_width_mismatch_groups\":0") == std::string::npos ||
+            schedule.cbawStats->find("\"canonical_compute_materialized_value_target_count\":1") == std::string::npos ||
+            schedule.cbawStats->find("\"canonical_boundary_activation_delta\":1") == std::string::npos)
+        {
+            return fail("Expected cbaw_stats to report canonical source-clone diagnostics in top case: " +
+                        *schedule.cbawStats);
+        }
+        if (schedule.cbawStats->find("\"resource_cap\":{\"branch_count\":") == std::string::npos ||
+            schedule.cbawStats->find("\"emitted_code_units\":") == std::string::npos ||
+            schedule.cbawStats->find("\"helper_call_count\":") == std::string::npos ||
+            schedule.cbawStats->find("\"live_value_bytes\":") == std::string::npos ||
+            schedule.cbawStats->find("\"op_count\":") == std::string::npos ||
+            schedule.cbawStats->find("\"temporary_bytes\":") == std::string::npos)
+        {
+            return fail("Expected cbaw_stats resource_cap to include all P0 resource components");
+        }
+        if (schedule.cbawStats->find("\"trigger_signature_bits\":256") == std::string::npos ||
+            schedule.cbawStats->find("\"trigger_signature_popcount_p50\":") == std::string::npos ||
+            schedule.cbawStats->find("\"trigger_non_empty_equal_bucket_covered_supernode_ratio_ppm\":") ==
+                std::string::npos ||
+            schedule.cbawStats->find("\"trigger_non_empty_equal_bucket_internalizable_compute_targets\":") ==
+                std::string::npos ||
+            schedule.cbawStats->find("\"trigger_ate_equal_merge_recommended\":") == std::string::npos)
+        {
+            return fail("Expected cbaw_stats to include P1 trigger ATE readonly fields");
+        }
+        if (schedule.cbawStats->find("\"semantic_seed_groups\":") == std::string::npos ||
+            schedule.cbawStats->find("\"semantic_merge_hint_groups\":") == std::string::npos ||
+            schedule.cbawStats->find("\"semantic_rule_debug_labels\"") == std::string::npos ||
+            schedule.cbawStats->find("\"semantic_top_root_attribution\"") == std::string::npos)
+        {
+            return fail("Expected cbaw_stats to include P2 semantic readonly fields");
+        }
+        if (schedule.cbawStats->find("\"cbaw_atom_count\":") == std::string::npos ||
+            schedule.cbawStats->find("\"cbaw_atom_quotient_edges\":") == std::string::npos ||
+            schedule.cbawStats->find("\"cbaw_atom_resource_cap\":{\"branch_count\":") ==
+                std::string::npos ||
+            schedule.cbawStats->find("\"cbaw_atom_kind_counts\"") == std::string::npos)
+        {
+            return fail("Expected cbaw_stats to include P3 atom resource fields");
+        }
+        if (schedule.cbawStats->find("\"cbaw_atom_plain_replay_boundary_delta\":0") ==
+                std::string::npos ||
+            schedule.cbawStats->find("\"cbaw_atom_plain_replay_dag_delta\":0") ==
+                std::string::npos ||
+            schedule.cbawStats->find("\"cbaw_atom_plain_replay_compute_compute_delta\":0") ==
+                std::string::npos)
+        {
+            return fail("Expected P3 atom plain replay deltas to be zero in top case: " +
+                        *schedule.cbawStats);
+        }
         if (schedule.summaryStats->find("\"compute_compute_value_pairs\":0") == std::string::npos)
         {
             return fail("Expected summary_stats to report zero compute->compute value pairs in top case");
@@ -856,6 +955,323 @@ int main()
             graph.valueDef(graph.opOperands(addOp)[1]) != clonedConstOp)
         {
             return fail("Expected compute op operand to be rewritten to source clone");
+        }
+    }
+
+    {
+        currentCase = "cbaw_trigger_equal_chain";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("cbaw_trigger_equal_chain");
+        design.markAsTop("cbaw_trigger_equal_chain");
+
+        const auto a = makeValue(graph, "a", 1);
+        graph.bindInputPort("a", a);
+
+        const auto mid = makeValue(graph, "mid", 1);
+        const auto first = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                 graph.internSymbol("first_assign"));
+        graph.addOperand(first, a);
+        graph.addResult(first, mid);
+
+        const auto out = makeValue(graph, "out", 1);
+        const auto second = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                  graph.internSymbol("second_assign"));
+        graph.addOperand(second, mid);
+        graph.addResult(second, out);
+        graph.bindOutputPort("out", out);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
+            .path = "cbaw_trigger_equal_chain",
+            .maxOpInComputeSupernode = 1,
+            .maxOpInComputeNode = 1,
+            .enableCoarsen = false,
+        }));
+
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected cbaw trigger equal chain schedule to succeed");
+        }
+        const auto schedule = loadSchedule(session, "cbaw_trigger_equal_chain");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        const uint32_t firstSupernode = (*schedule.opToSupernode)[first.index - 1];
+        const uint32_t secondSupernode = (*schedule.opToSupernode)[second.index - 1];
+        if (firstSupernode == kInvalidActivitySupernodeId ||
+            secondSupernode == kInvalidActivitySupernodeId ||
+            firstSupernode == secondSupernode)
+        {
+            return fail("Expected trigger chain ops to stay in distinct compute supernodes");
+        }
+        if (!hasFanoutTo(*schedule.valueFanout, mid, secondSupernode))
+        {
+            return fail("Expected trigger chain to expose one compute->compute value target");
+        }
+        if (parseJsonDoubleField(*schedule.cbawStats, "trigger_volatile_source_values") != 1.0 ||
+            parseJsonDoubleField(*schedule.cbawStats,
+                                 "trigger_non_empty_equal_bucket_internalizable_compute_targets") != 1.0 ||
+            parseJsonDoubleField(*schedule.cbawStats,
+                                 "trigger_non_empty_equal_bucket_internalizable_dependency_edges") != 1.0 ||
+            parseJsonDoubleField(*schedule.cbawStats, "trigger_ate_equal_merge_recommended") != 1.0)
+        {
+            return fail("Expected P1 trigger ATE stats to find one safe equal-trigger compute target: " +
+                        *schedule.cbawStats);
+        }
+        if (parseJsonDoubleField(*schedule.cbawStats, "semantic_plain_out1_hints") < 1.0 ||
+            parseJsonDoubleField(*schedule.cbawStats, "semantic_plain_in1_hints") < 1.0 ||
+            parseJsonDoubleField(*schedule.cbawStats, "semantic_passthrough_ops") < 1.0)
+        {
+            return fail("Expected P2 semantic stats to report plain and passthrough hints: " +
+                        *schedule.cbawStats);
+        }
+        if (parseJsonDoubleField(*schedule.cbawStats, "cbaw_atom_count") < 2.0 ||
+            parseJsonDoubleField(*schedule.cbawStats, "cbaw_atom_passthrough_atoms") < 2.0 ||
+            parseJsonDoubleField(*schedule.cbawStats, "cbaw_atom_quotient_cycle_detected") != 0.0 ||
+            parseJsonDoubleField(*schedule.cbawStats, "cbaw_atom_plain_replay_compute_compute_delta") != 0.0)
+        {
+            return fail("Expected P3 atom stats to preserve the trigger chain replay: " +
+                        *schedule.cbawStats);
+        }
+    }
+
+    {
+        currentCase = "cbaw_partition_policy_chain";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("cbaw_partition_policy_chain");
+        design.markAsTop("cbaw_partition_policy_chain");
+
+        const auto a = makeValue(graph, "a", 1);
+        graph.bindInputPort("a", a);
+
+        const auto mid = makeValue(graph, "mid", 1);
+        const auto first = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                 graph.internSymbol("first_assign"));
+        graph.addOperand(first, a);
+        graph.addResult(first, mid);
+
+        const auto out = makeValue(graph, "out", 1);
+        const auto second = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                  graph.internSymbol("second_assign"));
+        graph.addOperand(second, mid);
+        graph.addResult(second, out);
+        graph.bindOutputPort("out", out);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
+            .path = "cbaw_partition_policy_chain",
+            .maxOpInComputeSupernode = 2,
+            .maxOpInComputeNode = 1,
+            .enableCoarsen = true,
+            .partitionPolicy = "cbaw",
+        }));
+
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected cbaw partition policy chain schedule to succeed");
+        }
+        const auto schedule = loadSchedule(session, "cbaw_partition_policy_chain");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        const uint32_t firstSupernode = (*schedule.opToSupernode)[first.index - 1];
+        const uint32_t secondSupernode = (*schedule.opToSupernode)[second.index - 1];
+        if (firstSupernode == kInvalidActivitySupernodeId ||
+            firstSupernode != secondSupernode)
+        {
+            return fail("Expected CBAW policy to merge the direct chain into one compute supernode");
+        }
+        if (parseJsonDoubleField(*schedule.cbawStats, "quotient_dag_cycle_detected") != 0.0 ||
+            parseJsonDoubleField(*schedule.cbawStats, "replay_boundary_activation_delta") != 0.0 ||
+            parseJsonDoubleField(*schedule.cbawStats, "replay_dag_edge_delta") != 0.0 ||
+            parseJsonDoubleField(*schedule.cbawStats, "replay_compute_compute_delta") != 0.0)
+        {
+            return fail("Expected CBAW policy replay to remain aligned on chain case: " +
+                        *schedule.cbawStats);
+        }
+        if (schedule.cbawGateStats == nullptr ||
+            schedule.cbawGateStats->find("runtime_allowed=1") == std::string::npos ||
+            schedule.cbawGateStats->find("reason=pass") == std::string::npos)
+        {
+            return fail("Expected CBAW structure gate to pass on the chain case");
+        }
+        if (schedule.cbawCoarsenStats == nullptr ||
+            schedule.cbawCoarsenStats->find("accepted=1") == std::string::npos ||
+            schedule.cbawCoarsenStats->find("accepted_by_kind=plain_out1:1") == std::string::npos ||
+            schedule.cbawCoarsenStats->find("accepted_by_tag=") == std::string::npos ||
+            schedule.cbawCoarsenStats->find("mffc_dominance:1") == std::string::npos ||
+            schedule.cbawCoarsenStats->find("passthrough:1") == std::string::npos ||
+            schedule.cbawCoarsenStats->find("dedup_lost_tag_by_kind=") == std::string::npos ||
+            schedule.cbawCoarsenStats->find("selected_reason=exact_delta_semantic_tie:1") ==
+                std::string::npos ||
+            schedule.cbawCoarsenStats->find("after_p5_compute_compute=0") == std::string::npos ||
+            schedule.cbawCoarsenStats->find("after_dp_compute_compute=0") == std::string::npos ||
+            schedule.cbawCoarsenStats->find("after_fm_compute_compute=0") == std::string::npos)
+        {
+            return fail("Expected CBAW chain coarsen stats to expose multi-tag exact-delta accounting: " +
+                        (schedule.cbawCoarsenStats == nullptr ? std::string("<missing>")
+                                                              : *schedule.cbawCoarsenStats));
+        }
+    }
+
+    {
+        currentCase = "cbaw_sibling_exact_delta";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("cbaw_sibling_exact_delta");
+        design.markAsTop("cbaw_sibling_exact_delta");
+
+        const auto a = makeValue(graph, "a", 1);
+        graph.bindInputPort("a", a);
+        const auto b = makeValue(graph, "b", 1);
+        graph.bindInputPort("b", b);
+
+        const auto rootValue = makeValue(graph, "root_value", 1);
+        const auto root = graph.createOperation(wolvrix::lib::grh::OperationKind::kAnd,
+                                                graph.internSymbol("root_assign"));
+        graph.addOperand(root, a);
+        graph.addOperand(root, b);
+        graph.addResult(root, rootValue);
+
+        const auto leftValue = makeValue(graph, "left_value", 1);
+        const auto left = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                graph.internSymbol("left_assign"));
+        graph.addOperand(left, rootValue);
+        graph.addResult(left, leftValue);
+        graph.bindOutputPort("left_out", leftValue);
+
+        const auto rightValue = makeValue(graph, "right_value", 1);
+        const auto right = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                 graph.internSymbol("right_assign"));
+        graph.addOperand(right, rootValue);
+        graph.addResult(right, rightValue);
+        graph.bindOutputPort("right_out", rightValue);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
+            .path = "cbaw_sibling_exact_delta",
+            .maxOpInComputeSupernode = 2,
+            .maxOpInComputeNode = 1,
+            .enableCoarsen = true,
+            .partitionPolicy = "cbaw",
+        }));
+
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected cbaw sibling exact-delta schedule to succeed");
+        }
+        const auto schedule = loadSchedule(session, "cbaw_sibling_exact_delta");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        const uint32_t rootSupernode = (*schedule.opToSupernode)[root.index - 1];
+        const uint32_t leftSupernode = (*schedule.opToSupernode)[left.index - 1];
+        const uint32_t rightSupernode = (*schedule.opToSupernode)[right.index - 1];
+        if (rootSupernode == kInvalidActivitySupernodeId ||
+            leftSupernode == kInvalidActivitySupernodeId ||
+            rightSupernode == kInvalidActivitySupernodeId ||
+            rootSupernode == leftSupernode ||
+            leftSupernode != rightSupernode)
+        {
+            return fail("Expected CBAW exact-delta sibling queue to merge sibling consumers only");
+        }
+        if (schedule.cbawCoarsenStats == nullptr ||
+            schedule.cbawCoarsenStats->find("accepted=1") == std::string::npos ||
+            schedule.cbawCoarsenStats->find("accepted_by_kind=plain_siblings:1") ==
+                std::string::npos ||
+            schedule.cbawCoarsenStats->find("accepted_by_tag=plain_siblings:1") ==
+                std::string::npos ||
+            schedule.cbawCoarsenStats->find("after_p5_compute_compute=1") ==
+                std::string::npos)
+        {
+            return fail("Expected CBAW sibling coarsen stats to prove exact-delta sibling merge: " +
+                        (schedule.cbawCoarsenStats == nullptr ? std::string("<missing>")
+                                                              : *schedule.cbawCoarsenStats));
+        }
+    }
+
+    {
+        currentCase = "mem_read";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("cbaw_partition_policy_chain_external_gate");
+        design.markAsTop("cbaw_partition_policy_chain_external_gate");
+
+        const auto a = makeValue(graph, "a", 1);
+        graph.bindInputPort("a", a);
+
+        const auto mid = makeValue(graph, "mid", 1);
+        const auto first = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                 graph.internSymbol("first_assign"));
+        graph.addOperand(first, a);
+        graph.addResult(first, mid);
+
+        const auto out = makeValue(graph, "out", 1);
+        const auto second = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                  graph.internSymbol("second_assign"));
+        graph.addOperand(second, mid);
+        graph.addResult(second, out);
+        graph.bindOutputPort("out", out);
+
+        const auto mid2 = makeValue(graph, "mid2", 1);
+        const auto third = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                 graph.internSymbol("third_assign"));
+        graph.addOperand(third, a);
+        graph.addResult(third, mid2);
+
+        const auto out2 = makeValue(graph, "out2", 1);
+        const auto fourth = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                  graph.internSymbol("fourth_assign"));
+        graph.addOperand(fourth, mid2);
+        graph.addResult(fourth, out2);
+        graph.bindOutputPort("out2", out2);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
+            .path = "cbaw_partition_policy_chain_external_gate",
+            .maxOpInComputeSupernode = 1,
+            .maxOpInComputeNode = 1,
+            .enableCoarsen = true,
+            .partitionPolicy = "cbaw",
+            .cbawPlainBoundaryBaseline = 1,
+            .cbawPlainDagBaseline = 1,
+            .cbawPlainComputeComputeBaseline = 1,
+        }));
+
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected cbaw external baseline gate schedule to succeed");
+        }
+        const auto schedule = loadSchedule(session, "cbaw_partition_policy_chain_external_gate");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        if (schedule.cbawGateStats == nullptr ||
+            schedule.cbawGateStats->find("runtime_allowed=0") == std::string::npos ||
+            schedule.cbawGateStats->find("reason=structure_regression") == std::string::npos ||
+            schedule.cbawGateStats->find("plain_boundary=1") == std::string::npos)
+        {
+            return fail("Expected external CBAW plain baseline to drive structure gate: " +
+                        (schedule.cbawGateStats == nullptr ? std::string("<missing>")
+                                                          : *schedule.cbawGateStats));
         }
     }
 
