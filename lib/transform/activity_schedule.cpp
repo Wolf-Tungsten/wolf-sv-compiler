@@ -3091,6 +3091,10 @@ namespace wolvrix::lib::transform
             std::size_t maxOpIndex = 0;
         };
 
+        bool topoLessOp(const ActivityOpData &opData,
+                        wolvrix::lib::grh::OperationId lhs,
+                        wolvrix::lib::grh::OperationId rhs);
+
         struct WorkingPartition
         {
             std::vector<std::vector<uint32_t>> clusters;
