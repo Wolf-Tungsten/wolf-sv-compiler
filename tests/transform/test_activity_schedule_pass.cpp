@@ -822,7 +822,7 @@ int main()
                 std::string::npos ||
             schedule.cbawStats->find("\"trigger_ate_equal_merge_recommended\":") == std::string::npos)
         {
-            return fail("Expected cbaw_stats to include P1 trigger ATE readonly fields");
+            return fail("Expected cbaw_stats to include P1 trigger readonly fields");
         }
         if (schedule.cbawStats->find("\"semantic_seed_groups\":") == std::string::npos ||
             schedule.cbawStats->find("\"semantic_merge_hint_groups\":") == std::string::npos ||
@@ -1020,7 +1020,7 @@ int main()
                                  "trigger_non_empty_equal_bucket_internalizable_dependency_edges") != 1.0 ||
             parseJsonDoubleField(*schedule.cbawStats, "trigger_ate_equal_merge_recommended") != 1.0)
         {
-            return fail("Expected P1 trigger ATE stats to find one safe equal-trigger compute target: " +
+            return fail("Expected P1 trigger stats to find one equal-trigger compute target: " +
                         *schedule.cbawStats);
         }
         if (parseJsonDoubleField(*schedule.cbawStats, "semantic_plain_out1_hints") < 1.0 ||

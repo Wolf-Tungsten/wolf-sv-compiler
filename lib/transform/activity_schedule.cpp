@@ -14863,17 +14863,6 @@ namespace wolvrix::lib::transform
                 std::to_string(cbawStats.cbawAtomPlainReplayDagDelta) +
                 " plain_replay_compute_compute_delta=" +
                 std::to_string(cbawStats.cbawAtomPlainReplayComputeComputeDelta));
-        const std::string p4AteReason =
-            cbawStats.triggerAteNoGoReason.empty() ? "report_only_default_off"
-                                                   : cbawStats.triggerAteNoGoReason;
-        logInfo("activity-schedule cbaw p4 ate: enabled=0 reason=" +
-                p4AteReason +
-                " ate_equal_merge_recommended=" +
-                std::to_string(cbawStats.triggerAteEqualMergeRecommended) +
-                " saturated_ratio_ppm=" +
-                std::to_string(cbawStats.triggerSignatureSaturatedRatioPpm) +
-                " trigger_estimated_p99=" +
-                std::to_string(cbawStats.triggerEstimatedCountP99));
         if (options_.partitionPolicy == "cbaw")
         {
             const auto cbawKindCount =
