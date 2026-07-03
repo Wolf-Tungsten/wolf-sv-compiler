@@ -2444,6 +2444,106 @@ namespace wolvrix::lib::transform
                 }
                 out << "]";
             };
+            const auto emitTopRootStageReports =
+                [](std::ostringstream &out,
+                   const std::vector<ActivityScheduleCbawStats::TopRootStageReport> &reports)
+            {
+                out << ",\"cbaw_top_root_stage_reports\":[";
+                bool first = true;
+                for (const auto &report : reports)
+                {
+                    if (!first)
+                    {
+                        out << ",";
+                    }
+                    first = false;
+                    out << "{";
+                    out << "\"value_index\":" << report.valueIndex;
+                    out << ",\"rank_reasons\":\"" << escapeJsonString(report.rankReasons) << "\"";
+                    out << ",\"defining_op_kind\":\"" << escapeJsonString(report.definingOpKind) << "\"";
+                    out << ",\"source_kind\":\"" << escapeJsonString(report.sourceKind) << "\"";
+                    out << ",\"value_width\":" << report.valueWidth;
+                    out << ",\"width_bucket\":\"" << escapeJsonString(report.widthBucket) << "\"";
+                    out << ",\"fanout_bucket\":\"" << escapeJsonString(report.fanoutBucket) << "\"";
+                    out << ",\"shared_source_bucket\":\""
+                        << escapeJsonString(report.sharedSourceBucket) << "\"";
+                    out << ",\"value_bytes\":" << report.valueBytes;
+                    out << ",\"producer_atom_id\":" << report.producerAtomId;
+                    out << ",\"producer_compute_node_id\":" << report.producerComputeNodeId;
+                    out << ",\"producer_supernode_id\":" << report.producerSupernodeId;
+                    out << ",\"semantic_tags\":\"" << escapeJsonString(report.semanticTags) << "\"";
+                    out << ",\"after_p5_target_count\":" << report.afterP5TargetCount;
+                    out << ",\"after_p5_compute_target_count\":"
+                        << report.afterP5ComputeTargetCount;
+                    out << ",\"after_p5_commit_target_count\":"
+                        << report.afterP5CommitTargetCount;
+                    out << ",\"after_p5_source_cluster\":" << report.afterP5SourceCluster;
+                    out << ",\"after_p5_source_segment\":" << report.afterP5SourceSegment;
+                    out << ",\"after_p5_target_segment_count\":"
+                        << report.afterP5TargetSegmentCount;
+                    out << ",\"after_dp_target_count\":" << report.afterDpTargetCount;
+                    out << ",\"after_dp_compute_target_count\":"
+                        << report.afterDpComputeTargetCount;
+                    out << ",\"after_dp_commit_target_count\":"
+                        << report.afterDpCommitTargetCount;
+                    out << ",\"after_dp_source_cluster\":" << report.afterDpSourceCluster;
+                    out << ",\"after_dp_source_segment\":" << report.afterDpSourceSegment;
+                    out << ",\"after_dp_target_segment_count\":"
+                        << report.afterDpTargetSegmentCount;
+                    out << ",\"after_fm_target_count\":" << report.afterFmTargetCount;
+                    out << ",\"after_fm_compute_target_count\":"
+                        << report.afterFmComputeTargetCount;
+                    out << ",\"after_fm_commit_target_count\":"
+                        << report.afterFmCommitTargetCount;
+                    out << ",\"after_fm_source_cluster\":" << report.afterFmSourceCluster;
+                    out << ",\"after_fm_source_segment\":" << report.afterFmSourceSegment;
+                    out << ",\"after_fm_target_segment_count\":"
+                        << report.afterFmTargetSegmentCount;
+                    out << ",\"final_target_count\":" << report.finalTargetCount;
+                    out << ",\"final_compute_target_count\":"
+                        << report.finalComputeTargetCount;
+                    out << ",\"final_commit_target_count\":"
+                        << report.finalCommitTargetCount;
+                    out << ",\"delta_p5_to_dp\":" << report.deltaP5ToDp;
+                    out << ",\"delta_dp_to_fm\":" << report.deltaDpToFm;
+                    out << ",\"final_replay_delta\":" << report.finalReplayDelta;
+                    out << ",\"dp_to_fm_repair\":" << report.dpToFmRepair;
+                    out << ",\"compute_node_op_count\":" << report.computeNodeOpCount;
+                    out << ",\"source_clone_count\":" << report.sourceCloneCount;
+                    out << ",\"compute_like_op_count\":" << report.computeLikeOpCount;
+                    out << ",\"compute_user_count\":" << report.computeUserCount;
+                    out << ",\"external_target_count\":" << report.externalTargetCount;
+                    out << ",\"split_atom_count\":" << report.splitAtomCount;
+                    out << ",\"split_segment_count\":" << report.splitSegmentCount;
+                    out << ",\"high_fanout_bucket\":"
+                        << (report.highFanoutBucket ? "true" : "false");
+                    out << ",\"shared_source_bucket_hit\":"
+                        << (report.sharedSourceBucketHit ? "true" : "false");
+                    out << "}";
+                }
+                out << "]";
+            };
+            const auto emitTopRootStageDeltas =
+                [](std::ostringstream &out,
+                   const std::vector<ActivityScheduleCbawStats::TopRootStageDelta> &deltas)
+            {
+                out << ",\"cbaw_top_root_stage_deltas\":[";
+                bool first = true;
+                for (const auto &delta : deltas)
+                {
+                    if (!first)
+                    {
+                        out << ",";
+                    }
+                    first = false;
+                    out << "{";
+                    out << "\"transition\":\"" << escapeJsonString(delta.transition) << "\"";
+                    out << ",\"boundary_target_delta\":" << delta.boundaryTargetDelta;
+                    out << ",\"compute_target_delta\":" << delta.computeTargetDelta;
+                    out << "}";
+                }
+                out << "]";
+            };
             std::ostringstream out;
             out << "{";
             out << "\"value_use_groups\":" << stats.valueUseGroups;
@@ -2624,6 +2724,14 @@ namespace wolvrix::lib::transform
                 << stats.cbawAtomPlainReplayDagDelta;
             out << ",\"cbaw_atom_plain_replay_compute_compute_delta\":"
                 << stats.cbawAtomPlainReplayComputeComputeDelta;
+            out << ",\"cbaw_top_root_report_limit\":"
+                << stats.cbawTopRootReportLimit;
+            out << ",\"cbaw_top_root_after_dp_total_targets\":"
+                << stats.cbawTopRootAfterDpTotalTargets;
+            out << ",\"cbaw_top_root_after_dp_reported_targets\":"
+                << stats.cbawTopRootAfterDpReportedTargets;
+            out << ",\"cbaw_top_root_after_dp_coverage_ppm\":"
+                << stats.cbawTopRootAfterDpCoveragePpm;
             emitCountMap(out, "target_kind_matrix", stats.targetKindMatrix);
             emitCountMap(out, "source_kind_matrix", stats.sourceKindMatrix);
             emitCountMap(out, "source_target_kind_matrix", stats.sourceTargetKindMatrix);
@@ -2649,6 +2757,8 @@ namespace wolvrix::lib::transform
                          stats.cbawAtomResourceBaselineExceptions);
             emitCountMap(out, "cbaw_atom_kind_counts", stats.cbawAtomKindCounts);
             emitTopRoots(out, stats.topRoots);
+            emitTopRootStageReports(out, stats.topRootStageReports);
+            emitTopRootStageDeltas(out, stats.topRootStageDeltas);
             out << "}";
             return out.str();
         }
@@ -3041,6 +3151,17 @@ namespace wolvrix::lib::transform
                 std::size_t opCountMax = 0;
             };
 
+            struct CbawRootStageEntry
+            {
+                std::size_t valueIndex = 0;
+                std::size_t targetCount = 0;
+                std::size_t computeTargetCount = 0;
+                std::size_t commitTargetCount = 0;
+                uint32_t sourceCluster = kInvalidActivitySupernodeId;
+                uint32_t sourceSegment = kInvalidActivitySupernodeId;
+                std::size_t targetSegmentCount = 0;
+            };
+
             struct CoarsenIteration
             {
                 std::size_t iteration = 0;
@@ -3111,6 +3232,9 @@ namespace wolvrix::lib::transform
             CbawStageStats cbawAfterCoarsen;
             CbawStageStats cbawAfterDp;
             CbawStageStats cbawAfterFm;
+            std::vector<CbawRootStageEntry> cbawAfterCoarsenRootStages;
+            std::vector<CbawRootStageEntry> cbawAfterDpRootStages;
+            std::vector<CbawRootStageEntry> cbawAfterFmRootStages;
             std::size_t fmRefineRounds = 0;
             std::size_t fmRefineCandidates = 0;
             std::size_t fmRefineMoves = 0;
@@ -8481,6 +8605,805 @@ namespace wolvrix::lib::transform
             return stats;
         }
 
+        std::vector<uint32_t> cbawOwnerByClusterFromSegments(
+            std::size_t clusterCount,
+            const std::vector<std::vector<uint32_t>> &segments)
+        {
+            std::vector<uint32_t> owner(clusterCount, kInvalidActivitySupernodeId);
+            for (uint32_t segmentId = 0; segmentId < segments.size(); ++segmentId)
+            {
+                for (const uint32_t clusterId : segments[segmentId])
+                {
+                    if (clusterId < owner.size())
+                    {
+                        owner[clusterId] = segmentId;
+                    }
+                }
+            }
+            return owner;
+        }
+
+        std::vector<uint32_t> cbawIdentityOwnerByCluster(std::size_t clusterCount)
+        {
+            std::vector<uint32_t> owner(clusterCount, kInvalidActivitySupernodeId);
+            for (uint32_t clusterId = 0; clusterId < clusterCount; ++clusterId)
+            {
+                owner[clusterId] = clusterId;
+            }
+            return owner;
+        }
+
+        std::vector<ComputeNodeMaterializePerfStats::CbawRootStageEntry>
+        buildCbawRootStageEntriesForOwners(
+            const NodeClusterView &view,
+            const ClusterValueEdges &valueEdges,
+            const ComputeRewriteBuild &rewrite,
+            const wolvrix::lib::grh::Graph &graph,
+            const std::vector<uint32_t> &ownerByCluster)
+        {
+            using Entry = ComputeNodeMaterializePerfStats::CbawRootStageEntry;
+            std::unordered_map<std::size_t, Entry> byValue;
+            byValue.reserve(valueEdges.valueFanouts.size() + rewrite.commitNodes.size());
+
+            const auto ownerOfCluster = [&](uint32_t clusterId) {
+                return clusterId < ownerByCluster.size() ? ownerByCluster[clusterId]
+                                                         : kInvalidActivitySupernodeId;
+            };
+            const auto ensureEntry = [&](wolvrix::lib::grh::ValueId value,
+                                         uint32_t sourceCluster) -> Entry & {
+                auto [it, inserted] = byValue.emplace(value.index, Entry{});
+                auto &entry = it->second;
+                if (inserted || entry.valueIndex == 0)
+                {
+                    entry.valueIndex = value.index;
+                    entry.sourceCluster = sourceCluster;
+                    entry.sourceSegment = ownerOfCluster(sourceCluster);
+                }
+                return entry;
+            };
+
+            std::vector<uint32_t> targetSegments;
+            for (uint32_t valueFanoutId = 0; valueFanoutId < valueEdges.valueFanouts.size(); ++valueFanoutId)
+            {
+                if (valueFanoutId >= valueEdges.fanoutValues.size())
+                {
+                    continue;
+                }
+                const auto value = valueEdges.fanoutValues[valueFanoutId];
+                if (!value.valid() || value.index == 0)
+                {
+                    continue;
+                }
+                const auto &fanout = valueEdges.valueFanouts[valueFanoutId];
+                const uint32_t sourceSegment = ownerOfCluster(fanout.sourceCluster);
+                if (sourceSegment == kInvalidActivitySupernodeId)
+                {
+                    continue;
+                }
+                targetSegments.clear();
+                targetSegments.reserve(fanout.targetClusters.size());
+                for (const uint32_t targetCluster : fanout.targetClusters)
+                {
+                    const uint32_t targetSegment = ownerOfCluster(targetCluster);
+                    if (targetSegment == kInvalidActivitySupernodeId ||
+                        targetSegment == sourceSegment)
+                    {
+                        continue;
+                    }
+                    targetSegments.push_back(targetSegment);
+                }
+                if (targetSegments.empty())
+                {
+                    continue;
+                }
+                std::sort(targetSegments.begin(), targetSegments.end());
+                targetSegments.erase(std::unique(targetSegments.begin(), targetSegments.end()),
+                                     targetSegments.end());
+                auto &entry = ensureEntry(value, fanout.sourceCluster);
+                entry.computeTargetCount += targetSegments.size();
+                entry.targetSegmentCount += targetSegments.size();
+            }
+
+            std::unordered_map<std::size_t, std::vector<uint32_t>> commitTargetsByValue;
+            commitTargetsByValue.reserve(rewrite.commitNodes.size());
+            for (uint32_t commitId = 0; commitId < rewrite.commitNodes.size(); ++commitId)
+            {
+                const auto &commit = rewrite.commitNodes[commitId];
+                for (const auto input : commit.inputValues)
+                {
+                    if (!input.valid() || input.index == 0)
+                    {
+                        continue;
+                    }
+                    const auto defOp = graph.valueDef(input);
+                    if (!defOp.valid() || defOp.index >= rewrite.computeNodeOfOp.size())
+                    {
+                        continue;
+                    }
+                    const uint32_t predNode = rewrite.computeNodeOfOp[defOp.index];
+                    if (predNode == kInvalidActivitySupernodeId ||
+                        predNode >= view.clusterOfNode.size())
+                    {
+                        continue;
+                    }
+                    const uint32_t sourceCluster = view.clusterOfNode[predNode];
+                    if (sourceCluster == kInvalidActivitySupernodeId ||
+                        ownerOfCluster(sourceCluster) == kInvalidActivitySupernodeId)
+                    {
+                        continue;
+                    }
+                    (void)ensureEntry(input, sourceCluster);
+                    commitTargetsByValue[input.index].push_back(commitId);
+                }
+            }
+            for (auto &[valueIndex, targets] : commitTargetsByValue)
+            {
+                auto it = byValue.find(valueIndex);
+                if (it == byValue.end())
+                {
+                    continue;
+                }
+                std::sort(targets.begin(), targets.end());
+                targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+                it->second.commitTargetCount += targets.size();
+            }
+
+            std::vector<Entry> out;
+            out.reserve(byValue.size());
+            for (auto &[_, entry] : byValue)
+            {
+                entry.targetCount = entry.computeTargetCount + entry.commitTargetCount;
+                if (entry.targetCount != 0)
+                {
+                    out.push_back(entry);
+                }
+            }
+            std::sort(out.begin(),
+                      out.end(),
+                      [](const Entry &lhs, const Entry &rhs)
+                      {
+                          return lhs.valueIndex < rhs.valueIndex;
+                      });
+            return out;
+        }
+
+        struct CbawDiagnosticAtomInfo
+        {
+            std::vector<uint32_t> opToAtom;
+            std::vector<std::string> atomTags;
+            std::vector<std::vector<uint32_t>> computeNodeToAtoms;
+        };
+
+        std::string joinCbawDiagnosticTags(std::vector<std::string> tags)
+        {
+            if (tags.empty())
+            {
+                return "plain";
+            }
+            std::sort(tags.begin(), tags.end());
+            tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
+            std::ostringstream oss;
+            for (std::size_t i = 0; i < tags.size(); ++i)
+            {
+                if (i != 0)
+                {
+                    oss << "|";
+                }
+                oss << tags[i];
+            }
+            return oss.str();
+        }
+
+        CbawDiagnosticAtomInfo buildCbawDiagnosticAtomInfo(
+            const ActivityScheduleBuild &build,
+            const ComputeRewriteBuild &rewrite,
+            const wolvrix::lib::grh::Graph &graph)
+        {
+            CbawDiagnosticAtomInfo info;
+            info.computeNodeToAtoms.resize(rewrite.computeNodes.size());
+
+            std::size_t maxOpIndex = build.opToSupernode.size();
+            for (const auto opId : graph.operations())
+            {
+                maxOpIndex = std::max<std::size_t>(maxOpIndex, opId.index);
+            }
+            info.opToAtom.assign(maxOpIndex + 1, kInvalidActivitySupernodeId);
+
+            const auto addAtom = [&](const std::vector<wolvrix::lib::grh::OperationId> &ops,
+                                     const std::vector<uint32_t> &computeNodes)
+            {
+                if (ops.empty())
+                {
+                    return;
+                }
+                bool rtmIntent = false;
+                bool aggregate = false;
+                bool guard = false;
+                bool allPassthrough = true;
+                for (const auto opId : ops)
+                {
+                    const auto op = graph.getOperation(opId);
+                    const auto kind = op.kind();
+                    rtmIntent = rtmIntent || activityScheduleHasRegToMemIntent(op);
+                    aggregate = aggregate || activityScheduleIsAggregateShapeKind(kind);
+                    guard = guard || activityScheduleIsGuardLikeKind(kind);
+                    allPassthrough = allPassthrough && activityScheduleIsPassthroughKind(kind);
+                }
+
+                std::vector<std::string> tags;
+                if (rtmIntent)
+                {
+                    tags.push_back("rtm_intent");
+                }
+                if (computeNodes.size() == 1)
+                {
+                    tags.push_back("mffc");
+                }
+                if (allPassthrough)
+                {
+                    tags.push_back("passthrough");
+                }
+                if (aggregate)
+                {
+                    tags.push_back("aggregate");
+                }
+                if (guard)
+                {
+                    tags.push_back("guard");
+                }
+                const uint32_t atomId = static_cast<uint32_t>(info.atomTags.size());
+                info.atomTags.push_back(joinCbawDiagnosticTags(std::move(tags)));
+                for (const auto opId : ops)
+                {
+                    if (opId.index < info.opToAtom.size())
+                    {
+                        info.opToAtom[opId.index] = atomId;
+                    }
+                }
+                for (const uint32_t computeNodeId : computeNodes)
+                {
+                    if (computeNodeId < info.computeNodeToAtoms.size())
+                    {
+                        info.computeNodeToAtoms[computeNodeId].push_back(atomId);
+                    }
+                }
+            };
+
+            for (uint32_t supernodeId = 0; supernodeId < build.supernodeToOps.size(); ++supernodeId)
+            {
+                if (supernodeId >= build.supernodeKinds.size() ||
+                    build.supernodeKinds[supernodeId] != ActivityScheduleSupernodeKind::Compute)
+                {
+                    continue;
+                }
+                std::vector<uint8_t> assigned(build.supernodeToOps[supernodeId].size(), 0);
+                const std::vector<uint32_t> memberComputeNodes =
+                    supernodeId < build.computeNodesBySupernode.size()
+                        ? build.computeNodesBySupernode[supernodeId]
+                        : std::vector<uint32_t>{};
+                if (memberComputeNodes.empty())
+                {
+                    addAtom(build.supernodeToOps[supernodeId], {});
+                    continue;
+                }
+                for (const uint32_t computeNodeId : memberComputeNodes)
+                {
+                    if (computeNodeId >= rewrite.computeNodes.size())
+                    {
+                        continue;
+                    }
+                    std::vector<wolvrix::lib::grh::OperationId> atomOps;
+                    for (const auto opId : rewrite.computeNodes[computeNodeId].ops)
+                    {
+                        if (opId.index == 0 || opId.index - 1 >= build.opToSupernode.size() ||
+                            build.opToSupernode[opId.index - 1] != supernodeId)
+                        {
+                            continue;
+                        }
+                        atomOps.push_back(opId);
+                        const auto posIt = std::find(build.supernodeToOps[supernodeId].begin(),
+                                                     build.supernodeToOps[supernodeId].end(),
+                                                     opId);
+                        if (posIt != build.supernodeToOps[supernodeId].end())
+                        {
+                            assigned[static_cast<std::size_t>(
+                                std::distance(build.supernodeToOps[supernodeId].begin(), posIt))] = 1;
+                        }
+                    }
+                    addAtom(atomOps, {computeNodeId});
+                }
+                std::vector<wolvrix::lib::grh::OperationId> residualOps;
+                for (std::size_t i = 0; i < build.supernodeToOps[supernodeId].size(); ++i)
+                {
+                    if (assigned[i] == 0)
+                    {
+                        residualOps.push_back(build.supernodeToOps[supernodeId][i]);
+                    }
+                }
+                addAtom(residualOps, {});
+            }
+
+            for (auto &atoms : info.computeNodeToAtoms)
+            {
+                std::sort(atoms.begin(), atoms.end());
+                atoms.erase(std::unique(atoms.begin(), atoms.end()), atoms.end());
+            }
+            return info;
+        }
+
+        struct CbawFinalRootEntry
+        {
+            std::size_t targetCount = 0;
+            std::size_t computeTargetCount = 0;
+            std::size_t commitTargetCount = 0;
+            std::size_t consumerUseCount = 0;
+        };
+
+        std::unordered_map<std::size_t, CbawFinalRootEntry>
+        buildCbawFinalRootEntries(const ActivityScheduleBuild &build,
+                                  const ComputeRewriteBuild &rewrite,
+                                  const wolvrix::lib::grh::Graph &graph)
+        {
+            std::unordered_map<std::size_t, CbawFinalRootEntry> roots;
+            roots.reserve(build.valueFanout.size());
+            for (std::size_t valueOffset = 0; valueOffset < build.valueFanout.size(); ++valueOffset)
+            {
+                const auto &targets = build.valueFanout[valueOffset];
+                if (targets.empty())
+                {
+                    continue;
+                }
+                auto &entry = roots[valueOffset + 1];
+                entry.targetCount = targets.size();
+                for (const uint32_t target : targets)
+                {
+                    if (target < build.supernodeKinds.size() &&
+                        build.supernodeKinds[target] == ActivityScheduleSupernodeKind::Compute)
+                    {
+                        ++entry.computeTargetCount;
+                    }
+                    else if (target < build.supernodeKinds.size() &&
+                             build.supernodeKinds[target] == ActivityScheduleSupernodeKind::Commit)
+                    {
+                        ++entry.commitTargetCount;
+                    }
+                }
+            }
+
+            const auto noteUse = [&](wolvrix::lib::grh::ValueId value, uint32_t targetSupernode)
+            {
+                if (!value.valid() || value.index == 0 || targetSupernode >= build.supernodeToOps.size())
+                {
+                    return;
+                }
+                const auto canonical = canonicalActivityValue(value, &rewrite.canonicalValues);
+                if (!canonical.valid())
+                {
+                    return;
+                }
+                const auto defOp = graph.valueDef(canonical);
+                if (!defOp.valid() || defOp.index == 0 ||
+                    defOp.index - 1 >= build.opToSupernode.size())
+                {
+                    return;
+                }
+                const uint32_t sourceSupernode = build.opToSupernode[defOp.index - 1];
+                if (sourceSupernode == targetSupernode)
+                {
+                    return;
+                }
+                ++roots[canonical.index].consumerUseCount;
+            };
+            for (uint32_t supernodeId = 0; supernodeId < build.supernodeToOps.size(); ++supernodeId)
+            {
+                for (const auto opId : build.supernodeToOps[supernodeId])
+                {
+                    const auto op = graph.getOperation(opId);
+                    for (const auto operand : op.operands())
+                    {
+                        noteUse(operand, supernodeId);
+                    }
+                    if (isRegToMemIntentSlice(op))
+                    {
+                        if (const auto indexValue = regToMemIntentSliceIndexValue(graph, op))
+                        {
+                            noteUse(*indexValue, supernodeId);
+                        }
+                    }
+                }
+            }
+            return roots;
+        }
+
+        std::unordered_map<std::size_t, ComputeNodeMaterializePerfStats::CbawRootStageEntry>
+        mapCbawRootStageEntries(
+            const std::vector<ComputeNodeMaterializePerfStats::CbawRootStageEntry> &entries)
+        {
+            std::unordered_map<std::size_t, ComputeNodeMaterializePerfStats::CbawRootStageEntry> out;
+            out.reserve(entries.size());
+            for (const auto &entry : entries)
+            {
+                out[entry.valueIndex] = entry;
+            }
+            return out;
+        }
+
+        void attachCbawTopMultiplicityDiagnostics(
+            ActivityScheduleCbawStats &stats,
+            const ComputeNodeMaterializePerfStats &perf,
+            const ActivityScheduleBuild &build,
+            const ComputeRewriteBuild &rewrite,
+            const wolvrix::lib::grh::Graph &graph)
+        {
+            using StageEntry = ComputeNodeMaterializePerfStats::CbawRootStageEntry;
+            const auto afterP5 = mapCbawRootStageEntries(perf.cbawAfterCoarsenRootStages);
+            const auto afterDp = mapCbawRootStageEntries(perf.cbawAfterDpRootStages);
+            const auto afterFm = mapCbawRootStageEntries(perf.cbawAfterFmRootStages);
+            const auto finalRoots = buildCbawFinalRootEntries(build, rewrite, graph);
+            const CbawDiagnosticAtomInfo atomInfo =
+                buildCbawDiagnosticAtomInfo(build, rewrite, graph);
+
+            const auto signedDiff = [](std::size_t lhs, std::size_t rhs) {
+                return static_cast<std::int64_t>(lhs) -
+                       static_cast<std::int64_t>(rhs);
+            };
+            stats.topRootStageDeltas.push_back({
+                "after_p5_to_after_dp",
+                signedDiff(perf.cbawAfterDp.boundaryActivationEdges,
+                           perf.cbawAfterCoarsen.boundaryActivationEdges),
+                signedDiff(perf.cbawAfterDp.computeComputeValuePairs,
+                           perf.cbawAfterCoarsen.computeComputeValuePairs),
+            });
+            stats.topRootStageDeltas.push_back({
+                "after_dp_to_after_fm",
+                signedDiff(perf.cbawAfterFm.boundaryActivationEdges,
+                           perf.cbawAfterDp.boundaryActivationEdges),
+                signedDiff(perf.cbawAfterFm.computeComputeValuePairs,
+                           perf.cbawAfterDp.computeComputeValuePairs),
+            });
+            stats.topRootStageDeltas.push_back({
+                "after_fm_to_final_replay",
+                signedDiff(stats.crossBoundaryTargetCount,
+                           perf.cbawAfterFm.boundaryActivationEdges),
+                signedDiff(stats.computeMaterializedValueTargetCount,
+                           perf.cbawAfterFm.computeComputeValuePairs),
+            });
+
+            std::unordered_map<std::size_t, std::string> rankReasons;
+            const auto appendReason = [&](std::size_t valueIndex, std::string_view reason)
+            {
+                auto &slot = rankReasons[valueIndex];
+                if (slot.find(reason) != std::string::npos)
+                {
+                    return;
+                }
+                if (!slot.empty())
+                {
+                    slot += "|";
+                }
+                slot += reason;
+            };
+            constexpr std::size_t kPerKeyLimit = 128;
+            const auto selectTopFromStage =
+                [&](const std::unordered_map<std::size_t, StageEntry> &entries,
+                    std::string_view reason,
+                    const auto &metric)
+            {
+                std::vector<const StageEntry *> ordered;
+                ordered.reserve(entries.size());
+                for (const auto &[_, entry] : entries)
+                {
+                    if (metric(entry) != 0)
+                    {
+                        ordered.push_back(&entry);
+                    }
+                }
+                std::sort(ordered.begin(),
+                          ordered.end(),
+                          [&](const StageEntry *lhs, const StageEntry *rhs)
+                          {
+                              const std::size_t lhsMetric = metric(*lhs);
+                              const std::size_t rhsMetric = metric(*rhs);
+                              if (lhsMetric != rhsMetric)
+                              {
+                                  return lhsMetric > rhsMetric;
+                              }
+                              return lhs->valueIndex < rhs->valueIndex;
+                          });
+                const std::size_t n = std::min<std::size_t>(kPerKeyLimit, ordered.size());
+                for (std::size_t i = 0; i < n; ++i)
+                {
+                    appendReason(ordered[i]->valueIndex, reason);
+                }
+            };
+            selectTopFromStage(afterP5,
+                               "after_p5",
+                               [](const StageEntry &entry) { return entry.targetCount; });
+            selectTopFromStage(afterDp,
+                               "after_dp",
+                               [](const StageEntry &entry) { return entry.targetCount; });
+            selectTopFromStage(afterFm,
+                               "after_fm",
+                               [](const StageEntry &entry) { return entry.targetCount; });
+            selectTopFromStage(afterDp,
+                               "dp_to_fm_repair",
+                               [&](const StageEntry &entry) {
+                                   const auto fmIt = afterFm.find(entry.valueIndex);
+                                   const std::size_t fmTargets =
+                                       fmIt == afterFm.end() ? 0 : fmIt->second.targetCount;
+                                   return entry.targetCount > fmTargets ? entry.targetCount - fmTargets
+                                                                        : std::size_t{0};
+                               });
+
+            std::vector<std::size_t> computeCandidates;
+            computeCandidates.reserve(afterP5.size() + finalRoots.size());
+            std::unordered_set<std::size_t> seenCandidates;
+            const auto addCandidateValue = [&](std::size_t valueIndex)
+            {
+                if (seenCandidates.insert(valueIndex).second)
+                {
+                    computeCandidates.push_back(valueIndex);
+                }
+            };
+            for (const auto &[valueIndex, _] : afterP5)
+            {
+                addCandidateValue(valueIndex);
+            }
+            for (const auto &[valueIndex, _] : afterDp)
+            {
+                addCandidateValue(valueIndex);
+            }
+            for (const auto &[valueIndex, _] : afterFm)
+            {
+                addCandidateValue(valueIndex);
+            }
+            for (const auto &[valueIndex, _] : finalRoots)
+            {
+                addCandidateValue(valueIndex);
+            }
+            const auto stageComputeTargets =
+                [&](const std::unordered_map<std::size_t, StageEntry> &entries,
+                    std::size_t valueIndex) {
+                    const auto it = entries.find(valueIndex);
+                    return it == entries.end() ? std::size_t{0} : it->second.computeTargetCount;
+                };
+            const auto finalComputeTargets = [&](std::size_t valueIndex) {
+                const auto it = finalRoots.find(valueIndex);
+                return it == finalRoots.end() ? std::size_t{0} : it->second.computeTargetCount;
+            };
+            const auto computeMetric = [&](std::size_t valueIndex) {
+                return std::max({stageComputeTargets(afterP5, valueIndex),
+                                 stageComputeTargets(afterDp, valueIndex),
+                                 stageComputeTargets(afterFm, valueIndex),
+                                 finalComputeTargets(valueIndex)});
+            };
+            std::sort(computeCandidates.begin(),
+                      computeCandidates.end(),
+                      [&](std::size_t lhs, std::size_t rhs)
+                      {
+                          const std::size_t lhsMetric = computeMetric(lhs);
+                          const std::size_t rhsMetric = computeMetric(rhs);
+                          if (lhsMetric != rhsMetric)
+                          {
+                              return lhsMetric > rhsMetric;
+                          }
+                          return lhs < rhs;
+                      });
+            for (std::size_t i = 0;
+                 i < computeCandidates.size() && i < kPerKeyLimit && computeMetric(computeCandidates[i]) != 0;
+                 ++i)
+            {
+                appendReason(computeCandidates[i], "compute_targets");
+            }
+
+            std::vector<uint32_t> finalSegmentsByComputeNode(rewrite.computeNodes.size(), 0);
+            for (const auto &nodes : build.computeNodesBySupernode)
+            {
+                for (const uint32_t computeNodeId : nodes)
+                {
+                    if (computeNodeId < finalSegmentsByComputeNode.size())
+                    {
+                        ++finalSegmentsByComputeNode[computeNodeId];
+                    }
+                }
+            }
+
+            const auto stageOrEmpty =
+                [](const std::unordered_map<std::size_t, StageEntry> &entries,
+                   std::size_t valueIndex) -> StageEntry {
+                const auto it = entries.find(valueIndex);
+                return it == entries.end() ? StageEntry{} : it->second;
+            };
+            const auto finalOrEmpty =
+                [&](std::size_t valueIndex) -> CbawFinalRootEntry {
+                const auto it = finalRoots.find(valueIndex);
+                return it == finalRoots.end() ? CbawFinalRootEntry{} : it->second;
+            };
+
+            std::vector<ActivityScheduleCbawStats::TopRootStageReport> reports;
+            reports.reserve(rankReasons.size());
+            for (const auto &[valueIndex, reasons] : rankReasons)
+            {
+                const StageEntry p5 = stageOrEmpty(afterP5, valueIndex);
+                const StageEntry dp = stageOrEmpty(afterDp, valueIndex);
+                const StageEntry fm = stageOrEmpty(afterFm, valueIndex);
+                const CbawFinalRootEntry finalEntry = finalOrEmpty(valueIndex);
+
+                ActivityScheduleCbawStats::TopRootStageReport report;
+                report.valueIndex = valueIndex;
+                report.rankReasons = reasons;
+                report.afterP5TargetCount = p5.targetCount;
+                report.afterP5ComputeTargetCount = p5.computeTargetCount;
+                report.afterP5CommitTargetCount = p5.commitTargetCount;
+                report.afterP5SourceCluster = p5.sourceCluster;
+                report.afterP5SourceSegment = p5.sourceSegment;
+                report.afterP5TargetSegmentCount = p5.targetSegmentCount;
+                report.afterDpTargetCount = dp.targetCount;
+                report.afterDpComputeTargetCount = dp.computeTargetCount;
+                report.afterDpCommitTargetCount = dp.commitTargetCount;
+                report.afterDpSourceCluster = dp.sourceCluster;
+                report.afterDpSourceSegment = dp.sourceSegment;
+                report.afterDpTargetSegmentCount = dp.targetSegmentCount;
+                report.afterFmTargetCount = fm.targetCount;
+                report.afterFmComputeTargetCount = fm.computeTargetCount;
+                report.afterFmCommitTargetCount = fm.commitTargetCount;
+                report.afterFmSourceCluster = fm.sourceCluster;
+                report.afterFmSourceSegment = fm.sourceSegment;
+                report.afterFmTargetSegmentCount = fm.targetSegmentCount;
+                report.finalTargetCount = finalEntry.targetCount;
+                report.finalComputeTargetCount = finalEntry.computeTargetCount;
+                report.finalCommitTargetCount = finalEntry.commitTargetCount;
+                report.deltaP5ToDp = signedDiff(dp.targetCount, p5.targetCount);
+                report.deltaDpToFm = signedDiff(fm.targetCount, dp.targetCount);
+                report.finalReplayDelta = signedDiff(finalEntry.targetCount, fm.targetCount);
+                report.dpToFmRepair =
+                    dp.targetCount > fm.targetCount ? dp.targetCount - fm.targetCount : 0;
+                report.computeUserCount = finalEntry.computeTargetCount;
+                report.externalTargetCount =
+                    finalEntry.targetCount != 0 ? finalEntry.targetCount : fm.targetCount;
+
+                if (valueIndex != 0 && valueIndex <= graph.values().size())
+                {
+                    wolvrix::lib::grh::ValueId value;
+                    value.graph = graph.id();
+                    value.index = static_cast<uint32_t>(valueIndex);
+                    const int32_t width = graph.valueWidth(value);
+                    report.valueWidth = width > 0 ? static_cast<std::size_t>(width) : 0;
+                    report.widthBucket = widthBucket(report.valueWidth);
+                    report.valueBytes =
+                        static_cast<std::uint64_t>(activityScheduleValueByteCost(graph, valueIndex));
+                    const auto defOp = graph.valueDef(value);
+                    if (defOp.valid())
+                    {
+                        const auto kind = graph.opKind(defOp);
+                        report.definingOpKind = std::string(wolvrix::lib::grh::toString(kind));
+                        report.sourceKind = activityScheduleCbawSourceKindName(kind);
+                        if (defOp.index < rewrite.computeNodeOfOp.size())
+                        {
+                            report.producerComputeNodeId = rewrite.computeNodeOfOp[defOp.index];
+                        }
+                        if (defOp.index > 0 && defOp.index - 1 < build.opToSupernode.size())
+                        {
+                            report.producerSupernodeId = build.opToSupernode[defOp.index - 1];
+                        }
+                        if (defOp.index < atomInfo.opToAtom.size())
+                        {
+                            report.producerAtomId = atomInfo.opToAtom[defOp.index];
+                        }
+                    }
+                }
+                if (report.definingOpKind.empty())
+                {
+                    report.definingOpKind = "unknown";
+                }
+                if (report.sourceKind.empty())
+                {
+                    report.sourceKind = "unknown";
+                }
+                if (report.widthBucket.empty())
+                {
+                    report.widthBucket = "unknown";
+                }
+                if (report.producerAtomId != kInvalidActivitySupernodeId &&
+                    report.producerAtomId < atomInfo.atomTags.size())
+                {
+                    report.semanticTags = atomInfo.atomTags[report.producerAtomId];
+                }
+                else
+                {
+                    report.semanticTags = "plain";
+                }
+
+                if (report.producerComputeNodeId != kInvalidActivitySupernodeId &&
+                    report.producerComputeNodeId < rewrite.computeNodes.size())
+                {
+                    const auto &node = rewrite.computeNodes[report.producerComputeNodeId];
+                    report.computeNodeOpCount = node.ops.size();
+                    for (const auto opId : node.ops)
+                    {
+                        const auto kind = graph.opKind(opId);
+                        if (activityScheduleCbawSourceKindName(kind) == "compute_like")
+                        {
+                            ++report.computeLikeOpCount;
+                        }
+                        else
+                        {
+                            ++report.sourceCloneCount;
+                        }
+                    }
+                    if (report.producerComputeNodeId < atomInfo.computeNodeToAtoms.size())
+                    {
+                        report.splitAtomCount =
+                            atomInfo.computeNodeToAtoms[report.producerComputeNodeId].size();
+                    }
+                    if (report.producerComputeNodeId < finalSegmentsByComputeNode.size())
+                    {
+                        report.splitSegmentCount =
+                            finalSegmentsByComputeNode[report.producerComputeNodeId];
+                    }
+                }
+
+                const std::size_t maxTargets =
+                    std::max({report.afterP5TargetCount,
+                              report.afterDpTargetCount,
+                              report.afterFmTargetCount,
+                              report.finalTargetCount});
+                const std::size_t sharedUses =
+                    std::max(finalEntry.consumerUseCount, maxTargets);
+                report.fanoutBucket = fanoutBucket(maxTargets);
+                report.sharedSourceBucket = fanoutBucket(sharedUses);
+                report.highFanoutBucket = maxTargets > 16;
+                report.sharedSourceBucketHit = finalEntry.consumerUseCount > maxTargets;
+                reports.push_back(std::move(report));
+            }
+
+            std::sort(reports.begin(),
+                      reports.end(),
+                      [](const auto &lhs, const auto &rhs)
+                      {
+                          if (lhs.afterDpTargetCount != rhs.afterDpTargetCount)
+                          {
+                              return lhs.afterDpTargetCount > rhs.afterDpTargetCount;
+                          }
+                          if (lhs.dpToFmRepair != rhs.dpToFmRepair)
+                          {
+                              return lhs.dpToFmRepair > rhs.dpToFmRepair;
+                          }
+                          if (lhs.afterP5TargetCount != rhs.afterP5TargetCount)
+                          {
+                              return lhs.afterP5TargetCount > rhs.afterP5TargetCount;
+                          }
+                          if (lhs.afterFmTargetCount != rhs.afterFmTargetCount)
+                          {
+                              return lhs.afterFmTargetCount > rhs.afterFmTargetCount;
+                          }
+                          if (lhs.finalComputeTargetCount != rhs.finalComputeTargetCount)
+                          {
+                              return lhs.finalComputeTargetCount > rhs.finalComputeTargetCount;
+                          }
+                          return lhs.valueIndex < rhs.valueIndex;
+                      });
+            constexpr std::size_t kReportLimit = 512;
+            if (reports.size() > kReportLimit)
+            {
+                reports.resize(kReportLimit);
+            }
+
+            stats.cbawTopRootReportLimit = reports.size();
+            for (const auto &[_, entry] : afterDp)
+            {
+                stats.cbawTopRootAfterDpTotalTargets += entry.targetCount;
+            }
+            for (const auto &report : reports)
+            {
+                stats.cbawTopRootAfterDpReportedTargets += report.afterDpTargetCount;
+            }
+            stats.cbawTopRootAfterDpCoveragePpm =
+                activityScheduleRatioPpm(stats.cbawTopRootAfterDpReportedTargets,
+                                         stats.cbawTopRootAfterDpTotalTargets);
+            stats.topRootStageReports = std::move(reports);
+        }
+
         // NO0207 Phase C：computeNode/cluster 层的概率超图聚合。这里只构建只读分析结构，
         // 不改变 plain/prob 当前 materialize 路径；Phase E/F 会复用这些 W/pi/edge 数据。
         struct ActivityHyperedge
@@ -13658,6 +14581,13 @@ namespace wolvrix::lib::transform
                                                graph,
                                                nodeOpSizes,
                                                0);
+                perf->cbawAfterCoarsenRootStages =
+                    buildCbawRootStageEntriesForOwners(
+                        clusterView,
+                        clusterValueEdges,
+                        rewrite,
+                        graph,
+                        cbawIdentityOwnerByCluster(clusterView.members.size()));
             }
             std::vector<double> probSegmentValueWeights;
             const std::vector<double> *segmentValueWeights = nullptr;
@@ -13700,6 +14630,13 @@ namespace wolvrix::lib::transform
                                                                 nodeOpSizes,
                                                                 clusterView.members.size(),
                                                                 segments.size());
+                    perf->cbawAfterDpRootStages =
+                        buildCbawRootStageEntriesForOwners(
+                            clusterView,
+                            clusterValueEdges,
+                            rewrite,
+                            graph,
+                            cbawOwnerByClusterFromSegments(clusterView.members.size(), segments));
                 }
             }
 
@@ -13773,6 +14710,13 @@ namespace wolvrix::lib::transform
                                                                 nodeOpSizes,
                                                                 clusterView.members.size(),
                                                                 segments.size());
+                    perf->cbawAfterFmRootStages =
+                        buildCbawRootStageEntriesForOwners(
+                            clusterView,
+                            clusterValueEdges,
+                            rewrite,
+                            graph,
+                            cbawOwnerByClusterFromSegments(clusterView.members.size(), segments));
                 }
             }
 
@@ -14765,8 +15709,16 @@ namespace wolvrix::lib::transform
         setSessionValue(keyPrefix + "summary_stats",
                         encodeActivityScheduleSummaryStatsJson(summaryStats),
                         "stats");
-        const ActivityScheduleCbawStats cbawStats =
+        ActivityScheduleCbawStats cbawStats =
             buildActivityScheduleCbawStats(build, rewrite, opData, *graph, summaryStats);
+        if (options_.partitionPolicy == "cbaw")
+        {
+            attachCbawTopMultiplicityDiagnostics(cbawStats,
+                                                 materializePerf,
+                                                 build,
+                                                 rewrite,
+                                                 *graph);
+        }
         setSessionValue(keyPrefix + "cbaw_stats",
                         encodeActivityScheduleCbawStatsJson(cbawStats),
                         "activity-schedule.cbaw-stats");

@@ -167,6 +167,64 @@ namespace wolvrix::lib::transform
             std::string sourceKind;
         };
 
+        struct TopRootStageReport
+        {
+            std::size_t valueIndex = 0;
+            std::string rankReasons;
+            std::string definingOpKind;
+            std::string sourceKind;
+            std::size_t valueWidth = 0;
+            std::string widthBucket;
+            std::string fanoutBucket;
+            std::string sharedSourceBucket;
+            std::uint64_t valueBytes = 0;
+            uint32_t producerAtomId = std::numeric_limits<uint32_t>::max();
+            uint32_t producerComputeNodeId = std::numeric_limits<uint32_t>::max();
+            uint32_t producerSupernodeId = std::numeric_limits<uint32_t>::max();
+            std::string semanticTags;
+            std::size_t afterP5TargetCount = 0;
+            std::size_t afterP5ComputeTargetCount = 0;
+            std::size_t afterP5CommitTargetCount = 0;
+            uint32_t afterP5SourceCluster = std::numeric_limits<uint32_t>::max();
+            uint32_t afterP5SourceSegment = std::numeric_limits<uint32_t>::max();
+            std::size_t afterP5TargetSegmentCount = 0;
+            std::size_t afterDpTargetCount = 0;
+            std::size_t afterDpComputeTargetCount = 0;
+            std::size_t afterDpCommitTargetCount = 0;
+            uint32_t afterDpSourceCluster = std::numeric_limits<uint32_t>::max();
+            uint32_t afterDpSourceSegment = std::numeric_limits<uint32_t>::max();
+            std::size_t afterDpTargetSegmentCount = 0;
+            std::size_t afterFmTargetCount = 0;
+            std::size_t afterFmComputeTargetCount = 0;
+            std::size_t afterFmCommitTargetCount = 0;
+            uint32_t afterFmSourceCluster = std::numeric_limits<uint32_t>::max();
+            uint32_t afterFmSourceSegment = std::numeric_limits<uint32_t>::max();
+            std::size_t afterFmTargetSegmentCount = 0;
+            std::size_t finalTargetCount = 0;
+            std::size_t finalComputeTargetCount = 0;
+            std::size_t finalCommitTargetCount = 0;
+            std::int64_t deltaP5ToDp = 0;
+            std::int64_t deltaDpToFm = 0;
+            std::int64_t finalReplayDelta = 0;
+            std::size_t dpToFmRepair = 0;
+            std::size_t computeNodeOpCount = 0;
+            std::size_t sourceCloneCount = 0;
+            std::size_t computeLikeOpCount = 0;
+            std::size_t computeUserCount = 0;
+            std::size_t externalTargetCount = 0;
+            std::size_t splitAtomCount = 0;
+            std::size_t splitSegmentCount = 0;
+            bool highFanoutBucket = false;
+            bool sharedSourceBucketHit = false;
+        };
+
+        struct TopRootStageDelta
+        {
+            std::string transition;
+            std::int64_t boundaryTargetDelta = 0;
+            std::int64_t computeTargetDelta = 0;
+        };
+
         std::size_t valueUseGroups = 0;
         std::size_t crossBoundaryTargetCount = 0;
         std::size_t supernodeDependencyEdgeCount = 0;
@@ -284,6 +342,10 @@ namespace wolvrix::lib::transform
         std::size_t cbawAtomPlainReplayBoundaryDelta = 0;
         std::size_t cbawAtomPlainReplayDagDelta = 0;
         std::size_t cbawAtomPlainReplayComputeComputeDelta = 0;
+        std::size_t cbawTopRootReportLimit = 0;
+        std::size_t cbawTopRootAfterDpTotalTargets = 0;
+        std::size_t cbawTopRootAfterDpReportedTargets = 0;
+        std::size_t cbawTopRootAfterDpCoveragePpm = 0;
         std::string triggerAteNoGoReason;
         KindCountMap targetKindMatrix;
         KindCountMap sourceKindMatrix;
@@ -308,6 +370,8 @@ namespace wolvrix::lib::transform
         KindCountMap cbawAtomResourceBaselineExceptions;
         KindCountMap cbawAtomKindCounts;
         std::vector<TopRoot> topRoots;
+        std::vector<TopRootStageReport> topRootStageReports;
+        std::vector<TopRootStageDelta> topRootStageDeltas;
     };
 
     inline constexpr uint32_t kInvalidActivitySupernodeId = std::numeric_limits<uint32_t>::max();

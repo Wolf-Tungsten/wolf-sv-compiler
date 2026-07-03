@@ -1125,6 +1125,79 @@ int main()
     }
 
     {
+        currentCase = "cbaw_top_root_stage_report";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("cbaw_top_root_stage_report");
+        design.markAsTop("cbaw_top_root_stage_report");
+
+        const auto a = makeValue(graph, "top_root_a", 8);
+        const auto b = makeValue(graph, "top_root_b", 8);
+        graph.bindInputPort("a", a);
+        graph.bindInputPort("b", b);
+
+        const auto shared = makeValue(graph, "top_root_shared", 8);
+        const auto sharedOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
+                                                    graph.internSymbol("top_root_shared_xor"));
+        graph.addOperand(sharedOp, a);
+        graph.addOperand(sharedOp, b);
+        graph.addResult(sharedOp, shared);
+
+        const auto y = makeValue(graph, "top_root_y", 8);
+        const auto yOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                               graph.internSymbol("top_root_y_assign"));
+        graph.addOperand(yOp, shared);
+        graph.addResult(yOp, y);
+        graph.bindOutputPort("y", y);
+
+        const auto z = makeValue(graph, "top_root_z", 8);
+        const auto zOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                               graph.internSymbol("top_root_z_assign"));
+        graph.addOperand(zOp, shared);
+        graph.addResult(zOp, z);
+        graph.bindOutputPort("z", z);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        ActivityScheduleOptions options;
+        options.path = "cbaw_top_root_stage_report";
+        options.partitionPolicy = "cbaw";
+        options.enableCoarsen = false;
+        options.fmRefineMaxRounds = 0;
+        options.maxOpInComputeNode = 1;
+        options.maxOpInComputeSupernode = 1;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected CBAW top-root stage report schedule to succeed");
+        }
+        const auto schedule = loadSchedule(session, "cbaw_top_root_stage_report");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        if (schedule.cbawStats == nullptr ||
+            schedule.cbawStats->find("\"cbaw_top_root_stage_reports\":[{") == std::string::npos ||
+            schedule.cbawStats->find("\"cbaw_top_root_after_dp_total_targets\":2") ==
+                std::string::npos ||
+            schedule.cbawStats->find("\"after_dp_target_count\":2") == std::string::npos ||
+            schedule.cbawStats->find("\"after_fm_target_count\":2") == std::string::npos ||
+            schedule.cbawStats->find("\"final_compute_target_count\":2") == std::string::npos ||
+            schedule.cbawStats->find("\"fanout_bucket\":\"2-4\"") == std::string::npos ||
+            schedule.cbawStats->find("\"semantic_tags\":\"mffc\"") == std::string::npos ||
+            schedule.cbawStats->find("\"transition\":\"after_dp_to_after_fm\"") ==
+                std::string::npos)
+        {
+            return fail("Expected CBAW stats to include Phase-B top-root stage diagnostics: " +
+                        (schedule.cbawStats == nullptr ? std::string("<missing>")
+                                                       : *schedule.cbawStats));
+        }
+    }
+
+    {
         currentCase = "cbaw_sibling_exact_delta";
         wolvrix::lib::grh::Design design;
         auto &graph = design.createGraph("cbaw_sibling_exact_delta");
