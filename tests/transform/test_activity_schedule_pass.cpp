@@ -1278,6 +1278,82 @@ int main()
     }
 
     {
+        currentCase = "cbaw_top_root_roi_consumer_pair";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("cbaw_top_root_roi_consumer_pair");
+        design.markAsTop("cbaw_top_root_roi_consumer_pair");
+
+        const auto a = makeValue(graph, "roi_a", 1);
+        const auto b = makeValue(graph, "roi_b", 1);
+        graph.bindInputPort("a", a);
+        graph.bindInputPort("b", b);
+
+        const auto rootValue = makeValue(graph, "roi_root", 1);
+        const auto root = graph.createOperation(wolvrix::lib::grh::OperationKind::kAnd,
+                                                graph.internSymbol("roi_root_and"));
+        graph.addOperand(root, a);
+        graph.addOperand(root, b);
+        graph.addResult(root, rootValue);
+
+        for (int i = 0; i < 18; ++i)
+        {
+            const auto input = makeValue(graph, "roi_in_" + std::to_string(i), 1);
+            graph.bindInputPort("in_" + std::to_string(i), input);
+
+            const auto extraValue = makeValue(graph, "roi_extra_" + std::to_string(i), 1);
+            const auto extra = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
+                                                     graph.internSymbol("roi_extra_op_" + std::to_string(i)));
+            graph.addOperand(extra, input);
+            graph.addResult(extra, extraValue);
+
+            const auto outValue = makeValue(graph, "roi_out_" + std::to_string(i), 1);
+            const auto consumer = graph.createOperation(wolvrix::lib::grh::OperationKind::kAnd,
+                                                        graph.internSymbol("roi_consumer_" + std::to_string(i)));
+            graph.addOperand(consumer, rootValue);
+            graph.addOperand(consumer, extraValue);
+            graph.addResult(consumer, outValue);
+            graph.bindOutputPort("out_" + std::to_string(i), outValue);
+        }
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
+            .path = "cbaw_top_root_roi_consumer_pair",
+            .maxOpInComputeSupernode = 2,
+            .maxOpInComputeNode = 1,
+            .enableCoarsen = true,
+            .partitionPolicy = "cbaw",
+            .fmRefineMaxRounds = 0,
+        }));
+
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected cbaw top-root ROI schedule to succeed");
+        }
+        const auto schedule = loadSchedule(session, "cbaw_top_root_roi_consumer_pair");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+
+        if (schedule.cbawCoarsenStats == nullptr ||
+            schedule.cbawCoarsenStats->find("top_root_roi_values=") == std::string::npos ||
+            schedule.cbawCoarsenStats->find("top_root_roi_candidates=") == std::string::npos ||
+            schedule.cbawCoarsenStats->find("generated_by_kind=") == std::string::npos ||
+            schedule.cbawCoarsenStats->find("top_root_roi:") == std::string::npos ||
+            schedule.cbawCoarsenStats->find("accepted_prefix_top_root_boundary_gain=") ==
+                std::string::npos)
+        {
+            return fail("Expected CBAW top-root ROI coarsen stats: " +
+                        (schedule.cbawCoarsenStats == nullptr ? std::string("<missing>")
+                                                              : *schedule.cbawCoarsenStats));
+        }
+    }
+
+    {
         currentCase = "mem_read";
         wolvrix::lib::grh::Design design;
         auto &graph = design.createGraph("cbaw_partition_policy_chain_external_gate");
@@ -1699,6 +1775,232 @@ int main()
         if (schedule.summaryStats->find("\"compute_compute_value_pairs\":0") == std::string::npos)
         {
             return fail("Expected declared_value_local_compute case to report zero compute->compute value pairs");
+        }
+    }
+
+    {
+        currentCase = "declared_value_compute_node_boundary";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("declared_value_compute_node_boundary");
+        design.markAsTop("declared_value_compute_node_boundary");
+
+        const auto a = makeValue(graph, "a", 8);
+        const auto b = makeValue(graph, "b", 8);
+        const auto c = makeValue(graph, "c", 8);
+        graph.bindInputPort("a", a);
+        graph.bindInputPort("b", b);
+        graph.bindInputPort("c", c);
+
+        const auto wireSym = graph.internSymbol("declared_wire");
+        graph.addDeclaredSymbol(wireSym);
+        const auto declaredWire = graph.createValue(wireSym, 8, false);
+        const auto producer = graph.createOperation(wolvrix::lib::grh::OperationKind::kAdd,
+                                                    graph.internSymbol("declared_producer"));
+        graph.addOperand(producer, a);
+        graph.addOperand(producer, b);
+        graph.addResult(producer, declaredWire);
+
+        const auto y = makeValue(graph, "y", 8);
+        const auto consumer = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
+                                                    graph.internSymbol("declared_consumer"));
+        graph.addOperand(consumer, declaredWire);
+        graph.addOperand(consumer, c);
+        graph.addResult(consumer, y);
+        graph.bindOutputPort("y", y);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        ActivityScheduleOptions options;
+        options.path = "declared_value_compute_node_boundary";
+        options.maxOpInComputeSupernode = 1;
+        options.maxOpInComputeNode = 8;
+        options.enableCoarsen = false;
+        options.enableChainMerge = false;
+        options.declaredValueComputeNodeBoundary = true;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected declared-value compute-node boundary schedule to succeed");
+        }
+        const auto schedule = loadSchedule(session, "declared_value_compute_node_boundary");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        const uint32_t producerSupernode = (*schedule.opToSupernode)[producer.index - 1];
+        const uint32_t consumerSupernode = (*schedule.opToSupernode)[consumer.index - 1];
+        if (producerSupernode == kInvalidActivitySupernodeId ||
+            consumerSupernode == kInvalidActivitySupernodeId ||
+            producerSupernode == consumerSupernode)
+        {
+            return fail("Expected declared value producer and consumer to be separated when boundary option is enabled");
+        }
+        if (!hasFanoutTo(*schedule.valueFanout, declaredWire, consumerSupernode))
+        {
+            return fail("Expected declared value to become a cross-supernode fanout");
+        }
+        if (parseJsonDoubleField(*schedule.summaryStats, "compute_node_boundary_input_declared") != 1.0 ||
+            parseJsonDoubleField(*schedule.summaryStats, "compute_node_boundary_declared_values") != 1.0 ||
+            parseJsonDoubleField(*schedule.summaryStats, "compute_node_boundary_declared_edges") != 1.0)
+        {
+            return fail("Expected declared boundary stats to be recorded: " + *schedule.summaryStats);
+        }
+    }
+
+    {
+        currentCase = "prob_mffc_respects_declared_value_boundary";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("prob_declared_boundary");
+        design.markAsTop("prob_declared_boundary");
+        using K = wolvrix::lib::grh::OperationKind;
+
+        const auto a = makeValue(graph, "a", 8);
+        const auto b = makeValue(graph, "b", 8);
+        const auto c = makeValue(graph, "c", 8);
+        graph.bindInputPort("a", a);
+        graph.bindInputPort("b", b);
+        graph.bindInputPort("c", c);
+
+        const auto wireSym = graph.internSymbol("declared_wire");
+        graph.addDeclaredSymbol(wireSym);
+        const auto declaredWire = graph.createValue(wireSym, 8, false);
+        const auto producer = graph.createOperation(K::kXor, graph.internSymbol("declared_producer"));
+        graph.addOperand(producer, a);
+        graph.addOperand(producer, b);
+        graph.addResult(producer, declaredWire);
+
+        const auto y = makeValue(graph, "y", 8);
+        const auto consumer = graph.createOperation(K::kXor, graph.internSymbol("declared_consumer"));
+        graph.addOperand(consumer, declaredWire);
+        graph.addOperand(consumer, c);
+        graph.addResult(consumer, y);
+        graph.bindOutputPort("y", y);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        ActivityScheduleOptions options;
+        options.path = "prob_declared_boundary";
+        options.partitionPolicy = "prob";
+        options.maxOpInComputeNode = 8;
+        options.maxOpInComputeSupernode = 1;
+        options.enableCoarsen = false;
+        options.enableChainMerge = false;
+        options.declaredValueComputeNodeBoundary = true;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected prob declared boundary schedule to succeed");
+        }
+        const auto schedule = loadSchedule(session, "prob_declared_boundary");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        const uint32_t producerSupernode = (*schedule.opToSupernode)[producer.index - 1];
+        const uint32_t consumerSupernode = (*schedule.opToSupernode)[consumer.index - 1];
+        if (producerSupernode == kInvalidActivitySupernodeId ||
+            consumerSupernode == kInvalidActivitySupernodeId ||
+            producerSupernode == consumerSupernode)
+        {
+            return fail("Expected prob MFFC merge to preserve declared value boundary");
+        }
+        if (!hasFanoutTo(*schedule.valueFanout, declaredWire, consumerSupernode))
+        {
+            return fail("Expected prob declared value boundary fanout");
+        }
+        if (parseJsonDoubleField(*schedule.summaryStats, "compute_node_boundary_input_declared") != 1.0)
+        {
+            return fail("Expected prob declared boundary stat to be recorded: " + *schedule.summaryStats);
+        }
+    }
+
+    {
+        currentCase = "declared_source_clone_boundary";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("declared_source_clone_boundary");
+        design.markAsTop("declared_source_clone_boundary");
+        using K = wolvrix::lib::grh::OperationKind;
+
+        const auto reg = graph.createOperation(K::kRegister, graph.internSymbol("q"));
+        graph.setAttr(reg, "width", int64_t{8});
+        graph.setAttr(reg, "isSigned", false);
+
+        const auto readSym = graph.internSymbol("q_read");
+        graph.addDeclaredSymbol(readSym);
+        const auto qRead = graph.createValue(readSym, 8, false);
+        const auto readOp = graph.createOperation(K::kRegisterReadPort, graph.internSymbol("q_read_op"));
+        graph.addResult(readOp, qRead);
+        graph.setAttr(readOp, "regSymbol", std::string("q"));
+
+        const auto a = makeValue(graph, "a", 8);
+        graph.bindInputPort("a", a);
+
+        const auto y = makeValue(graph, "y", 8);
+        const auto consumer = graph.createOperation(K::kXor, graph.internSymbol("consumer"));
+        graph.addOperand(consumer, qRead);
+        graph.addOperand(consumer, a);
+        graph.addResult(consumer, y);
+        graph.bindOutputPort("y", y);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        ActivityScheduleOptions options;
+        options.path = "declared_source_clone_boundary";
+        options.maxOpInComputeSupernode = 1;
+        options.maxOpInComputeNode = 8;
+        options.enableCoarsen = false;
+        options.enableChainMerge = false;
+        options.declaredValueComputeNodeBoundary = true;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(options));
+
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected declared source-clone boundary schedule to succeed");
+        }
+        const auto schedule = loadSchedule(session, "declared_source_clone_boundary");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+
+        const auto consumerOperands = graph.opOperands(consumer);
+        if (consumerOperands.empty() || consumerOperands.front() == qRead)
+        {
+            return fail("Expected register-read source use to be cloned before compute");
+        }
+        const auto clonedReadValue = consumerOperands.front();
+        const auto clonedReadOp = graph.valueDef(clonedReadValue);
+        if (!clonedReadOp.valid() ||
+            graph.opKind(clonedReadOp) != K::kRegisterReadPort)
+        {
+            return fail("Expected cloned source value to be defined by a register read");
+        }
+        const uint32_t readSupernode = (*schedule.opToSupernode)[clonedReadOp.index - 1];
+        const uint32_t consumerSupernode = (*schedule.opToSupernode)[consumer.index - 1];
+        if (readSupernode == kInvalidActivitySupernodeId ||
+            consumerSupernode == kInvalidActivitySupernodeId ||
+            readSupernode == consumerSupernode)
+        {
+            return fail("Expected declared canonical source clone to be a compute-node boundary");
+        }
+        if (!hasFanoutTo(*schedule.valueFanout, clonedReadValue, consumerSupernode))
+        {
+            return fail("Expected cloned declared source value to fan out to consumer supernode");
+        }
+        if (parseJsonDoubleField(*schedule.summaryStats, "compute_node_boundary_input_declared") != 1.0)
+        {
+            return fail("Expected declared source clone boundary stat: " + *schedule.summaryStats);
         }
     }
 

@@ -2858,6 +2858,12 @@ namespace wolvrix::lib::transform
             out << ",\"compute_node_boundary_input_def_out_of_range\":"
                 << stats.computeNodeBoundaryInputDefOutOfRange;
             out << ",\"compute_node_boundary_input_declared\":" << stats.computeNodeBoundaryInputDeclared;
+            out << ",\"compute_node_boundary_declared_values\":" << stats.computeNodeBoundaryDeclaredValues;
+            out << ",\"compute_node_boundary_declared_edges\":" << stats.computeNodeBoundaryDeclaredEdges;
+            out << ",\"compute_node_declared_cut_violations_fixed\":"
+                << stats.computeNodeDeclaredCutViolationsFixed;
+            out << ",\"compute_node_declared_cut_violations_fatal\":"
+                << stats.computeNodeDeclaredCutViolationsFatal;
             out << ",\"compute_node_boundary_input_source_spill\":"
                 << stats.computeNodeBoundaryInputSourceSpill;
             out << ",\"compute_node_boundary_input_unsupported\":"
@@ -2929,6 +2935,10 @@ namespace wolvrix::lib::transform
             stats.computeNodeBoundaryInputNoDef = rewrite.stats.computeNodeBoundaryInputNoDef;
             stats.computeNodeBoundaryInputDefOutOfRange = rewrite.stats.computeNodeBoundaryInputDefOutOfRange;
             stats.computeNodeBoundaryInputDeclared = rewrite.stats.computeNodeBoundaryInputDeclared;
+            stats.computeNodeBoundaryDeclaredValues = rewrite.stats.computeNodeBoundaryDeclaredValues;
+            stats.computeNodeBoundaryDeclaredEdges = rewrite.stats.computeNodeBoundaryDeclaredEdges;
+            stats.computeNodeDeclaredCutViolationsFixed = rewrite.stats.computeNodeDeclaredCutViolationsFixed;
+            stats.computeNodeDeclaredCutViolationsFatal = rewrite.stats.computeNodeDeclaredCutViolationsFatal;
             stats.computeNodeBoundaryInputSourceSpill = rewrite.stats.computeNodeBoundaryInputSourceSpill;
             stats.computeNodeBoundaryInputUnsupported = rewrite.stats.computeNodeBoundaryInputUnsupported;
             stats.computeNodeBoundaryInputExistingOwner = rewrite.stats.computeNodeBoundaryInputExistingOwner;
@@ -3216,6 +3226,17 @@ namespace wolvrix::lib::transform
             std::size_t cbawCoarsenRejectedCycle = 0;
             std::size_t cbawCoarsenRejectedResource = 0;
             std::size_t cbawCoarsenStale = 0;
+            std::size_t cbawCoarsenTopRootRoiValues = 0;
+            std::size_t cbawCoarsenTopRootRoiCandidates = 0;
+            std::size_t cbawCoarsenHighDensityRoiBuckets = 0;
+            std::size_t cbawCoarsenHighDensityRoiCandidates = 0;
+            std::size_t cbawCoarsenRoiBudgetSkipped = 0;
+            std::size_t cbawCoarsenAcceptedPrefixBoundaryGain = 0;
+            std::size_t cbawCoarsenAcceptedPrefixDagGain = 0;
+            std::size_t cbawCoarsenAcceptedPrefixComputeComputeGain = 0;
+            std::size_t cbawCoarsenAcceptedPrefixTopRootBoundaryGain = 0;
+            std::size_t cbawCoarsenTopRootRegressionGuardDemoted = 0;
+            std::size_t cbawCoarsenTopRootRegressionRiskAccepted = 0;
             std::uint64_t cbawCoarsenEvaluateMs = 0;
             std::uint64_t cbawCoarsenTopoMs = 0;
             KindCountMap cbawCoarsenGeneratedByKind;
@@ -5447,6 +5468,10 @@ namespace wolvrix::lib::transform
             std::size_t computeNodeBoundaryInputNoDef = 0;
             std::size_t computeNodeBoundaryInputDefOutOfRange = 0;
             std::size_t computeNodeBoundaryInputDeclared = 0;
+            std::size_t computeNodeBoundaryDeclaredValues = 0;
+            std::size_t computeNodeBoundaryDeclaredEdges = 0;
+            std::size_t computeNodeDeclaredCutViolationsFixed = 0;
+            std::size_t computeNodeDeclaredCutViolationsFatal = 0;
             std::size_t computeNodeBoundaryInputSourceSpill = 0;
             std::size_t computeNodeBoundaryInputUnsupported = 0;
             std::size_t computeNodeBoundaryInputExistingOwner = 0;
@@ -5486,6 +5511,7 @@ namespace wolvrix::lib::transform
             std::vector<uint32_t> computeTopoOrder;
             std::vector<uint32_t> computeNodeOfOp;
             ValueCanonicalMap canonicalValues;
+            bool declaredValueComputeNodeBoundary = false;
             ComputeNodeRewriteStats stats;
         };
 
@@ -6430,6 +6456,18 @@ namespace wolvrix::lib::transform
             return symbol.valid() && graph.isDeclaredSymbol(symbol);
         }
 
+        bool isDeclaredCutValue(const wolvrix::lib::grh::Graph &graph,
+                                const ValueCanonicalMap &canonicalValues,
+                                wolvrix::lib::grh::ValueId value) noexcept
+        {
+            if (isDeclaredValue(graph, value))
+            {
+                return true;
+            }
+            const auto canonical = canonicalActivityValue(value, &canonicalValues);
+            return canonical != value && isDeclaredValue(graph, canonical);
+        }
+
         wolvrix::lib::grh::OperationId cloneSingleResultSourceOp(wolvrix::lib::grh::Graph &graph,
                                                                  wolvrix::lib::grh::OperationId sourceOpId,
                                                                  wolvrix::lib::grh::ValueId sourceValue,
@@ -7358,12 +7396,22 @@ namespace wolvrix::lib::transform
                         return;
                     }
                     const auto operand = operands[operandIndex];
+                    const bool declaredCut =
+                        options_.declaredValueComputeNodeBoundary &&
+                        isDeclaredCutValue(graph_, build_.canonicalValues, operand);
                     const auto defOp = graph_.valueDef(operand);
                     if (!defOp.valid())
                     {
                         addBoundary(nodeId, operand);
                         ++build_.stats.computeNodeBoundaryInputsTotal;
-                        ++build_.stats.computeNodeBoundaryInputNoDef;
+                        if (declaredCut)
+                        {
+                            ++build_.stats.computeNodeBoundaryInputDeclared;
+                        }
+                        else
+                        {
+                            ++build_.stats.computeNodeBoundaryInputNoDef;
+                        }
                         continue;
                     }
                     if (defOp.index >= opClasses_.size())
@@ -7376,6 +7424,18 @@ namespace wolvrix::lib::transform
                     const ActivityOpClass defClass = opClasses_[defOp.index];
                     if (defClass == ActivityOpClass::Source)
                     {
+                        if (declaredCut)
+                        {
+                            ensureSourceOwnerNode(defOp);
+                            if (!error_.empty())
+                            {
+                                return;
+                            }
+                            addBoundary(nodeId, operand);
+                            ++build_.stats.computeNodeBoundaryInputsTotal;
+                            ++build_.stats.computeNodeBoundaryInputDeclared;
+                            continue;
+                        }
                         ensureOpCapacity(defOp);
                         const uint32_t existingOwner = build_.computeNodeOfOp[defOp.index];
                         if (existingOwner == nodeId)
@@ -7423,6 +7483,24 @@ namespace wolvrix::lib::transform
                         addBoundary(nodeId, operand);
                         ++build_.stats.computeNodeBoundaryInputsTotal;
                         ++build_.stats.computeNodeBoundaryInputUnsupported;
+                        continue;
+                    }
+                    if (declaredCut)
+                    {
+                        const bool common =
+                            semanticConsumerCount(graph_,
+                                                  operand,
+                                                  opClasses_,
+                                                  kInvalidActivitySupernodeId,
+                                                  build_.computeNodeOfOp) > 1;
+                        ensureComputeNodeForOp(defOp, common);
+                        if (!error_.empty())
+                        {
+                            return;
+                        }
+                        addBoundary(nodeId, operand);
+                        ++build_.stats.computeNodeBoundaryInputsTotal;
+                        ++build_.stats.computeNodeBoundaryInputDeclared;
                         continue;
                     }
                     if (!isLocalSharedComputeOpKind(graph_.opKind(defOp)))
@@ -7927,11 +8005,22 @@ namespace wolvrix::lib::transform
         {
             build.computeDag.assign(build.computeNodes.size(), {});
             build.stats.computeNodeBoundaryValues = 0;
+            build.stats.computeNodeBoundaryDeclaredValues = 0;
+            build.stats.computeNodeBoundaryDeclaredEdges = 0;
             std::unordered_set<uint64_t> seen;
+            std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash> seenDeclaredValues;
+            std::unordered_set<uint64_t> seenDeclaredEdges;
             for (uint32_t nodeId = 0; nodeId < build.computeNodes.size(); ++nodeId)
             {
                 for (const auto boundary : build.computeNodes[nodeId].boundaryInputs)
                 {
+                    const bool declaredBoundary =
+                        build.declaredValueComputeNodeBoundary &&
+                        isDeclaredCutValue(graph, build.canonicalValues, boundary);
+                    if (declaredBoundary && seenDeclaredValues.insert(boundary).second)
+                    {
+                        ++build.stats.computeNodeBoundaryDeclaredValues;
+                    }
                     const auto defOp = graph.valueDef(boundary);
                     if (!defOp.valid() || defOp.index >= nodeOfOpByIndex.size())
                     {
@@ -7947,6 +8036,10 @@ namespace wolvrix::lib::transform
                     {
                         build.computeDag[pred].push_back(nodeId);
                         ++build.stats.computeNodeBoundaryValues;
+                    }
+                    if (declaredBoundary && seenDeclaredEdges.insert(packed).second)
+                    {
+                        ++build.stats.computeNodeBoundaryDeclaredEdges;
                     }
                 }
             }
@@ -8030,6 +8123,140 @@ namespace wolvrix::lib::transform
                     }
                 }
             }
+        }
+
+        bool computeNodeHasDeclaredCutViolation(const ComputeRewriteBuild &build,
+                                                const wolvrix::lib::grh::Graph &graph,
+                                                uint32_t nodeId)
+        {
+            if (!build.declaredValueComputeNodeBoundary || nodeId >= build.computeNodes.size())
+            {
+                return false;
+            }
+            for (const auto opId : build.computeNodes[nodeId].ops)
+            {
+                for (const auto operand : graph.opOperands(opId))
+                {
+                    if (!isDeclaredCutValue(graph, build.canonicalValues, operand))
+                    {
+                        continue;
+                    }
+                    const auto defOp = graph.valueDef(operand);
+                    if (!defOp.valid() || defOp.index >= build.computeNodeOfOp.size())
+                    {
+                        continue;
+                    }
+                    if (build.computeNodeOfOp[defOp.index] == nodeId)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        bool hasDeclaredCutViolation(const ComputeRewriteBuild &build,
+                                     const wolvrix::lib::grh::Graph &graph)
+        {
+            if (!build.declaredValueComputeNodeBoundary)
+            {
+                return false;
+            }
+            for (uint32_t nodeId = 0; nodeId < build.computeNodes.size(); ++nodeId)
+            {
+                if (computeNodeHasDeclaredCutViolation(build, graph, nodeId))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool splitDeclaredCutComputeNodes(ComputeRewriteBuild &build,
+                                          const wolvrix::lib::grh::Graph &graph,
+                                          const ActivityOpData &opData)
+        {
+            if (!build.declaredValueComputeNodeBoundary)
+            {
+                return true;
+            }
+
+            bool changed = false;
+            std::vector<ComputeNode> nextNodes;
+            nextNodes.reserve(build.computeNodes.size());
+
+            for (uint32_t nodeId = 0; nodeId < build.computeNodes.size(); ++nodeId)
+            {
+                const auto &node = build.computeNodes[nodeId];
+                if (!computeNodeHasDeclaredCutViolation(build, graph, nodeId))
+                {
+                    nextNodes.push_back(node);
+                    continue;
+                }
+
+                std::vector<wolvrix::lib::grh::OperationId> orderedOps = node.ops;
+                std::sort(orderedOps.begin(), orderedOps.end(), [&](const auto lhs, const auto rhs) {
+                    return topoLessOp(opData, lhs, rhs);
+                });
+
+                std::vector<wolvrix::lib::grh::OperationId> chunkOps;
+                std::unordered_set<uint32_t> chunkOpIndices;
+                auto flushChunk = [&]() {
+                    if (chunkOps.empty())
+                    {
+                        return;
+                    }
+                    ComputeNode chunk;
+                    chunk.ops = std::move(chunkOps);
+                    chunk.commonExpr = node.commonExpr;
+                    nextNodes.push_back(std::move(chunk));
+                    chunkOps = {};
+                    chunkOpIndices.clear();
+                };
+
+                for (const auto opId : orderedOps)
+                {
+                    bool cutBeforeOp = false;
+                    for (const auto operand : graph.opOperands(opId))
+                    {
+                        if (!isDeclaredCutValue(graph, build.canonicalValues, operand))
+                        {
+                            continue;
+                        }
+                        const auto defOp = graph.valueDef(operand);
+                        if (!defOp.valid())
+                        {
+                            continue;
+                        }
+                        if (chunkOpIndices.find(defOp.index) != chunkOpIndices.end())
+                        {
+                            cutBeforeOp = true;
+                            break;
+                        }
+                    }
+                    if (cutBeforeOp)
+                    {
+                        flushChunk();
+                    }
+                    chunkOps.push_back(opId);
+                    chunkOpIndices.insert(opId.index);
+                }
+                flushChunk();
+                ++build.stats.computeNodeDeclaredCutViolationsFixed;
+                changed = true;
+            }
+
+            if (changed)
+            {
+                build.computeNodes = std::move(nextNodes);
+                recomputeComputeNodeOwnersAndBoundaries(build, graph);
+            }
+            if (hasDeclaredCutViolation(build, graph))
+            {
+                ++build.stats.computeNodeDeclaredCutViolationsFatal;
+                return false;
+            }
+            return true;
         }
 
         bool splitCycleComputeNodesToSingletons(ComputeRewriteBuild &build,
@@ -10631,6 +10858,8 @@ namespace wolvrix::lib::transform
         constexpr uint32_t kCbawTagGuardHint = 1u << 6;
         constexpr uint32_t kCbawTagSinkCone = 1u << 7;
         constexpr uint32_t kCbawTagPassthrough = 1u << 8;
+        constexpr uint32_t kCbawTagTopRootRoi = 1u << 9;
+        constexpr uint32_t kCbawTagHighDensityRoi = 1u << 10;
 
         std::string_view cbawTagName(uint32_t tag) noexcept
         {
@@ -10645,6 +10874,8 @@ namespace wolvrix::lib::transform
             case kCbawTagGuardHint: return "guard_hint";
             case kCbawTagSinkCone: return "sink_cone";
             case kCbawTagPassthrough: return "passthrough";
+            case kCbawTagTopRootRoi: return "top_root_roi";
+            case kCbawTagHighDensityRoi: return "high_density_roi";
             default: return "unknown";
             }
         }
@@ -10652,7 +10883,7 @@ namespace wolvrix::lib::transform
         template <typename Fn>
         void forEachCbawTag(uint32_t tags, Fn &&fn)
         {
-            constexpr std::array<uint32_t, 9> kTags = {
+            constexpr std::array<uint32_t, 11> kTags = {
                 kCbawTagHeavyValueUse,
                 kCbawTagPlainOut1,
                 kCbawTagPlainIn1,
@@ -10662,6 +10893,8 @@ namespace wolvrix::lib::transform
                 kCbawTagGuardHint,
                 kCbawTagSinkCone,
                 kCbawTagPassthrough,
+                kCbawTagTopRootRoi,
+                kCbawTagHighDensityRoi,
             };
             for (const uint32_t tag : kTags)
             {
@@ -10687,6 +10920,8 @@ namespace wolvrix::lib::transform
                 return 2;
             case kCbawTagGuardHint:
             case kCbawTagSinkCone:
+            case kCbawTagTopRootRoi:
+            case kCbawTagHighDensityRoi:
                 return 3;
             case kCbawTagHeavyValueUse:
             default:
@@ -10740,6 +10975,23 @@ namespace wolvrix::lib::transform
                 score += 1;
             }
             return score;
+        }
+
+        const char *cbawCandidateSelectedReason(uint32_t tags) noexcept
+        {
+            if (cbawSemanticTieBreakScore(tags) != 0)
+            {
+                return "exact_delta_semantic_tie";
+            }
+            if ((tags & kCbawTagTopRootRoi) != 0)
+            {
+                return "exact_delta_top_root_roi";
+            }
+            if ((tags & kCbawTagHighDensityRoi) != 0)
+            {
+                return "exact_delta_high_density_roi";
+            }
+            return "exact_delta";
         }
 
         bool sortedStringVectorsIntersect(const std::vector<std::string> &lhs,
@@ -11099,17 +11351,143 @@ namespace wolvrix::lib::transform
                 normalizeStrings(labels[clusterId].sinkLabels);
             }
 
+            constexpr std::size_t kCbawTopRootTargetThreshold = 16;
+            constexpr std::size_t kCbawHighTargetDensityThreshold = 8;
+            std::vector<uint8_t> topRootFanout(valueEdges.valueFanouts.size(), 0);
+            std::vector<uint32_t> topRootFanoutIds;
+            topRootFanoutIds.reserve(valueEdges.valueFanouts.size());
+            for (uint32_t fanoutId = 0; fanoutId < valueEdges.valueFanouts.size(); ++fanoutId)
+            {
+                const auto &fanout = valueEdges.valueFanouts[fanoutId];
+                if (fanout.sourceCluster == kInvalidActivitySupernodeId ||
+                    fanout.targetClusters.size() <= kCbawTopRootTargetThreshold)
+                {
+                    continue;
+                }
+                topRootFanout[fanoutId] = 1;
+                topRootFanoutIds.push_back(fanoutId);
+            }
+            std::sort(topRootFanoutIds.begin(),
+                      topRootFanoutIds.end(),
+                      [&](uint32_t lhs, uint32_t rhs)
+                      {
+                          const std::size_t lhsTargets =
+                              lhs < valueEdges.valueFanouts.size()
+                                  ? valueEdges.valueFanouts[lhs].targetClusters.size()
+                                  : 0;
+                          const std::size_t rhsTargets =
+                              rhs < valueEdges.valueFanouts.size()
+                                  ? valueEdges.valueFanouts[rhs].targetClusters.size()
+                                  : 0;
+                          if (lhsTargets != rhsTargets)
+                          {
+                              return lhsTargets > rhsTargets;
+                          }
+                          return lhs < rhs;
+                      });
+            if (perf != nullptr)
+            {
+                perf->cbawCoarsenTopRootRoiValues += topRootFanoutIds.size();
+            }
+
+            std::vector<uint8_t> highTargetDensity(view.members.size(), 0);
+            for (uint32_t clusterId = 0; clusterId < view.members.size(); ++clusterId)
+            {
+                const std::size_t externalTargets =
+                    clusterId < valueEdges.targetValuesByCluster.size()
+                        ? valueEdges.targetValuesByCluster[clusterId].size()
+                        : 0;
+                if (externalTargets >= kCbawHighTargetDensityThreshold)
+                {
+                    highTargetDensity[clusterId] = 1;
+                }
+            }
+
+            const auto fanoutTargetsCluster = [&](uint32_t fanoutId, uint32_t clusterId) {
+                if (fanoutId >= valueEdges.valueFanouts.size())
+                {
+                    return false;
+                }
+                const auto &targets = valueEdges.valueFanouts[fanoutId].targetClusters;
+                return std::binary_search(targets.begin(), targets.end(), clusterId);
+            };
+            const auto countTopRootDirectTargets = [&](uint32_t source, uint32_t target) {
+                std::size_t count = 0;
+                if (source >= valueEdges.sourceValuesByCluster.size())
+                {
+                    return count;
+                }
+                for (const uint32_t fanoutId : valueEdges.sourceValuesByCluster[source])
+                {
+                    if (fanoutId < topRootFanout.size() &&
+                        topRootFanout[fanoutId] != 0 &&
+                        fanoutTargetsCluster(fanoutId, target))
+                    {
+                        ++count;
+                    }
+                }
+                return count;
+            };
+            const auto countTopRootSharedIncomingTargets = [&](uint32_t lhs, uint32_t rhs) {
+                std::size_t count = 0;
+                if (lhs >= valueEdges.targetValuesByCluster.size() ||
+                    rhs >= valueEdges.targetValuesByCluster.size())
+                {
+                    return count;
+                }
+                const auto &lhsTargets = valueEdges.targetValuesByCluster[lhs];
+                const auto &rhsTargets = valueEdges.targetValuesByCluster[rhs];
+                auto l = lhsTargets.begin();
+                auto r = rhsTargets.begin();
+                while (l != lhsTargets.end() && r != rhsTargets.end())
+                {
+                    if (*l == *r)
+                    {
+                        const uint32_t fanoutId = *l;
+                        if (fanoutId < topRootFanout.size() &&
+                            topRootFanout[fanoutId] != 0 &&
+                            fanoutId < valueEdges.valueFanouts.size())
+                        {
+                            const uint32_t source = valueEdges.valueFanouts[fanoutId].sourceCluster;
+                            if (source != lhs && source != rhs)
+                            {
+                                ++count;
+                            }
+                        }
+                        ++l;
+                        ++r;
+                    }
+                    else if (*l < *r)
+                    {
+                        ++l;
+                    }
+                    else
+                    {
+                        ++r;
+                    }
+                }
+                return count;
+            };
+            const auto countTopRootBoundaryDelta = [&](uint32_t lhs, uint32_t rhs) {
+                return countTopRootDirectTargets(lhs, rhs) +
+                       countTopRootDirectTargets(rhs, lhs) +
+                       countTopRootSharedIncomingTargets(lhs, rhs);
+            };
+
             struct Candidate
             {
                 uint32_t lhs = 0;
                 uint32_t rhs = 0;
                 CbawExactDelta delta;
                 std::size_t directWeight = 0;
+                std::size_t topRootBoundaryDelta = 0;
                 std::size_t mergedOps = 0;
                 std::size_t resourceSlack = 0;
                 uint32_t tags = 0;
                 uint32_t primaryTag = kCbawTagHeavyValueUse;
                 const char *selectedReason = "exact_delta";
+                bool boundaryRegressionRisk = false;
+                bool roiOnly = false;
             };
             std::map<std::uint64_t, Candidate> bestByPair;
             std::vector<std::size_t> sizes(view.members.size(), 0);
@@ -11118,6 +11496,10 @@ namespace wolvrix::lib::transform
                 sizes[clusterId] = clusterOpSize(view.members[clusterId], nodeOpSizes);
             }
             const auto betterCandidate = [](const Candidate &lhs, const Candidate &rhs) {
+                if (lhs.roiOnly != rhs.roiOnly)
+                {
+                    return !lhs.roiOnly;
+                }
                 if (lhs.delta.boundaryTargets != rhs.delta.boundaryTargets)
                 {
                     return lhs.delta.boundaryTargets > rhs.delta.boundaryTargets;
@@ -11129,6 +11511,10 @@ namespace wolvrix::lib::transform
                 if (lhs.delta.computeComputePairs != rhs.delta.computeComputePairs)
                 {
                     return lhs.delta.computeComputePairs > rhs.delta.computeComputePairs;
+                }
+                if (lhs.boundaryRegressionRisk != rhs.boundaryRegressionRisk)
+                {
+                    return !lhs.boundaryRegressionRisk;
                 }
                 const int lhsSemantic = cbawSemanticTieBreakScore(lhs.tags);
                 const int rhsSemantic = cbawSemanticTieBreakScore(rhs.tags);
@@ -11154,12 +11540,27 @@ namespace wolvrix::lib::transform
             {
                 ++map[std::string(cbawTagName(tag))];
             };
-            const auto addCandidateTag = [&](uint32_t lhs, uint32_t rhs, uint32_t tag)
+            const auto boundaryRegressionRisk = [](uint32_t tags,
+                                                   std::size_t topRootBoundaryDelta,
+                                                   const CbawExactDelta &delta) {
+                return (tags & (kCbawTagTopRootRoi | kCbawTagHighDensityRoi)) != 0 &&
+                       delta.boundaryTargets != 0 &&
+                       topRootBoundaryDelta == 0;
+            };
+            const auto addCandidateTag = [&](uint32_t lhs, uint32_t rhs, uint32_t tag, bool injectedRoi = false)
             {
                 if (perf != nullptr)
                 {
                     noteMap(perf->cbawCoarsenGeneratedByKind, tag);
                     ++perf->cbawCoarsenCandidates;
+                    if (tag == kCbawTagTopRootRoi)
+                    {
+                        ++perf->cbawCoarsenTopRootRoiCandidates;
+                    }
+                    else if (tag == kCbawTagHighDensityRoi)
+                    {
+                        ++perf->cbawCoarsenHighDensityRoiCandidates;
+                    }
                 }
                 if (lhs == rhs ||
                     lhs >= view.members.size() ||
@@ -11193,19 +11594,31 @@ namespace wolvrix::lib::transform
                 const std::size_t lhsSize = lhs < sizes.size() ? sizes[lhs] : 0;
                 const std::size_t rhsSize = rhs < sizes.size() ? sizes[rhs] : 0;
                 const std::size_t mergedOps = lhsSize + rhsSize;
+                const std::size_t topRootDelta = countTopRootBoundaryDelta(lhs, rhs);
                 Candidate candidate{
                     lhs,
                     rhs,
                     delta,
                     clusterEdgeWeight(valueEdges, lhs, rhs) + clusterEdgeWeight(valueEdges, rhs, lhs),
+                    topRootDelta,
                     mergedOps,
                     maxOps == std::numeric_limits<std::size_t>::max() || mergedOps >= maxOps
                         ? std::size_t{0}
                         : maxOps - mergedOps,
                     tag,
                     cbawChoosePrimaryTag(tag),
-                    "exact_delta",
+                    tag == kCbawTagTopRootRoi
+                        ? "exact_delta_top_root_roi"
+                        : (tag == kCbawTagHighDensityRoi
+                               ? "exact_delta_high_density_roi"
+                               : "exact_delta"),
+                    boundaryRegressionRisk(tag, topRootDelta, delta),
+                    injectedRoi,
                 };
+                if (candidate.boundaryRegressionRisk && perf != nullptr)
+                {
+                    ++perf->cbawCoarsenTopRootRegressionGuardDemoted;
+                }
                 const std::uint64_t packed = packClusterPair(lhs, rhs);
                 auto it = bestByPair.find(packed);
                 if (it == bestByPair.end())
@@ -11213,11 +11626,27 @@ namespace wolvrix::lib::transform
                     bestByPair[packed] = candidate;
                     return;
                 }
+                if (injectedRoi && !it->second.roiOnly)
+                {
+                    return;
+                }
+                if (!injectedRoi && it->second.roiOnly)
+                {
+                    it->second.tags = tag;
+                    it->second.primaryTag = cbawChoosePrimaryTag(tag);
+                    it->second.selectedReason = "exact_delta";
+                    it->second.boundaryRegressionRisk = false;
+                    it->second.roiOnly = false;
+                    return;
+                }
                 it->second.tags |= tag;
                 it->second.primaryTag = cbawChoosePrimaryTag(it->second.tags);
-                it->second.selectedReason =
-                    cbawSemanticTieBreakScore(it->second.tags) != 0 ? "exact_delta_semantic_tie"
-                                                                    : "exact_delta";
+                it->second.selectedReason = cbawCandidateSelectedReason(it->second.tags);
+                it->second.boundaryRegressionRisk =
+                    boundaryRegressionRisk(it->second.tags,
+                                           it->second.topRootBoundaryDelta,
+                                           it->second.delta);
+                it->second.roiOnly = it->second.roiOnly && injectedRoi;
             };
 
             for (const auto &[packed, weight] : valueEdges.weights)
@@ -11268,6 +11697,173 @@ namespace wolvrix::lib::transform
                 }
             }
 
+            const auto addSharedSemanticTags = [&](uint32_t lhs, uint32_t rhs, bool injectedRoi)
+            {
+                if (lhs >= labels.size() || rhs >= labels.size())
+                {
+                    return;
+                }
+                if (sortedStringVectorsIntersect(labels[lhs].aggregateFamilies,
+                                                 labels[rhs].aggregateFamilies))
+                {
+                    addCandidateTag(lhs, rhs, kCbawTagAggregateHint, injectedRoi);
+                }
+                if (labels[lhs].mffcRep != kInvalidActivitySupernodeId &&
+                    labels[lhs].mffcRep == labels[rhs].mffcRep)
+                {
+                    addCandidateTag(lhs, rhs, kCbawTagMffcDominance, injectedRoi);
+                }
+                if (sortedStringVectorsIntersect(labels[lhs].guardDomains,
+                                                 labels[rhs].guardDomains))
+                {
+                    addCandidateTag(lhs, rhs, kCbawTagGuardHint, injectedRoi);
+                }
+                if (!labels[lhs].multiSink &&
+                    !labels[rhs].multiSink &&
+                    sortedStringVectorsIntersect(labels[lhs].sinkLabels,
+                                                 labels[rhs].sinkLabels))
+                {
+                    addCandidateTag(lhs, rhs, kCbawTagSinkCone, injectedRoi);
+                }
+                if (labels[lhs].passthrough && labels[rhs].passthrough)
+                {
+                    addCandidateTag(lhs, rhs, kCbawTagPassthrough, injectedRoi);
+                }
+            };
+
+            constexpr std::size_t kCbawTopRootPairsPerRoot = 32;
+            constexpr std::size_t kCbawTopRootTotalPairBudget = 8192;
+            std::size_t topRootPairBudget = kCbawTopRootTotalPairBudget;
+            for (const uint32_t fanoutId : topRootFanoutIds)
+            {
+                if (fanoutId >= valueEdges.valueFanouts.size())
+                {
+                    continue;
+                }
+                const auto &targets = valueEdges.valueFanouts[fanoutId].targetClusters;
+                if (targets.size() < 2)
+                {
+                    continue;
+                }
+                const std::size_t pairCount = targets.size() - 1;
+                const std::size_t sampledPairs =
+                    std::min<std::size_t>(pairCount, kCbawTopRootPairsPerRoot);
+                for (std::size_t sample = 0; sample < sampledPairs; ++sample)
+                {
+                    if (topRootPairBudget == 0)
+                    {
+                        if (perf != nullptr)
+                        {
+                            ++perf->cbawCoarsenRoiBudgetSkipped;
+                        }
+                        break;
+                    }
+                    const std::size_t rhsIndex = 1 + (sample * pairCount) / sampledPairs;
+                    const uint32_t lhs = targets[rhsIndex - 1];
+                    const uint32_t rhs = targets[rhsIndex];
+                    addCandidateTag(lhs, rhs, kCbawTagTopRootRoi, true);
+                    addSharedSemanticTags(lhs, rhs, true);
+                    --topRootPairBudget;
+                }
+                if (topRootPairBudget == 0)
+                {
+                    break;
+                }
+            }
+
+            struct CbawSemanticRoiBucket
+            {
+                uint32_t tag = kCbawTagHeavyValueUse;
+                std::vector<uint32_t> clusters;
+            };
+            std::map<std::string, CbawSemanticRoiBucket> semanticRoiBuckets;
+            const auto addSemanticRoiBucket =
+                [&](uint32_t tag, std::string key, uint32_t clusterId)
+            {
+                auto &bucket = semanticRoiBuckets[key];
+                bucket.tag = tag;
+                bucket.clusters.push_back(clusterId);
+            };
+            for (uint32_t clusterId = 0; clusterId < view.members.size(); ++clusterId)
+            {
+                if (clusterId >= highTargetDensity.size() ||
+                    highTargetDensity[clusterId] == 0 ||
+                    clusterId >= labels.size())
+                {
+                    continue;
+                }
+                for (const auto &family : labels[clusterId].aggregateFamilies)
+                {
+                    addSemanticRoiBucket(kCbawTagAggregateHint,
+                                         "aggregate:" + family,
+                                         clusterId);
+                }
+                if (labels[clusterId].mffcRep != kInvalidActivitySupernodeId)
+                {
+                    addSemanticRoiBucket(kCbawTagMffcDominance,
+                                         "mffc:" + std::to_string(labels[clusterId].mffcRep),
+                                         clusterId);
+                }
+                for (const auto &domain : labels[clusterId].guardDomains)
+                {
+                    addSemanticRoiBucket(kCbawTagGuardHint,
+                                         "guard:" + domain,
+                                         clusterId);
+                }
+                if (!labels[clusterId].multiSink)
+                {
+                    for (const auto &sink : labels[clusterId].sinkLabels)
+                    {
+                        addSemanticRoiBucket(kCbawTagSinkCone,
+                                             "sink:" + sink,
+                                             clusterId);
+                    }
+                }
+            }
+
+            constexpr std::size_t kCbawHighDensityPairsPerBucket = 8;
+            constexpr std::size_t kCbawHighDensityTotalPairBudget = 4096;
+            std::size_t highDensityPairBudget = kCbawHighDensityTotalPairBudget;
+            for (auto &[_, bucket] : semanticRoiBuckets)
+            {
+                auto &bucketClusters = bucket.clusters;
+                std::sort(bucketClusters.begin(), bucketClusters.end());
+                bucketClusters.erase(std::unique(bucketClusters.begin(), bucketClusters.end()),
+                                     bucketClusters.end());
+                if (bucketClusters.size() < 2)
+                {
+                    continue;
+                }
+                if (perf != nullptr)
+                {
+                    ++perf->cbawCoarsenHighDensityRoiBuckets;
+                }
+                const std::size_t pairCount = bucketClusters.size() - 1;
+                const std::size_t sampledPairs =
+                    std::min<std::size_t>(pairCount, kCbawHighDensityPairsPerBucket);
+                for (std::size_t sample = 0; sample < sampledPairs; ++sample)
+                {
+                    if (highDensityPairBudget == 0)
+                    {
+                        if (perf != nullptr)
+                        {
+                            ++perf->cbawCoarsenRoiBudgetSkipped;
+                        }
+                        break;
+                    }
+                    const std::size_t rhsIndex = 1 + (sample * pairCount) / sampledPairs;
+                    const uint32_t lhs = bucketClusters[rhsIndex - 1];
+                    const uint32_t rhs = bucketClusters[rhsIndex];
+                    addCandidateTag(lhs, rhs, kCbawTagHighDensityRoi, true);
+                    addCandidateTag(lhs, rhs, bucket.tag, true);
+                    --highDensityPairBudget;
+                }
+                if (highDensityPairBudget == 0)
+                {
+                    break;
+                }
+            }
+
             std::unordered_map<std::uint64_t, std::vector<std::vector<uint32_t>>> siblingBuckets;
             siblingBuckets.reserve(view.members.size());
             for (uint32_t clusterId = 0; clusterId < view.members.size(); ++clusterId)
@@ -11311,6 +11907,7 @@ namespace wolvrix::lib::transform
 
             std::vector<Candidate> candidates;
             candidates.reserve(bestByPair.size());
+            std::vector<Candidate> roiOnlyCandidates;
             for (auto &[_, candidate] : bestByPair)
             {
                 candidate.primaryTag = cbawChoosePrimaryTag(candidate.tags);
@@ -11327,7 +11924,14 @@ namespace wolvrix::lib::transform
                                        }
                                    });
                 }
-                candidates.push_back(candidate);
+                if (candidate.roiOnly)
+                {
+                    roiOnlyCandidates.push_back(candidate);
+                }
+                else
+                {
+                    candidates.push_back(candidate);
+                }
             }
             std::sort(candidates.begin(),
                       candidates.end(),
@@ -11335,6 +11939,15 @@ namespace wolvrix::lib::transform
                       {
                           return betterCandidate(lhs, rhs);
                       });
+            std::sort(roiOnlyCandidates.begin(),
+                      roiOnlyCandidates.end(),
+                      [&](const Candidate &lhs, const Candidate &rhs)
+                      {
+                          return betterCandidate(lhs, rhs);
+                      });
+            candidates.insert(candidates.end(),
+                              roiOnlyCandidates.begin(),
+                              roiOnlyCandidates.end());
             if (perf != nullptr)
             {
                 perf->cbawCoarsenEvaluateMs += elapsedMs(evaluateStart);
@@ -11456,7 +12069,8 @@ namespace wolvrix::lib::transform
                 const bool locallyCycleSafe =
                     edge.oneWay
                         ? (locallySafeDirectContraction(edge) || adjacentInClusterTopo(lhs, rhs))
-                        : locallySafeNonDirectContraction(candidate);
+                        : (locallySafeNonDirectContraction(candidate) ||
+                           candidate.topRootBoundaryDelta != 0);
                 if (!locallyCycleSafe)
                 {
                     if (perf != nullptr)
@@ -11546,6 +12160,18 @@ namespace wolvrix::lib::transform
                             acceptedCandidates[i].primaryTag);
                     noteCandidateTags(perf->cbawCoarsenAcceptedByTag,
                                       acceptedCandidates[i]);
+                    perf->cbawCoarsenAcceptedPrefixBoundaryGain +=
+                        acceptedCandidates[i].delta.boundaryTargets;
+                    perf->cbawCoarsenAcceptedPrefixDagGain +=
+                        acceptedCandidates[i].delta.dagEdges;
+                    perf->cbawCoarsenAcceptedPrefixComputeComputeGain +=
+                        acceptedCandidates[i].delta.computeComputePairs;
+                    perf->cbawCoarsenAcceptedPrefixTopRootBoundaryGain +=
+                        acceptedCandidates[i].topRootBoundaryDelta;
+                    if (acceptedCandidates[i].boundaryRegressionRisk)
+                    {
+                        ++perf->cbawCoarsenTopRootRegressionRiskAccepted;
+                    }
                 }
             }
             clusters = std::move(trial);
@@ -13674,6 +14300,35 @@ namespace wolvrix::lib::transform
         // 合并到理想 MFFC 锥（仅 prob 策略）。用 rep[] 把同锥的 compute→compute 边对应的 computeNode
         // 用并查集合并，受 maxOpInComputeNode cap 约束；再 recompute owners/boundaries。DAG 重建与
         // cap 可能引发的 quotient 环修复，交给调用点后面已有的 cycle-split 循环。
+        bool hasDeclaredCutDependencyOnChunk(const ComputeRewriteBuild &build,
+                                             const wolvrix::lib::grh::Graph &graph,
+                                             uint32_t nodeId,
+                                             const std::vector<uint32_t> &chunkNodes)
+        {
+            if (!build.declaredValueComputeNodeBoundary || nodeId >= build.computeNodes.size())
+            {
+                return false;
+            }
+            for (const auto boundary : build.computeNodes[nodeId].boundaryInputs)
+            {
+                if (!isDeclaredCutValue(graph, build.canonicalValues, boundary))
+                {
+                    continue;
+                }
+                const auto defOp = graph.valueDef(boundary);
+                if (!defOp.valid() || defOp.index >= build.computeNodeOfOp.size())
+                {
+                    continue;
+                }
+                const uint32_t producerNode = build.computeNodeOfOp[defOp.index];
+                if (std::find(chunkNodes.begin(), chunkNodes.end(), producerNode) != chunkNodes.end())
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         void mergeComputeNodesToMffc(ComputeRewriteBuild &build,
                                      const ActivityOpData &data,
                                      const wolvrix::lib::grh::Graph &graph,
@@ -13753,18 +14408,26 @@ namespace wolvrix::lib::transform
                 });
                 std::size_t curIdx = SIZE_MAX;
                 std::size_t chunkOps = 0;
+                std::vector<uint32_t> chunkNodes;
                 for (const uint32_t id : ids)
                 {
                     const std::size_t sz = build.computeNodes[id].ops.size();
-                    if (curIdx == SIZE_MAX || (maxOpsPerNode != 0 && chunkOps + sz > maxOpsPerNode))
+                    const bool declaredCutBreak =
+                        curIdx != SIZE_MAX &&
+                        hasDeclaredCutDependencyOnChunk(build, graph, id, chunkNodes);
+                    if (curIdx == SIZE_MAX ||
+                        declaredCutBreak ||
+                        (maxOpsPerNode != 0 && chunkOps + sz > maxOpsPerNode))
                     {
                         curIdx = merged.size();
                         merged.emplace_back();
                         chunkOps = 0;
+                        chunkNodes.clear();
                     }
                     const ComputeNode &src = build.computeNodes[id];
                     merged[curIdx].ops.insert(merged[curIdx].ops.end(), src.ops.begin(), src.ops.end());
                     chunkOps += sz;
+                    chunkNodes.push_back(id);
                     consumed[id] = 1;
                 }
             }
@@ -13814,6 +14477,7 @@ namespace wolvrix::lib::transform
         {
             out = ComputeRewriteBuild{};
             out.canonicalValues = canonicalValues;
+            out.declaredValueComputeNodeBoundary = options.declaredValueComputeNodeBoundary;
             out.computeNodeOfOp.assign(opClasses.size(), kInvalidActivitySupernodeId);
             ComputeNodeBuilder builder(graph, options, opData, opClasses, out, error);
 
@@ -13982,11 +14646,22 @@ namespace wolvrix::lib::transform
                 }
             }
 
+            if (!splitDeclaredCutComputeNodes(out, graph, opData))
+            {
+                error = "activity-schedule declared-value compute-node boundary invariant failed";
+                return false;
+            }
+
             // NO0208 Phase D：把 over-split 的 computeNode 合并到理想 MFFC 锥（仅 prob）。CBAW
             // 从 P3 atom 层开始，不能把 prob/plain 的预合并结果作为初始解。
             if (options.partitionPolicy == "prob")
             {
                 mergeComputeNodesToMffc(out, opData, graph, options.maxOpInComputeNode);
+                if (!splitDeclaredCutComputeNodes(out, graph, opData))
+                {
+                    error = "activity-schedule declared-value compute-node boundary invariant failed after MFFC merge";
+                    return false;
+                }
             }
 
             constexpr std::size_t kMaxComputeNodeCycleSplitIters = 1024;
@@ -14006,6 +14681,12 @@ namespace wolvrix::lib::transform
                         splitCycleComputeNodesToSingletons(out, graph, opData, cycle))
                     {
                         ++cycleSplitIters;
+                        if (!splitDeclaredCutComputeNodes(out, graph, opData))
+                        {
+                            error =
+                                "activity-schedule declared-value compute-node boundary invariant failed after cycle split";
+                            return false;
+                        }
                         continue;
                     }
 
@@ -14357,7 +15038,6 @@ namespace wolvrix::lib::transform
                 bool changed = true;
                 std::size_t tailIterations = 0;
                 std::size_t cbawIterations = 0;
-                constexpr std::size_t kMaxCbawCoarsenIterations = 8;
                 while (changed)
                 {
                     const auto iterStart = std::chrono::steady_clock::now();
@@ -14471,7 +15151,8 @@ namespace wolvrix::lib::transform
                         }
                         const bool cbawRoundLimitStop =
                             options.partitionPolicy == "cbaw" &&
-                            cbawIterations >= kMaxCbawCoarsenIterations &&
+                            options.cbawCoarsenMaxIterations != 0 &&
+                            cbawIterations >= options.cbawCoarsenMaxIterations &&
                             changed;
                         const bool smallDeltaTail =
                             clustersBeforeIter >= kComputeNodeCoarsenTailLargeClusterThreshold &&
@@ -14518,7 +15199,8 @@ namespace wolvrix::lib::transform
                         }
                         const bool cbawRoundLimitStop =
                             options.partitionPolicy == "cbaw" &&
-                            cbawIterations >= kMaxCbawCoarsenIterations &&
+                            options.cbawCoarsenMaxIterations != 0 &&
+                            cbawIterations >= options.cbawCoarsenMaxIterations &&
                             changed;
                         const bool smallDeltaTail =
                             clustersBeforeIter >= kComputeNodeCoarsenTailLargeClusterThreshold &&
@@ -15138,6 +15820,12 @@ namespace wolvrix::lib::transform
                     " segment_penalty=" + std::to_string(options_.probDpSegmentPenalty) +
                     " fm_rounds=" + std::to_string(options_.fmRefineMaxRounds));
         }
+        else if (options_.partitionPolicy == "cbaw")
+        {
+            logInfo("activity-schedule cbaw options: coarsen_max_iterations=" +
+                    std::to_string(options_.cbawCoarsenMaxIterations) +
+                    " fm_rounds=" + std::to_string(options_.fmRefineMaxRounds));
+        }
 
         std::string resolveError;
         const std::optional<std::string> targetGraphName =
@@ -15644,6 +16332,28 @@ namespace wolvrix::lib::transform
                 << " reject_resource=" << materializePerf.cbawCoarsenRejectedResource
                 << " reject_cycle=" << materializePerf.cbawCoarsenRejectedCycle
                 << " stale=" << materializePerf.cbawCoarsenStale
+                << " top_root_roi_values="
+                << materializePerf.cbawCoarsenTopRootRoiValues
+                << " top_root_roi_candidates="
+                << materializePerf.cbawCoarsenTopRootRoiCandidates
+                << " high_density_roi_buckets="
+                << materializePerf.cbawCoarsenHighDensityRoiBuckets
+                << " high_density_roi_candidates="
+                << materializePerf.cbawCoarsenHighDensityRoiCandidates
+                << " roi_budget_skipped="
+                << materializePerf.cbawCoarsenRoiBudgetSkipped
+                << " accepted_prefix_boundary_gain="
+                << materializePerf.cbawCoarsenAcceptedPrefixBoundaryGain
+                << " accepted_prefix_dag_gain="
+                << materializePerf.cbawCoarsenAcceptedPrefixDagGain
+                << " accepted_prefix_compute_compute_gain="
+                << materializePerf.cbawCoarsenAcceptedPrefixComputeComputeGain
+                << " accepted_prefix_top_root_boundary_gain="
+                << materializePerf.cbawCoarsenAcceptedPrefixTopRootBoundaryGain
+                << " top_root_guard_demoted="
+                << materializePerf.cbawCoarsenTopRootRegressionGuardDemoted
+                << " top_root_guard_risk_accepted="
+                << materializePerf.cbawCoarsenTopRootRegressionRiskAccepted
                 << " generated_by_kind="
                 << formatPerfCounts(materializePerf.cbawCoarsenGeneratedByKind)
                 << " dedup_selected_by_kind="
@@ -15879,6 +16589,28 @@ namespace wolvrix::lib::transform
                     " reject_cycle=" +
                     std::to_string(materializePerf.cbawCoarsenRejectedCycle) +
                     " stale=" + std::to_string(materializePerf.cbawCoarsenStale) +
+                    " top_root_roi_values=" +
+                    std::to_string(materializePerf.cbawCoarsenTopRootRoiValues) +
+                    " top_root_roi_candidates=" +
+                    std::to_string(materializePerf.cbawCoarsenTopRootRoiCandidates) +
+                    " high_density_roi_buckets=" +
+                    std::to_string(materializePerf.cbawCoarsenHighDensityRoiBuckets) +
+                    " high_density_roi_candidates=" +
+                    std::to_string(materializePerf.cbawCoarsenHighDensityRoiCandidates) +
+                    " roi_budget_skipped=" +
+                    std::to_string(materializePerf.cbawCoarsenRoiBudgetSkipped) +
+                    " accepted_prefix_boundary_gain=" +
+                    std::to_string(materializePerf.cbawCoarsenAcceptedPrefixBoundaryGain) +
+                    " accepted_prefix_dag_gain=" +
+                    std::to_string(materializePerf.cbawCoarsenAcceptedPrefixDagGain) +
+                    " accepted_prefix_compute_compute_gain=" +
+                    std::to_string(materializePerf.cbawCoarsenAcceptedPrefixComputeComputeGain) +
+                    " accepted_prefix_top_root_boundary_gain=" +
+                    std::to_string(materializePerf.cbawCoarsenAcceptedPrefixTopRootBoundaryGain) +
+                    " top_root_guard_demoted=" +
+                    std::to_string(materializePerf.cbawCoarsenTopRootRegressionGuardDemoted) +
+                    " top_root_guard_risk_accepted=" +
+                    std::to_string(materializePerf.cbawCoarsenTopRootRegressionRiskAccepted) +
                     " clusters_before=" +
                     std::to_string(materializePerf.clustersBeforeCoarsen) +
                     " clusters_after=" +
@@ -16099,6 +16831,28 @@ namespace wolvrix::lib::transform
                 std::to_string(materializePerf.cbawCoarsenRejectedResource) +
                 " cbaw_reject_cycle=" + std::to_string(materializePerf.cbawCoarsenRejectedCycle) +
                 " cbaw_stale=" + std::to_string(materializePerf.cbawCoarsenStale) +
+                " cbaw_top_root_roi_values=" +
+                std::to_string(materializePerf.cbawCoarsenTopRootRoiValues) +
+                " cbaw_top_root_roi_candidates=" +
+                std::to_string(materializePerf.cbawCoarsenTopRootRoiCandidates) +
+                " cbaw_high_density_roi_buckets=" +
+                std::to_string(materializePerf.cbawCoarsenHighDensityRoiBuckets) +
+                " cbaw_high_density_roi_candidates=" +
+                std::to_string(materializePerf.cbawCoarsenHighDensityRoiCandidates) +
+                " cbaw_roi_budget_skipped=" +
+                std::to_string(materializePerf.cbawCoarsenRoiBudgetSkipped) +
+                " cbaw_accepted_prefix_boundary_gain=" +
+                std::to_string(materializePerf.cbawCoarsenAcceptedPrefixBoundaryGain) +
+                " cbaw_accepted_prefix_dag_gain=" +
+                std::to_string(materializePerf.cbawCoarsenAcceptedPrefixDagGain) +
+                " cbaw_accepted_prefix_compute_compute_gain=" +
+                std::to_string(materializePerf.cbawCoarsenAcceptedPrefixComputeComputeGain) +
+                " cbaw_accepted_prefix_top_root_boundary_gain=" +
+                std::to_string(materializePerf.cbawCoarsenAcceptedPrefixTopRootBoundaryGain) +
+                " cbaw_top_root_guard_demoted=" +
+                std::to_string(materializePerf.cbawCoarsenTopRootRegressionGuardDemoted) +
+                " cbaw_top_root_guard_risk_accepted=" +
+                std::to_string(materializePerf.cbawCoarsenTopRootRegressionRiskAccepted) +
                 " cbaw_eval_ms=" + std::to_string(materializePerf.cbawCoarsenEvaluateMs) +
                 " cbaw_topo_ms=" + std::to_string(materializePerf.cbawCoarsenTopoMs) +
                 " cbaw_generated_by_kind=" +
@@ -16213,6 +16967,14 @@ namespace wolvrix::lib::transform
                 " boundary_def_out_of_range=" +
                 std::to_string(rewrite.stats.computeNodeBoundaryInputDefOutOfRange) +
                 " boundary_declared=" + std::to_string(rewrite.stats.computeNodeBoundaryInputDeclared) +
+                " declared_boundary_values=" +
+                std::to_string(rewrite.stats.computeNodeBoundaryDeclaredValues) +
+                " declared_boundary_edges=" +
+                std::to_string(rewrite.stats.computeNodeBoundaryDeclaredEdges) +
+                " declared_cut_fixed=" +
+                std::to_string(rewrite.stats.computeNodeDeclaredCutViolationsFixed) +
+                " declared_cut_fatal=" +
+                std::to_string(rewrite.stats.computeNodeDeclaredCutViolationsFatal) +
                 " boundary_source_spill=" +
                 std::to_string(rewrite.stats.computeNodeBoundaryInputSourceSpill) +
                 " boundary_unsupported=" +

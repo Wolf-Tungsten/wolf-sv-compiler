@@ -1163,6 +1163,32 @@ namespace wolvrix::lib::transform
                         return nullptr;
                     }
                 }
+                else if (arg == "-declared-value-compute-node-boundary")
+                {
+                    if (!parseBoolArg("-declared-value-compute-node-boundary",
+                                      options.declaredValueComputeNodeBoundary))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-declared-value-compute-node-boundary="))
+                {
+                    const std::string_view text =
+                        arg.substr(std::string_view("-declared-value-compute-node-boundary=").size());
+                    if (text == "true" || text == "1" || text == "on")
+                    {
+                        options.declaredValueComputeNodeBoundary = true;
+                    }
+                    else if (text == "false" || text == "0" || text == "off")
+                    {
+                        options.declaredValueComputeNodeBoundary = false;
+                    }
+                    else
+                    {
+                        error = "invalid -declared-value-compute-node-boundary value";
+                        return nullptr;
+                    }
+                }
                 else if (arg == "-split-oversize-compute-node-max-ops")
                 {
                     if (!parseSizeArg("-split-oversize-compute-node-max-ops",
@@ -1314,6 +1340,13 @@ namespace wolvrix::lib::transform
                 else if (arg == "-fm-refine-max-rounds")
                 {
                     if (!parseSizeArg("-fm-refine-max-rounds", options.fmRefineMaxRounds))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-cbaw-coarsen-max-iterations")
+                {
+                    if (!parseSizeArg("-cbaw-coarsen-max-iterations", options.cbawCoarsenMaxIterations))
                     {
                         return nullptr;
                     }

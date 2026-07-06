@@ -42,6 +42,7 @@ namespace wolvrix::lib::transform
         bool enableLocalSharedCompute = false;
         bool commitGuardEventBuckets = true;
         bool splitOversizeComputeNodes = false;
+        bool declaredValueComputeNodeBoundary = false;
         std::string costModel = "edge-cut";
         // NO0207 概率驱动划分（框架；算法尚未实现）。默认 "plain" 与现状逐字节一致。
         // 以下数值均为占位默认，实现 Phase A–G 时由参数扫描标定，现阶段不参与划分决策。
@@ -53,6 +54,7 @@ namespace wolvrix::lib::transform
         double cBpMiss = 8.0;                  // 分支预测失误惩罚（相对 C_check_fast）
         std::size_t footprintMaxBytes = 32 * 1024; // F_max：宿主 x86 L1D 容量假设
         std::size_t fmRefineMaxRounds = 4;     // FM 边界精修轮数
+        std::size_t cbawCoarsenMaxIterations = 8; // CBAW exact-delta coarsen 最大轮数
         bool probDpCost = false;               // prob 路径下 DP 是否使用概率加权 boundary cost（实验项）
         std::string probDpCostMode = "mixed-pi"; // "pi" | "mixed-pi" | "change" | "mixed-change"
         double probDpAlpha = 1.0;              // mixed-* cost 中概率/变化权重项系数
@@ -129,6 +131,10 @@ namespace wolvrix::lib::transform
         std::size_t computeNodeBoundaryInputNoDef = 0;
         std::size_t computeNodeBoundaryInputDefOutOfRange = 0;
         std::size_t computeNodeBoundaryInputDeclared = 0;
+        std::size_t computeNodeBoundaryDeclaredValues = 0;
+        std::size_t computeNodeBoundaryDeclaredEdges = 0;
+        std::size_t computeNodeDeclaredCutViolationsFixed = 0;
+        std::size_t computeNodeDeclaredCutViolationsFatal = 0;
         std::size_t computeNodeBoundaryInputSourceSpill = 0;
         std::size_t computeNodeBoundaryInputUnsupported = 0;
         std::size_t computeNodeBoundaryInputExistingOwner = 0;

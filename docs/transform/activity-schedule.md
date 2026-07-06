@@ -40,6 +40,7 @@
 | `-path` | 无 | 目标 graph / 实例路径，必填 |
 | `-max-op-in-compute-supernode` | `128` | compute-node cluster coarsen 和连续 DP 分段的 op 数上限；它不是 emit 文件大小上限 |
 | `-max-op-in-commit-supernode` | `4096` | 单个 `commitSupernode` 最多包含的 sink op 数 |
+| `-declared-value-compute-node-boundary` | `false` | 开启后，compute node builder 把带 declared symbol 的 value 作为 seed 截断边界，不从 consumer 反向跨过该 value 吸收 producer |
 | `-export-compute-dag` | 无 | 将 compute op DAG 导出为 `topo-graph-partition-harness` 使用的 `wolvrix.compute-op-dag.v1` JSON |
 
 ### Compute DAG 导出

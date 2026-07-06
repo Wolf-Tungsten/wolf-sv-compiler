@@ -620,6 +620,7 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
         ("enable_chain_merge", "-enable-chain-merge"),
         ("commit_guard_event_buckets", "-commit-guard-event-buckets"),
         ("split_oversize_compute_nodes", "-split-oversize-compute-nodes"),
+        ("declared_value_compute_node_boundary", "-declared-value-compute-node-boundary"),
     ]
 
     for key, arg in string_options:
