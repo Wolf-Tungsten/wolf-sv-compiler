@@ -43,26 +43,7 @@ namespace wolvrix::lib::transform
         bool commitGuardEventBuckets = true;
         bool splitOversizeComputeNodes = false;
         bool declaredValueComputeNodeBoundary = false;
-        std::string costModel = "edge-cut";
-        // NO0207 概率驱动划分（框架；算法尚未实现）。默认 "plain" 与现状逐字节一致。
-        // 以下数值均为占位默认，实现 Phase A–G 时由参数扫描标定，现阶段不参与划分决策。
-        std::string partitionPolicy = "plain"; // "plain" | "prob" | "cbaw"
-        double piDataInput = 0.1;              // 数据 InputPort 静态变化概率先验
-        double piRegRead = 0.2;                // RegisterRead 静态变化概率先验
-        double piHighThreshold = 0.9;          // 高活跃节点阈值
-        double phiMin = 0.6;                   // 内聚度下限
-        double cBpMiss = 8.0;                  // 分支预测失误惩罚（相对 C_check_fast）
-        std::size_t footprintMaxBytes = 32 * 1024; // F_max：宿主 x86 L1D 容量假设
-        std::size_t fmRefineMaxRounds = 4;     // FM 边界精修轮数
-        std::size_t cbawCoarsenMaxIterations = 8; // CBAW exact-delta coarsen 最大轮数
-        bool probDpCost = false;               // prob 路径下 DP 是否使用概率加权 boundary cost（实验项）
-        std::string probDpCostMode = "mixed-pi"; // "pi" | "mixed-pi" | "change" | "mixed-change"
-        double probDpAlpha = 1.0;              // mixed-* cost 中概率/变化权重项系数
-        double probDpSegmentPenalty = 1.25;    // probDpCost=true 时 DP 每段固定惩罚
         std::string exportComputeDagPath;
-        std::size_t cbawPlainBoundaryBaseline = 0;
-        std::size_t cbawPlainDagBaseline = 0;
-        std::size_t cbawPlainComputeComputeBaseline = 0;
     };
 
     struct ActivityScheduleSymbolIdHash
@@ -85,7 +66,6 @@ namespace wolvrix::lib::transform
     struct ActivityScheduleSummaryStats
     {
         using KindCountMap = std::map<std::string, std::size_t>;
-        using KindDoubleMap = std::map<std::string, double>;
 
         std::size_t supernodes = 0;
         std::size_t computeSupernodes = 0;
@@ -105,14 +85,6 @@ namespace wolvrix::lib::transform
         std::size_t otherComputeMultiTargetActivationEdges = 0;
         std::size_t otherComputeUniqueSupernodePairs = 0;
         std::size_t otherComputeDuplicateActivationEdges = 0;
-        double boundaryValuePiSum = 0.0;
-        double boundaryEdgePiSum = 0.0;
-        double computeComputeEdgePiSum = 0.0;
-        double computeCommitEdgePiSum = 0.0;
-        double boundaryValueChangeWeightSum = 0.0;
-        double boundaryEdgeChangeWeightSum = 0.0;
-        double computeComputeEdgeChangeWeightSum = 0.0;
-        double computeCommitEdgeChangeWeightSum = 0.0;
         std::size_t computeNodes = 0;
         std::size_t computeNodeOpsTotal = 0;
         std::size_t computeNodeCycleSplitIters = 0;
@@ -151,233 +123,9 @@ namespace wolvrix::lib::transform
         std::size_t graphValues = 0;
         KindCountMap activationEdgesBySourceKind;
         KindCountMap activationSourceValuesBySourceKind;
-        KindDoubleMap activationEdgePiBySourceKind;
-        KindDoubleMap activationEdgeChangeWeightBySourceKind;
         KindCountMap computeNodeBoundaryExistingCommonOwnerByKind;
         KindCountMap computeNodeBoundaryExistingCommonOwnerByWidthBucket;
         KindCountMap computeNodeBoundaryExistingCommonOwnerByFanoutBucket;
-    };
-
-    struct ActivityScheduleCbawStats
-    {
-        using KindCountMap = std::map<std::string, std::size_t>;
-
-        struct TopRoot
-        {
-            std::size_t valueIndex = 0;
-            std::size_t targetCount = 0;
-            std::size_t computeTargetCount = 0;
-            std::size_t commitTargetCount = 0;
-            std::size_t consumerUseCount = 0;
-            std::uint64_t valueBytes = 0;
-            std::string sourceKind;
-        };
-
-        struct TopRootStageReport
-        {
-            std::size_t valueIndex = 0;
-            std::string rankReasons;
-            std::string definingOpKind;
-            std::string sourceKind;
-            std::size_t valueWidth = 0;
-            std::string widthBucket;
-            std::string fanoutBucket;
-            std::string sharedSourceBucket;
-            std::uint64_t valueBytes = 0;
-            uint32_t producerAtomId = std::numeric_limits<uint32_t>::max();
-            uint32_t producerComputeNodeId = std::numeric_limits<uint32_t>::max();
-            uint32_t producerSupernodeId = std::numeric_limits<uint32_t>::max();
-            std::string semanticTags;
-            std::size_t afterP5TargetCount = 0;
-            std::size_t afterP5ComputeTargetCount = 0;
-            std::size_t afterP5CommitTargetCount = 0;
-            uint32_t afterP5SourceCluster = std::numeric_limits<uint32_t>::max();
-            uint32_t afterP5SourceSegment = std::numeric_limits<uint32_t>::max();
-            std::size_t afterP5TargetSegmentCount = 0;
-            std::size_t afterDpTargetCount = 0;
-            std::size_t afterDpComputeTargetCount = 0;
-            std::size_t afterDpCommitTargetCount = 0;
-            uint32_t afterDpSourceCluster = std::numeric_limits<uint32_t>::max();
-            uint32_t afterDpSourceSegment = std::numeric_limits<uint32_t>::max();
-            std::size_t afterDpTargetSegmentCount = 0;
-            std::size_t afterFmTargetCount = 0;
-            std::size_t afterFmComputeTargetCount = 0;
-            std::size_t afterFmCommitTargetCount = 0;
-            uint32_t afterFmSourceCluster = std::numeric_limits<uint32_t>::max();
-            uint32_t afterFmSourceSegment = std::numeric_limits<uint32_t>::max();
-            std::size_t afterFmTargetSegmentCount = 0;
-            std::size_t finalTargetCount = 0;
-            std::size_t finalComputeTargetCount = 0;
-            std::size_t finalCommitTargetCount = 0;
-            std::int64_t deltaP5ToDp = 0;
-            std::int64_t deltaDpToFm = 0;
-            std::int64_t finalReplayDelta = 0;
-            std::size_t dpToFmRepair = 0;
-            std::size_t computeNodeOpCount = 0;
-            std::size_t sourceCloneCount = 0;
-            std::size_t computeLikeOpCount = 0;
-            std::size_t computeUserCount = 0;
-            std::size_t externalTargetCount = 0;
-            std::size_t splitAtomCount = 0;
-            std::size_t splitSegmentCount = 0;
-            bool highFanoutBucket = false;
-            bool sharedSourceBucketHit = false;
-        };
-
-        struct TopRootStageDelta
-        {
-            std::string transition;
-            std::int64_t boundaryTargetDelta = 0;
-            std::int64_t computeTargetDelta = 0;
-        };
-
-        std::size_t valueUseGroups = 0;
-        std::size_t crossBoundaryTargetCount = 0;
-        std::size_t supernodeDependencyEdgeCount = 0;
-        std::size_t computeMaterializedValueTargetCount = 0;
-        std::size_t computeCommitValueTargetCount = 0;
-        std::uint64_t crossBoundaryValueBytes = 0;
-        std::size_t crossBoundaryConsumerUseCount = 0;
-        std::size_t sourceCloneCanonicalizedGroups = 0;
-        std::size_t cloneWidthMismatchGroups = 0;
-        std::size_t canonicalValueUseGroups = 0;
-        std::size_t canonicalCrossBoundaryTargetCount = 0;
-        std::size_t canonicalSupernodeDependencyEdgeCount = 0;
-        std::size_t canonicalComputeMaterializedValueTargetCount = 0;
-        std::size_t canonicalComputeCommitValueTargetCount = 0;
-        std::size_t canonicalCrossBoundaryConsumerUseCount = 0;
-        std::size_t canonicalBoundaryActivationDelta = 0;
-        std::size_t canonicalDagEdgeDelta = 0;
-        std::size_t canonicalComputeComputeDelta = 0;
-        std::size_t quotientDagCycleDetected = 0;
-        std::size_t replayBoundaryActivationDelta = 0;
-        std::size_t replayDagEdgeDelta = 0;
-        std::size_t replayComputeComputeDelta = 0;
-        std::size_t computeSupernodes = 0;
-        std::size_t computeSupernodeOpCountP50 = 0;
-        std::size_t computeSupernodeOpCountP90 = 0;
-        std::size_t computeSupernodeOpCountP99 = 0;
-        std::size_t computeSupernodeOpCountP995 = 0;
-        std::size_t computeSupernodeOpCountMax = 0;
-        std::size_t resourceOpCountCap = 0;
-        std::size_t resourceOpCountBaselineExceptions = 0;
-        std::size_t triggerSignatureBits = 0;
-        std::size_t triggerSignatureHashFunctions = 0;
-        std::size_t triggerSaturationThresholdBits = 0;
-        std::size_t triggerVolatileSourceValues = 0;
-        std::size_t triggerComputeSupernodesWithTrigger = 0;
-        std::size_t triggerEmptyComputeSupernodes = 0;
-        std::size_t triggerSignaturePopcountP50 = 0;
-        std::size_t triggerSignaturePopcountP90 = 0;
-        std::size_t triggerSignaturePopcountP99 = 0;
-        std::size_t triggerSignaturePopcountP995 = 0;
-        std::size_t triggerSignaturePopcountMax = 0;
-        std::size_t triggerEstimatedCountP50 = 0;
-        std::size_t triggerEstimatedCountP90 = 0;
-        std::size_t triggerEstimatedCountP99 = 0;
-        std::size_t triggerEstimatedCountP995 = 0;
-        std::size_t triggerEstimatedCountMax = 0;
-        std::size_t triggerSignatureSaturatedComputeSupernodes = 0;
-        std::size_t triggerSignatureSaturatedRatioPpm = 0;
-        std::size_t triggerEqualBucketCount = 0;
-        std::size_t triggerEqualBucketMultiCount = 0;
-        std::size_t triggerEqualBucketCoveredSupernodes = 0;
-        std::size_t triggerEqualBucketCoveredSupernodeRatioPpm = 0;
-        std::size_t triggerEqualBucketLargest = 0;
-        std::size_t triggerNonEmptyEqualBucketCount = 0;
-        std::size_t triggerNonEmptyEqualBucketMultiCount = 0;
-        std::size_t triggerNonEmptyEqualBucketCoveredSupernodes = 0;
-        std::size_t triggerNonEmptyEqualBucketCoveredSupernodeRatioPpm = 0;
-        std::size_t triggerNonEmptyEqualBucketLargest = 0;
-        std::size_t triggerEqualBucketInternalizableBoundaryTargets = 0;
-        std::size_t triggerNonEmptyEqualBucketInternalizableBoundaryTargets = 0;
-        std::size_t triggerEqualBucketInternalizableComputeTargets = 0;
-        std::size_t triggerNonEmptyEqualBucketInternalizableComputeTargets = 0;
-        std::size_t triggerEqualBucketInternalizableDependencyEdges = 0;
-        std::size_t triggerNonEmptyEqualBucketInternalizableDependencyEdges = 0;
-        std::size_t triggerAteEqualMergeRecommended = 0;
-        std::size_t semanticSeedGroups = 0;
-        std::size_t semanticMergeHintGroups = 0;
-        std::size_t semanticDebugLabels = 0;
-        std::size_t semanticRtmIntentGroups = 0;
-        std::size_t semanticRtmIntentOps = 0;
-        std::size_t semanticMffcGroups = 0;
-        std::size_t semanticMffcCoveredOps = 0;
-        std::size_t semanticMffcSplitGroups = 0;
-        std::size_t semanticPlainOut1Hints = 0;
-        std::size_t semanticPlainIn1Hints = 0;
-        std::size_t semanticPlainSiblingGroups = 0;
-        std::size_t semanticPlainSiblingMembers = 0;
-        std::size_t semanticAggregateFamilies = 0;
-        std::size_t semanticAggregateSeedGroups = 0;
-        std::size_t semanticAggregateMergeHintGroups = 0;
-        std::size_t semanticGuardDomains = 0;
-        std::size_t semanticGuardDomainMembers = 0;
-        std::size_t semanticGuardUnknownOps = 0;
-        std::size_t semanticSinkConeLabels = 0;
-        std::size_t semanticSinkConeMembers = 0;
-        std::size_t semanticSinkConeMultiSinkOps = 0;
-        std::size_t semanticPassthroughChains = 0;
-        std::size_t semanticPassthroughOps = 0;
-        std::size_t semanticHierarchyDebugLabels = 0;
-        std::size_t semanticTopRootAttributedCount = 0;
-        std::size_t semanticTopRootRtmCount = 0;
-        std::size_t semanticTopRootAggregateCount = 0;
-        std::size_t semanticTopRootGuardCount = 0;
-        std::size_t semanticTopRootSinkCount = 0;
-        std::size_t semanticTopRootPassthroughCount = 0;
-        std::size_t cbawAtomCount = 0;
-        std::size_t cbawAtomOpCountP50 = 0;
-        std::size_t cbawAtomOpCountP90 = 0;
-        std::size_t cbawAtomOpCountP99 = 0;
-        std::size_t cbawAtomOpCountP995 = 0;
-        std::size_t cbawAtomOpCountMax = 0;
-        std::size_t cbawAtomQuotientEdges = 0;
-        std::size_t cbawAtomQuotientCycleDetected = 0;
-        std::size_t cbawAtomResourceOpCountCap = 0;
-        std::size_t cbawAtomResourceOpCountBaselineExceptions = 0;
-        std::size_t cbawAtomRtmIntentAtoms = 0;
-        std::size_t cbawAtomMffcAtoms = 0;
-        std::size_t cbawAtomPassthroughAtoms = 0;
-        std::size_t cbawAtomAggregateAtoms = 0;
-        std::size_t cbawAtomGuardAtoms = 0;
-        std::size_t cbawAtomPlainReplaySupernodes = 0;
-        std::size_t cbawAtomPlainReplayCrossBoundaryTargetCount = 0;
-        std::size_t cbawAtomPlainReplaySupernodeDependencyEdgeCount = 0;
-        std::size_t cbawAtomPlainReplayComputeMaterializedValueTargetCount = 0;
-        std::size_t cbawAtomPlainReplayBoundaryDelta = 0;
-        std::size_t cbawAtomPlainReplayDagDelta = 0;
-        std::size_t cbawAtomPlainReplayComputeComputeDelta = 0;
-        std::size_t cbawTopRootReportLimit = 0;
-        std::size_t cbawTopRootAfterDpTotalTargets = 0;
-        std::size_t cbawTopRootAfterDpReportedTargets = 0;
-        std::size_t cbawTopRootAfterDpCoveragePpm = 0;
-        std::string triggerAteNoGoReason;
-        KindCountMap targetKindMatrix;
-        KindCountMap sourceKindMatrix;
-        KindCountMap sourceTargetKindMatrix;
-        KindCountMap resourceP50;
-        KindCountMap resourceP90;
-        KindCountMap resourceP99;
-        KindCountMap resourceP995;
-        KindCountMap resourceMax;
-        KindCountMap resourceCap;
-        KindCountMap resourceBaselineExceptions;
-        KindCountMap semanticRuleSeedGroups;
-        KindCountMap semanticRuleMergeHintGroups;
-        KindCountMap semanticRuleDebugLabels;
-        KindCountMap semanticTopRootAttribution;
-        KindCountMap cbawAtomResourceP50;
-        KindCountMap cbawAtomResourceP90;
-        KindCountMap cbawAtomResourceP99;
-        KindCountMap cbawAtomResourceP995;
-        KindCountMap cbawAtomResourceMax;
-        KindCountMap cbawAtomResourceCap;
-        KindCountMap cbawAtomResourceBaselineExceptions;
-        KindCountMap cbawAtomKindCounts;
-        std::vector<TopRoot> topRoots;
-        std::vector<TopRootStageReport> topRootStageReports;
-        std::vector<TopRootStageDelta> topRootStageDeltas;
     };
 
     inline constexpr uint32_t kInvalidActivitySupernodeId = std::numeric_limits<uint32_t>::max();

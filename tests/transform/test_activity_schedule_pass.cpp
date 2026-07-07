@@ -3,7 +3,6 @@
 #include "transform/activity_schedule.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -84,9 +83,6 @@ namespace
         const ActivityScheduleSupernodeKinds *supernodeKinds = nullptr;
         const ActivityScheduleComputeNodesBySupernode *computeNodesBySupernode = nullptr;
         const std::string *summaryStats = nullptr;
-        const std::string *cbawStats = nullptr;
-        const std::string *cbawGateStats = nullptr;
-        const std::string *cbawCoarsenStats = nullptr;
     };
 
     ScheduleView loadSchedule(const SessionStore &session, const std::string &graphName)
@@ -102,9 +98,6 @@ namespace
             getSessionValue<ActivityScheduleSupernodeKinds>(session, prefix + "supernode_kind"),
             getSessionValue<ActivityScheduleComputeNodesBySupernode>(session, prefix + "compute_nodes_by_supernode"),
             getSessionValue<std::string>(session, prefix + "summary_stats"),
-            getSessionValue<std::string>(session, prefix + "cbaw_stats"),
-            getSessionValue<std::string>(session, prefix + "cbaw_gate_stats"),
-            getSessionValue<std::string>(session, prefix + "cbaw_coarsen_stats"),
         };
     }
 
@@ -201,7 +194,7 @@ namespace
             schedule.dag == nullptr || schedule.valueFanout == nullptr ||
             schedule.topoOrder == nullptr || schedule.stateReadSupernodes == nullptr ||
             schedule.supernodeKinds == nullptr || schedule.computeNodesBySupernode == nullptr ||
-            schedule.summaryStats == nullptr || schedule.cbawStats == nullptr)
+            schedule.summaryStats == nullptr)
         {
             return fail("Expected all activity-schedule session outputs to exist");
         }
@@ -408,15 +401,6 @@ int main()
             {
                 return fail("reg-to-mem intent slice missing storage-register activation mapping");
             }
-        }
-        if (parseJsonDoubleField(*schedule.cbawStats, "semantic_rtm_intent_groups") < 1.0 ||
-            parseJsonDoubleField(*schedule.cbawStats, "semantic_aggregate_families") < 1.0 ||
-            schedule.cbawStats->find("\"semantic_rule_seed_groups\"") == std::string::npos ||
-            schedule.cbawStats->find("\"rtm_intent\"") == std::string::npos ||
-            schedule.cbawStats->find("\"aggregate_family\"") == std::string::npos)
-        {
-            return fail("Expected P2 semantic stats to report rtm and aggregate annotations: " +
-                        *schedule.cbawStats);
         }
     }
 
@@ -765,90 +749,6 @@ int main()
         {
             return fail("Expected summary_stats to report two compute->commit value pairs in top case");
         }
-        if (schedule.cbawStats->find("\"cross_boundary_target_count\":2") == std::string::npos)
-        {
-            return fail("Expected cbaw_stats to replay two cross-boundary targets in top case: " +
-                        *schedule.cbawStats);
-        }
-        if (schedule.cbawStats->find("\"supernode_dependency_edge_count\":1") == std::string::npos)
-        {
-            return fail("Expected cbaw_stats to replay one quotient DAG edge in top case");
-        }
-        if (schedule.cbawStats->find("\"compute_materialized_value_target_count\":0") == std::string::npos)
-        {
-            return fail("Expected cbaw_stats to replay zero compute materialized targets in top case");
-        }
-        if (schedule.cbawStats->find("\"compute_commit_value_target_count\":2") == std::string::npos)
-        {
-            return fail("Expected cbaw_stats to replay two commit value targets in top case");
-        }
-        if (schedule.cbawStats->find("\"replay_boundary_activation_delta\":0") == std::string::npos ||
-            schedule.cbawStats->find("\"replay_dag_edge_delta\":0") == std::string::npos ||
-            schedule.cbawStats->find("\"replay_compute_compute_delta\":0") == std::string::npos)
-        {
-            return fail("Expected cbaw_stats replay deltas to be zero in top case");
-        }
-        if (schedule.cbawStats->find("\"target_kind_matrix\":{\"commit\":2}") == std::string::npos)
-        {
-            return fail("Expected cbaw_stats target-kind matrix to report two commit targets");
-        }
-        if (schedule.cbawStats->find("\"compute_supernode_op_count_p995\":") == std::string::npos ||
-            schedule.cbawStats->find("\"resource_op_count_cap\":") == std::string::npos)
-        {
-            return fail("Expected cbaw_stats to include plain op-count resource distribution");
-        }
-        if (schedule.cbawStats->find("\"source_clone_canonicalized_groups\":1") == std::string::npos ||
-            schedule.cbawStats->find("\"clone_width_mismatch_groups\":0") == std::string::npos ||
-            schedule.cbawStats->find("\"canonical_compute_materialized_value_target_count\":1") == std::string::npos ||
-            schedule.cbawStats->find("\"canonical_boundary_activation_delta\":1") == std::string::npos)
-        {
-            return fail("Expected cbaw_stats to report canonical source-clone diagnostics in top case: " +
-                        *schedule.cbawStats);
-        }
-        if (schedule.cbawStats->find("\"resource_cap\":{\"branch_count\":") == std::string::npos ||
-            schedule.cbawStats->find("\"emitted_code_units\":") == std::string::npos ||
-            schedule.cbawStats->find("\"helper_call_count\":") == std::string::npos ||
-            schedule.cbawStats->find("\"live_value_bytes\":") == std::string::npos ||
-            schedule.cbawStats->find("\"op_count\":") == std::string::npos ||
-            schedule.cbawStats->find("\"temporary_bytes\":") == std::string::npos)
-        {
-            return fail("Expected cbaw_stats resource_cap to include all P0 resource components");
-        }
-        if (schedule.cbawStats->find("\"trigger_signature_bits\":256") == std::string::npos ||
-            schedule.cbawStats->find("\"trigger_signature_popcount_p50\":") == std::string::npos ||
-            schedule.cbawStats->find("\"trigger_non_empty_equal_bucket_covered_supernode_ratio_ppm\":") ==
-                std::string::npos ||
-            schedule.cbawStats->find("\"trigger_non_empty_equal_bucket_internalizable_compute_targets\":") ==
-                std::string::npos ||
-            schedule.cbawStats->find("\"trigger_ate_equal_merge_recommended\":") == std::string::npos)
-        {
-            return fail("Expected cbaw_stats to include P1 trigger readonly fields");
-        }
-        if (schedule.cbawStats->find("\"semantic_seed_groups\":") == std::string::npos ||
-            schedule.cbawStats->find("\"semantic_merge_hint_groups\":") == std::string::npos ||
-            schedule.cbawStats->find("\"semantic_rule_debug_labels\"") == std::string::npos ||
-            schedule.cbawStats->find("\"semantic_top_root_attribution\"") == std::string::npos)
-        {
-            return fail("Expected cbaw_stats to include P2 semantic readonly fields");
-        }
-        if (schedule.cbawStats->find("\"cbaw_atom_count\":") == std::string::npos ||
-            schedule.cbawStats->find("\"cbaw_atom_quotient_edges\":") == std::string::npos ||
-            schedule.cbawStats->find("\"cbaw_atom_resource_cap\":{\"branch_count\":") ==
-                std::string::npos ||
-            schedule.cbawStats->find("\"cbaw_atom_kind_counts\"") == std::string::npos)
-        {
-            return fail("Expected cbaw_stats to include P3 atom resource fields");
-        }
-        if (schedule.cbawStats->find("\"cbaw_atom_plain_replay_boundary_delta\":0") ==
-                std::string::npos ||
-            schedule.cbawStats->find("\"cbaw_atom_plain_replay_dag_delta\":0") ==
-                std::string::npos ||
-            schedule.cbawStats->find("\"cbaw_atom_plain_replay_compute_compute_delta\":0") ==
-                std::string::npos)
-        {
-            return fail("Expected P3 atom plain replay deltas to be zero in top case: " +
-                        *schedule.cbawStats);
-        }
         if (schedule.summaryStats->find("\"compute_compute_value_pairs\":0") == std::string::npos)
         {
             return fail("Expected summary_stats to report zero compute->compute value pairs in top case");
@@ -959,10 +859,10 @@ int main()
     }
 
     {
-        currentCase = "cbaw_trigger_equal_chain";
+        currentCase = "plain trigger equal chain";
         wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("cbaw_trigger_equal_chain");
-        design.markAsTop("cbaw_trigger_equal_chain");
+        auto &graph = design.createGraph("plain_trigger_equal_chain");
+        design.markAsTop("plain_trigger_equal_chain");
 
         const auto a = makeValue(graph, "a", 1);
         graph.bindInputPort("a", a);
@@ -984,7 +884,7 @@ int main()
         PassManager manager;
         manager.options().session = &session;
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
-            .path = "cbaw_trigger_equal_chain",
+            .path = "plain_trigger_equal_chain",
             .maxOpInComputeSupernode = 1,
             .maxOpInComputeNode = 1,
             .enableCoarsen = false,
@@ -994,9 +894,9 @@ int main()
         const PassManagerResult runResult = manager.run(design, diags);
         if (!runResult.success || diags.hasError())
         {
-            return fail("Expected cbaw trigger equal chain schedule to succeed");
+            return fail("Expected plain trigger equal chain schedule to succeed");
         }
-        const auto schedule = loadSchedule(session, "cbaw_trigger_equal_chain");
+        const auto schedule = loadSchedule(session, "plain_trigger_equal_chain");
         if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
         {
             return rc;
@@ -1013,38 +913,13 @@ int main()
         {
             return fail("Expected trigger chain to expose one compute->compute value target");
         }
-        if (parseJsonDoubleField(*schedule.cbawStats, "trigger_volatile_source_values") != 1.0 ||
-            parseJsonDoubleField(*schedule.cbawStats,
-                                 "trigger_non_empty_equal_bucket_internalizable_compute_targets") != 1.0 ||
-            parseJsonDoubleField(*schedule.cbawStats,
-                                 "trigger_non_empty_equal_bucket_internalizable_dependency_edges") != 1.0 ||
-            parseJsonDoubleField(*schedule.cbawStats, "trigger_ate_equal_merge_recommended") != 1.0)
-        {
-            return fail("Expected P1 trigger stats to find one equal-trigger compute target: " +
-                        *schedule.cbawStats);
-        }
-        if (parseJsonDoubleField(*schedule.cbawStats, "semantic_plain_out1_hints") < 1.0 ||
-            parseJsonDoubleField(*schedule.cbawStats, "semantic_plain_in1_hints") < 1.0 ||
-            parseJsonDoubleField(*schedule.cbawStats, "semantic_passthrough_ops") < 1.0)
-        {
-            return fail("Expected P2 semantic stats to report plain and passthrough hints: " +
-                        *schedule.cbawStats);
-        }
-        if (parseJsonDoubleField(*schedule.cbawStats, "cbaw_atom_count") < 2.0 ||
-            parseJsonDoubleField(*schedule.cbawStats, "cbaw_atom_passthrough_atoms") < 2.0 ||
-            parseJsonDoubleField(*schedule.cbawStats, "cbaw_atom_quotient_cycle_detected") != 0.0 ||
-            parseJsonDoubleField(*schedule.cbawStats, "cbaw_atom_plain_replay_compute_compute_delta") != 0.0)
-        {
-            return fail("Expected P3 atom stats to preserve the trigger chain replay: " +
-                        *schedule.cbawStats);
-        }
     }
 
     {
-        currentCase = "cbaw_partition_policy_chain";
+        currentCase = "plain coarsen chain";
         wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("cbaw_partition_policy_chain");
-        design.markAsTop("cbaw_partition_policy_chain");
+        auto &graph = design.createGraph("plain_coarsen_chain");
+        design.markAsTop("plain_coarsen_chain");
 
         const auto a = makeValue(graph, "a", 1);
         graph.bindInputPort("a", a);
@@ -1066,20 +941,19 @@ int main()
         PassManager manager;
         manager.options().session = &session;
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
-            .path = "cbaw_partition_policy_chain",
+            .path = "plain_coarsen_chain",
             .maxOpInComputeSupernode = 2,
             .maxOpInComputeNode = 1,
             .enableCoarsen = true,
-            .partitionPolicy = "cbaw",
         }));
 
         PassDiagnostics diags;
         const PassManagerResult runResult = manager.run(design, diags);
         if (!runResult.success || diags.hasError())
         {
-            return fail("Expected cbaw partition policy chain schedule to succeed");
+            return fail("Expected plain coarsen chain schedule to succeed");
         }
-        const auto schedule = loadSchedule(session, "cbaw_partition_policy_chain");
+        const auto schedule = loadSchedule(session, "plain_coarsen_chain");
         if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
         {
             return rc;
@@ -1089,119 +963,15 @@ int main()
         if (firstSupernode == kInvalidActivitySupernodeId ||
             firstSupernode != secondSupernode)
         {
-            return fail("Expected CBAW policy to merge the direct chain into one compute supernode");
-        }
-        if (parseJsonDoubleField(*schedule.cbawStats, "quotient_dag_cycle_detected") != 0.0 ||
-            parseJsonDoubleField(*schedule.cbawStats, "replay_boundary_activation_delta") != 0.0 ||
-            parseJsonDoubleField(*schedule.cbawStats, "replay_dag_edge_delta") != 0.0 ||
-            parseJsonDoubleField(*schedule.cbawStats, "replay_compute_compute_delta") != 0.0)
-        {
-            return fail("Expected CBAW policy replay to remain aligned on chain case: " +
-                        *schedule.cbawStats);
-        }
-        if (schedule.cbawGateStats == nullptr ||
-            schedule.cbawGateStats->find("runtime_allowed=1") == std::string::npos ||
-            schedule.cbawGateStats->find("reason=pass") == std::string::npos)
-        {
-            return fail("Expected CBAW structure gate to pass on the chain case");
-        }
-        if (schedule.cbawCoarsenStats == nullptr ||
-            schedule.cbawCoarsenStats->find("accepted=1") == std::string::npos ||
-            schedule.cbawCoarsenStats->find("accepted_by_kind=plain_out1:1") == std::string::npos ||
-            schedule.cbawCoarsenStats->find("accepted_by_tag=") == std::string::npos ||
-            schedule.cbawCoarsenStats->find("mffc_dominance:1") == std::string::npos ||
-            schedule.cbawCoarsenStats->find("passthrough:1") == std::string::npos ||
-            schedule.cbawCoarsenStats->find("dedup_lost_tag_by_kind=") == std::string::npos ||
-            schedule.cbawCoarsenStats->find("selected_reason=exact_delta_semantic_tie:1") ==
-                std::string::npos ||
-            schedule.cbawCoarsenStats->find("after_p5_compute_compute=0") == std::string::npos ||
-            schedule.cbawCoarsenStats->find("after_dp_compute_compute=0") == std::string::npos ||
-            schedule.cbawCoarsenStats->find("after_fm_compute_compute=0") == std::string::npos)
-        {
-            return fail("Expected CBAW chain coarsen stats to expose multi-tag exact-delta accounting: " +
-                        (schedule.cbawCoarsenStats == nullptr ? std::string("<missing>")
-                                                              : *schedule.cbawCoarsenStats));
+            return fail("Expected plain coarsen to merge the direct chain into one compute supernode");
         }
     }
 
     {
-        currentCase = "cbaw_top_root_stage_report";
+        currentCase = "plain sibling coarsen";
         wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("cbaw_top_root_stage_report");
-        design.markAsTop("cbaw_top_root_stage_report");
-
-        const auto a = makeValue(graph, "top_root_a", 8);
-        const auto b = makeValue(graph, "top_root_b", 8);
-        graph.bindInputPort("a", a);
-        graph.bindInputPort("b", b);
-
-        const auto shared = makeValue(graph, "top_root_shared", 8);
-        const auto sharedOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
-                                                    graph.internSymbol("top_root_shared_xor"));
-        graph.addOperand(sharedOp, a);
-        graph.addOperand(sharedOp, b);
-        graph.addResult(sharedOp, shared);
-
-        const auto y = makeValue(graph, "top_root_y", 8);
-        const auto yOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
-                                               graph.internSymbol("top_root_y_assign"));
-        graph.addOperand(yOp, shared);
-        graph.addResult(yOp, y);
-        graph.bindOutputPort("y", y);
-
-        const auto z = makeValue(graph, "top_root_z", 8);
-        const auto zOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
-                                               graph.internSymbol("top_root_z_assign"));
-        graph.addOperand(zOp, shared);
-        graph.addResult(zOp, z);
-        graph.bindOutputPort("z", z);
-
-        SessionStore session;
-        PassManager manager;
-        manager.options().session = &session;
-        ActivityScheduleOptions options;
-        options.path = "cbaw_top_root_stage_report";
-        options.partitionPolicy = "cbaw";
-        options.enableCoarsen = false;
-        options.fmRefineMaxRounds = 0;
-        options.maxOpInComputeNode = 1;
-        options.maxOpInComputeSupernode = 1;
-        manager.addPass(std::make_unique<ActivitySchedulePass>(options));
-
-        PassDiagnostics diags;
-        const PassManagerResult runResult = manager.run(design, diags);
-        if (!runResult.success || diags.hasError())
-        {
-            return fail("Expected CBAW top-root stage report schedule to succeed");
-        }
-        const auto schedule = loadSchedule(session, "cbaw_top_root_stage_report");
-        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
-        {
-            return rc;
-        }
-        if (schedule.cbawStats == nullptr ||
-            schedule.cbawStats->find("\"cbaw_top_root_stage_reports\":[{") == std::string::npos ||
-            schedule.cbawStats->find("\"cbaw_top_root_after_dp_total_targets\":2") ==
-                std::string::npos ||
-            schedule.cbawStats->find("\"after_dp_target_count\":2") == std::string::npos ||
-            schedule.cbawStats->find("\"after_fm_target_count\":2") == std::string::npos ||
-            schedule.cbawStats->find("\"final_compute_target_count\":2") == std::string::npos ||
-            schedule.cbawStats->find("\"fanout_bucket\":\"2-4\"") == std::string::npos ||
-            schedule.cbawStats->find("\"semantic_tags\":\"mffc\"") == std::string::npos ||
-            schedule.cbawStats->find("\"transition\":\"after_dp_to_after_fm\"") ==
-                std::string::npos)
-        {
-            return fail("Expected CBAW stats to include Phase-B top-root stage diagnostics: " +
-                        (schedule.cbawStats == nullptr ? std::string("<missing>")
-                                                       : *schedule.cbawStats));
-        }
-    }
-
-    {
-        currentCase = "cbaw_sibling_exact_delta";
-        wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("cbaw_sibling_exact_delta");
-        design.markAsTop("cbaw_sibling_exact_delta");
+        auto &graph = design.createGraph("plain_sibling_coarsen");
+        design.markAsTop("plain_sibling_coarsen");
 
         const auto a = makeValue(graph, "a", 1);
         graph.bindInputPort("a", a);
@@ -1233,20 +1003,20 @@ int main()
         PassManager manager;
         manager.options().session = &session;
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
-            .path = "cbaw_sibling_exact_delta",
+            .path = "plain_sibling_coarsen",
             .maxOpInComputeSupernode = 2,
             .maxOpInComputeNode = 1,
             .enableCoarsen = true,
-            .partitionPolicy = "cbaw",
+            .enableChainMerge = false,
         }));
 
         PassDiagnostics diags;
         const PassManagerResult runResult = manager.run(design, diags);
         if (!runResult.success || diags.hasError())
         {
-            return fail("Expected cbaw sibling exact-delta schedule to succeed");
+            return fail("Expected plain sibling coarsen schedule to succeed");
         }
-        const auto schedule = loadSchedule(session, "cbaw_sibling_exact_delta");
+        const auto schedule = loadSchedule(session, "plain_sibling_coarsen");
         if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
         {
             return rc;
@@ -1260,167 +1030,7 @@ int main()
             rootSupernode == leftSupernode ||
             leftSupernode != rightSupernode)
         {
-            return fail("Expected CBAW exact-delta sibling queue to merge sibling consumers only");
-        }
-        if (schedule.cbawCoarsenStats == nullptr ||
-            schedule.cbawCoarsenStats->find("accepted=1") == std::string::npos ||
-            schedule.cbawCoarsenStats->find("accepted_by_kind=plain_siblings:1") ==
-                std::string::npos ||
-            schedule.cbawCoarsenStats->find("accepted_by_tag=plain_siblings:1") ==
-                std::string::npos ||
-            schedule.cbawCoarsenStats->find("after_p5_compute_compute=1") ==
-                std::string::npos)
-        {
-            return fail("Expected CBAW sibling coarsen stats to prove exact-delta sibling merge: " +
-                        (schedule.cbawCoarsenStats == nullptr ? std::string("<missing>")
-                                                              : *schedule.cbawCoarsenStats));
-        }
-    }
-
-    {
-        currentCase = "cbaw_top_root_roi_consumer_pair";
-        wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("cbaw_top_root_roi_consumer_pair");
-        design.markAsTop("cbaw_top_root_roi_consumer_pair");
-
-        const auto a = makeValue(graph, "roi_a", 1);
-        const auto b = makeValue(graph, "roi_b", 1);
-        graph.bindInputPort("a", a);
-        graph.bindInputPort("b", b);
-
-        const auto rootValue = makeValue(graph, "roi_root", 1);
-        const auto root = graph.createOperation(wolvrix::lib::grh::OperationKind::kAnd,
-                                                graph.internSymbol("roi_root_and"));
-        graph.addOperand(root, a);
-        graph.addOperand(root, b);
-        graph.addResult(root, rootValue);
-
-        for (int i = 0; i < 18; ++i)
-        {
-            const auto input = makeValue(graph, "roi_in_" + std::to_string(i), 1);
-            graph.bindInputPort("in_" + std::to_string(i), input);
-
-            const auto extraValue = makeValue(graph, "roi_extra_" + std::to_string(i), 1);
-            const auto extra = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
-                                                     graph.internSymbol("roi_extra_op_" + std::to_string(i)));
-            graph.addOperand(extra, input);
-            graph.addResult(extra, extraValue);
-
-            const auto outValue = makeValue(graph, "roi_out_" + std::to_string(i), 1);
-            const auto consumer = graph.createOperation(wolvrix::lib::grh::OperationKind::kAnd,
-                                                        graph.internSymbol("roi_consumer_" + std::to_string(i)));
-            graph.addOperand(consumer, rootValue);
-            graph.addOperand(consumer, extraValue);
-            graph.addResult(consumer, outValue);
-            graph.bindOutputPort("out_" + std::to_string(i), outValue);
-        }
-
-        SessionStore session;
-        PassManager manager;
-        manager.options().session = &session;
-        manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
-            .path = "cbaw_top_root_roi_consumer_pair",
-            .maxOpInComputeSupernode = 2,
-            .maxOpInComputeNode = 1,
-            .enableCoarsen = true,
-            .partitionPolicy = "cbaw",
-            .fmRefineMaxRounds = 0,
-        }));
-
-        PassDiagnostics diags;
-        const PassManagerResult runResult = manager.run(design, diags);
-        if (!runResult.success || diags.hasError())
-        {
-            return fail("Expected cbaw top-root ROI schedule to succeed");
-        }
-        const auto schedule = loadSchedule(session, "cbaw_top_root_roi_consumer_pair");
-        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
-        {
-            return rc;
-        }
-
-        if (schedule.cbawCoarsenStats == nullptr ||
-            schedule.cbawCoarsenStats->find("top_root_roi_values=") == std::string::npos ||
-            schedule.cbawCoarsenStats->find("top_root_roi_candidates=") == std::string::npos ||
-            schedule.cbawCoarsenStats->find("generated_by_kind=") == std::string::npos ||
-            schedule.cbawCoarsenStats->find("top_root_roi:") == std::string::npos ||
-            schedule.cbawCoarsenStats->find("accepted_prefix_top_root_boundary_gain=") ==
-                std::string::npos)
-        {
-            return fail("Expected CBAW top-root ROI coarsen stats: " +
-                        (schedule.cbawCoarsenStats == nullptr ? std::string("<missing>")
-                                                              : *schedule.cbawCoarsenStats));
-        }
-    }
-
-    {
-        currentCase = "mem_read";
-        wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("cbaw_partition_policy_chain_external_gate");
-        design.markAsTop("cbaw_partition_policy_chain_external_gate");
-
-        const auto a = makeValue(graph, "a", 1);
-        graph.bindInputPort("a", a);
-
-        const auto mid = makeValue(graph, "mid", 1);
-        const auto first = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
-                                                 graph.internSymbol("first_assign"));
-        graph.addOperand(first, a);
-        graph.addResult(first, mid);
-
-        const auto out = makeValue(graph, "out", 1);
-        const auto second = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
-                                                  graph.internSymbol("second_assign"));
-        graph.addOperand(second, mid);
-        graph.addResult(second, out);
-        graph.bindOutputPort("out", out);
-
-        const auto mid2 = makeValue(graph, "mid2", 1);
-        const auto third = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
-                                                 graph.internSymbol("third_assign"));
-        graph.addOperand(third, a);
-        graph.addResult(third, mid2);
-
-        const auto out2 = makeValue(graph, "out2", 1);
-        const auto fourth = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
-                                                  graph.internSymbol("fourth_assign"));
-        graph.addOperand(fourth, mid2);
-        graph.addResult(fourth, out2);
-        graph.bindOutputPort("out2", out2);
-
-        SessionStore session;
-        PassManager manager;
-        manager.options().session = &session;
-        manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
-            .path = "cbaw_partition_policy_chain_external_gate",
-            .maxOpInComputeSupernode = 1,
-            .maxOpInComputeNode = 1,
-            .enableCoarsen = true,
-            .partitionPolicy = "cbaw",
-            .cbawPlainBoundaryBaseline = 1,
-            .cbawPlainDagBaseline = 1,
-            .cbawPlainComputeComputeBaseline = 1,
-        }));
-
-        PassDiagnostics diags;
-        const PassManagerResult runResult = manager.run(design, diags);
-        if (!runResult.success || diags.hasError())
-        {
-            return fail("Expected cbaw external baseline gate schedule to succeed");
-        }
-        const auto schedule = loadSchedule(session, "cbaw_partition_policy_chain_external_gate");
-        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
-        {
-            return rc;
-        }
-        if (schedule.cbawGateStats == nullptr ||
-            schedule.cbawGateStats->find("runtime_allowed=0") == std::string::npos ||
-            schedule.cbawGateStats->find("reason=structure_regression") == std::string::npos ||
-            schedule.cbawGateStats->find("plain_boundary=1") == std::string::npos)
-        {
-            return fail("Expected external CBAW plain baseline to drive structure gate: " +
-                        (schedule.cbawGateStats == nullptr ? std::string("<missing>")
-                                                          : *schedule.cbawGateStats));
+            return fail("Expected plain sibling coarsen to merge sibling consumers only");
         }
     }
 
@@ -1852,77 +1462,6 @@ int main()
     }
 
     {
-        currentCase = "prob_mffc_respects_declared_value_boundary";
-        wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("prob_declared_boundary");
-        design.markAsTop("prob_declared_boundary");
-        using K = wolvrix::lib::grh::OperationKind;
-
-        const auto a = makeValue(graph, "a", 8);
-        const auto b = makeValue(graph, "b", 8);
-        const auto c = makeValue(graph, "c", 8);
-        graph.bindInputPort("a", a);
-        graph.bindInputPort("b", b);
-        graph.bindInputPort("c", c);
-
-        const auto wireSym = graph.internSymbol("declared_wire");
-        graph.addDeclaredSymbol(wireSym);
-        const auto declaredWire = graph.createValue(wireSym, 8, false);
-        const auto producer = graph.createOperation(K::kXor, graph.internSymbol("declared_producer"));
-        graph.addOperand(producer, a);
-        graph.addOperand(producer, b);
-        graph.addResult(producer, declaredWire);
-
-        const auto y = makeValue(graph, "y", 8);
-        const auto consumer = graph.createOperation(K::kXor, graph.internSymbol("declared_consumer"));
-        graph.addOperand(consumer, declaredWire);
-        graph.addOperand(consumer, c);
-        graph.addResult(consumer, y);
-        graph.bindOutputPort("y", y);
-
-        SessionStore session;
-        PassManager manager;
-        manager.options().session = &session;
-        ActivityScheduleOptions options;
-        options.path = "prob_declared_boundary";
-        options.partitionPolicy = "prob";
-        options.maxOpInComputeNode = 8;
-        options.maxOpInComputeSupernode = 1;
-        options.enableCoarsen = false;
-        options.enableChainMerge = false;
-        options.declaredValueComputeNodeBoundary = true;
-        manager.addPass(std::make_unique<ActivitySchedulePass>(options));
-
-        PassDiagnostics diags;
-        const PassManagerResult runResult = manager.run(design, diags);
-        if (!runResult.success || diags.hasError())
-        {
-            return fail("Expected prob declared boundary schedule to succeed");
-        }
-        const auto schedule = loadSchedule(session, "prob_declared_boundary");
-        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
-        {
-            return rc;
-        }
-        const uint32_t producerSupernode = (*schedule.opToSupernode)[producer.index - 1];
-        const uint32_t consumerSupernode = (*schedule.opToSupernode)[consumer.index - 1];
-        if (producerSupernode == kInvalidActivitySupernodeId ||
-            consumerSupernode == kInvalidActivitySupernodeId ||
-            producerSupernode == consumerSupernode)
-        {
-            return fail("Expected prob MFFC merge to preserve declared value boundary");
-        }
-        if (!hasFanoutTo(*schedule.valueFanout, declaredWire, consumerSupernode))
-        {
-            return fail("Expected prob declared value boundary fanout");
-        }
-        if (parseJsonDoubleField(*schedule.summaryStats, "compute_node_boundary_input_declared") != 1.0)
-        {
-            return fail("Expected prob declared boundary stat to be recorded: " + *schedule.summaryStats);
-        }
-    }
-
-    {
         currentCase = "declared_source_clone_boundary";
         wolvrix::lib::grh::Design design;
         auto &graph = design.createGraph("declared_source_clone_boundary");
@@ -2154,7 +1693,7 @@ int main()
         }
         if (!splitReachable)
         {
-            return fail("Expected split chunks from the same MFFC compute node to stay reachable in DAG");
+            return fail("Expected split chunks from the same compute node to stay reachable in DAG");
         }
         for (const auto &supernodeOps : *schedule.supernodeToOps)
         {
@@ -2436,873 +1975,6 @@ int main()
             std::find(commitOps.begin(), commitOps.end(), write2) == commitOps.end())
         {
             return fail("Expected oversized guard bucket supernode to contain exactly the same-guard writes");
-        }
-    }
-
-    {
-        // NO0207 Phase A: static change-probability propagation (-partition-policy=prob).
-        currentCase = "Phase A static probability propagation";
-        wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("pi_top");
-        design.markAsTop("pi_top");
-        using K = wolvrix::lib::grh::OperationKind;
-
-        auto makeRegRead = [&](const std::string &reg)
-            -> std::pair<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::ValueId> {
-            const auto regOp = graph.createOperation(K::kRegister, graph.internSymbol(reg));
-            graph.setAttr(regOp, "width", int64_t{8});
-            graph.setAttr(regOp, "isSigned", false);
-            const auto val = makeValue(graph, reg + "_read", 8);
-            const auto readOp =
-                graph.createOperation(K::kRegisterReadPort, graph.internSymbol(reg + "_read_op"));
-            graph.addResult(readOp, val);
-            graph.setAttr(readOp, "regSymbol", reg);
-            return {readOp, val};
-        };
-
-        const auto [aReadOp, aRead] = makeRegRead("pa");
-        const auto [bReadOp, bRead] = makeRegRead("pb");
-        (void)bReadOp;
-
-        const auto c0Val = makeValue(graph, "pi_c0", 8);
-        const auto c0Op = graph.createOperation(K::kConstant, graph.internSymbol("pi_c0_op"));
-        graph.addResult(c0Op, c0Val);
-        graph.setAttr(c0Op, "constValue", std::string("0"));
-
-        auto makeAssign = [&](const std::string &name, wolvrix::lib::grh::ValueId in) {
-            const auto v = makeValue(graph, name, 8);
-            const auto op = graph.createOperation(K::kAssign, graph.internSymbol(name + "_op"));
-            graph.addOperand(op, in);
-            graph.addResult(op, v);
-            return v;
-        };
-        const auto a1 = makeAssign("pi_a1", aRead);
-        const auto a2 = makeAssign("pi_a2", aRead);
-
-        const auto csVal = makeValue(graph, "pi_cs", 16);
-        const auto concatSame = graph.createOperation(K::kConcat, graph.internSymbol("pi_concat_same"));
-        graph.addOperand(concatSame, a1);
-        graph.addOperand(concatSame, a2);
-        graph.addResult(concatSame, csVal);
-
-        const auto cdVal = makeValue(graph, "pi_cd", 16);
-        const auto concatDiff = graph.createOperation(K::kConcat, graph.internSymbol("pi_concat_diff"));
-        graph.addOperand(concatDiff, aRead);
-        graph.addOperand(concatDiff, bRead);
-        graph.addResult(concatDiff, cdVal);
-
-        const auto mxVal = makeValue(graph, "pi_mx", 8);
-        const auto muxOp = graph.createOperation(K::kMux, graph.internSymbol("pi_mux"));
-        graph.addOperand(muxOp, aRead); // sel
-        graph.addOperand(muxOp, bRead); // a
-        graph.addOperand(muxOp, c0Val); // b
-        graph.addResult(muxOp, mxVal);
-
-        // NO0208 §附录 A: 逻辑掩蔽 vs 透传 —— AND 衰减、XOR 透传
-        const auto andVal = makeValue(graph, "pi_and", 8);
-        const auto andOp = graph.createOperation(K::kAnd, graph.internSymbol("pi_and_op"));
-        graph.addOperand(andOp, aRead);
-        graph.addOperand(andOp, bRead);
-        graph.addResult(andOp, andVal);
-
-        const auto xorVal = makeValue(graph, "pi_xor", 8);
-        const auto xorOp = graph.createOperation(K::kXor, graph.internSymbol("pi_xor_op"));
-        graph.addOperand(xorOp, aRead);
-        graph.addOperand(xorOp, bRead);
-        graph.addResult(xorOp, xorVal);
-
-        graph.bindOutputPort("o_cs", csVal);
-        graph.bindOutputPort("o_cd", cdVal);
-        graph.bindOutputPort("o_mx", mxVal);
-        graph.bindOutputPort("o_and", andVal);
-        graph.bindOutputPort("o_xor", xorVal);
-
-        SessionStore session;
-        PassManager manager;
-        manager.options().session = &session;
-        manager.addPass(std::make_unique<ActivitySchedulePass>(
-            ActivityScheduleOptions{.path = "pi_top", .partitionPolicy = "prob"}));
-
-        PassDiagnostics diags;
-        const PassManagerResult runResult = manager.run(design, diags);
-        if (!runResult.success || diags.hasError())
-        {
-            return fail("Expected activity-schedule (prob) to succeed for pi propagation");
-        }
-
-        const auto *pi = getSessionValue<std::vector<float>>(session, "pi_top.activity_schedule.op_pi");
-        if (pi == nullptr)
-        {
-            return fail("Expected op_pi session value under prob policy");
-        }
-        auto piOf = [&](wolvrix::lib::grh::OperationId op) -> float {
-            return op.index < pi->size() ? (*pi)[op.index] : -1.0F;
-        };
-        auto near = [](float got, float want) { return std::fabs(got - want) < 1e-3F; };
-
-        if (!near(piOf(c0Op), 0.0F))
-        {
-            return fail("Expected constant pi=0");
-        }
-        if (!near(piOf(aReadOp), 0.2F))
-        {
-            return fail("Expected register-read pi=piRegRead(0.2)");
-        }
-        if (!near(piOf(concatSame), 0.2F))
-        {
-            return fail("Expected same-source concat pi=0.2 (source de-correlated)");
-        }
-        if (!near(piOf(concatDiff), 0.36F))
-        {
-            return fail("Expected independent concat pi=0.36 (transparent product-complement)");
-        }
-        if (!near(piOf(andOp), 0.2F))
-        {
-            return fail("Expected AND pi=0.2 (logical-masking attenuation, p1=0.5)");
-        }
-        if (!near(piOf(xorOp), 0.36F))
-        {
-            return fail("Expected XOR pi=0.36 (transparent)");
-        }
-        if (!near(piOf(muxOp), 0.2F))
-        {
-            return fail("Expected mux pi=0.2 (branch mean + 0.5*sel)");
-        }
-    }
-
-    {
-        // NO0207 Phase B: cost uses GRHSIM execution slots, not raw bit width.
-        currentCase = "Phase B activity cost model";
-        wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("cost_top");
-        design.markAsTop("cost_top");
-        using K = wolvrix::lib::grh::OperationKind;
-
-        const auto reg = graph.createOperation(K::kRegister, graph.internSymbol("cost_reg"));
-        graph.setAttr(reg, "width", int64_t{64});
-        graph.setAttr(reg, "isSigned", false);
-
-        auto makeRegRead = [&](const std::string &name, int32_t width)
-            -> std::pair<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::ValueId> {
-            const auto val = makeValue(graph, name + "_read", width);
-            const auto readOp =
-                graph.createOperation(K::kRegisterReadPort, graph.internSymbol(name + "_read_op"));
-            graph.addResult(readOp, val);
-            graph.setAttr(readOp, "regSymbol", std::string("cost_reg"));
-            return {readOp, val};
-        };
-        auto makeConst = [&](const std::string &name, int32_t width)
-            -> std::pair<wolvrix::lib::grh::OperationId, wolvrix::lib::grh::ValueId> {
-            const auto val = makeValue(graph, name + "_const", width);
-            const auto op = graph.createOperation(K::kConstant, graph.internSymbol(name + "_const_op"));
-            graph.addResult(op, val);
-            graph.setAttr(op, "constValue", std::string("0"));
-            return {op, val};
-        };
-        auto makeAssign = [&](const std::string &name, wolvrix::lib::grh::ValueId in, int32_t width) {
-            const auto val = makeValue(graph, name, width);
-            const auto op = graph.createOperation(K::kAssign, graph.internSymbol(name + "_op"));
-            graph.addOperand(op, in);
-            graph.addResult(op, val);
-            graph.bindOutputPort(name, val);
-            return op;
-        };
-
-        const auto [read8Op, read8] = makeRegRead("cost_w8", 8);
-        const auto [const8Op, const8] = makeConst("cost_w8", 8);
-        const auto assign8Op = makeAssign("cost_assign8", read8, 8);
-        (void)const8;
-
-        const auto [read9Op, read9] = makeRegRead("cost_w9", 9);
-        (void)read9Op;
-        const auto assign9Op = makeAssign("cost_assign9", read9, 9);
-
-        const auto [read31Op, read31] = makeRegRead("cost_w31", 31);
-        (void)read31Op;
-        const auto assign31Op = makeAssign("cost_assign31", read31, 31);
-
-        const auto [read64Op, read64] = makeRegRead("cost_w64", 64);
-        (void)read64Op;
-        const auto assign64Op = makeAssign("cost_assign64", read64, 64);
-
-        const auto [read65Op, read65] = makeRegRead("cost_w65", 65);
-        const auto assign65Op = makeAssign("cost_assign65", read65, 65);
-
-        SessionStore session;
-        PassManager manager;
-        manager.options().session = &session;
-        manager.addPass(std::make_unique<ActivitySchedulePass>(
-            ActivityScheduleOptions{.path = "cost_top", .partitionPolicy = "prob"}));
-
-        PassDiagnostics diags;
-        const PassManagerResult runResult = manager.run(design, diags);
-        if (!runResult.success || diags.hasError())
-        {
-            return fail("Expected activity-schedule (prob) to succeed for activity cost model");
-        }
-
-        const auto *weight =
-            getSessionValue<std::vector<double>>(session, "cost_top.activity_schedule.op_compute_weight");
-        const auto *change =
-            getSessionValue<std::vector<double>>(session, "cost_top.activity_schedule.op_change_weight");
-        const auto *footprint =
-            getSessionValue<std::vector<std::uint64_t>>(session, "cost_top.activity_schedule.op_footprint_bytes");
-        const auto *pi = getSessionValue<std::vector<float>>(session, "cost_top.activity_schedule.op_pi");
-        if (weight == nullptr || change == nullptr || footprint == nullptr || pi == nullptr)
-        {
-            return fail("Expected Phase B cost model session values under prob policy");
-        }
-        auto wOf = [&](wolvrix::lib::grh::OperationId op) -> double {
-            return op.index < weight->size() ? (*weight)[op.index] : -1.0;
-        };
-        auto cwOf = [&](wolvrix::lib::grh::OperationId op) -> double {
-            return op.index < change->size() ? (*change)[op.index] : -1.0;
-        };
-        auto fpOf = [&](wolvrix::lib::grh::OperationId op) -> std::uint64_t {
-            return op.index < footprint->size() ? (*footprint)[op.index] : 0;
-        };
-        auto piOf = [&](wolvrix::lib::grh::OperationId op) -> double {
-            return op.index < pi->size() ? static_cast<double>((*pi)[op.index]) : -1.0;
-        };
-        auto nearD = [](double got, double want) { return std::fabs(got - want) < 1e-9; };
-        auto nearDLoose = [](double got, double want) { return std::fabs(got - want) < 1e-6; };
-
-        if (!nearD(wOf(assign8Op), 1.0) ||
-            !nearD(wOf(assign9Op), 1.0) ||
-            !nearD(wOf(assign31Op), 1.0) ||
-            !nearD(wOf(assign64Op), 1.0))
-        {
-            return fail("Expected scalar widths 8/9/31/64 to have one compute unit");
-        }
-        if (!nearD(wOf(assign65Op), 2.0))
-        {
-            return fail("Expected width 65 to round up to two compute units");
-        }
-        if (!nearD(wOf(read8Op), 2.0) || !nearD(wOf(read65Op), 4.0))
-        {
-            return fail("Expected source read cost to use src class multiplier over compute units");
-        }
-        if (!nearD(wOf(const8Op), 0.125))
-        {
-            return fail("Expected constant cost to use lightweight const multiplier");
-        }
-        if (fpOf(assign8Op) != 1 || fpOf(assign9Op) != 2 ||
-            fpOf(assign31Op) != 4 || fpOf(assign64Op) != 8 ||
-            fpOf(assign65Op) != 16)
-        {
-            return fail("Expected footprint bytes to follow GRHSIM storage buckets");
-        }
-        if (!nearDLoose(cwOf(assign8Op), wOf(assign8Op) * piOf(assign8Op)))
-        {
-            return fail("Expected change weight to equal compute weight times propagated pi");
-        }
-    }
-
-    {
-        // NO0207 Phase C: aggregate probability/cost data at computeNode granularity.
-        currentCase = "Phase C activity hypergraph aggregation";
-        wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("hyper_top");
-        design.markAsTop("hyper_top");
-        using K = wolvrix::lib::grh::OperationKind;
-
-        const auto addr = makeValue(graph, "hyper_addr", 8);
-        const auto data = makeValue(graph, "hyper_data", 8);
-        graph.bindInputPort("addr", addr);
-        graph.bindInputPort("data", data);
-
-        const auto memDecl = graph.createOperation(K::kMemory, graph.internSymbol("hyper_mem"));
-        graph.setAttr(memDecl, "width", int64_t{8});
-        graph.setAttr(memDecl, "row", int64_t{4});
-        graph.setAttr(memDecl, "isSigned", false);
-
-        const auto readValue = makeValue(graph, "hyper_read", 8);
-        const auto readOp = graph.createOperation(K::kMemoryReadPort, graph.internSymbol("hyper_read_op"));
-        graph.setAttr(readOp, "memSymbol", std::string("hyper_mem"));
-        graph.addOperand(readOp, addr);
-        graph.addResult(readOp, readValue);
-
-        const auto andValue = makeValue(graph, "hyper_and", 8);
-        const auto andOp = graph.createOperation(K::kAnd, graph.internSymbol("hyper_and_op"));
-        graph.addOperand(andOp, readValue);
-        graph.addOperand(andOp, data);
-        graph.addResult(andOp, andValue);
-
-        const auto xorValue = makeValue(graph, "hyper_xor", 8);
-        const auto xorOp = graph.createOperation(K::kXor, graph.internSymbol("hyper_xor_op"));
-        graph.addOperand(xorOp, andValue);
-        graph.addOperand(xorOp, data);
-        graph.addResult(xorOp, xorValue);
-        graph.bindOutputPort("y", xorValue);
-
-        const auto orValue = makeValue(graph, "hyper_or", 8);
-        const auto orOp = graph.createOperation(K::kOr, graph.internSymbol("hyper_or_op"));
-        graph.addOperand(orOp, andValue);
-        graph.addOperand(orOp, data);
-        graph.addResult(orOp, orValue);
-        graph.bindOutputPort("z", orValue);
-
-        SessionStore session;
-        PassManager manager;
-        manager.options().session = &session;
-        ActivityScheduleOptions options;
-        options.path = "hyper_top";
-        options.partitionPolicy = "prob";
-        options.enableCoarsen = false;
-        options.maxOpInComputeSupernode = 2;
-        manager.addPass(std::make_unique<ActivitySchedulePass>(options));
-
-        PassDiagnostics diags;
-        const PassManagerResult runResult = manager.run(design, diags);
-        if (!runResult.success || diags.hasError())
-        {
-            return fail("Expected activity-schedule (prob) to succeed for Phase C aggregate");
-        }
-
-        const auto *nodeWeight =
-            getSessionValue<std::vector<double>>(session, "hyper_top.activity_schedule.compute_node_weight");
-        const auto *nodeChange =
-            getSessionValue<std::vector<double>>(session, "hyper_top.activity_schedule.compute_node_change_weight");
-        const auto *nodeFootprint = getSessionValue<std::vector<std::uint64_t>>(
-            session,
-            "hyper_top.activity_schedule.compute_node_footprint_bytes");
-        const auto *nodeActive =
-            getSessionValue<std::vector<double>>(session, "hyper_top.activity_schedule.compute_node_active_prob");
-        const auto *nodeOps =
-            getSessionValue<std::vector<uint32_t>>(session, "hyper_top.activity_schedule.compute_node_op_count");
-        const auto *edgeFrom =
-            getSessionValue<std::vector<uint32_t>>(session, "hyper_top.activity_schedule.compute_node_edge_from");
-        const auto *edgeTo =
-            getSessionValue<std::vector<uint32_t>>(session, "hyper_top.activity_schedule.compute_node_edge_to");
-        const auto *edgeCount =
-            getSessionValue<std::vector<std::uint64_t>>(session, "hyper_top.activity_schedule.compute_node_edge_count");
-        const auto *edgeProb =
-            getSessionValue<std::vector<double>>(session, "hyper_top.activity_schedule.compute_node_edge_total_prob");
-        if (nodeWeight == nullptr || nodeChange == nullptr || nodeFootprint == nullptr ||
-            nodeActive == nullptr || nodeOps == nullptr || edgeFrom == nullptr || edgeTo == nullptr ||
-            edgeCount == nullptr || edgeProb == nullptr)
-        {
-            return fail("Expected Phase C computeNode aggregate session values under prob policy");
-        }
-
-        auto nearD = [](double got, double want) { return std::fabs(got - want) < 1e-6; };
-        uint32_t andNode = kInvalidActivitySupernodeId;
-        uint32_t orNode = kInvalidActivitySupernodeId;
-        for (uint32_t i = 0; i < nodeWeight->size(); ++i)
-        {
-            if (i < nodeOps->size() && (*nodeOps)[i] == 3 && nearD((*nodeWeight)[i], 4.0))
-            {
-                andNode = i;
-            }
-            else if (i < nodeOps->size() && (*nodeOps)[i] == 1 && nearD((*nodeWeight)[i], 1.0))
-            {
-                orNode = i;
-            }
-        }
-        if (andNode == kInvalidActivitySupernodeId || orNode == kInvalidActivitySupernodeId ||
-            andNode == orNode)
-        {
-            return fail("Expected Phase C aggregate to expose AND+XOR node and distinct OR node");
-        }
-        if ((*nodeOps)[andNode] != 3)
-        {
-            return fail("Expected AND+XOR computeNode to include source clone plus two compute ops");
-        }
-        if (!nearD((*nodeWeight)[andNode], 4.0))
-        {
-            return fail("Expected canonical memory-read clone to contribute source weight to computeNode W");
-        }
-        if (!nearD((*nodeChange)[andNode], 0.49))
-        {
-            return fail("Expected canonical memory-read clone pi to contribute to computeNode change_weight");
-        }
-        if ((*nodeFootprint)[andNode] != 3)
-        {
-            return fail("Expected computeNode footprint to deduplicate canonical source/result values");
-        }
-        if (!nearD((*nodeActive)[andNode], 0.271))
-        {
-            return fail("Expected computeNode active_prob to include source/output and boundary pi estimates");
-        }
-
-        bool foundAndToOr = false;
-        for (std::size_t i = 0; i < edgeFrom->size(); ++i)
-        {
-            if ((*edgeFrom)[i] == andNode && (*edgeTo)[i] == orNode)
-            {
-                foundAndToOr = true;
-                if ((*edgeCount)[i] != 1 || !nearD((*edgeProb)[i], 0.1))
-                {
-                    return fail("Expected AND+XOR -> OR hyperedge count=1 and total_prob=pi(and)=0.1");
-                }
-            }
-        }
-        if (!foundAndToOr)
-        {
-            return fail("Expected Phase C hyperedge from AND+XOR computeNode to OR computeNode");
-        }
-    }
-
-    {
-        currentCase = "Phase F probability DP cuts low-activity boundary";
-        wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("prob_dp_top");
-        design.markAsTop("prob_dp_top");
-        using K = wolvrix::lib::grh::OperationKind;
-
-        const auto a = makeValue(graph, "prob_dp_a", 8);
-        const auto b = makeValue(graph, "prob_dp_b", 8);
-        graph.bindInputPort("a", a);
-        graph.bindInputPort("b", b);
-
-        const auto highValue = makeValue(graph, "prob_dp_high", 8);
-        const auto highOp = graph.createOperation(K::kXor, graph.internSymbol("prob_dp_high_op"));
-        graph.addOperand(highOp, a);
-        graph.addOperand(highOp, b);
-        graph.addResult(highOp, highValue);
-
-        const auto lowValue = makeValue(graph, "prob_dp_low", 1);
-        const auto lowOp = graph.createOperation(K::kReduceAnd, graph.internSymbol("prob_dp_low_op"));
-        graph.addOperand(lowOp, highValue);
-        graph.addResult(lowOp, lowValue);
-
-        const auto outValue = makeValue(graph, "prob_dp_out", 1);
-        const auto outOp = graph.createOperation(K::kLogicNot, graph.internSymbol("prob_dp_out_op"));
-        graph.addOperand(outOp, lowValue);
-        graph.addResult(outOp, outValue);
-        graph.bindOutputPort("y", outValue);
-
-        SessionStore session;
-        PassManager manager;
-        manager.options().session = &session;
-        ActivityScheduleOptions options;
-        options.path = "prob_dp_top";
-        options.partitionPolicy = "prob";
-        options.probDpCost = true;
-        options.probDpCostMode = "pi";
-        options.fmRefineMaxRounds = 0;
-        options.enableCoarsen = false;
-        options.maxOpInComputeNode = 1;
-        options.maxOpInComputeSupernode = 2;
-        manager.addPass(std::make_unique<ActivitySchedulePass>(options));
-
-        PassDiagnostics diags;
-        const PassManagerResult runResult = manager.run(design, diags);
-        if (!runResult.success || diags.hasError())
-        {
-            return fail("Expected probability DP segment schedule to succeed");
-        }
-        const auto schedule = loadSchedule(session, "prob_dp_top");
-        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
-        {
-            return rc;
-        }
-        const uint32_t highSupernode = (*schedule.opToSupernode)[highOp.index - 1];
-        const uint32_t lowSupernode = (*schedule.opToSupernode)[lowOp.index - 1];
-        const uint32_t outSupernode = (*schedule.opToSupernode)[outOp.index - 1];
-        if (highSupernode == kInvalidActivitySupernodeId ||
-            lowSupernode == kInvalidActivitySupernodeId ||
-            outSupernode == kInvalidActivitySupernodeId)
-        {
-            return fail("Expected probability DP test ops to be scheduled");
-        }
-        if (highSupernode != lowSupernode)
-        {
-            return fail("Expected probability DP to keep high-activity boundary inside the segment");
-        }
-        if (lowSupernode == outSupernode)
-        {
-            return fail("Expected probability DP to cut the lower-activity boundary under capacity=2");
-        }
-        const double edgePi = parseJsonDoubleField(*schedule.summaryStats, "compute_compute_edge_pi_sum");
-        const double edgeChangeWeight =
-            parseJsonDoubleField(*schedule.summaryStats, "compute_compute_edge_change_weight_sum");
-        if (std::fabs(edgePi - 0.095) > 1e-6)
-        {
-            return fail("Expected weighted summary stats to report only the low-activity cut edge pi");
-        }
-        if (std::fabs(edgeChangeWeight - 0.095) > 1e-6)
-        {
-            return fail("Expected weighted summary stats to report only the low-activity cut edge change weight");
-        }
-        if (parseJsonDoubleField(*schedule.summaryStats, "boundary_edge_pi_sum") < edgePi)
-        {
-            return fail("Expected total weighted boundary pi to include compute->compute edge pi");
-        }
-    }
-
-    {
-        currentCase = "Phase F probability DP cost can be disabled";
-        wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("prob_dp_off_top");
-        design.markAsTop("prob_dp_off_top");
-        using K = wolvrix::lib::grh::OperationKind;
-
-        const auto a = makeValue(graph, "prob_dp_off_a", 8);
-        const auto b = makeValue(graph, "prob_dp_off_b", 8);
-        graph.bindInputPort("a", a);
-        graph.bindInputPort("b", b);
-
-        const auto highValue = makeValue(graph, "prob_dp_off_high", 8);
-        const auto highOp = graph.createOperation(K::kXor, graph.internSymbol("prob_dp_off_high_op"));
-        graph.addOperand(highOp, a);
-        graph.addOperand(highOp, b);
-        graph.addResult(highOp, highValue);
-
-        const auto lowValue = makeValue(graph, "prob_dp_off_low", 1);
-        const auto lowOp = graph.createOperation(K::kReduceAnd, graph.internSymbol("prob_dp_off_low_op"));
-        graph.addOperand(lowOp, highValue);
-        graph.addResult(lowOp, lowValue);
-
-        const auto outValue = makeValue(graph, "prob_dp_off_out", 1);
-        const auto outOp = graph.createOperation(K::kLogicNot, graph.internSymbol("prob_dp_off_out_op"));
-        graph.addOperand(outOp, lowValue);
-        graph.addResult(outOp, outValue);
-        graph.bindOutputPort("y", outValue);
-
-        SessionStore session;
-        PassManager manager;
-        manager.options().session = &session;
-        ActivityScheduleOptions options;
-        options.path = "prob_dp_off_top";
-        options.partitionPolicy = "prob";
-        options.probDpCost = false;
-        options.fmRefineMaxRounds = 0;
-        options.enableCoarsen = false;
-        options.maxOpInComputeNode = 1;
-        options.maxOpInComputeSupernode = 2;
-        manager.addPass(std::make_unique<ActivitySchedulePass>(options));
-
-        PassDiagnostics diags;
-        const PassManagerResult runResult = manager.run(design, diags);
-        if (!runResult.success || diags.hasError())
-        {
-            return fail("Expected disabled probability DP cost schedule to succeed");
-        }
-        const auto schedule = loadSchedule(session, "prob_dp_off_top");
-        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
-        {
-            return rc;
-        }
-        const uint32_t highSupernode = (*schedule.opToSupernode)[highOp.index - 1];
-        const uint32_t lowSupernode = (*schedule.opToSupernode)[lowOp.index - 1];
-        const uint32_t outSupernode = (*schedule.opToSupernode)[outOp.index - 1];
-        if (highSupernode == kInvalidActivitySupernodeId ||
-            lowSupernode == kInvalidActivitySupernodeId ||
-            outSupernode == kInvalidActivitySupernodeId)
-        {
-            return fail("Expected disabled probability DP test ops to be scheduled");
-        }
-        if (highSupernode == lowSupernode)
-        {
-            return fail("Expected disabled probability DP cost to cut the first boundary");
-        }
-        if (lowSupernode != outSupernode)
-        {
-            return fail("Expected disabled probability DP cost to keep the later unweighted segment");
-        }
-        const double edgePi = parseJsonDoubleField(*schedule.summaryStats, "compute_compute_edge_pi_sum");
-        if (std::fabs(edgePi - 0.19) > 1e-6)
-        {
-            return fail("Expected disabled probability DP cost to expose the higher-pi cut edge in stats");
-        }
-    }
-
-    {
-        currentCase = "Phase G FM refines probability boundary";
-        wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("prob_fm_top");
-        design.markAsTop("prob_fm_top");
-        using K = wolvrix::lib::grh::OperationKind;
-
-        const auto a = makeValue(graph, "prob_fm_a", 8);
-        const auto b = makeValue(graph, "prob_fm_b", 8);
-        graph.bindInputPort("a", a);
-        graph.bindInputPort("b", b);
-
-        const auto highValue = makeValue(graph, "prob_fm_high", 8);
-        const auto highOp = graph.createOperation(K::kXor, graph.internSymbol("prob_fm_high_op"));
-        graph.addOperand(highOp, a);
-        graph.addOperand(highOp, b);
-        graph.addResult(highOp, highValue);
-
-        const auto lowValue = makeValue(graph, "prob_fm_low", 1);
-        const auto lowOp = graph.createOperation(K::kReduceAnd, graph.internSymbol("prob_fm_low_op"));
-        graph.addOperand(lowOp, highValue);
-        graph.addResult(lowOp, lowValue);
-
-        const auto outValue = makeValue(graph, "prob_fm_out", 1);
-        const auto outOp = graph.createOperation(K::kLogicNot, graph.internSymbol("prob_fm_out_op"));
-        graph.addOperand(outOp, lowValue);
-        graph.addResult(outOp, outValue);
-        graph.bindOutputPort("y", outValue);
-
-        SessionStore session;
-        PassManager manager;
-        manager.options().session = &session;
-        ActivityScheduleOptions options;
-        options.path = "prob_fm_top";
-        options.partitionPolicy = "prob";
-        options.probDpCost = false;
-        options.enableCoarsen = false;
-        options.maxOpInComputeNode = 1;
-        options.maxOpInComputeSupernode = 2;
-        options.phiMin = 0.0;
-        manager.addPass(std::make_unique<ActivitySchedulePass>(options));
-
-        PassDiagnostics diags;
-        const PassManagerResult runResult = manager.run(design, diags);
-        if (!runResult.success || diags.hasError())
-        {
-            return fail("Expected FM probability refinement schedule to succeed");
-        }
-        const auto schedule = loadSchedule(session, "prob_fm_top");
-        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
-        {
-            return rc;
-        }
-        const uint32_t highSupernode = (*schedule.opToSupernode)[highOp.index - 1];
-        const uint32_t lowSupernode = (*schedule.opToSupernode)[lowOp.index - 1];
-        const uint32_t outSupernode = (*schedule.opToSupernode)[outOp.index - 1];
-        if (highSupernode == kInvalidActivitySupernodeId ||
-            lowSupernode == kInvalidActivitySupernodeId ||
-            outSupernode == kInvalidActivitySupernodeId)
-        {
-            return fail("Expected FM probability test ops to be scheduled");
-        }
-        if (highSupernode != lowSupernode)
-        {
-            return fail("Expected FM to move the middle node across the high-pi boundary");
-        }
-        if (lowSupernode == outSupernode)
-        {
-            return fail("Expected FM to leave the lower-pi boundary cut under capacity=2");
-        }
-        const double edgePi = parseJsonDoubleField(*schedule.summaryStats, "compute_compute_edge_pi_sum");
-        if (std::fabs(edgePi - 0.095) > 1e-6)
-        {
-            return fail("Expected FM to reduce compute->compute edge pi to the low-pi boundary");
-        }
-        const auto *stats =
-            getSessionValue<std::string>(session, "prob_fm_top.activity_schedule.prob_coarsen_stats");
-        if (stats == nullptr || parseStatField(*stats, "fm_moves") == 0)
-        {
-            return fail("Expected FM stats to report at least one accepted move");
-        }
-    }
-
-    {
-        currentCase = "Phase F mixed probability DP cost tie-breaks by low pi";
-        wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("prob_dp_mixed_top");
-        design.markAsTop("prob_dp_mixed_top");
-        using K = wolvrix::lib::grh::OperationKind;
-
-        const auto a = makeValue(graph, "prob_dp_mixed_a", 8);
-        const auto b = makeValue(graph, "prob_dp_mixed_b", 8);
-        graph.bindInputPort("a", a);
-        graph.bindInputPort("b", b);
-
-        const auto highValue = makeValue(graph, "prob_dp_mixed_high", 8);
-        const auto highOp = graph.createOperation(K::kXor, graph.internSymbol("prob_dp_mixed_high_op"));
-        graph.addOperand(highOp, a);
-        graph.addOperand(highOp, b);
-        graph.addResult(highOp, highValue);
-
-        const auto lowValue = makeValue(graph, "prob_dp_mixed_low", 1);
-        const auto lowOp = graph.createOperation(K::kReduceAnd, graph.internSymbol("prob_dp_mixed_low_op"));
-        graph.addOperand(lowOp, highValue);
-        graph.addResult(lowOp, lowValue);
-
-        const auto outValue = makeValue(graph, "prob_dp_mixed_out", 1);
-        const auto outOp = graph.createOperation(K::kLogicNot, graph.internSymbol("prob_dp_mixed_out_op"));
-        graph.addOperand(outOp, lowValue);
-        graph.addResult(outOp, outValue);
-        graph.bindOutputPort("y", outValue);
-
-        SessionStore session;
-        PassManager manager;
-        manager.options().session = &session;
-        ActivityScheduleOptions options;
-        options.path = "prob_dp_mixed_top";
-        options.partitionPolicy = "prob";
-        options.probDpCost = true;
-        options.probDpCostMode = "mixed-pi";
-        options.probDpAlpha = 1.0;
-        options.fmRefineMaxRounds = 0;
-        options.enableCoarsen = false;
-        options.maxOpInComputeNode = 1;
-        options.maxOpInComputeSupernode = 2;
-        manager.addPass(std::make_unique<ActivitySchedulePass>(options));
-
-        PassDiagnostics diags;
-        const PassManagerResult runResult = manager.run(design, diags);
-        if (!runResult.success || diags.hasError())
-        {
-            return fail("Expected mixed probability DP cost schedule to succeed");
-        }
-        const auto schedule = loadSchedule(session, "prob_dp_mixed_top");
-        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
-        {
-            return rc;
-        }
-        const uint32_t highSupernode = (*schedule.opToSupernode)[highOp.index - 1];
-        const uint32_t lowSupernode = (*schedule.opToSupernode)[lowOp.index - 1];
-        const uint32_t outSupernode = (*schedule.opToSupernode)[outOp.index - 1];
-        if (highSupernode == kInvalidActivitySupernodeId ||
-            lowSupernode == kInvalidActivitySupernodeId ||
-            outSupernode == kInvalidActivitySupernodeId)
-        {
-            return fail("Expected mixed probability DP test ops to be scheduled");
-        }
-        if (highSupernode != lowSupernode)
-        {
-            return fail("Expected mixed probability DP cost to keep high-pi boundary inside the segment");
-        }
-        if (lowSupernode == outSupernode)
-        {
-            return fail("Expected mixed probability DP cost to cut the lower-pi boundary under capacity=2");
-        }
-    }
-
-    {
-        currentCase = "Phase E probability coarsen merges sibling candidates";
-        wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("prob_coarsen_top");
-        design.markAsTop("prob_coarsen_top");
-        using K = wolvrix::lib::grh::OperationKind;
-
-        const auto a = makeValue(graph, "prob_a", 8);
-        const auto b = makeValue(graph, "prob_b", 8);
-        graph.bindInputPort("a", a);
-        graph.bindInputPort("b", b);
-
-        const auto shared = makeValue(graph, "prob_shared", 8);
-        const auto sharedOp = graph.createOperation(K::kXor, graph.internSymbol("prob_shared_op"));
-        graph.addOperand(sharedOp, a);
-        graph.addOperand(sharedOp, b);
-        graph.addResult(sharedOp, shared);
-
-        const auto y = makeValue(graph, "prob_y", 8);
-        const auto yOp = graph.createOperation(K::kXor, graph.internSymbol("prob_y_op"));
-        graph.addOperand(yOp, shared);
-        graph.addOperand(yOp, a);
-        graph.addResult(yOp, y);
-        graph.bindOutputPort("y", y);
-
-        const auto z = makeValue(graph, "prob_z", 8);
-        const auto zOp = graph.createOperation(K::kXor, graph.internSymbol("prob_z_op"));
-        graph.addOperand(zOp, shared);
-        graph.addOperand(zOp, b);
-        graph.addResult(zOp, z);
-        graph.bindOutputPort("z", z);
-
-        SessionStore session;
-        PassManager manager;
-        manager.options().session = &session;
-        ActivityScheduleOptions options;
-        options.path = "prob_coarsen_top";
-        options.partitionPolicy = "prob";
-        options.maxOpInComputeNode = 1;
-        options.maxOpInComputeSupernode = 8;
-        options.enableChainMerge = false;
-        options.phiMin = 0.0;
-        options.footprintMaxBytes = 1024;
-        manager.addPass(std::make_unique<ActivitySchedulePass>(options));
-
-        PassDiagnostics diags;
-        const PassManagerResult runResult = manager.run(design, diags);
-        if (!runResult.success || diags.hasError())
-        {
-            return fail("Expected probability coarsen sibling merge schedule to succeed");
-        }
-        const auto schedule = loadSchedule(session, "prob_coarsen_top");
-        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
-        {
-            return rc;
-        }
-        const auto *stats =
-            getSessionValue<std::string>(session, "prob_coarsen_top.activity_schedule.prob_coarsen_stats");
-        if (stats == nullptr)
-        {
-            return fail("Expected probability coarsen stats session value");
-        }
-        if (parseStatField(*stats, "merges") == 0)
-        {
-            return fail("Expected probability coarsen to merge sibling candidates");
-        }
-    }
-
-    {
-        currentCase = "Phase E probability coarsen respects footprint cap";
-        wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("prob_coarsen_footprint_top");
-        design.markAsTop("prob_coarsen_footprint_top");
-        using K = wolvrix::lib::grh::OperationKind;
-
-        const auto a = makeValue(graph, "prob_fp_a", 8);
-        const auto b = makeValue(graph, "prob_fp_b", 8);
-        graph.bindInputPort("a", a);
-        graph.bindInputPort("b", b);
-
-        const auto shared = makeValue(graph, "prob_fp_shared", 8);
-        const auto sharedOp = graph.createOperation(K::kXor, graph.internSymbol("prob_fp_shared_op"));
-        graph.addOperand(sharedOp, a);
-        graph.addOperand(sharedOp, b);
-        graph.addResult(sharedOp, shared);
-
-        const auto y = makeValue(graph, "prob_fp_y", 8);
-        const auto yOp = graph.createOperation(K::kXor, graph.internSymbol("prob_fp_y_op"));
-        graph.addOperand(yOp, shared);
-        graph.addOperand(yOp, a);
-        graph.addResult(yOp, y);
-        graph.bindOutputPort("y", y);
-
-        const auto z = makeValue(graph, "prob_fp_z", 8);
-        const auto zOp = graph.createOperation(K::kXor, graph.internSymbol("prob_fp_z_op"));
-        graph.addOperand(zOp, shared);
-        graph.addOperand(zOp, b);
-        graph.addResult(zOp, z);
-        graph.bindOutputPort("z", z);
-
-        SessionStore session;
-        PassManager manager;
-        manager.options().session = &session;
-        ActivityScheduleOptions options;
-        options.path = "prob_coarsen_footprint_top";
-        options.partitionPolicy = "prob";
-        options.maxOpInComputeNode = 1;
-        options.maxOpInComputeSupernode = 8;
-        options.enableChainMerge = false;
-        options.phiMin = 0.0;
-        options.footprintMaxBytes = 1;
-        manager.addPass(std::make_unique<ActivitySchedulePass>(options));
-
-        PassDiagnostics diags;
-        const PassManagerResult runResult = manager.run(design, diags);
-        if (!runResult.success || diags.hasError())
-        {
-            return fail("Expected probability coarsen footprint cap schedule to succeed");
-        }
-        const auto schedule = loadSchedule(session, "prob_coarsen_footprint_top");
-        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
-        {
-            return rc;
-        }
-        const auto *stats = getSessionValue<std::string>(
-            session,
-            "prob_coarsen_footprint_top.activity_schedule.prob_coarsen_stats");
-        if (stats == nullptr)
-        {
-            return fail("Expected probability coarsen footprint stats session value");
-        }
-        if (parseStatField(*stats, "merges") != 0)
-        {
-            return fail("Expected footprint cap to block probability coarsen merge");
-        }
-        if (parseStatField(*stats, "reject_footprint") == 0)
-        {
-            return fail("Expected probability coarsen to report footprint rejection");
         }
     }
 

@@ -603,7 +603,6 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
 
     string_options = [
         ("path", "-path"),
-        ("partition_policy", "-partition-policy"),
         ("export_compute_dag", "-export-compute-dag"),
     ]
     size_options = [
@@ -611,9 +610,6 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
         ("max_op_in_compute_node", "-max-op-in-compute-node"),
         ("max_op_in_commit_supernode", "-max-op-in-commit-supernode"),
         ("split_oversize_compute_node_max_ops", "-split-oversize-compute-node-max-ops"),
-        ("cbaw_plain_boundary_baseline", "-cbaw-plain-boundary-baseline"),
-        ("cbaw_plain_dag_baseline", "-cbaw-plain-dag-baseline"),
-        ("cbaw_plain_compute_compute_baseline", "-cbaw-plain-compute-compute-baseline"),
     ]
     bool_options = [
         ("enable_coarsen", "-enable-coarsen"),
