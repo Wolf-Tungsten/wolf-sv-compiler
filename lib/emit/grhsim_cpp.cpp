@@ -20791,15 +20791,29 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             if (!model.commitInputValues.empty())
             {
                 std::vector<std::string> commitInputConditions;
+                std::vector<std::string> nonEventCommitInputConditions;
                 commitInputConditions.reserve(model.commitInputValues.size());
                 for (ValueId value : model.commitInputValues)
                 {
-                    commitInputConditions.push_back("(" + model.inputFieldByValue.at(value) + " != " +
-                                                   model.prevInputFieldByValue.at(value) + ")");
+                    const std::string condition = "(" + model.inputFieldByValue.at(value) + " != " +
+                                                  model.prevInputFieldByValue.at(value) + ")";
+                    commitInputConditions.push_back(condition);
+                    if (std::find(model.inputEventValues.begin(), model.inputEventValues.end(), value) ==
+                        model.inputEventValues.end())
+                    {
+                        nonEventCommitInputConditions.push_back(condition);
+                    }
                 }
                 *stream << "    if (!initial_eval && (" << joinStrings(commitInputConditions, " || ") << ")) {\n";
                 *stream << "        pending_eval_round = true;\n";
                 *stream << "    }\n";
+                if (model.inputFullpassSpecialization && !nonEventCommitInputConditions.empty())
+                {
+                    *stream << "    if (!initial_eval && ("
+                            << joinStrings(nonEventCommitInputConditions, " || ") << ")) {\n";
+                    *stream << "        input_fullpass_blocked = true;\n";
+                    *stream << "    }\n";
+                }
             }
             if (!model.inputEventValues.empty())
             {
@@ -20815,18 +20829,79 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             }
             if (model.inputFullpassSpecialization && !model.inputEventValues.empty())
             {
-                std::vector<std::string> posedgeConditions;
-                posedgeConditions.reserve(model.inputEventValues.size());
-                for (ValueId value : model.inputEventValues)
+                std::vector<std::string> commitEventBlockConditions;
+                bool blockAllInputFullpass = false;
+                const std::unordered_set<ValueId, ValueIdHash> inputEventValueSet(model.inputEventValues.begin(),
+                                                                                  model.inputEventValues.end());
+                const auto appendCommitEventBlockCondition = [&](ValueId value, const std::string &edge)
                 {
-                    posedgeConditions.push_back("((" +
-                                                eventClassifyExpr(model.prevInputFieldByValue.at(value),
-                                                                  model.inputFieldByValue.at(value)) +
-                                                ") == grhsim_event_edge_kind::posedge)");
+                    if (inputEventValueSet.find(value) == inputEventValueSet.end())
+                    {
+                        blockAllInputFullpass = true;
+                        return;
+                    }
+                    const std::string edgeExpr =
+                        eventClassifyExpr(model.prevInputFieldByValue.at(value),
+                                          model.inputFieldByValue.at(value));
+                    if (edge == "posedge")
+                    {
+                        commitEventBlockConditions.push_back("((" + edgeExpr +
+                                                             ") == grhsim_event_edge_kind::posedge)");
+                    }
+                    else if (edge == "negedge")
+                    {
+                        commitEventBlockConditions.push_back("((" + edgeExpr +
+                                                             ") == grhsim_event_edge_kind::negedge)");
+                    }
+                    else
+                    {
+                        commitEventBlockConditions.push_back("((" + edgeExpr +
+                                                             ") != grhsim_event_edge_kind::none)");
+                    }
+                };
+                for (uint32_t supernodeId : model.commitSupernodeIds)
+                {
+                    if (supernodeId >= schedule.supernodeToOps.size())
+                    {
+                        continue;
+                    }
+                    for (OperationId opId : schedule.supernodeToOps[supernodeId])
+                    {
+                        const Operation op = graph.getOperation(opId);
+                        if (!isCommitPhaseOp(op))
+                        {
+                            continue;
+                        }
+                        const auto sampleIt = model.eventSamplesByOp.find(opId);
+                        if (sampleIt == model.eventSamplesByOp.end() || sampleIt->second.values.empty())
+                        {
+                            blockAllInputFullpass = true;
+                            continue;
+                        }
+                        const EventSampleDecl &samples = sampleIt->second;
+                        for (std::size_t i = 0; i < samples.values.size(); ++i)
+                        {
+                            const std::string edge =
+                                i < samples.edges.size() ? samples.edges[i] : std::string{};
+                            appendCommitEventBlockCondition(samples.values[i], edge);
+                        }
+                    }
                 }
-                *stream << "    if (!initial_eval && (" << joinStrings(posedgeConditions, " || ") << ")) {\n";
-                *stream << "        input_fullpass_blocked = true;\n";
-                *stream << "    }\n";
+                std::sort(commitEventBlockConditions.begin(), commitEventBlockConditions.end());
+                commitEventBlockConditions.erase(std::unique(commitEventBlockConditions.begin(),
+                                                             commitEventBlockConditions.end()),
+                                                 commitEventBlockConditions.end());
+                if (blockAllInputFullpass)
+                {
+                    *stream << "    input_fullpass_blocked = true;\n";
+                }
+                if (!commitEventBlockConditions.empty())
+                {
+                    *stream << "    if (!initial_eval && ("
+                            << joinStrings(commitEventBlockConditions, " || ") << ")) {\n";
+                    *stream << "        input_fullpass_blocked = true;\n";
+                    *stream << "    }\n";
+                }
             }
             if (emitPosedgeFullpassSpecialization)
             {
