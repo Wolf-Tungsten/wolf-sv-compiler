@@ -15234,9 +15234,16 @@ namespace wolvrix::lib::emit
             *stream << "    }\n";
             *stream << "    return changed;\n";
             *stream << "}\n\n";
+            *stream << "#ifndef GRHSIM_ALWAYS_INLINE\n";
+            *stream << "#if defined(__GNUC__) || defined(__clang__)\n";
+            *stream << "#define GRHSIM_ALWAYS_INLINE inline __attribute__((always_inline))\n";
+            *stream << "#else\n";
+            *stream << "#define GRHSIM_ALWAYS_INLINE inline\n";
+            *stream << "#endif\n";
+            *stream << "#endif\n\n";
             *stream << "template <std::size_t N>\n";
-            *stream << "inline bool grhsim_assign_words_full(std::array<std::uint64_t, N> &dst,\n";
-            *stream << "                                    const std::array<std::uint64_t, N> &src)\n{\n";
+            *stream << "GRHSIM_ALWAYS_INLINE bool grhsim_assign_words_full(std::array<std::uint64_t, N> &dst,\n";
+            *stream << "                                                  const std::array<std::uint64_t, N> &src)\n{\n";
             *stream << "    bool changed = false;\n";
             *stream << "    for (std::size_t i = 0; i < N; ++i) {\n";
             *stream << "        const std::uint64_t next = src[i];\n";
@@ -16357,7 +16364,7 @@ inline std::array<std::uint64_t, DestN> grhsim_slice_words(const std::array<std:
 }
 
 template <std::size_t N>
-inline std::array<std::uint64_t, N> grhsim_not_words_full(const std::array<std::uint64_t, N> &value)
+GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, N> grhsim_not_words_full(const std::array<std::uint64_t, N> &value)
 {
     std::array<std::uint64_t, N> out{};
     for (std::size_t i = 0; i < N; ++i) {
@@ -16393,8 +16400,8 @@ inline std::array<std::uint64_t, N> grhsim_mux_words(std::uint64_t cond,
 }
 
 template <std::size_t N>
-inline std::array<std::uint64_t, N> grhsim_and_words_full(const std::array<std::uint64_t, N> &lhs,
-                                                          const std::array<std::uint64_t, N> &rhs)
+GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, N> grhsim_and_words_full(const std::array<std::uint64_t, N> &lhs,
+                                                                        const std::array<std::uint64_t, N> &rhs)
 {
     std::array<std::uint64_t, N> out{};
     for (std::size_t i = 0; i < N; ++i) {
@@ -16417,8 +16424,8 @@ inline std::array<std::uint64_t, N> grhsim_and_words(const std::array<std::uint6
 }
 
 template <std::size_t N>
-inline std::array<std::uint64_t, N> grhsim_or_words_full(const std::array<std::uint64_t, N> &lhs,
-                                                         const std::array<std::uint64_t, N> &rhs)
+GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, N> grhsim_or_words_full(const std::array<std::uint64_t, N> &lhs,
+                                                                       const std::array<std::uint64_t, N> &rhs)
 {
     std::array<std::uint64_t, N> out{};
     for (std::size_t i = 0; i < N; ++i) {
@@ -16441,8 +16448,8 @@ inline std::array<std::uint64_t, N> grhsim_or_words(const std::array<std::uint64
 }
 
 template <std::size_t N>
-inline std::array<std::uint64_t, N> grhsim_xor_words_full(const std::array<std::uint64_t, N> &lhs,
-                                                          const std::array<std::uint64_t, N> &rhs)
+GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, N> grhsim_xor_words_full(const std::array<std::uint64_t, N> &lhs,
+                                                                        const std::array<std::uint64_t, N> &rhs)
 {
     std::array<std::uint64_t, N> out{};
     for (std::size_t i = 0; i < N; ++i) {
@@ -16465,8 +16472,8 @@ inline std::array<std::uint64_t, N> grhsim_xor_words(const std::array<std::uint6
 }
 
 template <std::size_t N>
-inline std::array<std::uint64_t, N> grhsim_xnor_words_full(const std::array<std::uint64_t, N> &lhs,
-                                                           const std::array<std::uint64_t, N> &rhs)
+GRHSIM_ALWAYS_INLINE std::array<std::uint64_t, N> grhsim_xnor_words_full(const std::array<std::uint64_t, N> &lhs,
+                                                                         const std::array<std::uint64_t, N> &rhs)
 {
     return grhsim_not_words_full(grhsim_xor_words_full(lhs, rhs));
 }
