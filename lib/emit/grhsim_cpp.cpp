@@ -8766,6 +8766,26 @@ namespace wolvrix::lib::emit
             return out.str();
         }
 
+        bool canUseFullWidthWordsHelper(int32_t width)
+        {
+            return width > 0 &&
+                   (static_cast<std::uint32_t>(width) % 64u) == 0u &&
+                   logicWordCount(width) >= 3u;
+        }
+
+        bool isFullWidthBinaryWordsHelper(std::string_view helperName)
+        {
+            return helperName == "grhsim_and_words" ||
+                   helperName == "grhsim_or_words" ||
+                   helperName == "grhsim_xor_words" ||
+                   helperName == "grhsim_xnor_words";
+        }
+
+        bool isFullWidthUnaryWordsHelper(std::string_view helperName)
+        {
+            return helperName == "grhsim_not_words";
+        }
+
         void appendWordsTailTruncation(std::ostringstream &out,
                                        std::string_view arrayExpr,
                                        int32_t width)
@@ -8892,6 +8912,11 @@ namespace wolvrix::lib::emit
             if (logicWordCount(width) == 2)
             {
                 return "grhsim_assign_words_2<" + std::to_string(width) + ">(" + lhsExpr + ", " + rhsExpr + ")";
+            }
+            if (canUseFullWidthWordsHelper(width))
+            {
+                return "grhsim_assign_words_full<" + std::to_string(logicWordCount(width)) + ">(" +
+                       lhsExpr + ", " + rhsExpr + ")";
             }
             return "grhsim_assign_words(" + lhsExpr + ", " + rhsExpr + ", " + std::to_string(width) + ")";
         }
@@ -9367,7 +9392,14 @@ namespace wolvrix::lib::emit
                                            std::string_view helperName)
         {
             std::ostringstream out;
-            out << helperName << "(" << valueExpr << ", " << resultWidth << ")";
+            if (canUseFullWidthWordsHelper(resultWidth) && isFullWidthUnaryWordsHelper(helperName))
+            {
+                out << helperName << "_full<" << logicWordCount(resultWidth) << ">(" << valueExpr << ")";
+            }
+            else
+            {
+                out << helperName << "(" << valueExpr << ", " << resultWidth << ")";
+            }
             return out.str();
         }
 
@@ -9377,7 +9409,15 @@ namespace wolvrix::lib::emit
                                             std::string_view helperName)
         {
             std::ostringstream out;
-            out << helperName << "(" << lhsExpr << ", " << rhsExpr << ", " << resultWidth << ")";
+            if (canUseFullWidthWordsHelper(resultWidth) && isFullWidthBinaryWordsHelper(helperName))
+            {
+                out << helperName << "_full<" << logicWordCount(resultWidth) << ">("
+                    << lhsExpr << ", " << rhsExpr << ")";
+            }
+            else
+            {
+                out << helperName << "(" << lhsExpr << ", " << rhsExpr << ", " << resultWidth << ")";
+            }
             return out.str();
         }
 
@@ -15194,6 +15234,17 @@ namespace wolvrix::lib::emit
             *stream << "    }\n";
             *stream << "    return changed;\n";
             *stream << "}\n\n";
+            *stream << "template <std::size_t N>\n";
+            *stream << "inline bool grhsim_assign_words_full(std::array<std::uint64_t, N> &dst,\n";
+            *stream << "                                    const std::array<std::uint64_t, N> &src)\n{\n";
+            *stream << "    bool changed = false;\n";
+            *stream << "    for (std::size_t i = 0; i < N; ++i) {\n";
+            *stream << "        const std::uint64_t next = src[i];\n";
+            *stream << "        changed = static_cast<bool>(changed | (dst[i] != next));\n";
+            *stream << "        dst[i] = next;\n";
+            *stream << "    }\n";
+            *stream << "    return changed;\n";
+            *stream << "}\n\n";
             *stream << "template <typename T, std::size_t N>\n";
             *stream << "inline T &grhsim_value_storage_ref(std::array<std::byte, N> &storage, std::size_t offset)\n{\n";
             *stream << "    return *reinterpret_cast<T *>(storage.data() + offset);\n";
@@ -16306,6 +16357,16 @@ inline std::array<std::uint64_t, DestN> grhsim_slice_words(const std::array<std:
 }
 
 template <std::size_t N>
+inline std::array<std::uint64_t, N> grhsim_not_words_full(const std::array<std::uint64_t, N> &value)
+{
+    std::array<std::uint64_t, N> out{};
+    for (std::size_t i = 0; i < N; ++i) {
+        out[i] = ~value[i];
+    }
+    return out;
+}
+
+template <std::size_t N>
 inline std::array<std::uint64_t, N> grhsim_not_words(const std::array<std::uint64_t, N> &value, std::size_t width)
 {
     std::array<std::uint64_t, N> out{};
@@ -16332,6 +16393,17 @@ inline std::array<std::uint64_t, N> grhsim_mux_words(std::uint64_t cond,
 }
 
 template <std::size_t N>
+inline std::array<std::uint64_t, N> grhsim_and_words_full(const std::array<std::uint64_t, N> &lhs,
+                                                          const std::array<std::uint64_t, N> &rhs)
+{
+    std::array<std::uint64_t, N> out{};
+    for (std::size_t i = 0; i < N; ++i) {
+        out[i] = lhs[i] & rhs[i];
+    }
+    return out;
+}
+
+template <std::size_t N>
 inline std::array<std::uint64_t, N> grhsim_and_words(const std::array<std::uint64_t, N> &lhs,
                                                      const std::array<std::uint64_t, N> &rhs,
                                                      std::size_t width)
@@ -16341,6 +16413,17 @@ inline std::array<std::uint64_t, N> grhsim_and_words(const std::array<std::uint6
         out[i] = lhs[i] & rhs[i];
     }
     grhsim_trunc_words(out, width);
+    return out;
+}
+
+template <std::size_t N>
+inline std::array<std::uint64_t, N> grhsim_or_words_full(const std::array<std::uint64_t, N> &lhs,
+                                                         const std::array<std::uint64_t, N> &rhs)
+{
+    std::array<std::uint64_t, N> out{};
+    for (std::size_t i = 0; i < N; ++i) {
+        out[i] = lhs[i] | rhs[i];
+    }
     return out;
 }
 
@@ -16358,6 +16441,17 @@ inline std::array<std::uint64_t, N> grhsim_or_words(const std::array<std::uint64
 }
 
 template <std::size_t N>
+inline std::array<std::uint64_t, N> grhsim_xor_words_full(const std::array<std::uint64_t, N> &lhs,
+                                                          const std::array<std::uint64_t, N> &rhs)
+{
+    std::array<std::uint64_t, N> out{};
+    for (std::size_t i = 0; i < N; ++i) {
+        out[i] = lhs[i] ^ rhs[i];
+    }
+    return out;
+}
+
+template <std::size_t N>
 inline std::array<std::uint64_t, N> grhsim_xor_words(const std::array<std::uint64_t, N> &lhs,
                                                      const std::array<std::uint64_t, N> &rhs,
                                                      std::size_t width)
@@ -16368,6 +16462,13 @@ inline std::array<std::uint64_t, N> grhsim_xor_words(const std::array<std::uint6
     }
     grhsim_trunc_words(out, width);
     return out;
+}
+
+template <std::size_t N>
+inline std::array<std::uint64_t, N> grhsim_xnor_words_full(const std::array<std::uint64_t, N> &lhs,
+                                                           const std::array<std::uint64_t, N> &rhs)
+{
+    return grhsim_not_words_full(grhsim_xor_words_full(lhs, rhs));
 }
 
 template <std::size_t N>
