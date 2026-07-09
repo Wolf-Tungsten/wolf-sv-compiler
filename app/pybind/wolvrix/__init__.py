@@ -297,12 +297,14 @@ class Session:
         sched_batches_per_cpp: int | None = None,
         emit_parallelism: int | None = None,
         perf: str | None = None,
+        input_fullpass_specialization: bool | None = None,
         **named_args,
     ) -> list[dict]:
         self._ensure_open()
         if (max_cpp_file_bytes is not None or sched_batch_max_ops is not None or
                 sched_batch_max_estimated_lines is not None or sched_batch_target_count is not None or
-                sched_batches_per_cpp is not None or emit_parallelism is not None or perf is not None):
+                sched_batches_per_cpp is not None or emit_parallelism is not None or perf is not None or
+                input_fullpass_specialization is not None):
             named_args = dict(named_args)
         if max_cpp_file_bytes is not None:
             named_args["max_cpp_file_bytes"] = max_cpp_file_bytes
@@ -318,6 +320,8 @@ class Session:
             named_args["emit_parallelism"] = emit_parallelism
         if perf is not None:
             named_args["perf"] = perf
+        if input_fullpass_specialization is not None:
+            named_args["input_fullpass_specialization"] = input_fullpass_specialization
         _compile_emit_grhsim_cpp_kwargs(named_args)
         success, diagnostics = _native.session_emit_grhsim_cpp(
             self._capsule,
@@ -686,6 +690,10 @@ def _compile_emit_grhsim_cpp_kwargs(named: dict[str, Any]) -> None:
             raise ValueError("emit_grhsim_cpp perf must be a string")
         if perf not in {"off", "eval"}:
             raise ValueError("emit_grhsim_cpp perf must be one of: off, eval")
+    input_fullpass_specialization = local.pop("input_fullpass_specialization", None)
+    if input_fullpass_specialization is not None:
+        if not isinstance(input_fullpass_specialization, bool):
+            raise ValueError("emit_grhsim_cpp input_fullpass_specialization must be a bool")
     _ensure_no_extra_named("emit_grhsim_cpp", local)
 
 

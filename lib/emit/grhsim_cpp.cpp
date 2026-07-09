@@ -443,6 +443,7 @@ namespace wolvrix::lib::emit
             std::size_t currentWordIndex = 0;
             std::size_t currentActiveId = kInvalidIndex;
             std::string_view localActiveExpr;
+            bool suppressComputePropagation = false;
         };
 
         struct DeferredActivationGroup
@@ -2367,6 +2368,11 @@ namespace wolvrix::lib::emit
                    std::to_string(batch.index);
         }
 
+        std::string scheduleBatchFullpassMethodName(const ScheduleBatch &batch)
+        {
+            return scheduleBatchMethodName(batch) + "_fullpass";
+        }
+
         std::string scheduleBatchWordHelperName(const ScheduleBatch &batch, std::size_t wordIndex)
         {
             return scheduleBatchMethodName(batch) + "_word_" + std::to_string(wordIndex);
@@ -2665,6 +2671,7 @@ namespace wolvrix::lib::emit
             bool needsSystemTaskRuntime = false;
             bool emitPerf = false;
             bool emitWaveform = false;
+            bool inputFullpassSpecialization = false;
         };
 
         bool isStoredValue(const EmitModel &model, ValueId value) noexcept
@@ -4984,6 +4991,10 @@ namespace wolvrix::lib::emit
             {
                 stream << indent << eventIt->second << " = " << eventClassifyExpr(oldExpr, newExpr) << ";\n";
                 deferredContext = nullptr;
+            }
+            if (context != nullptr && context->suppressComputePropagation)
+            {
+                return;
             }
             const auto fanoutIt = model.boundaryFanoutByValue.find(resultValue);
             if (fanoutIt == model.boundaryFanoutByValue.end())
@@ -12734,7 +12745,8 @@ namespace wolvrix::lib::emit
 
             for (const ScheduleBatch &batch : batches)
             {
-            const auto emitWordBody = [&](const ScheduleBatch::Word &word) -> std::optional<std::string>
+            const auto emitWordBody = [&](const ScheduleBatch::Word &word,
+                                          bool fullpassVariant) -> std::optional<std::string>
             {
                 const std::uint8_t dispatchMask = scheduleBatchWordDispatchMask(model, word);
                 const std::uint8_t clearMask = scheduleBatchWordClearMask(model, batch, word);
@@ -12792,7 +12804,12 @@ namespace wolvrix::lib::emit
                        << static_cast<unsigned>(dispatchMask) << ");\n";
                 stream << "            constexpr std::uint8_t clearMask = UINT8_C("
                        << static_cast<unsigned>(clearMask) << ");\n";
-                if (batch.phase == ScheduleBatch::Phase::kCommit)
+                if (fullpassVariant)
+                {
+                    stream << "            std::uint8_t activeWordFlags = UINT8_C("
+                           << static_cast<unsigned>(dispatchMask) << ");\n";
+                }
+                else if (batch.phase == ScheduleBatch::Phase::kCommit)
                 {
                     const auto commitEventClusters = buildCommitEventWordClusters();
                     if (!commitEventClusters)
@@ -12827,9 +12844,12 @@ namespace wolvrix::lib::emit
                            << word.activeFlagWordIndex << "u] & dispatchMask);\n";
                 }
                 stream << "            if (unlikely(activeWordFlags != UINT8_C(0))) {\n";
-                stream << "                supernode_active_curr_[" << word.activeFlagWordIndex
-                        << "u] = static_cast<std::uint8_t>(supernode_active_curr_["
-                       << word.activeFlagWordIndex << "u] & static_cast<std::uint8_t>(~clearMask));\n";
+                if (!fullpassVariant)
+                {
+                    stream << "                supernode_active_curr_[" << word.activeFlagWordIndex
+                            << "u] = static_cast<std::uint8_t>(supernode_active_curr_["
+                           << word.activeFlagWordIndex << "u] & static_cast<std::uint8_t>(~clearMask));\n";
+                }
                 for (uint32_t supernodeId : word.supernodeIds)
                 {
                     const std::size_t activeId =
@@ -12837,7 +12857,8 @@ namespace wolvrix::lib::emit
                     const ActivationEmitContext activationContext{
                         .currentWordIndex = word.activeFlagWordIndex,
                         .currentActiveId = activeId,
-                        .localActiveExpr = "activeWordFlags"};
+                        .localActiveExpr = "activeWordFlags",
+                        .suppressComputePropagation = fullpassVariant};
                     const std::uint8_t supernodeMask =
                         static_cast<std::uint8_t>(UINT8_C(1) << (activeId % kActiveFlagBitsPerWord));
                     stream << "    \n";
@@ -12880,7 +12901,7 @@ namespace wolvrix::lib::emit
                 std::size_t nextConcatPrefixDecl = 0;
                 const auto &supernodeOps = schedule.supernodeToOps[supernodeId];
                 DeferredActivationGroups deferredActivationGroups;
-                if (batch.phase == ScheduleBatch::Phase::kCompute)
+                if (batch.phase == ScheduleBatch::Phase::kCompute && !fullpassVariant)
                 {
                     deferredActivationGroups =
                         buildDeferredActivationGroups(graph, model, schedule.supernodeToOps, supernodeId);
@@ -14008,12 +14029,15 @@ namespace wolvrix::lib::emit
                     }
                     ++opIndex;
                 }
-                    emitDeferredActivationFlushStatements(stream,
-                                                          "supernode_active_curr_",
-                                                          "active_count_",
-                                                          deferredActivationGroups,
-                                                          "            ",
-                                                          &activationContext);
+                    if (!fullpassVariant)
+                    {
+                        emitDeferredActivationFlushStatements(stream,
+                                                              "supernode_active_curr_",
+                                                              "active_count_",
+                                                              deferredActivationGroups,
+                                                              "            ",
+                                                              &activationContext);
+                    }
                     if (outerCommitEventExpr.has_value())
                     {
                         stream << "            }\n";
@@ -14021,9 +14045,12 @@ namespace wolvrix::lib::emit
                         stream << "        }\n";
                         stream << "        }\n";
                 }
-                stream << "                supernode_active_curr_[" << word.activeFlagWordIndex
-                       << "u] = static_cast<std::uint8_t>(supernode_active_curr_["
-                       << word.activeFlagWordIndex << "u] | activeWordFlags);\n";
+                if (!fullpassVariant)
+                {
+                    stream << "                supernode_active_curr_[" << word.activeFlagWordIndex
+                           << "u] = static_cast<std::uint8_t>(supernode_active_curr_["
+                           << word.activeFlagWordIndex << "u] | activeWordFlags);\n";
+                }
                 stream << "            }\n";
                 stream << "        }\n";
                 return std::nullopt;
@@ -14034,7 +14061,7 @@ namespace wolvrix::lib::emit
             {
                 if (batch.phase == ScheduleBatch::Phase::kCommit)
                 {
-                    return emitWordBody(word);
+                    return emitWordBody(word, false);
                 }
                 std::uint8_t dispatchMask = UINT8_C(0);
                 std::uint8_t clearMask = UINT8_C(0);
@@ -14136,7 +14163,7 @@ namespace wolvrix::lib::emit
                           stream << "void " << className << "::"
                               << scheduleBatchWordChunkHelperName(batch, wordChunkIndex, chunkIndex)
                               << "()\n{\n";
-                    if (auto error = emitWordBody(chunkWord))
+                    if (auto error = emitWordBody(chunkWord, false))
                     {
                         return error;
                     }
@@ -14145,7 +14172,7 @@ namespace wolvrix::lib::emit
                   stream << "void " << className << "::"
                       << scheduleBatchWordHelperName(batch, wordChunkIndex)
                       << "()\n{\n";
-                if (auto error = word.helperChunks.empty() ? emitWordBody(word)
+                if (auto error = word.helperChunks.empty() ? emitWordBody(word, false)
                                                            : emitSplitWordBody(word, wordChunkIndex))
                 {
                     return error;
@@ -14172,12 +14199,26 @@ namespace wolvrix::lib::emit
                     stream << "        " << scheduleBatchWordHelperName(batch, wordChunkIndex) << "();\n";
                     continue;
                 }
-                if (auto error = emitWordBody(word))
+                if (auto error = emitWordBody(word, false))
                 {
                     return error;
                 }
             }
             stream << "}\n";
+            if (model.inputFullpassSpecialization && batch.phase == ScheduleBatch::Phase::kCompute)
+            {
+                stream << "\nvoid " << className << "::" << scheduleBatchFullpassMethodName(batch) << "()\n{\n";
+                stream << "        // compute batch " << batch.index
+                       << " full-pass specialization: evaluate all supernodes and suppress compute propagation.\n";
+                for (const auto &word : batch.words)
+                {
+                    if (auto error = emitWordBody(word, true))
+                    {
+                        return error;
+                    }
+                }
+                stream << "}\n";
+            }
             if (model.emitWaveform)
             {
                 const auto [waveformBegin, waveformEnd] =
@@ -14278,6 +14319,10 @@ namespace wolvrix::lib::emit
         const PerfMode perfMode = parsePerfMode(options);
         const bool emitRuntimeProfile =
             parseBooleanEmitOption(options, "emit_runtime_profile", "GRHSIM_EMIT_RUNTIME_PROFILE");
+        const bool inputFullpassSpecialization =
+            parseBooleanEmitOption(options,
+                                   "input_fullpass_specialization",
+                                   "GRHSIM_INPUT_FULLPASS_SPECIALIZATION");
         const std::size_t schedBatchesPerCpp = parseScheduleBatchesPerCpp(options);
         const std::unordered_set<ValueId, ValueIdHash> waveformValueIds =
             waveformMode == WaveformMode::kDeclaredSymbols ? collectDeclaredSymbolWaveformValueIds(graph)
@@ -14303,6 +14348,7 @@ namespace wolvrix::lib::emit
         model.emitWaveform = waveformMode != WaveformMode::kOff;
         model.emitPerf = perfMode != PerfMode::kOff;
         model.emitRuntimeProfile = emitRuntimeProfile;
+        model.inputFullpassSpecialization = inputFullpassSpecialization;
         if (model.emitRuntimeProfile)
         {
             buildRuntimeProfileWeights(graph, schedule, model);
@@ -17885,6 +17931,10 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             for (const auto &batch : scheduleBatches)
             {
                 *stream << "    void " << scheduleBatchMethodName(batch) << "();\n";
+                if (model.inputFullpassSpecialization && batch.phase == ScheduleBatch::Phase::kCompute)
+                {
+                    *stream << "    void " << scheduleBatchFullpassMethodName(batch) << "();\n";
+                }
             }
             for (const auto &batch : scheduleBatches)
             {
@@ -20641,6 +20691,11 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             }
             *stream << "    std::uint64_t fixed_point_round_count = UINT64_C(0);\n";
             *stream << "    bool pending_eval_round = initial_eval;\n";
+            if (model.inputFullpassSpecialization)
+            {
+                *stream << "    bool input_fullpass_candidate = false;\n";
+                *stream << "    bool input_fullpass_blocked = initial_eval;\n";
+            }
             *stream << "    register_write_conflict_ = false;\n";
             *stream << "    if (initial_eval) {\n";
             if (!initialComputeActiveMasks.empty())
@@ -20697,7 +20752,29 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                         supernodes,
                         "        ");
                 *stream << "        pending_eval_round = true;\n";
+                if (model.inputFullpassSpecialization)
+                {
+                    *stream << "        input_fullpass_candidate = true;\n";
+                }
                 *stream << "    }\n";
+            }
+            if (model.inputFullpassSpecialization)
+            {
+                std::vector<std::string> resetInputConditions;
+                for (const auto &port : graph.inputPorts())
+                {
+                    if (sanitizeIdentifier(port.name) == "reset")
+                    {
+                        resetInputConditions.push_back("(" + model.inputFieldByValue.at(port.value) + " != " +
+                                                       model.prevInputFieldByValue.at(port.value) + ")");
+                    }
+                }
+                if (!resetInputConditions.empty())
+                {
+                    *stream << "    if (!initial_eval && (" << joinStrings(resetInputConditions, " || ") << ")) {\n";
+                    *stream << "        input_fullpass_blocked = true;\n";
+                    *stream << "    }\n";
+                }
             }
             if (!model.commitInputValues.empty())
             {
@@ -20724,7 +20801,64 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                             << ";\n";
                 }
             }
+            if (model.inputFullpassSpecialization && !model.inputEventValues.empty())
+            {
+                std::vector<std::string> posedgeConditions;
+                posedgeConditions.reserve(model.inputEventValues.size());
+                for (ValueId value : model.inputEventValues)
+                {
+                    posedgeConditions.push_back("((" +
+                                                eventClassifyExpr(model.prevInputFieldByValue.at(value),
+                                                                  model.inputFieldByValue.at(value)) +
+                                                ") == grhsim_event_edge_kind::posedge)");
+                }
+                *stream << "    if (!initial_eval && (" << joinStrings(posedgeConditions, " || ") << ")) {\n";
+                *stream << "        input_fullpass_blocked = true;\n";
+                *stream << "    }\n";
+            }
             *stream << '\n';
+            const auto emitEvalEpilogue = [&](std::string_view indent)
+            {
+                *stream << indent << "// Refresh public outputs after the final visible state of this eval is known.\n";
+                *stream << indent << "refresh_outputs();\n\n";
+                if (model.emitWaveform)
+                {
+                    *stream << indent << "dump_waveform(eval_id);\n\n";
+                }
+                *stream << indent << "// Publish current inputs as the previous-eval baseline for the next call.\n";
+                for (const auto &port : graph.inputPorts())
+                {
+                    *stream << indent << model.prevInputFieldByValue.at(port.value) << " = "
+                            << sanitizeIdentifier(port.name) << ";\n";
+                }
+                for (const auto &port : graph.inoutPorts())
+                {
+                    *stream << indent << model.prevInputFieldByValue.at(port.in) << " = "
+                            << sanitizeIdentifier(port.name) << ".in;\n";
+                }
+                *stream << indent << "event_baseline_initialized_ = true;\n";
+                *stream << indent << "first_eval_ = false;\n";
+            };
+            if (model.inputFullpassSpecialization)
+            {
+                *stream << "    if (input_fullpass_candidate && !input_fullpass_blocked) {\n";
+                *stream << "        pending_eval_round = false;\n";
+                *stream << "        supernode_active_curr_.fill(0);\n";
+                *stream << "        // Run compute-phase full-pass batches in direct schedule order.\n";
+                for (const auto &batch : computeScheduleBatches)
+                {
+                    *stream << "        this->" << scheduleBatchFullpassMethodName(batch) << "();\n";
+                }
+                *stream << "        supernode_active_curr_.fill(0);\n";
+                if (!model.allEventValues.empty())
+                {
+                    *stream << "        // Fast path consumed this eval without fixed-point rounds.\n";
+                    emitClearAllEventEdges(*stream, model, "        ");
+                }
+                emitEvalEpilogue("        ");
+                *stream << "        return;\n";
+                *stream << "    }\n\n";
+            }
             if (model.emitPerf)
             {
                 *stream << "    const bool trace_this_eval = trace_eval_enabled_ && (trace_eval_interval_ != 0) &&\n";

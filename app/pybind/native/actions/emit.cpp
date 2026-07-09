@@ -149,6 +149,7 @@ namespace wolvrix::app::pybind
         PyObject *emitParallelismObj = Py_None;
         const char *waveformMode = nullptr;
         const char *perfMode = nullptr;
+        PyObject *inputFullpassSpecializationObj = Py_None;
         static const char *kwlist[] = {"session",
                                        "design",
                                        "output",
@@ -161,8 +162,9 @@ namespace wolvrix::app::pybind
                                        "emit_parallelism",
                                        "waveform",
                                        "perf",
+                                       "input_fullpass_specialization",
                                        nullptr};
-                        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|OOOOOOOss", const_cast<char **>(kwlist),
+                        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|OOOOOOOssO", const_cast<char **>(kwlist),
                                          &sessionObj,
                                          &designKey,
                                          &output,
@@ -174,7 +176,8 @@ namespace wolvrix::app::pybind
                                          &schedBatchesPerCppObj,
                                          &emitParallelismObj,
                                          &waveformMode,
-                                         &perfMode))
+                                         &perfMode,
+                                         &inputFullpassSpecializationObj))
         {
             return nullptr;
         }
@@ -285,6 +288,15 @@ namespace wolvrix::app::pybind
         if (perfMode != nullptr)
         {
             options.attributes["perf"] = perfMode;
+        }
+        if (inputFullpassSpecializationObj != Py_None)
+        {
+            const int enabled = PyObject_IsTrue(inputFullpassSpecializationObj);
+            if (enabled < 0)
+            {
+                return nullptr;
+            }
+            options.attributes["input_fullpass_specialization"] = enabled != 0 ? "1" : "0";
         }
 
         const auto result = emitter.emit(*design, options);
