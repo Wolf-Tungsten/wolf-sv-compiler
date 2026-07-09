@@ -297,12 +297,14 @@ class Session:
         sched_batches_per_cpp: int | None = None,
         emit_parallelism: int | None = None,
         perf: str | None = None,
+        emit_runtime_stats: bool | None = None,
         **named_args,
     ) -> list[dict]:
         self._ensure_open()
         if (max_cpp_file_bytes is not None or sched_batch_max_ops is not None or
                 sched_batch_max_estimated_lines is not None or sched_batch_target_count is not None or
-                sched_batches_per_cpp is not None or emit_parallelism is not None or perf is not None):
+                sched_batches_per_cpp is not None or emit_parallelism is not None or perf is not None or
+                emit_runtime_stats is not None):
             named_args = dict(named_args)
         if max_cpp_file_bytes is not None:
             named_args["max_cpp_file_bytes"] = max_cpp_file_bytes
@@ -318,6 +320,8 @@ class Session:
             named_args["emit_parallelism"] = emit_parallelism
         if perf is not None:
             named_args["perf"] = perf
+        if emit_runtime_stats is not None:
+            named_args["emit_runtime_stats"] = emit_runtime_stats
         _compile_emit_grhsim_cpp_kwargs(named_args)
         success, diagnostics = _native.session_emit_grhsim_cpp(
             self._capsule,
@@ -686,6 +690,9 @@ def _compile_emit_grhsim_cpp_kwargs(named: dict[str, Any]) -> None:
             raise ValueError("emit_grhsim_cpp perf must be a string")
         if perf not in {"off", "eval"}:
             raise ValueError("emit_grhsim_cpp perf must be one of: off, eval")
+    emit_runtime_stats = local.pop("emit_runtime_stats", None)
+    if emit_runtime_stats is not None and not isinstance(emit_runtime_stats, bool):
+        raise ValueError("emit_grhsim_cpp emit_runtime_stats must be a bool")
     _ensure_no_extra_named("emit_grhsim_cpp", local)
 
 

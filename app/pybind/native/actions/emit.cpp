@@ -147,6 +147,7 @@ namespace wolvrix::app::pybind
         PyObject *schedBatchTargetCountObj = Py_None;
         PyObject *schedBatchesPerCppObj = Py_None;
         PyObject *emitParallelismObj = Py_None;
+        PyObject *emitRuntimeStatsObj = Py_None;
         const char *waveformMode = nullptr;
         const char *perfMode = nullptr;
         static const char *kwlist[] = {"session",
@@ -161,8 +162,9 @@ namespace wolvrix::app::pybind
                                        "emit_parallelism",
                                        "waveform",
                                        "perf",
+                                       "emit_runtime_stats",
                                        nullptr};
-                        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|OOOOOOOss", const_cast<char **>(kwlist),
+                        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|OOOOOOOssO", const_cast<char **>(kwlist),
                                          &sessionObj,
                                          &designKey,
                                          &output,
@@ -174,7 +176,8 @@ namespace wolvrix::app::pybind
                                          &schedBatchesPerCppObj,
                                          &emitParallelismObj,
                                          &waveformMode,
-                                         &perfMode))
+                                         &perfMode,
+                                         &emitRuntimeStatsObj))
         {
             return nullptr;
         }
@@ -285,6 +288,15 @@ namespace wolvrix::app::pybind
         if (perfMode != nullptr)
         {
             options.attributes["perf"] = perfMode;
+        }
+        if (emitRuntimeStatsObj != Py_None)
+        {
+            const int enabled = PyObject_IsTrue(emitRuntimeStatsObj);
+            if (enabled < 0)
+            {
+                return nullptr;
+            }
+            options.attributes["emit_runtime_stats"] = enabled ? "1" : "0";
         }
 
         const auto result = emitter.emit(*design, options);

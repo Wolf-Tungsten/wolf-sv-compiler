@@ -144,6 +144,14 @@ namespace
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{.path = "top"}));
         PassDiagnostics diags;
         const PassManagerResult result = manager.run(design, diags);
+        if (!result.success || diags.hasError())
+        {
+            for (const auto &diag : diags.messages())
+            {
+                std::cerr << "[emit_grhsim_cpp_memory_fill] activity-schedule "
+                          << diag.message << '\n';
+            }
+        }
         return result.success && !diags.hasError();
     }
 } // namespace

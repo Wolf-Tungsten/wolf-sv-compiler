@@ -102,9 +102,6 @@ incoming_boundary_activation_edges + 1
 - `<target>.activity_schedule.value_fanout`
 - `<target>.activity_schedule.topo_order`
 - `<target>.activity_schedule.state_read_supernodes`
-- `<target>.activity_schedule.summary_stats`
-
-`summary_stats` 是 plain schedule 的结构统计 JSON，只包含当前调度结构统计字段。
 
 ## Compute DAG 导出
 

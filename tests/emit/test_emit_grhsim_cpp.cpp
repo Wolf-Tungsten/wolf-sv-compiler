@@ -89,24 +89,6 @@ namespace
         return std::string_view::npos;
     }
 
-    std::vector<std::string_view> splitTabs(std::string_view line)
-    {
-        std::vector<std::string_view> fields;
-        std::size_t pos = 0;
-        while (pos <= line.size())
-        {
-            const std::size_t next = line.find('\t', pos);
-            if (next == std::string_view::npos)
-            {
-                fields.push_back(line.substr(pos));
-                break;
-            }
-            fields.push_back(line.substr(pos, next - pos));
-            pos = next + 1;
-        }
-        return fields;
-    }
-
     std::vector<std::filesystem::path> collectSchedFiles(const std::filesystem::path &dir, std::string_view prefix)
     {
         std::vector<std::filesystem::path> files;
@@ -2254,20 +2236,25 @@ int main()
         const std::filesystem::path statePath = outDir / "grhsim_top_state.cpp";
         const std::filesystem::path evalPath = outDir / "grhsim_top_eval.cpp";
         const std::filesystem::path makefilePath = outDir / "Makefile";
-        const std::filesystem::path emitStatsPath = outDir / "grhsim_emit_stats.json";
+        const std::filesystem::path staticStatsPath = outDir / "grhsim_static_stats.json";
         const std::vector<std::filesystem::path> stateFiles = collectSchedFiles(outDir, "grhsim_top_state");
         const std::vector<std::filesystem::path> schedFiles = collectSchedFiles(outDir, "grhsim_top_sched_");
         if (!std::filesystem::exists(headerPath) || !std::filesystem::exists(runtimePath) || !std::filesystem::exists(statePath) ||
             !std::filesystem::exists(evalPath) || !std::filesystem::exists(makefilePath) ||
-            !std::filesystem::exists(emitStatsPath) || stateFiles.size() < 2 ||
-            schedFiles.empty())
+            !std::filesystem::exists(staticStatsPath) || stateFiles.size() < 2 || schedFiles.empty())
         {
             return fail("Expected generated grhsim split state/schedule artifacts to exist");
         }
-        if (std::find(result.artifacts.begin(), result.artifacts.end(), emitStatsPath.string()) ==
+        if (std::find(result.artifacts.begin(), result.artifacts.end(), staticStatsPath.string()) ==
             result.artifacts.end())
         {
-            return fail("EmitGrhSimCpp should report grhsim_emit_stats.json as an artifact");
+            return fail("EmitGrhSimCpp should report grhsim_static_stats.json as an artifact");
+        }
+        if (std::find_if(result.artifacts.begin(), result.artifacts.end(), [](const std::string &artifact) {
+                return artifact.find("grhsim_emit_stats.json") != std::string::npos;
+            }) != result.artifacts.end())
+        {
+            return fail("EmitGrhSimCpp should not report removed stats artifacts");
         }
 
         const std::string header = readFile(headerPath);
@@ -2275,7 +2262,7 @@ int main()
         const std::string state = readFiles(stateFiles);
         const std::string eval = readFile(evalPath);
         const std::string makefile = readFile(makefilePath);
-        const std::string emitStats = readFile(emitStatsPath);
+        const std::string staticStats = readFile(staticStatsPath);
         const std::string sched = readFiles(schedFiles);
 
     if (header.find("class GrhSIM_top") == std::string::npos)
@@ -2314,13 +2301,28 @@ int main()
         return fail("default grhsim emit should define perf feature macro as disabled");
     }
     if (header.find("static constexpr bool kRuntimeProfileCompiled = false;") == std::string::npos ||
+        header.find("static constexpr bool kRuntimeStatsCompiled = false;") == std::string::npos ||
         header.find("runtime_profile_active_supernodes_") != std::string::npos ||
         header.find("runtime_profile_fire_compute_") != std::string::npos ||
+        header.find("runtime_stats_activation_count_") != std::string::npos ||
         sched.find("runtime_profile_enabled_") != std::string::npos ||
         sched.find("runtime_profile_compute_ops_") != std::string::npos ||
-        sched.find("runtime_profile_fire_compute_") != std::string::npos)
+        sched.find("runtime_profile_fire_compute_") != std::string::npos ||
+        sched.find("++runtime_stats_activation_count_") != std::string::npos)
     {
-        return fail("default grhsim emit should omit runtime profile hot-path storage and updates");
+        return fail("default grhsim emit should omit runtime profile/stats hot-path storage and updates");
+    }
+    if (staticStats.find("\"format\": \"wolvrix.sim-supernode-static-stats.v1\"") == std::string::npos ||
+        staticStats.find("\"sim\": \"grhsim\"") == std::string::npos ||
+        staticStats.find("\"summary\"") == std::string::npos ||
+        staticStats.find("\"supernodes\"") == std::string::npos ||
+        staticStats.find("\"compute_compute\"") == std::string::npos ||
+        staticStats.find("\"compute_commit\"") == std::string::npos ||
+        staticStats.find("\"commit_compute\"") == std::string::npos ||
+        staticStats.find("\"commit_commit\"") == std::string::npos ||
+        staticStats.find("\"activation_checks\"") == std::string::npos)
+    {
+        return fail("grhsim_static_stats.json should use the unified JSON schema");
     }
     if (header.find("struct PerfCounters") != std::string::npos ||
         header.find("PerfCounters perf_counters() const") != std::string::npos ||
@@ -2459,16 +2461,6 @@ int main()
         sched.find("slice_array_y = static_cast<std::uint8_t>(grhsim_trunc_u64(scalar_slice_array") != std::string::npos)
     {
         return fail("packed-array kSliceArray should emit lane storage and direct lane lookup");
-    }
-    if (emitStats.find("\"packed_array_lane_emit\"") == std::string::npos ||
-        emitStats.find("\"sv_packed_array_attr_defops\": 1") == std::string::npos ||
-        emitStats.find("\"sv_packed_array_attr_concat_defops\": 1") == std::string::npos ||
-        emitStats.find("\"packed_array_slice_array_users\": 1") == std::string::npos ||
-        emitStats.find("\"packed_array_slice_dynamic_legacy_users\": 0") == std::string::npos ||
-        emitStats.find("\"packed_array_lane_emit_values\": 1") == std::string::npos ||
-        emitStats.find("\"packed_array_lane_emit_selects\": 1") == std::string::npos)
-    {
-        return fail("packed-array lane emit stats should report the kSliceArray fast path");
     }
     if (sched.find("grhsim_cast_u64") == std::string::npos ||
         sched.find("grhsim_compare_signed_u64") == std::string::npos ||
@@ -4706,14 +4698,14 @@ int main()
         }
 
         const std::filesystem::path runtimeProfileDir =
-            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_runtime_profile";
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_runtime_profile_removed";
         std::filesystem::remove_all(runtimeProfileDir);
         std::filesystem::create_directories(runtimeProfileDir);
         Design runtimeProfileDesign = buildDesign(wideMemInitPath.string());
         SessionStore runtimeProfileSession;
         if (!runActivitySchedule(runtimeProfileDesign, runtimeProfileSession))
         {
-            return fail("runtime-profile activity-schedule pass failed");
+            return fail("runtime-profile-removed activity-schedule pass failed");
         }
         EmitOptions runtimeProfileOptions;
         runtimeProfileOptions.outputDir = runtimeProfileDir.string();
@@ -4728,88 +4720,78 @@ int main()
         EmitResult runtimeProfileResult = runtimeProfileEmitter.emit(runtimeProfileDesign, runtimeProfileOptions);
         if (!runtimeProfileResult.success || runtimeProfileDiag.hasError())
         {
-            return fail("runtime-profile-enabled emit failed");
+            return fail("runtime-profile-removed emit failed");
         }
         const std::string runtimeProfileHeader = readFile(runtimeProfileDir / "grhsim_top.hpp");
         const std::string runtimeProfileState = readFile(runtimeProfileDir / "grhsim_top_state.cpp");
         const std::string runtimeProfileSched = readFiles(collectSchedFiles(runtimeProfileDir, "grhsim_top_sched_"));
-        if (runtimeProfileHeader.find("static constexpr bool kRuntimeProfileCompiled = true;") == std::string::npos ||
-            runtimeProfileHeader.find("runtime_profile_fire_compute_") == std::string::npos ||
-            runtimeProfileHeader.find("runtime_profile_fire_commit_") == std::string::npos ||
+        if (runtimeProfileHeader.find("static constexpr bool kRuntimeProfileCompiled = false;") == std::string::npos ||
+            runtimeProfileHeader.find("runtime_profile_fire_compute_") != std::string::npos ||
+            runtimeProfileHeader.find("runtime_profile_fire_commit_") != std::string::npos ||
             runtimeProfileHeader.find("runtime_profile_active_supernodes_") != std::string::npos ||
-            runtimeProfileHeader.find("runtime_profile_compute_supernodes_") != std::string::npos ||
-            runtimeProfileHeader.find("runtime_profile_compute_nodes_") != std::string::npos ||
-            runtimeProfileHeader.find("eval_invocation_count_") != std::string::npos ||
-            runtimeProfileSched.find("if (runtime_profile_enabled_)") == std::string::npos ||
-            runtimeProfileSched.find("++runtime_profile_fire_compute_[") == std::string::npos ||
+            runtimeProfileSched.find("if (runtime_profile_enabled_)") != std::string::npos ||
+            runtimeProfileSched.find("++runtime_profile_fire_compute_[") != std::string::npos ||
             runtimeProfileSched.find("runtime_profile_compute_ops_") != std::string::npos ||
-            runtimeProfileSched.find("runtime_profile_source_ops_") != std::string::npos ||
-            runtimeProfileSched.find("runtime_profile_sink_ops_") != std::string::npos ||
-            runtimeProfileState.find("WOLVRIX_GRHSIM_SUPERNODE_TSV") == std::string::npos ||
-            runtimeProfileState.find("# total_evals") != std::string::npos ||
-            runtimeProfileState.find("# N_rows") != std::string::npos ||
-            runtimeProfileState.find("sim\\tsupernode_id") != std::string::npos ||
-            runtimeProfileState.find("e_total") != std::string::npos ||
-            runtimeProfileState.find("supernode_id\\tphase\\tf\\tn_comp") != std::string::npos ||
-            runtimeProfileState.find("supernode_id\\tphase\\tf\\n") == std::string::npos)
+            runtimeProfileState.find("WOLVRIX_GRHSIM_SUPERNODE_TSV") != std::string::npos ||
+            runtimeProfileState.find("supernode_id\\tphase\\tf") != std::string::npos)
         {
-            return fail("runtime-profile-enabled emit should write the fire-only TSV (static columns move to the emit-time file)");
+            return fail("removed runtime profile option should not generate counters or TSV writers");
         }
-        // NO0190 §10.1: static cost columns are an EMIT-time artifact, separate from the runtime fire file.
-        const std::string runtimeProfileStaticTsv = readFile(runtimeProfileDir / "grhsim_supernode_static.tsv");
-        if (runtimeProfileStaticTsv.find("supernode_id\tphase\tn_comp\tn_src\tn_sink\tn_const\ta_succ") == std::string::npos)
+        if (std::filesystem::exists(runtimeProfileDir / "grhsim_supernode_static.tsv") ||
+            std::filesystem::exists(runtimeProfileDir / "grhsim_supernode_fire.tsv"))
         {
-            return fail("emit should write grhsim_supernode_static.tsv with the 7-column static header");
+            return fail("removed runtime profile option should not write static or fire TSV artifacts");
         }
+
+        const std::filesystem::path runtimeStatsDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_runtime_stats";
+        std::filesystem::remove_all(runtimeStatsDir);
+        std::filesystem::create_directories(runtimeStatsDir);
+        Design runtimeStatsDesign = buildDesign(wideMemInitPath.string());
+        SessionStore runtimeStatsSession;
+        if (!runActivitySchedule(runtimeStatsDesign, runtimeStatsSession))
         {
-            bool sawStaticCompute = false, sawStaticCommit = false, sawStaticCommitASucc = false;
-            std::size_t ls = 0;
-            while (ls < runtimeProfileStaticTsv.size())
-            {
-                const std::size_t le = runtimeProfileStaticTsv.find('\n', ls);
-                const std::string_view line(runtimeProfileStaticTsv.data() + ls,
-                                            (le == std::string::npos ? runtimeProfileStaticTsv.size() : le) - ls);
-                ls = le == std::string::npos ? runtimeProfileStaticTsv.size() : le + 1;
-                if (line.empty() || line.front() == '#' || line.rfind("supernode_id", 0) == 0)
-                {
-                    continue;
-                }
-                const std::vector<std::string_view> f = splitTabs(line);
-                if (f.size() != 7)
-                {
-                    return fail("static TSV rows should have exactly 7 fields");
-                }
-                if (f[1] == "compute")
-                {
-                    sawStaticCompute = true;
-                }
-                else if (f[1] == "commit")
-                {
-                    sawStaticCommit = true;
-                    if (f[6] != "0")
-                    {
-                        sawStaticCommitASucc = true;
-                    }
-                }
-            }
-            if (!sawStaticCompute || !sawStaticCommit || !sawStaticCommitASucc)
-            {
-                return fail("static TSV should include compute rows and nonzero commit a_succ rows");
-            }
+            return fail("runtime-stats activity-schedule pass failed");
         }
-        const std::string runtimeProfileBuildCmd =
-            "make -C " + runtimeProfileDir.string() + " CXX=clang++ CXXFLAGS='" +
+        EmitOptions runtimeStatsOptions;
+        runtimeStatsOptions.outputDir = runtimeStatsDir.string();
+        runtimeStatsOptions.session = &runtimeStatsSession;
+        runtimeStatsOptions.sessionPathPrefix = std::string("top");
+        runtimeStatsOptions.attributes["sched_batch_max_ops"] = "8";
+        runtimeStatsOptions.attributes["sched_batch_max_estimated_lines"] = "96";
+        runtimeStatsOptions.attributes["emit_parallelism"] = "2";
+        runtimeStatsOptions.attributes["emit_runtime_stats"] = "1";
+        EmitDiagnostics runtimeStatsDiag;
+        EmitGrhSimCpp runtimeStatsEmitter(&runtimeStatsDiag);
+        EmitResult runtimeStatsResult = runtimeStatsEmitter.emit(runtimeStatsDesign, runtimeStatsOptions);
+        if (!runtimeStatsResult.success || runtimeStatsDiag.hasError())
+        {
+            return fail("runtime-stats emit failed");
+        }
+        const std::string runtimeStatsHeader = readFile(runtimeStatsDir / "grhsim_top.hpp");
+        const std::string runtimeStatsState = readFile(runtimeStatsDir / "grhsim_top_state.cpp");
+        const std::string runtimeStatsSched = readFiles(collectSchedFiles(runtimeStatsDir, "grhsim_top_sched_"));
+        if (runtimeStatsHeader.find("static constexpr bool kRuntimeStatsCompiled = true;") == std::string::npos ||
+            runtimeStatsHeader.find("runtime_stats_activation_count_") == std::string::npos ||
+            runtimeStatsState.find("wolvrix.sim-supernode-runtime-stats.v1") == std::string::npos ||
+            runtimeStatsState.find("grhsim_runtime_stats.json") == std::string::npos ||
+            runtimeStatsSched.find("++runtime_stats_activation_count_") == std::string::npos)
+        {
+            return fail("runtime-stats emit should generate activation counters and JSON writer");
+        }
+        const std::string runtimeStatsBuildCmd =
+            "make -C " + runtimeStatsDir.string() + " CXX=clang++ CXXFLAGS='" +
             std::string(kHarnessCompileFlags) + "'";
-        if (std::system(runtimeProfileBuildCmd.c_str()) != 0)
+        if (std::system(runtimeStatsBuildCmd.c_str()) != 0)
         {
-            return fail("runtime-profile-enabled generated archive failed to build");
+            return fail("runtime-stats generated archive failed to build");
         }
-        const std::filesystem::path runtimeProfileHarnessPath = runtimeProfileDir / "grhsim_top_profile_harness.cpp";
+        const std::filesystem::path runtimeStatsHarnessPath = runtimeStatsDir / "grhsim_top_runtime_stats_harness.cpp";
         {
-            std::ofstream harness(runtimeProfileHarnessPath);
+            std::ofstream harness(runtimeStatsHarnessPath);
             if (!harness.is_open())
             {
-                return fail("Failed to create runtime-profile grhsim harness");
+                return fail("Failed to create runtime-stats grhsim harness");
             }
             harness << "#include \"grhsim_top.hpp\"\n";
             harness << "#include <cstdint>\n\n";
@@ -4817,73 +4799,36 @@ int main()
             harness << "int main()\n";
             harness << "{\n";
             harness << "    GrhSIM_top sim;\n";
-            harness << "    sim.set_runtime_profile_enabled(true);\n";
             harness << "    sim.init();\n";
             harness << "    sim.clk = true;\n";
             harness << "    sim.en = true;\n";
             harness << "    sim.a = static_cast<std::uint8_t>(3);\n";
             harness << "    sim.eval();\n";
-            harness << "    sim.dump_runtime_profile();\n";
+            harness << "    sim.dump_runtime_stats(\"" << (runtimeStatsDir / "runtime.json").string() << "\");\n";
             harness << "    return 0;\n";
             harness << "}\n";
         }
-        const std::filesystem::path runtimeProfileHarnessExe = runtimeProfileDir / "grhsim_top_profile_harness";
-        const std::string runtimeProfileHarnessCompileCmd =
-            "clang++ " + std::string(kHarnessCompileFlags) + " -I" + runtimeProfileDir.string() + " " +
-            runtimeProfileHarnessPath.string() + " " + (runtimeProfileDir / "libgrhsim_top.a").string() +
-            " -o " + runtimeProfileHarnessExe.string();
-        if (std::system(runtimeProfileHarnessCompileCmd.c_str()) != 0)
+        const std::filesystem::path runtimeStatsHarnessExe = runtimeStatsDir / "grhsim_top_runtime_stats_harness";
+        const std::string runtimeStatsHarnessCompileCmd =
+            "clang++ " + std::string(kHarnessCompileFlags) + " -I" + runtimeStatsDir.string() + " " +
+            runtimeStatsHarnessPath.string() + " " + (runtimeStatsDir / "libgrhsim_top.a").string() +
+            " -o " + runtimeStatsHarnessExe.string();
+        if (std::system(runtimeStatsHarnessCompileCmd.c_str()) != 0)
         {
-            return fail("runtime-profile grhsim harness failed to compile");
+            return fail("runtime-stats grhsim harness failed to compile");
         }
-        const std::filesystem::path runtimeProfileTsvPath = runtimeProfileDir / "profile.tsv";
-        const std::string runtimeProfileHarnessRunCmd =
-            "WOLVRIX_GRHSIM_SUPERNODE_TSV=" + runtimeProfileTsvPath.string() + " " +
-            runtimeProfileHarnessExe.string();
-        if (std::system(runtimeProfileHarnessRunCmd.c_str()) != 0)
+        if (std::system(runtimeStatsHarnessExe.string().c_str()) != 0)
         {
-            return fail("runtime-profile grhsim harness failed to run");
+            return fail("runtime-stats grhsim harness failed to run");
         }
-        const std::string runtimeProfileTsv = readFile(runtimeProfileTsvPath);
-        if (runtimeProfileTsv.find("# total_evals") != std::string::npos ||
-            runtimeProfileTsv.find("# N_rows=") != std::string::npos ||
-            runtimeProfileTsv.find("supernode_id\tphase\tf\n") == std::string::npos ||
-            runtimeProfileTsv.find("\tn_comp") != std::string::npos ||
-            runtimeProfileTsv.find("grhsim\t") != std::string::npos ||
-            runtimeProfileTsv.find("fire_count") != std::string::npos)
+        const std::string runtimeStatsJson = readFile(runtimeStatsDir / "runtime.json");
+        if (runtimeStatsJson.find("\"format\": \"wolvrix.sim-supernode-runtime-stats.v1\"") == std::string::npos ||
+            runtimeStatsJson.find("\"sim\": \"grhsim\"") == std::string::npos ||
+            runtimeStatsJson.find("\"summary\"") == std::string::npos ||
+            runtimeStatsJson.find("\"activation_count\"") == std::string::npos ||
+            runtimeStatsJson.find("\"supernode_id\"") == std::string::npos)
         {
-            return fail("runtime-profile grhsim harness should write the fire-only per-supernode TSV");
-        }
-        bool sawComputeRow = false;
-        bool sawCommitRow = false;
-        std::size_t lineStart = 0;
-        while (lineStart < runtimeProfileTsv.size())
-        {
-            const std::size_t lineEnd = runtimeProfileTsv.find('\n', lineStart);
-            const std::string_view line(runtimeProfileTsv.data() + lineStart,
-                                        (lineEnd == std::string::npos ? runtimeProfileTsv.size() : lineEnd) - lineStart);
-            lineStart = lineEnd == std::string::npos ? runtimeProfileTsv.size() : lineEnd + 1;
-            if (line.empty() || line.front() == '#' || line == "supernode_id\tphase\tf")
-            {
-                continue;
-            }
-            const std::vector<std::string_view> fields = splitTabs(line);
-            if (fields.size() != 3)
-            {
-                return fail("runtime-profile fire TSV rows should have exactly 3 fields");
-            }
-            if (fields[1] == "compute")
-            {
-                sawComputeRow = true;
-            }
-            else if (fields[1] == "commit")
-            {
-                sawCommitRow = true;
-            }
-        }
-        if (!sawComputeRow || !sawCommitRow)
-        {
-            return fail("runtime-profile fire TSV should include compute and commit rows");
+            return fail("runtime-stats harness should write unified runtime JSON");
         }
 
         const std::filesystem::path perfDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_perf";

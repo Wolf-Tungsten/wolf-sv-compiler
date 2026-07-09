@@ -42,7 +42,7 @@ static PyMethodDef WolvrixMethods[] = {
     {"session_emit_grhsim_cpp",
      reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_session_emit_grhsim_cpp),
      METH_VARARGS | METH_KEYWORDS,
-     "session_emit_grhsim_cpp(session, design, output, top=None, max_cpp_file_bytes=None, waveform=None, perf=None) -> (success, diagnostics)"},
+     "session_emit_grhsim_cpp(session, design, output, top=None, max_cpp_file_bytes=None, waveform=None, perf=None, emit_runtime_stats=False) -> (success, diagnostics)"},
     {"session_emit_verilator_repcut_package",
      reinterpret_cast<PyCFunction>(wolvrix::app::pybind::py_session_emit_verilator_repcut_package),
      METH_VARARGS | METH_KEYWORDS,

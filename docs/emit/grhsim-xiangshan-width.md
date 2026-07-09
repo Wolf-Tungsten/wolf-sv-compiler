@@ -4,11 +4,11 @@ This note summarizes how wide logic values appear in the current XiangShan GrhSI
 
 ## Scope
 
-- Data source: `build/xs/grhsim/wolvrix_xs_post_stats.json`
+- Historical data source: `build/xs/grhsim/wolvrix_xs_post_stats.json` (obsolete; do not regenerate as a statistics source)
 - Counting rule: only values with `type == "logic"`
 - "Wide" in this document means result width `> 64` bits
 
-This filter matters. The raw stats file also contains non-logic values such as `string`, and those can produce very large apparent widths that are not relevant to logic op lowering.
+This filter matters. The historical raw file also contains non-logic values such as `string`, and those can produce very large apparent widths that are not relevant to logic op lowering.
 
 ## Width Distribution
 

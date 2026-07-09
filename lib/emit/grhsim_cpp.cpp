@@ -49,6 +49,7 @@ namespace wolvrix::lib::emit
         using wolvrix::lib::transform::ActivityScheduleSupernodeToOps;
         using wolvrix::lib::transform::ActivityScheduleTopoOrder;
         using wolvrix::lib::transform::ActivityScheduleValueFanout;
+        using wolvrix::lib::transform::kInvalidActivitySupernodeId;
 
         constexpr std::size_t kInlineSystemTaskArgLimit = 16;
         constexpr std::size_t kRegToMemIntentIndexInlineOpLimit = 32;
@@ -91,6 +92,37 @@ namespace wolvrix::lib::emit
         }
 
         std::string escapeCppString(std::string_view text)
+        {
+            std::string out;
+            out.reserve(text.size() + 8);
+            for (unsigned char ch : text)
+            {
+                switch (ch)
+                {
+                case '\\':
+                    out.append("\\\\");
+                    break;
+                case '"':
+                    out.append("\\\"");
+                    break;
+                case '\n':
+                    out.append("\\n");
+                    break;
+                case '\r':
+                    out.append("\\r");
+                    break;
+                case '\t':
+                    out.append("\\t");
+                    break;
+                default:
+                    out.push_back(static_cast<char>(ch));
+                    break;
+                }
+            }
+            return out;
+        }
+
+        std::string escapeJsonString(std::string_view text)
         {
             std::string out;
             out.reserve(text.size() + 8);
@@ -1339,34 +1371,16 @@ namespace wolvrix::lib::emit
             }
         }
 
-        bool parseBooleanEmitOption(const EmitOptions &options,
-                                    std::string_view attributeName,
-                                    const char *envName,
-                                    bool defaultValue = false)
+        bool parseEmitRuntimeStats(const EmitOptions &options)
         {
-            auto parse = [](std::string_view text, bool fallback) {
-                if (text.empty())
-                {
-                    return fallback;
-                }
-                if (text == "0" || text == "false" || text == "False" || text == "FALSE" ||
-                    text == "off" || text == "Off" || text == "OFF" ||
-                    text == "no" || text == "No" || text == "NO")
-                {
-                    return false;
-                }
-                return true;
-            };
-
-            if (auto it = options.attributes.find(std::string(attributeName)); it != options.attributes.end())
+            auto it = options.attributes.find("emit_runtime_stats");
+            if (it == options.attributes.end())
             {
-                return parse(it->second, defaultValue);
+                return false;
             }
-            if (const char *env = std::getenv(envName))
-            {
-                return parse(env, defaultValue);
-            }
-            return defaultValue;
+            const std::string &value = it->second;
+            return value == "1" || value == "true" || value == "TRUE" || value == "on" ||
+                   value == "ON" || value == "yes" || value == "YES";
         }
 
         bool emitStorageRefAliasesEnabled()
@@ -1379,18 +1393,6 @@ namespace wolvrix::lib::emit
                          value == "no" || value == "No" || value == "NO");
             }
             return true;
-        }
-
-        bool emitMaterializedValueStatsEnabled()
-        {
-            if (const char *env = std::getenv("WOLVRIX_GRHSIM_MATERIALIZED_VALUE_STATS"))
-            {
-                const std::string_view value(env);
-                return !(value == "0" || value == "false" || value == "False" || value == "FALSE" ||
-                         value == "off" || value == "Off" || value == "OFF" ||
-                         value == "no" || value == "No" || value == "NO");
-            }
-            return false;
         }
 
         enum class WaveformMode
@@ -1582,6 +1584,10 @@ namespace wolvrix::lib::emit
                    name == prefixText + "_declared_value_index.txt" ||
                    name == prefixText + "_packed_value_index.txt" ||
                    name == "grhsim_emit_stats.json" ||
+                   name == "grhsim_supernode_static.tsv" ||
+                   name == "grhsim_supernode_fire.tsv" ||
+                   name == "grhsim_static_stats.json" ||
+                   name == "grhsim_runtime_stats.json" ||
                    name == prefixText + "_state.cpp" ||
                    name == prefixText + "_state.o" ||
                    name == prefixText + "_eval.cpp" ||
@@ -2612,12 +2618,6 @@ namespace wolvrix::lib::emit
             std::vector<uint32_t> commitSupernodeIds;
             std::vector<uint8_t> supernodeHasComputePart;
             std::vector<uint8_t> supernodeHasCommitPart;
-            bool emitRuntimeProfile = false;
-            std::vector<std::size_t> runtimeProfileSourceOpsBySupernode;
-            std::vector<std::size_t> runtimeProfileComputeOpsBySupernode;
-            std::vector<std::size_t> runtimeProfileSinkOpsBySupernode;
-            std::vector<std::size_t> runtimeProfileConstOpsBySupernode;
-            std::vector<std::size_t> runtimeProfileASuccBySupernode;
             std::vector<std::string> staticConstStringDecls;
             std::vector<std::string> staticConstStringDefs;
             std::vector<std::string> valueFieldDecls;
@@ -2665,6 +2665,7 @@ namespace wolvrix::lib::emit
             bool needsSystemTaskRuntime = false;
             bool emitPerf = false;
             bool emitWaveform = false;
+            bool emitRuntimeStats = false;
         };
 
         bool isStoredValue(const EmitModel &model, ValueId value) noexcept
@@ -2683,6 +2684,277 @@ namespace wolvrix::lib::emit
         {
             return supernodeId < model.supernodeHasCommitPart.size() &&
                    model.supernodeHasCommitPart[supernodeId] != 0U;
+        }
+
+        struct GrhSimStaticStatsRow
+        {
+            std::size_t computeComputeEdges = 0;
+            std::size_t computeCommitEdges = 0;
+            std::size_t commitComputeEdges = 0;
+            std::size_t commitCommitEdges = 0;
+            std::size_t totalEdges = 0;
+            std::size_t selfEdges = 0;
+            std::size_t activationChecks = 0;
+        };
+
+        std::vector<uint32_t> buildOperationSupernodeMap(const ScheduleRefs &schedule)
+        {
+            std::size_t maxOpIndex = 0;
+            for (const auto &ops : schedule.supernodeToOps)
+            {
+                for (OperationId opId : ops)
+                {
+                    maxOpIndex = std::max<std::size_t>(maxOpIndex, opId.index);
+                }
+            }
+            std::vector<uint32_t> opToSupernode(maxOpIndex + 1u, kInvalidActivitySupernodeId);
+            for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps.size(); ++supernodeId)
+            {
+                for (OperationId opId : schedule.supernodeToOps[supernodeId])
+                {
+                    if (opId.index < opToSupernode.size())
+                    {
+                        opToSupernode[opId.index] = supernodeId;
+                    }
+                }
+            }
+            return opToSupernode;
+        }
+
+        bool writeGrhSimStaticStatsJson(const std::filesystem::path &path,
+                                        const Graph &graph,
+                                        const ScheduleRefs &schedule,
+                                        const EmitModel &model,
+                                        std::string &error)
+        {
+            std::vector<GrhSimStaticStatsRow> rows(schedule.supernodeToOps.size());
+            std::vector<std::unordered_set<std::uint64_t>> seenEdges(rows.size());
+            std::vector<std::unordered_set<std::uint64_t>> seenDetectedValues(rows.size());
+            const std::vector<uint32_t> opToSupernode = buildOperationSupernodeMap(schedule);
+
+            const auto supernodeKindText = [&](uint32_t supernodeId) -> std::string_view {
+                return isCommitSupernode(model, supernodeId) ? std::string_view("commit")
+                                                             : std::string_view("compute");
+            };
+
+            const auto addEdge = [&](uint32_t from, uint32_t to) {
+                if (from >= rows.size() || to >= rows.size())
+                {
+                    return;
+                }
+                const std::uint64_t packed = (static_cast<std::uint64_t>(from) << 32u) |
+                                             static_cast<std::uint64_t>(to);
+                if (!seenEdges[from].insert(packed).second)
+                {
+                    return;
+                }
+                GrhSimStaticStatsRow &row = rows[from];
+                ++row.totalEdges;
+                if (from == to)
+                {
+                    ++row.selfEdges;
+                }
+                const bool fromCommit = isCommitSupernode(model, from);
+                const bool toCommit = isCommitSupernode(model, to);
+                if (!fromCommit && !toCommit)
+                {
+                    ++row.computeComputeEdges;
+                }
+                else if (!fromCommit && toCommit)
+                {
+                    ++row.computeCommitEdges;
+                }
+                else if (fromCommit && !toCommit)
+                {
+                    ++row.commitComputeEdges;
+                }
+                else
+                {
+                    ++row.commitCommitEdges;
+                }
+            };
+
+            const auto addDetectedValue = [&](uint32_t supernodeId, ValueId valueId) {
+                if (supernodeId >= rows.size() || !valueId.valid())
+                {
+                    return;
+                }
+                const std::uint64_t key = static_cast<std::uint64_t>(valueId.index);
+                if (seenDetectedValues[supernodeId].insert(key).second)
+                {
+                    ++rows[supernodeId].activationChecks;
+                }
+            };
+
+            for (ValueId valueId : graph.values())
+            {
+                if (valueId.index == 0 || valueId.index > schedule.valueFanout.size())
+                {
+                    continue;
+                }
+                const OperationId defOp = graph.valueDef(valueId);
+                if (!defOp.valid() || defOp.index >= opToSupernode.size())
+                {
+                    continue;
+                }
+                const uint32_t from = opToSupernode[defOp.index];
+                if (from == kInvalidActivitySupernodeId || !isComputeSupernode(model, from))
+                {
+                    continue;
+                }
+                bool hasComputeTarget = false;
+                for (uint32_t to : schedule.valueFanout[valueId.index - 1u])
+                {
+                    if (isComputeSupernode(model, to))
+                    {
+                        addEdge(from, to);
+                        hasComputeTarget = true;
+                    }
+                }
+                if (hasComputeTarget)
+                {
+                    addDetectedValue(from, valueId);
+                }
+            }
+
+            for (const auto &[opId, samples] : model.eventSamplesByOp)
+            {
+                if (opId.index >= opToSupernode.size())
+                {
+                    continue;
+                }
+                const uint32_t to = opToSupernode[opId.index];
+                if (to == kInvalidActivitySupernodeId || !isCommitSupernode(model, to))
+                {
+                    continue;
+                }
+                for (ValueId valueId : samples.values)
+                {
+                    const OperationId defOp = graph.valueDef(valueId);
+                    if (!defOp.valid() || defOp.index >= opToSupernode.size())
+                    {
+                        continue;
+                    }
+                    const uint32_t from = opToSupernode[defOp.index];
+                    if (from == kInvalidActivitySupernodeId)
+                    {
+                        continue;
+                    }
+                    addEdge(from, to);
+                    addDetectedValue(from, valueId);
+                }
+            }
+
+            for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps.size(); ++supernodeId)
+            {
+                if (!isCommitSupernode(model, supernodeId))
+                {
+                    continue;
+                }
+                for (OperationId opId : schedule.supernodeToOps[supernodeId])
+                {
+                    const auto writeIt = model.writeByOp.find(opId);
+                    if (writeIt == model.writeByOp.end())
+                    {
+                        continue;
+                    }
+                    const WriteDecl &write = writeIt->second;
+                    if (write.memoryMaskMode == WriteDecl::MemoryMaskMode::kConstZero)
+                    {
+                        continue;
+                    }
+                    const auto readersIt = schedule.stateReadSupernodes.find(write.symbol);
+                    if (readersIt == schedule.stateReadSupernodes.end() || readersIt->second.empty())
+                    {
+                        continue;
+                    }
+                    ++rows[supernodeId].activationChecks;
+                    for (uint32_t to : readersIt->second)
+                    {
+                        addEdge(supernodeId, to);
+                    }
+                }
+            }
+
+            std::size_t computeSupernodes = 0;
+            std::size_t commitSupernodes = 0;
+            GrhSimStaticStatsRow summary;
+            std::size_t computeActivationChecks = 0;
+            std::size_t commitActivationChecks = 0;
+            for (uint32_t supernodeId = 0; supernodeId < rows.size(); ++supernodeId)
+            {
+                const bool commit = isCommitSupernode(model, supernodeId);
+                if (commit)
+                {
+                    ++commitSupernodes;
+                    commitActivationChecks += rows[supernodeId].activationChecks;
+                }
+                else
+                {
+                    ++computeSupernodes;
+                    computeActivationChecks += rows[supernodeId].activationChecks;
+                }
+                summary.computeComputeEdges += rows[supernodeId].computeComputeEdges;
+                summary.computeCommitEdges += rows[supernodeId].computeCommitEdges;
+                summary.commitComputeEdges += rows[supernodeId].commitComputeEdges;
+                summary.commitCommitEdges += rows[supernodeId].commitCommitEdges;
+                summary.totalEdges += rows[supernodeId].totalEdges;
+                summary.selfEdges += rows[supernodeId].selfEdges;
+                summary.activationChecks += rows[supernodeId].activationChecks;
+            }
+
+            std::ofstream out(path);
+            if (!out.is_open())
+            {
+                error = "failed to open static stats json: " + path.string();
+                return false;
+            }
+            out << "{\n";
+            out << "  \"format\": \"wolvrix.sim-supernode-static-stats.v1\",\n";
+            out << "  \"sim\": \"grhsim\",\n";
+            out << "  \"top\": \"" << escapeJsonString(graph.symbol()) << "\",\n";
+            out << "  \"summary\": {\n";
+            out << "    \"supernodes\": {\"total\": " << rows.size()
+                << ", \"compute\": " << computeSupernodes
+                << ", \"commit\": " << commitSupernodes << "},\n";
+            out << "    \"activation_edges\": {\"total\": " << summary.totalEdges
+                << ", \"self\": " << summary.selfEdges
+                << ", \"compute_compute\": " << summary.computeComputeEdges
+                << ", \"compute_commit\": " << summary.computeCommitEdges
+                << ", \"commit_compute\": " << summary.commitComputeEdges
+                << ", \"commit_commit\": " << summary.commitCommitEdges << "},\n";
+            out << "    \"activation_checks\": {\"total\": " << summary.activationChecks
+                << ", \"compute\": " << computeActivationChecks
+                << ", \"commit\": " << commitActivationChecks << "}\n";
+            out << "  },\n";
+            out << "  \"supernodes\": [\n";
+            for (uint32_t supernodeId = 0; supernodeId < rows.size(); ++supernodeId)
+            {
+                const auto &row = rows[supernodeId];
+                out << "    {\"sim\": \"grhsim\", \"top\": \"" << escapeJsonString(graph.symbol())
+                    << "\", \"supernode_id\": " << supernodeId
+                    << ", \"kind\": \"" << supernodeKindText(supernodeId) << "\""
+                    << ", \"activation_edges\": {\"total\": " << row.totalEdges
+                    << ", \"self\": " << row.selfEdges
+                    << ", \"compute_compute\": " << row.computeComputeEdges
+                    << ", \"compute_commit\": " << row.computeCommitEdges
+                    << ", \"commit_compute\": " << row.commitComputeEdges
+                    << ", \"commit_commit\": " << row.commitCommitEdges << "}"
+                    << ", \"activation_checks\": " << row.activationChecks << "}";
+                if (supernodeId + 1u != rows.size())
+                {
+                    out << ',';
+                }
+                out << '\n';
+            }
+            out << "  ]\n";
+            out << "}\n";
+            if (!out)
+            {
+                error = "failed to write static stats json: " + path.string();
+                return false;
+            }
+            return true;
         }
 
         std::vector<ActiveMaskEntry> buildComputeSupernodeActiveMaskEntries(const EmitModel &model)
@@ -2773,101 +3045,6 @@ namespace wolvrix::lib::emit
             stream << indent << "perf_counters_ = PerfCounters{};\n";
         }
 
-        enum class RuntimeProfileOpClass
-        {
-            Source,
-            Const,
-            Compute,
-            Sink,
-            Ignored,
-        };
-
-        RuntimeProfileOpClass classifyRuntimeProfileOp(OperationKind kind) noexcept
-        {
-            switch (kind)
-            {
-            case OperationKind::kConstant:
-                return RuntimeProfileOpClass::Const;
-            case OperationKind::kRegisterReadPort:
-            case OperationKind::kLatchReadPort:
-            case OperationKind::kMemoryReadPort:
-                return RuntimeProfileOpClass::Source;
-            case OperationKind::kRegisterWritePort:
-            case OperationKind::kLatchWritePort:
-            case OperationKind::kMemoryWritePort:
-            case OperationKind::kMemoryFillPort:
-                return RuntimeProfileOpClass::Sink;
-            case OperationKind::kRegister:
-            case OperationKind::kMemory:
-            case OperationKind::kLatch:
-            case OperationKind::kDpicImport:
-            case OperationKind::kInstance:
-            case OperationKind::kBlackbox:
-            case OperationKind::kXMRRead:
-            case OperationKind::kXMRWrite:
-                return RuntimeProfileOpClass::Ignored;
-            default:
-                return RuntimeProfileOpClass::Compute;
-            }
-        }
-
-        void buildRuntimeProfileWeights(const Graph &graph,
-                                        const ScheduleRefs &schedule,
-                                        EmitModel &model)
-        {
-            const std::size_t supernodeCount = schedule.supernodeToOps.size();
-            model.runtimeProfileSourceOpsBySupernode.assign(supernodeCount, 0);
-            model.runtimeProfileComputeOpsBySupernode.assign(supernodeCount, 0);
-            model.runtimeProfileSinkOpsBySupernode.assign(supernodeCount, 0);
-            model.runtimeProfileConstOpsBySupernode.assign(supernodeCount, 0);
-            model.runtimeProfileASuccBySupernode.assign(supernodeCount, 0);
-            for (std::size_t supernodeId = 0; supernodeId < supernodeCount; ++supernodeId)
-            {
-                for (OperationId opId : schedule.supernodeToOps[supernodeId])
-                {
-                    const Operation op = graph.getOperation(opId);
-                    const OperationKind kind = op.kind();
-                    switch (classifyRuntimeProfileOp(kind))
-                    {
-                    case RuntimeProfileOpClass::Source:
-                        ++model.runtimeProfileSourceOpsBySupernode[supernodeId];
-                        break;
-                    case RuntimeProfileOpClass::Const:
-                        ++model.runtimeProfileConstOpsBySupernode[supernodeId];
-                        break;
-                    case RuntimeProfileOpClass::Compute:
-                        ++model.runtimeProfileComputeOpsBySupernode[supernodeId];
-                        break;
-                    case RuntimeProfileOpClass::Sink:
-                        ++model.runtimeProfileSinkOpsBySupernode[supernodeId];
-                        break;
-                    case RuntimeProfileOpClass::Ignored:
-                        break;
-                    }
-                    for (ValueId result : op.results())
-                    {
-                        const auto fanoutIt = model.boundaryFanoutByValue.find(result);
-                        if (fanoutIt != model.boundaryFanoutByValue.end() && !fanoutIt->second.empty())
-                        {
-                            ++model.runtimeProfileASuccBySupernode[supernodeId];
-                        }
-                    }
-                    if (isWritePortKind(kind))
-                    {
-                        const auto writeIt = model.writeByOp.find(opId);
-                        if (writeIt != model.writeByOp.end())
-                        {
-                            const auto headIt = model.stateHeadSupernodesBySymbol.find(writeIt->second.symbol);
-                            if (headIt != model.stateHeadSupernodesBySymbol.end() && !headIt->second.empty())
-                            {
-                                ++model.runtimeProfileASuccBySupernode[supernodeId];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         std::optional<std::string> staticConstStringExpr(const Graph &graph, ValueId valueId)
         {
             if (graph.valueType(valueId) != ValueType::String)
@@ -2935,42 +3112,6 @@ namespace wolvrix::lib::emit
         {
             return "packed_array_lanes_" + std::to_string(value.index) + "_" +
                    std::to_string(value.generation) + "_" + valueDebugName(graph, value) + "_";
-        }
-
-        std::optional<std::string> writePackedArrayLaneEmitStatsJson(const std::filesystem::path &path,
-                                                                     const PackedArrayLaneEmitStats &stats,
-                                                                     std::uint64_t maxOutputFileBytes)
-        {
-            if (auto error = ensureOutputDirectory(path))
-            {
-                return error;
-            }
-            LimitedOutputStream stream(path, maxOutputFileBytes);
-            if (!stream.isOpen())
-            {
-                return "failed to open output file";
-            }
-            stream << "{\n";
-            stream << "  \"packed_array_lane_emit\": {\n";
-            stream << "    \"packed_array_lane_emit_fallback_invalid_shape\": "
-                   << stats.packedArrayLaneEmitFallbackInvalidShape << ",\n";
-            stream << "    \"packed_array_lane_emit_fallback_mixed_user\": "
-                   << stats.packedArrayLaneEmitFallbackMixedUser << ",\n";
-            stream << "    \"packed_array_lane_emit_selects\": "
-                   << stats.packedArrayLaneEmitSelects << ",\n";
-            stream << "    \"packed_array_lane_emit_values\": "
-                   << stats.packedArrayLaneEmitValues << ",\n";
-            stream << "    \"packed_array_slice_array_users\": "
-                   << stats.packedArraySliceArrayUsers << ",\n";
-            stream << "    \"packed_array_slice_dynamic_legacy_users\": "
-                   << stats.packedArraySliceDynamicLegacyUsers << ",\n";
-            stream << "    \"sv_packed_array_attr_concat_defops\": "
-                   << stats.svPackedArrayAttrConcatDefops << ",\n";
-            stream << "    \"sv_packed_array_attr_defops\": "
-                   << stats.svPackedArrayAttrDefops << "\n";
-            stream << "  }\n";
-            stream << "}\n";
-            return finalizeOutputFile(stream, path);
         }
 
         std::optional<OperationId> singleAssignWrapperConsumer(const Graph &graph, ValueId value)
@@ -7416,96 +7557,6 @@ namespace wolvrix::lib::emit
                 model.materializedValues.insert(valueId);
             }
             collectRegToMemIntentBypassOps(graph, model);
-            if (emitMaterializedValueStatsEnabled())
-            {
-                std::map<std::string, std::size_t> reasonCounts;
-                std::map<std::string, std::size_t> sourceKindCounts;
-                std::size_t materializedBoundaryValues = 0;
-                std::size_t materializedBoundaryEdges = 0;
-                std::size_t materializedTrackedChangeValues = 0;
-                std::size_t localValueCount = 0;
-                std::size_t localScalarLogicValues = 0;
-                std::size_t localWideLogicValues = 0;
-                for (ValueId valueId : graph.values())
-                {
-                    if (model.inputFieldByValue.contains(valueId))
-                    {
-                        continue;
-                    }
-                    if (!persistentValues.contains(valueId))
-                    {
-                        ++localValueCount;
-                        if (graph.valueType(valueId) == ValueType::Logic)
-                        {
-                            if (isWideLogicValue(graph, valueId))
-                            {
-                                ++localWideLogicValues;
-                            }
-                            else
-                            {
-                                ++localScalarLogicValues;
-                            }
-                        }
-                        continue;
-                    }
-                    const uint32_t reasons = persistentReasonByValue[valueId];
-                    ++reasonCounts[persistentReasonSummary(reasons)];
-                    const OperationId defOpId = graph.valueDef(valueId);
-                    const std::string sourceKind =
-                        defOpId.valid() ? std::string(toString(graph.opKind(defOpId))) : std::string("<no_def>");
-                    ++sourceKindCounts[sourceKind];
-                    if ((reasons & kPersistentBoundaryFanout) != 0)
-                    {
-                        ++materializedBoundaryValues;
-                        if (const auto it = model.boundaryFanoutByValue.find(valueId);
-                            it != model.boundaryFanoutByValue.end())
-                        {
-                            materializedBoundaryEdges += it->second.size();
-                        }
-                    }
-                    if (valueNeedsTrackedChange(model, valueId))
-                    {
-                        ++materializedTrackedChangeValues;
-                    }
-                }
-                auto emitTopCounts = [](const char *label, const std::map<std::string, std::size_t> &counts) {
-                    std::vector<std::pair<std::string, std::size_t>> ordered(counts.begin(), counts.end());
-                    std::sort(ordered.begin(),
-                              ordered.end(),
-                              [](const auto &lhs, const auto &rhs)
-                              {
-                                  if (lhs.second != rhs.second)
-                                  {
-                                      return lhs.second > rhs.second;
-                                  }
-                                  return lhs.first < rhs.first;
-                              });
-                    const std::size_t limit = std::min<std::size_t>(ordered.size(), 16);
-                    for (std::size_t i = 0; i < limit; ++i)
-                    {
-                        std::fprintf(stderr,
-                                     "[GRHSIM_MATERIALIZED_VALUE_STATS] %s[%zu]=%s:%zu\n",
-                                     label,
-                                     i,
-                                     ordered[i].first.c_str(),
-                                     ordered[i].second);
-                    }
-                };
-                std::fprintf(stderr,
-                             "[GRHSIM_MATERIALIZED_VALUE_STATS] graph_values=%zu inputs=%zu materialized=%zu persistent=%zu local=%zu local_scalar_logic=%zu local_wide_logic=%zu boundary_values=%zu boundary_edges=%zu tracked_change=%zu\n",
-                             graph.values().size(),
-                             model.inputFieldByValue.size(),
-                             materializedValueOrder.size(),
-                             persistentValues.size(),
-                             localValueCount,
-                             localScalarLogicValues,
-                             localWideLogicValues,
-                             materializedBoundaryValues,
-                             materializedBoundaryEdges,
-                             materializedTrackedChangeValues);
-                emitTopCounts("reason", reasonCounts);
-                emitTopCounts("source_kind", sourceKindCounts);
-            }
             rebuildMaterializedValueStorage(graph, materializedValueOrder, model);
 
             for (const auto &[stateSymbol, supernodes] : schedule.stateReadSupernodes)
@@ -12806,20 +12857,11 @@ namespace wolvrix::lib::emit
                     stream << "        activeWordFlags = static_cast<std::uint8_t>(\n";
                     stream << "            activeWordFlags & static_cast<std::uint8_t>(~UINT8_C("
                            << static_cast<unsigned>(supernodeMask) << ")));\n";
-                    if (model.emitRuntimeProfile)
-                    {
-                        stream << "        if (runtime_profile_enabled_) {\n";
-                        if (batch.phase == ScheduleBatch::Phase::kCompute)
-                        {
-                            stream << "            ++runtime_profile_fire_compute_[" << supernodeId << "u];\n";
-                        }
-                        else
-                        {
-                            stream << "            ++runtime_profile_fire_commit_[" << supernodeId << "u];\n";
-                        }
-                        stream << "        }\n";
-                    }
                     stream << "        {\n";
+                    if (model.emitRuntimeStats)
+                    {
+                        stream << "            ++runtime_stats_activation_count_[" << supernodeId << "u];\n";
+                    }
                 const std::vector<ScalarConcatPrefixCacheDecl> concatPrefixCacheDecls =
                     collectScalarConcatPrefixCaches(graph, schedule.supernodeToOps[supernodeId]);
                 std::unordered_map<ScalarConcatPrefixCacheKey, std::string, ScalarConcatPrefixCacheKeyHash>
@@ -14236,8 +14278,7 @@ namespace wolvrix::lib::emit
         const std::size_t schedBatchTargetCount = parseScheduleBatchTargetCount(options);
         const WaveformMode waveformMode = parseWaveformMode(options);
         const PerfMode perfMode = parsePerfMode(options);
-        const bool emitRuntimeProfile =
-            parseBooleanEmitOption(options, "emit_runtime_profile", "GRHSIM_EMIT_RUNTIME_PROFILE");
+        const bool emitRuntimeStats = parseEmitRuntimeStats(options);
         const std::size_t schedBatchesPerCpp = parseScheduleBatchesPerCpp(options);
         const std::unordered_set<ValueId, ValueIdHash> waveformValueIds =
             waveformMode == WaveformMode::kDeclaredSymbols ? collectDeclaredSymbolWaveformValueIds(graph)
@@ -14262,11 +14303,7 @@ namespace wolvrix::lib::emit
         }
         model.emitWaveform = waveformMode != WaveformMode::kOff;
         model.emitPerf = perfMode != PerfMode::kOff;
-        model.emitRuntimeProfile = emitRuntimeProfile;
-        if (model.emitRuntimeProfile)
-        {
-            buildRuntimeProfileWeights(graph, schedule, model);
-        }
+        model.emitRuntimeStats = emitRuntimeStats;
         std::vector<ScheduleBatch> computeScheduleBatches =
             buildScheduleBatches(graph,
                                  model,
@@ -14330,11 +14367,22 @@ namespace wolvrix::lib::emit
         const std::string normalizedTop = sanitizeIdentifier(graph.symbol());
         const std::string className = "GrhSIM_" + normalizedTop;
         const std::string prefix = "grhsim_" + normalizedTop;
+        const std::filesystem::path staticStatsPath = outDir / "grhsim_static_stats.json";
+        const std::filesystem::path runtimeStatsPath = outDir / "grhsim_runtime_stats.json";
         if (auto error = removeStaleGeneratedArtifacts(outDir, prefix))
         {
             reportError(*error, outDir.string());
             result.success = false;
             return result;
+        }
+        {
+            std::string statsError;
+            if (!writeGrhSimStaticStatsJson(staticStatsPath, graph, schedule, model, statsError))
+            {
+                reportError(statsError, staticStatsPath.string());
+                result.success = false;
+                return result;
+            }
         }
         const std::filesystem::path headerPath = outDir / (prefix + ".hpp");
         const std::filesystem::path runtimePath = outDir / (prefix + "_runtime.hpp");
@@ -14362,38 +14410,7 @@ namespace wolvrix::lib::emit
             schedPaths.push_back(schedOutputPaths[batchIndex / schedBatchesPerCpp]);
         }
         const std::filesystem::path makefilePath = outDir / "Makefile";
-        const std::filesystem::path emitStatsPath = outDir / "grhsim_emit_stats.json";
         const std::uint64_t maxOutputFileBytes = effectiveMaxOutputFileBytes(options);
-
-        // NO0190 §10.1: EMIT-time output — STATIC per-supernode cost columns, written host-side
-        // (not baked into generated code). Kept separate from the runtime fire-count output
-        // (emit-time structural data vs runtime dynamic data; aligned with gsim §10.2).
-        if (model.emitRuntimeProfile)
-        {
-            const std::filesystem::path staticTsvPath = outDir / "grhsim_supernode_static.tsv";
-            if (std::FILE *fp = std::fopen(staticTsvPath.string().c_str(), "w"))
-            {
-                std::fprintf(fp, "supernode_id\tphase\tn_comp\tn_src\tn_sink\tn_const\ta_succ\n");
-                const auto writeStaticRow = [&](uint32_t sid, const char *phase) {
-                    std::fprintf(fp, "%u\t%s\t%zu\t%zu\t%zu\t%zu\t%zu\n",
-                                 static_cast<unsigned>(sid), phase,
-                                 model.runtimeProfileComputeOpsBySupernode[sid],
-                                 model.runtimeProfileSourceOpsBySupernode[sid],
-                                 model.runtimeProfileSinkOpsBySupernode[sid],
-                                 model.runtimeProfileConstOpsBySupernode[sid],
-                                 model.runtimeProfileASuccBySupernode[sid]);
-                };
-                for (const uint32_t sid : model.computeSupernodeIds) writeStaticRow(sid, "compute");
-                for (const uint32_t sid : model.commitSupernodeIds) writeStaticRow(sid, "commit");
-                std::fclose(fp);
-            }
-            else
-            {
-                std::fprintf(stderr,
-                             "[GRHSIM_RUNTIME_PROFILE] failed to open supernode static TSV %s\n",
-                             staticTsvPath.string().c_str());
-            }
-        }
         const std::filesystem::path libfstSrcDir = std::filesystem::path(WOLVRIX_SOURCE_DIR) / "external/libfst/src";
 
         struct InitChunkSpec
@@ -17749,8 +17766,10 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             *stream << "    void set_runtime_profile_enabled(bool enabled);\n";
             *stream << "    [[nodiscard]] bool runtime_profile_enabled() const;\n";
             *stream << "    void dump_runtime_profile() const;\n";
-            *stream << "    static constexpr bool kRuntimeProfileCompiled = "
-                    << (model.emitRuntimeProfile ? "true" : "false") << ";\n";
+            *stream << "    static constexpr bool kRuntimeProfileCompiled = false;\n";
+            *stream << "    void dump_runtime_stats(const char *path = nullptr) const;\n";
+            *stream << "    static constexpr bool kRuntimeStatsCompiled = "
+                    << (model.emitRuntimeStats ? "true" : "false") << ";\n";
             if (model.emitWaveform)
             {
                 *stream << "    void configure_waveform(bool enabled, std::string path = {});\n";
@@ -18068,12 +18087,6 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             {
                 *stream << "    PerfCounters perf_counters_{};\n";
             }
-            if (model.emitRuntimeProfile)
-            {
-                *stream << "    bool runtime_profile_enabled_ = false;\n";
-                *stream << "    std::array<std::uint64_t, kSupernodeCount> runtime_profile_fire_compute_{};\n";
-                *stream << "    std::array<std::uint64_t, kSupernodeCount> runtime_profile_fire_commit_{};\n";
-            }
             *stream << "    bool register_write_conflict_ = false;\n";
             *stream << "    std::uint64_t random_seed_ = UINT64_C(0);\n";
             *stream << "    std::uint64_t random_state_ = UINT64_C(0);\n";
@@ -18099,6 +18112,11 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             }
             *stream << "    std::array<std::uint8_t, kActiveFlagWordCount> supernode_active_curr_{};\n";
             *stream << "    bool commit_activated_readers_ = false;\n";
+            if (model.emitRuntimeStats)
+            {
+                *stream << "    std::array<std::uint64_t, kSupernodeCount> runtime_stats_activation_count_{};\n";
+                *stream << "    mutable bool runtime_stats_default_dumped_ = false;\n";
+            }
             if (!model.stateShadows.empty())
             {
                 *stream << "    std::array<std::uint32_t, kStateShadowCount> touched_state_shadow_indices_{};\n";
@@ -18511,12 +18529,12 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             }
             *stream << "#include \"" << headerPath.filename().string() << "\"\n";
             *stream << "#include <cstdlib>\n";
-            *stream << "#include <cstdio>\n\n";
-            if (model.emitRuntimeProfile)
+            *stream << "#include <cstdio>\n";
+            if (model.emitRuntimeStats)
             {
-                *stream << "#include <filesystem>\n";
-                *stream << "#include <system_error>\n\n";
+                *stream << "#include <fstream>\n";
             }
+            *stream << "\n";
             *stream << className << "::" << className << "()\n";
             *stream << "{\n";
             if (model.emitPerf)
@@ -18633,6 +18651,10 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             {
                 *stream << "    finalize();\n";
             }
+            if (model.emitRuntimeStats)
+            {
+                *stream << "    dump_runtime_stats();\n";
+            }
             *stream << "}\n\n";
             *stream << "void " << className << "::init()\n{\n";
             if (model.emitWaveform)
@@ -18643,6 +18665,11 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "    }\n";
                 *stream << "    waveform_handles_.clear();\n";
                 *stream << "    reset_waveform_tracking();\n";
+            }
+            if (model.emitRuntimeStats)
+            {
+                *stream << "    runtime_stats_activation_count_.fill(UINT64_C(0));\n";
+                *stream << "    runtime_stats_default_dumped_ = false;\n";
             }
             for (const auto &chunk : initChunks)
             {
@@ -18665,97 +18692,67 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "}\n\n";
             }
             *stream << "void " << className << "::set_runtime_profile_enabled(bool enabled)\n{\n";
-            if (model.emitRuntimeProfile)
-            {
-                *stream << "    runtime_profile_enabled_ = enabled;\n";
-            }
-            else
-            {
-                *stream << "    (void)enabled;\n";
-            }
+            *stream << "    (void)enabled;\n";
             *stream << "}\n\n";
             *stream << "bool " << className << "::runtime_profile_enabled() const\n{\n";
-            if (model.emitRuntimeProfile)
+            *stream << "    return false;\n";
+            *stream << "}\n\n";
+            *stream << "void " << className << "::dump_runtime_profile() const\n{\n";
+            *stream << "}\n\n";
+            *stream << "void " << className << "::dump_runtime_stats(const char *path) const\n{\n";
+            if (model.emitRuntimeStats)
             {
-                *stream << "    return runtime_profile_enabled_;\n";
+                *stream << "    const bool useDefaultPath = path == nullptr || path[0] == '\\0';\n";
+                *stream << "    if (useDefaultPath && runtime_stats_default_dumped_) {\n";
+                *stream << "        return;\n";
+                *stream << "    }\n";
+                *stream << "    const char *outPath = useDefaultPath ? \""
+                        << escapeCppString(runtimeStatsPath.string()) << "\" : path;\n";
+                *stream << "    std::ofstream out(outPath);\n";
+                *stream << "    if (!out.is_open()) {\n";
+                *stream << "        return;\n";
+                *stream << "    }\n";
+                *stream << "    std::uint64_t totalActivationCount = UINT64_C(0);\n";
+                *stream << "    for (std::uint64_t count : runtime_stats_activation_count_) {\n";
+                *stream << "        totalActivationCount += count;\n";
+                *stream << "    }\n";
+                *stream << "    out << \"{\\n\";\n";
+                *stream << "    out << \"  \\\"format\\\": \\\"wolvrix.sim-supernode-runtime-stats.v1\\\",\\n\";\n";
+                *stream << "    out << \"  \\\"sim\\\": \\\"grhsim\\\",\\n\";\n";
+                *stream << "    out << \"  \\\"top\\\": \\\"" << escapeCppString(escapeJsonString(graph.symbol()))
+                        << "\\\",\\n\";\n";
+                *stream << "    out << \"  \\\"summary\\\": {\\\"activation_count\\\": \" << totalActivationCount << \"},\\n\";\n";
+                *stream << "    out << \"  \\\"supernodes\\\": [\\n\";\n";
+                *stream << "    static constexpr std::array<std::uint8_t, kSupernodeCount> kRuntimeStatsSupernodeKind = {";
+                for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps.size(); ++supernodeId)
+                {
+                    if (supernodeId != 0)
+                    {
+                        *stream << ", ";
+                    }
+                    *stream << (isCommitSupernode(model, supernodeId) ? "UINT8_C(1)" : "UINT8_C(0)");
+                }
+                *stream << "};\n";
+                *stream << "    for (std::size_t supernodeId = 0; supernodeId < runtime_stats_activation_count_.size(); ++supernodeId) {\n";
+                *stream << "        out << \"    {\\\"sim\\\": \\\"grhsim\\\", \\\"top\\\": \\\""
+                        << escapeCppString(escapeJsonString(graph.symbol()))
+                        << "\\\", \\\"supernode_id\\\": \" << supernodeId\n";
+                *stream << "            << \", \\\"kind\\\": \\\"\" << (kRuntimeStatsSupernodeKind[supernodeId] != 0 ? \"commit\" : \"compute\")\n";
+                *stream << "            << \"\\\", \\\"activation_count\\\": \" << runtime_stats_activation_count_[supernodeId] << \"}\";\n";
+                *stream << "        if (supernodeId + 1u != runtime_stats_activation_count_.size()) {\n";
+                *stream << "            out << \",\";\n";
+                *stream << "        }\n";
+                *stream << "        out << \"\\n\";\n";
+                *stream << "    }\n";
+                *stream << "    out << \"  ]\\n\";\n";
+                *stream << "    out << \"}\\n\";\n";
+                *stream << "    if (useDefaultPath) {\n";
+                *stream << "        runtime_stats_default_dumped_ = true;\n";
+                *stream << "    }\n";
             }
             else
             {
-                *stream << "    return false;\n";
-            }
-            *stream << "}\n\n";
-            *stream << "void " << className << "::dump_runtime_profile() const\n{\n";
-            if (model.emitRuntimeProfile)
-            {
-                *stream << "    if (!runtime_profile_enabled_) {\n";
-                *stream << "        return;\n";
-                *stream << "    }\n";
-                // NO0190 §10.1: RUNTIME output = per-(supernode,phase) fire counts only. Static
-                // columns are an EMIT-time artifact (grhsim_supernode_static.tsv); join on
-                // (supernode_id, phase). Only a minimal (id, phase) row table is baked here so the
-                // runtime can pick the right fire counter and label the phase.
-                *stream << "    struct RuntimeProfileFireRow {\n";
-                *stream << "        std::uint32_t supernodeId = 0;\n";
-                *stream << "        bool computePhase = true;\n";
-                *stream << "    };\n";
-                const std::size_t runtimeProfileRowCount =
-                    model.computeSupernodeIds.size() + model.commitSupernodeIds.size();
-                if (runtimeProfileRowCount == 0)
-                {
-                    *stream << "    static constexpr std::array<RuntimeProfileFireRow, 0> kRows{};\n";
-                }
-                else
-                {
-                    *stream << "    static constexpr std::array<RuntimeProfileFireRow, "
-                            << runtimeProfileRowCount << "> kRows = {{\n";
-                    for (const uint32_t supernodeId : model.computeSupernodeIds)
-                    {
-                        *stream << "        RuntimeProfileFireRow{" << supernodeId << "u, true},\n";
-                    }
-                    for (const uint32_t supernodeId : model.commitSupernodeIds)
-                    {
-                        *stream << "        RuntimeProfileFireRow{" << supernodeId << "u, false},\n";
-                    }
-                    *stream << "    }};\n";
-                }
-                *stream << "    const char *envPath = std::getenv(\"WOLVRIX_GRHSIM_SUPERNODE_TSV\");\n";
-                *stream << "    const char *path = (envPath != nullptr && envPath[0] != '\\0')\n";
-                *stream << "        ? envPath\n";
-                *stream << "        : \"" << escapeCppString((outDir / "grhsim_supernode_fire.tsv").string()) << "\";\n";
-                *stream << "    const std::filesystem::path outputPath(path);\n";
-                *stream << "    if (outputPath.has_parent_path()) {\n";
-                *stream << "        std::error_code ec;\n";
-                *stream << "        std::filesystem::create_directories(outputPath.parent_path(), ec);\n";
-                *stream << "        if (ec) {\n";
-                *stream << "            std::fprintf(stderr,\n";
-                *stream << "                         \"[GRHSIM_RUNTIME_PROFILE] failed to create supernode TSV directory %s: %s\\n\",\n";
-                *stream << "                         outputPath.parent_path().string().c_str(),\n";
-                *stream << "                         ec.message().c_str());\n";
-                *stream << "            return;\n";
-                *stream << "        }\n";
-                *stream << "    }\n";
-                *stream << "    std::FILE *fp = std::fopen(path, \"w\");\n";
-                *stream << "    if (fp == nullptr) {\n";
-                *stream << "        std::fprintf(stderr,\n";
-                *stream << "                     \"[GRHSIM_RUNTIME_PROFILE] failed to open supernode TSV %s\\n\",\n";
-                *stream << "                     path);\n";
-                *stream << "        return;\n";
-                *stream << "    }\n";
-                *stream << "    std::fprintf(fp, \"supernode_id\\tphase\\tf\\n\");\n";
-                *stream << "    for (const auto &row : kRows) {\n";
-                *stream << "        const std::uint64_t fireCount = row.computePhase\n";
-                *stream << "            ? runtime_profile_fire_compute_[row.supernodeId]\n";
-                *stream << "            : runtime_profile_fire_commit_[row.supernodeId];\n";
-                *stream << "        std::fprintf(fp,\n";
-                *stream << "                     \"%u\\t%s\\t%llu\\n\",\n";
-                *stream << "                     static_cast<unsigned>(row.supernodeId),\n";
-                *stream << "                     row.computePhase ? \"compute\" : \"commit\",\n";
-                *stream << "                     static_cast<unsigned long long>(fireCount));\n";
-                *stream << "    }\n";
-                *stream << "    std::fclose(fp);\n";
-                *stream << "    std::printf(\"[GRHSIM_RUNTIME_PROFILE] supernode_fire_tsv=%s rows=%zu\\n\",\n";
-                *stream << "                path,\n";
-                *stream << "                kRows.size());\n";
+                *stream << "    (void)path;\n";
             }
             *stream << "}\n\n";
             const bool useCommitBoolRange = modelUsesCommitScalarStateWriteKind(model, ValueSlotScalarKind::kBool);
@@ -20347,11 +20344,6 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                     *stream << "    touched_state_shadow_count_ = 0;\n";
                 }
                 emitPerfCounterReset(*stream, model, "    ");
-                if (model.emitRuntimeProfile)
-                {
-                    *stream << "    runtime_profile_fire_compute_.fill(UINT64_C(0));\n";
-                    *stream << "    runtime_profile_fire_commit_.fill(UINT64_C(0));\n";
-                }
                 *stream << "    first_eval_ = true;\n";
                 *stream << "    event_baseline_initialized_ = false;\n";
                 *stream << "    register_write_conflict_ = false;\n";
@@ -20979,21 +20971,12 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             }
         }
 
-        if (auto error = writePackedArrayLaneEmitStatsJson(emitStatsPath,
-                                                           model.packedArrayLaneEmitStats,
-                                                           maxOutputFileBytes))
-        {
-            reportError(*error, emitStatsPath.string());
-            result.success = false;
-            return result;
-        }
-
         result.artifacts = {
+            staticStatsPath.string(),
             headerPath.string(),
             runtimePath.string(),
             statePath.string(),
             evalPath.string(),
-            emitStatsPath.string(),
         };
         for (const auto &stateInitPath : stateInitPaths)
         {

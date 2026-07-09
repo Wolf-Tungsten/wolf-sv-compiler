@@ -353,7 +353,6 @@ DP 输出的 segment 会 flatten 成 compute node 列表，再展开成 compute 
 | `value_fanout` | 跨 supernode value 到目标 supernode 的 fanout。 |
 | `topo_order` | supernode topo order。 |
 | `state_read_supernodes` | state symbol 到 reader compute supernode 的映射。 |
-| `summary_stats` | 统计信息 JSON。 |
 
 最终 DAG 的边来自跨 supernode operand def-use。Commit supernode 不作为 value
 producer 产生出边。
