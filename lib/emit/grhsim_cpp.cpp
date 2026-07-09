@@ -2672,6 +2672,7 @@ namespace wolvrix::lib::emit
             bool emitPerf = false;
             bool emitWaveform = false;
             bool inputFullpassSpecialization = false;
+            bool posedgeFullpassSpecialization = false;
         };
 
         bool isStoredValue(const EmitModel &model, ValueId value) noexcept
@@ -14205,7 +14206,8 @@ namespace wolvrix::lib::emit
                 }
             }
             stream << "}\n";
-            if (model.inputFullpassSpecialization && batch.phase == ScheduleBatch::Phase::kCompute)
+            if ((model.inputFullpassSpecialization || model.posedgeFullpassSpecialization) &&
+                batch.phase == ScheduleBatch::Phase::kCompute)
             {
                 stream << "\nvoid " << className << "::" << scheduleBatchFullpassMethodName(batch) << "()\n{\n";
                 stream << "        // compute batch " << batch.index
@@ -14323,6 +14325,10 @@ namespace wolvrix::lib::emit
             parseBooleanEmitOption(options,
                                    "input_fullpass_specialization",
                                    "GRHSIM_INPUT_FULLPASS_SPECIALIZATION");
+        const bool posedgeFullpassSpecialization =
+            parseBooleanEmitOption(options,
+                                   "posedge_fullpass_specialization",
+                                   "GRHSIM_POSEDGE_FULLPASS_SPECIALIZATION");
         const std::size_t schedBatchesPerCpp = parseScheduleBatchesPerCpp(options);
         const std::unordered_set<ValueId, ValueIdHash> waveformValueIds =
             waveformMode == WaveformMode::kDeclaredSymbols ? collectDeclaredSymbolWaveformValueIds(graph)
@@ -14349,6 +14355,7 @@ namespace wolvrix::lib::emit
         model.emitPerf = perfMode != PerfMode::kOff;
         model.emitRuntimeProfile = emitRuntimeProfile;
         model.inputFullpassSpecialization = inputFullpassSpecialization;
+        model.posedgeFullpassSpecialization = posedgeFullpassSpecialization;
         if (model.emitRuntimeProfile)
         {
             buildRuntimeProfileWeights(graph, schedule, model);
@@ -17931,7 +17938,8 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             for (const auto &batch : scheduleBatches)
             {
                 *stream << "    void " << scheduleBatchMethodName(batch) << "();\n";
-                if (model.inputFullpassSpecialization && batch.phase == ScheduleBatch::Phase::kCompute)
+                if ((model.inputFullpassSpecialization || model.posedgeFullpassSpecialization) &&
+                    batch.phase == ScheduleBatch::Phase::kCompute)
                 {
                     *stream << "    void " << scheduleBatchFullpassMethodName(batch) << "();\n";
                 }
@@ -20682,6 +20690,10 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             };
             const std::vector<ActiveMaskEntry> initialComputeActiveMasks =
                 buildComputeSupernodeActiveMaskEntries(model);
+            const bool emitPosedgeFullpassSpecialization =
+                model.posedgeFullpassSpecialization &&
+                model.inputEventValues.size() == 1u &&
+                !commitScheduleBatches.empty();
             *stream << "    // Seed this eval from first-eval compute activation and changed external inputs.\n";
             *stream << "    const bool initial_eval = first_eval_;\n";
             emitPerfCounterIncrement(*stream, model, "    ", "evalCount");
@@ -20816,6 +20828,43 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "        input_fullpass_blocked = true;\n";
                 *stream << "    }\n";
             }
+            if (emitPosedgeFullpassSpecialization)
+            {
+                const ValueId eventValue = model.inputEventValues.front();
+                std::vector<std::string> stableInputConditions;
+                for (const auto &port : graph.inputPorts())
+                {
+                    if (port.value == eventValue)
+                    {
+                        continue;
+                    }
+                    const auto fieldIt = model.inputFieldByValue.find(port.value);
+                    const auto prevIt = model.prevInputFieldByValue.find(port.value);
+                    if (fieldIt == model.inputFieldByValue.end() || prevIt == model.prevInputFieldByValue.end())
+                    {
+                        continue;
+                    }
+                    stableInputConditions.push_back("(" + fieldIt->second + " == " + prevIt->second + ")");
+                }
+                for (const auto &port : graph.inoutPorts())
+                {
+                    const auto fieldIt = model.inputFieldByValue.find(port.in);
+                    const auto prevIt = model.prevInputFieldByValue.find(port.in);
+                    if (fieldIt == model.inputFieldByValue.end() || prevIt == model.prevInputFieldByValue.end())
+                    {
+                        continue;
+                    }
+                    stableInputConditions.push_back("(" + fieldIt->second + " == " + prevIt->second + ")");
+                }
+                *stream << "    const bool posedge_fullpass_candidate = !initial_eval &&\n";
+                *stream << "        (" << model.eventEdgeFieldByValue.at(eventValue)
+                        << " == grhsim_event_edge_kind::posedge)";
+                for (const std::string &condition : stableInputConditions)
+                {
+                    *stream << " &&\n        " << condition;
+                }
+                *stream << ";\n";
+            }
             *stream << '\n';
             const auto emitEvalEpilogue = [&](std::string_view indent)
             {
@@ -20853,6 +20902,36 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 if (!model.allEventValues.empty())
                 {
                     *stream << "        // Fast path consumed this eval without fixed-point rounds.\n";
+                    emitClearAllEventEdges(*stream, model, "        ");
+                }
+                emitEvalEpilogue("        ");
+                *stream << "        return;\n";
+                *stream << "    }\n\n";
+            }
+            if (emitPosedgeFullpassSpecialization)
+            {
+                *stream << "    if (posedge_fullpass_candidate) {\n";
+                *stream << "        pending_eval_round = false;\n";
+                *stream << "        supernode_active_curr_.fill(0);\n";
+                *stream << "        commit_activated_readers_ = false;\n";
+                *stream << "        // Posedge-only full-pass fast path: commit once, then settle compute once.\n";
+                for (const auto &batch : commitScheduleBatches)
+                {
+                    *stream << "        this->" << scheduleBatchMethodName(batch) << "();\n";
+                }
+                *stream << "        const bool state_changed = commit_activated_readers_;\n";
+                *stream << "        supernode_active_curr_.fill(0);\n";
+                *stream << "        if (state_changed) {\n";
+                for (const auto &batch : computeScheduleBatches)
+                {
+                    *stream << "            this->" << scheduleBatchFullpassMethodName(batch) << "();\n";
+                }
+                *stream << "        }\n";
+                *stream << "        commit_activated_readers_ = false;\n";
+                *stream << "        supernode_active_curr_.fill(0);\n";
+                if (!model.allEventValues.empty())
+                {
+                    *stream << "        // Fast path consumed the event edge without fixed-point rounds.\n";
                     emitClearAllEventEdges(*stream, model, "        ");
                 }
                 emitEvalEpilogue("        ");

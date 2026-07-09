@@ -150,6 +150,7 @@ namespace wolvrix::app::pybind
         const char *waveformMode = nullptr;
         const char *perfMode = nullptr;
         PyObject *inputFullpassSpecializationObj = Py_None;
+        PyObject *posedgeFullpassSpecializationObj = Py_None;
         static const char *kwlist[] = {"session",
                                        "design",
                                        "output",
@@ -163,8 +164,9 @@ namespace wolvrix::app::pybind
                                        "waveform",
                                        "perf",
                                        "input_fullpass_specialization",
+                                       "posedge_fullpass_specialization",
                                        nullptr};
-                        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|OOOOOOOssO", const_cast<char **>(kwlist),
+                        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|OOOOOOOssOO", const_cast<char **>(kwlist),
                                          &sessionObj,
                                          &designKey,
                                          &output,
@@ -177,7 +179,8 @@ namespace wolvrix::app::pybind
                                          &emitParallelismObj,
                                          &waveformMode,
                                          &perfMode,
-                                         &inputFullpassSpecializationObj))
+                                         &inputFullpassSpecializationObj,
+                                         &posedgeFullpassSpecializationObj))
         {
             return nullptr;
         }
@@ -297,6 +300,15 @@ namespace wolvrix::app::pybind
                 return nullptr;
             }
             options.attributes["input_fullpass_specialization"] = enabled != 0 ? "1" : "0";
+        }
+        if (posedgeFullpassSpecializationObj != Py_None)
+        {
+            const int enabled = PyObject_IsTrue(posedgeFullpassSpecializationObj);
+            if (enabled < 0)
+            {
+                return nullptr;
+            }
+            options.attributes["posedge_fullpass_specialization"] = enabled != 0 ? "1" : "0";
         }
 
         const auto result = emitter.emit(*design, options);
