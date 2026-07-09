@@ -17757,6 +17757,8 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "        std::uint64_t totalRoundCount = UINT64_C(0);\n";
                 *stream << "        std::uint64_t computeBatchExecCount = UINT64_C(0);\n";
                 *stream << "        std::uint64_t commitBatchExecCount = UINT64_C(0);\n";
+                *stream << "        std::uint64_t computePhaseTimeUs = UINT64_C(0);\n";
+                *stream << "        std::uint64_t commitPhaseTimeUs = UINT64_C(0);\n";
                 *stream << "        std::uint64_t touchedStateShadowCount = UINT64_C(0);\n";
                 *stream << "        std::uint64_t touchedWriteCount = UINT64_C(0);\n";
                 *stream << "    };\n";
@@ -20483,6 +20485,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 {
                     if (model.emitPerf)
                     {
+                        *stream << "        {\n";
                         *stream << "        const auto batch_begin_time = trace_this_eval\n";
                         *stream << "            ? std::chrono::steady_clock::now()\n";
                         *stream << "            : std::chrono::steady_clock::time_point{};\n";
@@ -20509,6 +20512,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                         *stream << "        }\n";
                         *stream << "        ++round_executed_batches;\n";
                         emitPerfCounterIncrement(*stream, model, "        ", perfCounterField);
+                        *stream << "        }\n";
                     }
                 }
             };
@@ -20663,19 +20667,24 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "        const auto round_touched_state_shadow_base = perf_counters_.touchedStateShadowCount;\n";
                 *stream << "        const auto round_touched_write_base = perf_counters_.touchedWriteCount;\n";
                 *stream << "        // Run compute-phase batches in direct schedule order.\n";
-                emitDirectPhaseDispatch(computeScheduleBatches, "compute", "computeBatchExecCount", true);
+                *stream << "        const auto compute_begin_time = std::chrono::steady_clock::now();\n";
+                emitDirectPhaseDispatch(computeScheduleBatches, "compute", "computeBatchExecCount", false);
+                *stream << "        const auto round_compute_us = static_cast<std::uint64_t>(\n";
+                *stream << "            std::chrono::duration_cast<std::chrono::microseconds>(\n";
+                *stream << "                std::chrono::steady_clock::now() - compute_begin_time)\n";
+                *stream << "                .count());\n";
+                *stream << "        round_batch_us += round_compute_us;\n";
+                *stream << "        perf_counters_.computePhaseTimeUs += round_compute_us;\n";
                 *stream << "        // Run sink supernodes after compute has reached the current round boundary.\n";
-                *stream << "        const auto commit_begin_time =\n";
-                *stream << "            trace_this_eval ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};\n";
+                *stream << "        const auto commit_begin_time = std::chrono::steady_clock::now();\n";
                 *stream << "        commit_activated_readers_ = false;\n";
                 *stream << "        // Run commit-phase batches in direct schedule order.\n";
                 emitDirectPhaseDispatch(commitScheduleBatches, "commit", "commitBatchExecCount", false);
-                *stream << "        if (trace_this_eval) {\n";
-                *stream << "            round_commit_us += static_cast<std::uint64_t>(\n";
-                *stream << "                std::chrono::duration_cast<std::chrono::microseconds>(\n";
-                *stream << "                    std::chrono::steady_clock::now() - commit_begin_time)\n";
-                *stream << "                    .count());\n";
-                *stream << "        }\n";
+                *stream << "        round_commit_us += static_cast<std::uint64_t>(\n";
+                *stream << "            std::chrono::duration_cast<std::chrono::microseconds>(\n";
+                *stream << "                std::chrono::steady_clock::now() - commit_begin_time)\n";
+                *stream << "                .count());\n";
+                *stream << "        perf_counters_.commitPhaseTimeUs += round_commit_us;\n";
                 *stream << "        pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);\n";
                 if (!model.allEventValues.empty())
                 {
@@ -20716,7 +20725,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "                peak_active_words = round_active_words_out;\n";
                 *stream << "            }\n";
                 *stream << "            std::fprintf(stderr,\n";
-                *stream << "                         \"[grhsim] eval round #%llu.%llu active_in=%zu active_words_in=%zu executed_batches=%zu touched_shadows=%zu touched_writes=%zu commit_activated=%d batch_us=%llu commit_us=%llu clear_evt_us=%llu total_us=%llu active_out=%zu active_words_out=%zu\\n\",\n";
+                *stream << "                         \"[grhsim] eval round #%llu.%llu active_in=%zu active_words_in=%zu executed_batches=%zu touched_shadows=%zu touched_writes=%zu commit_activated=%d batch_us=%llu compute_us=%llu commit_us=%llu clear_evt_us=%llu total_us=%llu active_out=%zu active_words_out=%zu\\n\",\n";
                 *stream << "                         static_cast<unsigned long long>(eval_id),\n";
                 *stream << "                         static_cast<unsigned long long>(fixed_point_round_count),\n";
                 *stream << "                         round_active_in,\n";
@@ -20725,6 +20734,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "                         round_touched_state_shadows,\n";
                 *stream << "                         round_touched_writes,\n";
                 *stream << "                         commit_activated_readers_ ? 1 : 0,\n";
+                *stream << "                         static_cast<unsigned long long>(round_batch_us),\n";
                 *stream << "                         static_cast<unsigned long long>(round_batch_us),\n";
                 *stream << "                         static_cast<unsigned long long>(round_commit_us),\n";
                 *stream << "                         static_cast<unsigned long long>(round_event_clear_us),\n";
@@ -20740,7 +20750,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "                std::chrono::steady_clock::now() - trace_eval_begin_time)\n";
                 *stream << "                .count());\n";
                 *stream << "        std::fprintf(stderr,\n";
-                *stream << "                     \"[grhsim] eval end   #%llu rounds=%llu peak_active_supernodes=%zu peak_active_words=%zu executed_batches=%zu touched_shadows=%zu touched_writes=%zu commit_activated_rounds=%zu batch_us=%llu commit_us=%llu clear_evt_us=%llu total_us=%llu write_conflict=%d\\n\",\n";
+                *stream << "                     \"[grhsim] eval end   #%llu rounds=%llu peak_active_supernodes=%zu peak_active_words=%zu executed_batches=%zu touched_shadows=%zu touched_writes=%zu commit_activated_rounds=%zu batch_us=%llu compute_us=%llu commit_us=%llu clear_evt_us=%llu total_us=%llu write_conflict=%d\\n\",\n";
                 *stream << "                     static_cast<unsigned long long>(eval_id),\n";
                 *stream << "                     static_cast<unsigned long long>(fixed_point_round_count),\n";
                 *stream << "                     peak_active_supernodes,\n";
@@ -20749,6 +20759,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "                     total_touched_state_shadows,\n";
                 *stream << "                     total_touched_writes,\n";
                 *stream << "                     total_commit_activated_rounds,\n";
+                *stream << "                     static_cast<unsigned long long>(total_batch_us),\n";
                 *stream << "                     static_cast<unsigned long long>(total_batch_us),\n";
                 *stream << "                     static_cast<unsigned long long>(total_commit_us),\n";
                 *stream << "                     static_cast<unsigned long long>(total_event_clear_us),\n";
