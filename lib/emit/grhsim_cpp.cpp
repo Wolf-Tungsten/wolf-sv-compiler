@@ -20597,9 +20597,11 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             {
                 for (const auto &batch : phaseBatches)
                 {
+                    const std::string batchBeginTimeName = "batch_begin_time_" + std::to_string(batch.index);
+                    const std::string batchElapsedUsName = "batch_elapsed_us_" + std::to_string(batch.index);
                     if (model.emitPerf)
                     {
-                        *stream << "        const auto batch_begin_time = trace_this_eval\n";
+                        *stream << "        const auto " << batchBeginTimeName << " = trace_this_eval\n";
                         *stream << "            ? std::chrono::steady_clock::now()\n";
                         *stream << "            : std::chrono::steady_clock::time_point{};\n";
                     }
@@ -20607,13 +20609,13 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                     if (model.emitPerf)
                     {
                         *stream << "        if (trace_this_eval) {\n";
-                        *stream << "            const auto batch_elapsed_us = static_cast<std::uint64_t>(\n";
+                        *stream << "            const auto " << batchElapsedUsName << " = static_cast<std::uint64_t>(\n";
                         *stream << "                std::chrono::duration_cast<std::chrono::microseconds>(\n";
-                        *stream << "                    std::chrono::steady_clock::now() - batch_begin_time)\n";
+                        *stream << "                    std::chrono::steady_clock::now() - " << batchBeginTimeName << ")\n";
                         *stream << "                    .count());\n";
                         if (accumulateBatchUs)
                         {
-                            *stream << "            round_batch_us += batch_elapsed_us;\n";
+                            *stream << "            round_batch_us += " << batchElapsedUsName << ";\n";
                         }
                         *stream << "            std::fprintf(stderr,\n";
                         *stream << "                         \"[grhsim] eval batch #%llu.%llu phase=" << phaseName
@@ -20621,7 +20623,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                         *stream << "                         static_cast<unsigned long long>(eval_id),\n";
                         *stream << "                         static_cast<unsigned long long>(fixed_point_round_count),\n";
                         *stream << "                         static_cast<std::size_t>(" << batch.index << "u),\n";
-                        *stream << "                         static_cast<unsigned long long>(batch_elapsed_us));\n";
+                        *stream << "                         static_cast<unsigned long long>(" << batchElapsedUsName << "));\n";
                         *stream << "        }\n";
                         *stream << "        ++round_executed_batches;\n";
                         emitPerfCounterIncrement(*stream, model, "        ", perfCounterField);
