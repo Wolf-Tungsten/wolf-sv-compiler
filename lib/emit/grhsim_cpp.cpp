@@ -20690,10 +20690,76 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             };
             const std::vector<ActiveMaskEntry> initialComputeActiveMasks =
                 buildComputeSupernodeActiveMaskEntries(model);
-            const bool emitPosedgeFullpassSpecialization =
-                model.posedgeFullpassSpecialization &&
-                model.inputEventValues.size() == 1u &&
-                !commitScheduleBatches.empty();
+            std::optional<ValueId> eventFullpassValue;
+            std::vector<std::string> eventFullpassEdgeConditions;
+            if (model.posedgeFullpassSpecialization &&
+                !model.inputEventValues.empty() &&
+                !commitScheduleBatches.empty())
+            {
+                std::unordered_set<ValueId, ValueIdHash> inputEventValueSet(model.inputEventValues.begin(),
+                                                                             model.inputEventValues.end());
+                for (const auto &port : graph.inputPorts())
+                {
+                    if (sanitizeIdentifier(port.name) == "clock" &&
+                        inputEventValueSet.find(port.value) != inputEventValueSet.end())
+                    {
+                        eventFullpassValue = port.value;
+                        break;
+                    }
+                }
+                if (!eventFullpassValue)
+                {
+                    eventFullpassValue = model.inputEventValues.front();
+                }
+                const auto appendEventFullpassEdgeCondition = [&](const std::string &edge)
+                {
+                    const std::string &edgeField = model.eventEdgeFieldByValue.at(*eventFullpassValue);
+                    if (edge == "posedge")
+                    {
+                        eventFullpassEdgeConditions.push_back(edgeField + " == grhsim_event_edge_kind::posedge");
+                    }
+                };
+                for (uint32_t supernodeId : model.commitSupernodeIds)
+                {
+                    if (supernodeId >= schedule.supernodeToOps.size())
+                    {
+                        continue;
+                    }
+                    for (OperationId opId : schedule.supernodeToOps[supernodeId])
+                    {
+                        const Operation op = graph.getOperation(opId);
+                        if (!isCommitPhaseOp(op))
+                        {
+                            continue;
+                        }
+                        const auto sampleIt = model.eventSamplesByOp.find(opId);
+                        if (sampleIt == model.eventSamplesByOp.end() || sampleIt->second.values.empty())
+                        {
+                            continue;
+                        }
+                        const EventSampleDecl &samples = sampleIt->second;
+                        for (std::size_t i = 0; i < samples.values.size(); ++i)
+                        {
+                            if (samples.values[i] != *eventFullpassValue)
+                            {
+                                continue;
+                            }
+                            const std::string edge =
+                                i < samples.edges.size() ? samples.edges[i] : std::string{};
+                            appendEventFullpassEdgeCondition(edge);
+                        }
+                    }
+                }
+                std::sort(eventFullpassEdgeConditions.begin(), eventFullpassEdgeConditions.end());
+                eventFullpassEdgeConditions.erase(std::unique(eventFullpassEdgeConditions.begin(),
+                                                              eventFullpassEdgeConditions.end()),
+                                                  eventFullpassEdgeConditions.end());
+                if (eventFullpassEdgeConditions.empty())
+                {
+                    eventFullpassValue.reset();
+                }
+            }
+            const bool emitPosedgeFullpassSpecialization = eventFullpassValue.has_value();
             *stream << "    // Seed this eval from first-eval compute activation and changed external inputs.\n";
             *stream << "    const bool initial_eval = first_eval_;\n";
             emitPerfCounterIncrement(*stream, model, "    ", "evalCount");
@@ -20893,7 +20959,28 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                                                  commitEventBlockConditions.end());
                 if (blockAllInputFullpass)
                 {
-                    *stream << "    input_fullpass_blocked = true;\n";
+                    std::vector<std::string> inputEventEdgeConditions;
+                    inputEventEdgeConditions.reserve(model.inputEventValues.size());
+                    for (ValueId value : model.inputEventValues)
+                    {
+                        inputEventEdgeConditions.push_back("((" +
+                                                            eventClassifyExpr(model.prevInputFieldByValue.at(value),
+                                                                              model.inputFieldByValue.at(value)) +
+                                                            ") != grhsim_event_edge_kind::none)");
+                    }
+                    if (!inputEventEdgeConditions.empty())
+                    {
+                        *stream << "    // Some commit ops have non-direct or implicit event guards; keep compute-only input full-pass\n";
+                        *stream << "    // off on direct input event edges, but do not disable it for pure data-input settles.\n";
+                        *stream << "    if (!initial_eval && ("
+                                << joinStrings(inputEventEdgeConditions, " || ") << ")) {\n";
+                        *stream << "        input_fullpass_blocked = true;\n";
+                        *stream << "    }\n";
+                    }
+                    else
+                    {
+                        *stream << "    input_fullpass_blocked = true;\n";
+                    }
                 }
                 if (!commitEventBlockConditions.empty())
                 {
@@ -20905,7 +20992,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             }
             if (emitPosedgeFullpassSpecialization)
             {
-                const ValueId eventValue = model.inputEventValues.front();
+                const ValueId eventValue = *eventFullpassValue;
                 std::vector<std::string> stableInputConditions;
                 for (const auto &port : graph.inputPorts())
                 {
@@ -20931,9 +21018,8 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                     }
                     stableInputConditions.push_back("(" + fieldIt->second + " == " + prevIt->second + ")");
                 }
-                *stream << "    const bool posedge_fullpass_candidate = !initial_eval &&\n";
-                *stream << "        (" << model.eventEdgeFieldByValue.at(eventValue)
-                        << " == grhsim_event_edge_kind::posedge)";
+                *stream << "    const bool event_fullpass_candidate = !initial_eval &&\n";
+                *stream << "        (" << joinStrings(eventFullpassEdgeConditions, " || ") << ")";
                 for (const std::string &condition : stableInputConditions)
                 {
                     *stream << " &&\n        " << condition;
@@ -20985,30 +21071,39 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             }
             if (emitPosedgeFullpassSpecialization)
             {
-                *stream << "    if (posedge_fullpass_candidate) {\n";
+                *stream << "    if (event_fullpass_candidate) {\n";
                 *stream << "        pending_eval_round = false;\n";
                 *stream << "        supernode_active_curr_.fill(0);\n";
                 *stream << "        commit_activated_readers_ = false;\n";
-                *stream << "        // Posedge-only full-pass fast path: commit once, then settle compute once.\n";
+                *stream << "        // Event full-pass fast path: match the normal round order.\n";
+                *stream << "        // First settle compute with the event edge visible so commits read fresh values.\n";
+                for (const auto &batch : computeScheduleBatches)
+                {
+                    *stream << "        this->" << scheduleBatchFullpassMethodName(batch) << "();\n";
+                }
+                *stream << "        // Full-pass compute may leave propagation bits behind; event commits are edge-scanned.\n";
+                *stream << "        supernode_active_curr_.fill(0);\n";
+                *stream << "        commit_activated_readers_ = false;\n";
+                *stream << "        // Then commit event-driven state updates.\n";
                 for (const auto &batch : commitScheduleBatches)
                 {
                     *stream << "        this->" << scheduleBatchMethodName(batch) << "();\n";
                 }
                 *stream << "        const bool state_changed = commit_activated_readers_;\n";
+                *stream << "        commit_activated_readers_ = false;\n";
                 *stream << "        supernode_active_curr_.fill(0);\n";
+                if (!model.allEventValues.empty())
+                {
+                    *stream << "        // Event edges are per fixed-point round; post-commit settling must not see the consumed edge.\n";
+                    emitClearAllEventEdges(*stream, model, "        ");
+                }
                 *stream << "        if (state_changed) {\n";
                 for (const auto &batch : computeScheduleBatches)
                 {
                     *stream << "            this->" << scheduleBatchFullpassMethodName(batch) << "();\n";
                 }
                 *stream << "        }\n";
-                *stream << "        commit_activated_readers_ = false;\n";
                 *stream << "        supernode_active_curr_.fill(0);\n";
-                if (!model.allEventValues.empty())
-                {
-                    *stream << "        // Fast path consumed the event edge without fixed-point rounds.\n";
-                    emitClearAllEventEdges(*stream, model, "        ");
-                }
                 emitEvalEpilogue("        ");
                 *stream << "        return;\n";
                 *stream << "    }\n\n";
