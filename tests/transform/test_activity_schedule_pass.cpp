@@ -82,6 +82,7 @@ namespace
         const ActivityScheduleStateReadSupernodes *stateReadSupernodes = nullptr;
         const ActivityScheduleSupernodeKinds *supernodeKinds = nullptr;
         const ActivityScheduleComputeNodesBySupernode *computeNodesBySupernode = nullptr;
+        const ActivityScheduleComputeNodeOutDegreeStats *computeNodeOutDegree = nullptr;
     };
 
     ScheduleView loadSchedule(const SessionStore &session, const std::string &graphName)
@@ -96,6 +97,7 @@ namespace
             getSessionValue<ActivityScheduleStateReadSupernodes>(session, prefix + "state_read_supernodes"),
             getSessionValue<ActivityScheduleSupernodeKinds>(session, prefix + "supernode_kind"),
             getSessionValue<ActivityScheduleComputeNodesBySupernode>(session, prefix + "compute_nodes_by_supernode"),
+            getSessionValue<ActivityScheduleComputeNodeOutDegreeStats>(session, prefix + "compute_node_out_degree"),
         };
     }
 
@@ -156,9 +158,23 @@ namespace
         if (schedule.supernodeToOps == nullptr || schedule.opToSupernode == nullptr ||
             schedule.dag == nullptr || schedule.valueFanout == nullptr ||
             schedule.topoOrder == nullptr || schedule.stateReadSupernodes == nullptr ||
-            schedule.supernodeKinds == nullptr || schedule.computeNodesBySupernode == nullptr)
+            schedule.supernodeKinds == nullptr || schedule.computeNodesBySupernode == nullptr ||
+            schedule.computeNodeOutDegree == nullptr)
         {
             return fail("Expected all activity-schedule session outputs to exist");
+        }
+        if (schedule.computeNodeOutDegree->semantics != "value_target_dedup")
+        {
+            return fail("Expected compute-node out-degree stats to use value_target_dedup semantics");
+        }
+        std::size_t outDegreeBucketTotal = 0;
+        for (const auto &bucket : schedule.computeNodeOutDegree->buckets)
+        {
+            outDegreeBucketTotal += bucket.count;
+        }
+        if (outDegreeBucketTotal != schedule.computeNodeOutDegree->nodes)
+        {
+            return fail("Expected compute-node out-degree buckets to sum to node count");
         }
         if (schedule.supernodeToOps->size() != schedule.supernodeKinds->size() ||
             schedule.supernodeToOps->size() != schedule.topoOrder->size())
@@ -942,7 +958,7 @@ int main()
         manager.options().session = &session;
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
             .path = "plain_sibling_coarsen",
-            .maxOpInComputeSupernode = 2,
+            .maxOpInComputeSupernode = 1,
             .maxOpInComputeNode = 1,
             .enableCoarsen = true,
             .enableChainMerge = false,
@@ -1456,10 +1472,10 @@ int main()
     }
 
     {
-        currentCase = "coarsen_respects_compute_supernode_op_limit";
+        currentCase = "coarsen_allows_relaxed_chain_limit";
         wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("coarsen_respects_compute_supernode_op_limit");
-        design.markAsTop("coarsen_respects_compute_supernode_op_limit");
+        auto &graph = design.createGraph("coarsen_allows_relaxed_chain_limit");
+        design.markAsTop("coarsen_allows_relaxed_chain_limit");
 
         const auto a = makeValue(graph, "a", 8);
         const auto b = makeValue(graph, "b", 8);
@@ -1496,7 +1512,7 @@ int main()
         PassManager manager;
         manager.options().session = &session;
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
-            .path = "coarsen_respects_compute_supernode_op_limit",
+            .path = "coarsen_allows_relaxed_chain_limit",
             .maxOpInComputeSupernode = 3,
             .maxOpInComputeNode = 1,
             .enableCoarsen = true,
@@ -1506,20 +1522,37 @@ int main()
         const PassManagerResult runResult = manager.run(design, diags);
         if (!runResult.success || diags.hasError())
         {
-            return fail("Expected coarsen op-limit schedule to succeed");
+            return fail("Expected relaxed coarsen chain-limit schedule to succeed");
         }
-        const auto schedule = loadSchedule(session, "coarsen_respects_compute_supernode_op_limit");
+        const auto schedule = loadSchedule(session, "coarsen_allows_relaxed_chain_limit");
         if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
         {
             return rc;
         }
+        bool foundRelaxedComputeSupernode = false;
         for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps->size(); ++supernodeId)
         {
-            if ((*schedule.supernodeKinds)[supernodeId] == ActivityScheduleSupernodeKind::Compute &&
-                (*schedule.supernodeToOps)[supernodeId].size() > 3)
+            if ((*schedule.supernodeKinds)[supernodeId] != ActivityScheduleSupernodeKind::Compute)
             {
-                return fail("Expected coarsened compute supernodes to obey maxOpInComputeSupernode");
+                continue;
             }
+            const std::size_t opCount = (*schedule.supernodeToOps)[supernodeId].size();
+            if (opCount > 3)
+            {
+                foundRelaxedComputeSupernode = true;
+            }
+            if (opCount > 16 * 3)
+            {
+                return fail("Expected relaxed chain coarsen to obey 16x maxOpInComputeSupernode");
+            }
+        }
+        if (!foundRelaxedComputeSupernode)
+        {
+            return fail("Expected relaxed chain coarsen to allow compute supernodes above maxOpInComputeSupernode");
+        }
+        if (schedule.computeNodeOutDegree->edges == 0)
+        {
+            return fail("Expected relaxed coarsen graph to report compute-node out-degree edges");
         }
     }
 

@@ -281,6 +281,12 @@ producer compute node -> consumer compute node
 如果 DAG 有 cycle，pass 会尝试把 cycle 中的多 op compute node 拆成 singleton，
 然后重建 DAG。最多尝试 1024 次。
 
+日志中的 `activity-schedule compute-node out-degree detail` 统计该 DAG 的出度分布。
+口径为 `value_target_dedup`：若 `cn1` 产生的一个或多个 value 被 `cn2` 读取，
+则 `(cn1, cn2)` 只计 1 条 compute->compute 出边；多个 value 不重复计数。
+该分布不包含 compute->commit 边，也不包含同 compute node 内部依赖。
+同一统计也写入 Session key `<target>.activity_schedule.compute_node_out_degree`。
+
 ### 5. Compute-node coarsen
 
 Materialize 阶段先创建初始 cluster：
@@ -290,9 +296,12 @@ Materialize 阶段先创建初始 cluster：
 ```
 
 然后在 compute-node cluster DAG 上做 coarsen。当前 coarsen 受
-`maxOpInComputeSupernode` 约束：两个 cluster 合并后的 op 数不能超过该值。
+`maxOpInComputeSupernode` 派生出的 stage 上限约束：
+`out1` / `in1` 的合并上限为 `16 * maxOpInComputeSupernode`，
+`siblings` 的合并上限为 `16 * maxOpInComputeSupernode`。
+`maxOpInComputeSupernode=0` 时这些 coarsen 上限视为无限制。
 
-Coarsen pipeline 每轮按以下 stage 执行：
+Coarsen pipeline 按以下 stage 只执行一轮，然后直接进入 DP：
 
 | Stage | 候选 | 排序/限制 |
 | --- | --- | --- |
@@ -304,9 +313,6 @@ Coarsen pipeline 每轮按以下 stage 执行：
 不受 `enableChainMerge` 控制。每个 stage 使用 DSU 批量合并，合并后重新检查
 topo 合法性。
 
-性能保护：当 cluster 数不少于 100000，且连续 3 轮每轮减少的 cluster 数都小于
-1024 时，coarsen 提前停止。
-
 ### 6. DP 连续分段
 
 Coarsen 后，pass 在 topo-ordered cluster 序列上做连续分段 DP。这里不是任意 DAG
@@ -314,7 +320,8 @@ partition；它只决定 topo 序列中相邻 cluster 如何切成 compute super
 
 约束：
 
-- 一个 segment 的 op 数不超过 `maxOpInComputeSupernode`。
+- 除单个 cluster 已经超过上限的情况外，一个 segment 的 op 数不超过
+  `maxOpInComputeSupernode`。
 - 如果单个 cluster 已经超过上限，DP 不会把它和其他 cluster 合并。
 
 目标函数：

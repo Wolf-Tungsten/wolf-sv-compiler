@@ -434,10 +434,21 @@ namespace wolvrix::lib::transform
             return cycle;
         }
 
+        constexpr std::size_t kComputeNodeChainMergeMaxOpsMultiplier = 16;
+        constexpr std::size_t kComputeNodeSiblingMergeMaxOpsMultiplier = 16;
 
-        constexpr std::size_t kComputeNodeCoarsenTailLargeClusterThreshold = 100000;
-        constexpr std::size_t kComputeNodeCoarsenTailMaxClusterDeltaExclusive = 1024;
-        constexpr std::size_t kComputeNodeCoarsenTailMaxConsecutiveIters = 3;
+        std::size_t scaledCoarsenMaxOps(std::size_t base, std::size_t multiplier) noexcept
+        {
+            if (base == 0)
+            {
+                return std::numeric_limits<std::size_t>::max();
+            }
+            if (multiplier != 0 && base > std::numeric_limits<std::size_t>::max() / multiplier)
+            {
+                return std::numeric_limits<std::size_t>::max();
+            }
+            return base * multiplier;
+        }
 
         std::uint64_t elapsedMs(const std::chrono::steady_clock::time_point &start) noexcept
         {
@@ -856,6 +867,13 @@ namespace wolvrix::lib::transform
             std::size_t computeNodes = 0;
             std::size_t computeNodeOpsTotal = 0;
             std::size_t computeNodeCycleSplitIters = 0;
+            std::size_t computeNodeValueOutDegreeEdges = 0;
+            std::size_t computeNodeValueOutDegreeMax = 0;
+            std::size_t computeNodeValueOutDegreeMeanMilli = 0;
+            std::size_t computeNodeValueOutDegreeP50 = 0;
+            std::size_t computeNodeValueOutDegreeP90 = 0;
+            std::size_t computeNodeValueOutDegreeP99 = 0;
+            std::vector<std::size_t> computeNodeValueOutDegreeBuckets;
             std::size_t initialComputeSupernodes = 0;
             std::size_t initialComputeSupernodeOpsTotal = 0;
             std::size_t initialComputeSupernodeDagEdges = 0;
@@ -3527,6 +3545,153 @@ namespace wolvrix::lib::transform
             return values[index];
         }
 
+        std::size_t computeNodeOutDegreeBucketIndex(std::size_t degree) noexcept
+        {
+            if (degree <= 2)
+            {
+                return degree;
+            }
+            if (degree <= 4)
+            {
+                return 3;
+            }
+            if (degree <= 8)
+            {
+                return 4;
+            }
+            if (degree <= 16)
+            {
+                return 5;
+            }
+            if (degree <= 32)
+            {
+                return 6;
+            }
+            if (degree <= 64)
+            {
+                return 7;
+            }
+            if (degree <= 128)
+            {
+                return 8;
+            }
+            if (degree <= 256)
+            {
+                return 9;
+            }
+            if (degree <= 512)
+            {
+                return 10;
+            }
+            if (degree <= 1024)
+            {
+                return 11;
+            }
+            return 12;
+        }
+
+        const std::vector<std::string> &computeNodeOutDegreeBucketLabels()
+        {
+            static const std::vector<std::string> labels{
+                "0",
+                "1",
+                "2",
+                "3-4",
+                "5-8",
+                "9-16",
+                "17-32",
+                "33-64",
+                "65-128",
+                "129-256",
+                "257-512",
+                "513-1024",
+                ">1024",
+            };
+            return labels;
+        }
+
+        std::string formatComputeNodeOutDegreeBuckets(const std::vector<std::size_t> &buckets)
+        {
+            const auto &labels = computeNodeOutDegreeBucketLabels();
+            std::ostringstream oss;
+            for (std::size_t i = 0; i < labels.size(); ++i)
+            {
+                if (i != 0)
+                {
+                    oss << ",";
+                }
+                const std::size_t count = i < buckets.size() ? buckets[i] : 0;
+                oss << labels[i] << ":" << count;
+            }
+            return oss.str();
+        }
+
+        ActivityScheduleComputeNodeOutDegreeStats makeComputeNodeOutDegreeSessionStats(
+            const ComputeNodeRewriteStats &stats)
+        {
+            ActivityScheduleComputeNodeOutDegreeStats out;
+            out.semantics = "value_target_dedup";
+            out.nodes = stats.computeNodes;
+            out.edges = stats.computeNodeValueOutDegreeEdges;
+            out.meanMilli = stats.computeNodeValueOutDegreeMeanMilli;
+            out.p50 = stats.computeNodeValueOutDegreeP50;
+            out.p90 = stats.computeNodeValueOutDegreeP90;
+            out.p99 = stats.computeNodeValueOutDegreeP99;
+            out.max = stats.computeNodeValueOutDegreeMax;
+
+            const auto &labels = computeNodeOutDegreeBucketLabels();
+            out.buckets.reserve(labels.size());
+            for (std::size_t i = 0; i < labels.size(); ++i)
+            {
+                out.buckets.push_back(ActivityScheduleComputeNodeOutDegreeBucket{
+                    labels[i],
+                    i < stats.computeNodeValueOutDegreeBuckets.size()
+                        ? stats.computeNodeValueOutDegreeBuckets[i]
+                        : std::size_t{0},
+                });
+            }
+            return out;
+        }
+
+        void recordComputeNodeOutDegreeStats(ComputeRewriteBuild &build)
+        {
+            auto &stats = build.stats;
+            std::vector<std::size_t> degrees;
+            degrees.reserve(build.computeDag.size());
+            stats.computeNodeValueOutDegreeEdges = 0;
+            stats.computeNodeValueOutDegreeMax = 0;
+            stats.computeNodeValueOutDegreeMeanMilli = 0;
+            stats.computeNodeValueOutDegreeP50 = 0;
+            stats.computeNodeValueOutDegreeP90 = 0;
+            stats.computeNodeValueOutDegreeP99 = 0;
+            stats.computeNodeValueOutDegreeBuckets.assign(computeNodeOutDegreeBucketLabels().size(), 0);
+
+            for (const auto &succs : build.computeDag)
+            {
+                const std::size_t degree = succs.size();
+                degrees.push_back(degree);
+                stats.computeNodeValueOutDegreeEdges += degree;
+                stats.computeNodeValueOutDegreeMax =
+                    std::max(stats.computeNodeValueOutDegreeMax, degree);
+                const std::size_t bucket = computeNodeOutDegreeBucketIndex(degree);
+                if (bucket < stats.computeNodeValueOutDegreeBuckets.size())
+                {
+                    ++stats.computeNodeValueOutDegreeBuckets[bucket];
+                }
+            }
+
+            if (degrees.empty())
+            {
+                return;
+            }
+            std::sort(degrees.begin(), degrees.end());
+            stats.computeNodeValueOutDegreeMeanMilli =
+                stats.computeNodeValueOutDegreeEdges * static_cast<std::size_t>(1000) / degrees.size();
+            stats.computeNodeValueOutDegreeP50 = percentileOfSorted(degrees, 50);
+            stats.computeNodeValueOutDegreeP90 = percentileOfSorted(degrees, 90);
+            stats.computeNodeValueOutDegreeP99 = percentileOfSorted(degrees, 99);
+        }
+
         std::string summarizeCoarsenClusterShape(const NodeClusterView &view,
                                                  const ComputeRewriteBuild &rewrite,
                                                  const wolvrix::lib::grh::Graph &graph,
@@ -4496,6 +4661,7 @@ namespace wolvrix::lib::transform
             {
                 out.stats.computeNodeOpsTotal += node.ops.size();
             }
+            recordComputeNodeOutDegreeStats(out);
             return true;
         }
 
@@ -4775,129 +4941,81 @@ namespace wolvrix::lib::transform
             const auto coarsenStart = std::chrono::steady_clock::now();
             if (options.enableCoarsen)
             {
-                const std::size_t coarsenMaxOps =
-                    maxOpsPerComputeSupernode == 0 ? std::numeric_limits<std::size_t>::max()
-                                                   : maxOpsPerComputeSupernode;
-                bool changed = true;
-                std::size_t tailIterations = 0;
-                while (changed)
+                const std::size_t chainCoarsenMaxOps =
+                    scaledCoarsenMaxOps(maxOpsPerComputeSupernode, kComputeNodeChainMergeMaxOpsMultiplier);
+                const std::size_t siblingCoarsenMaxOps =
+                    scaledCoarsenMaxOps(maxOpsPerComputeSupernode, kComputeNodeSiblingMergeMaxOpsMultiplier);
+                const auto iterStart = std::chrono::steady_clock::now();
+                const std::size_t clustersBeforeIter = clusters.size();
+                bool out1Changed = false;
+                bool in1Changed = false;
+                bool siblingsChanged = false;
+                if (options.enableChainMerge)
                 {
-                    const auto iterStart = std::chrono::steady_clock::now();
-                    const std::size_t clustersBeforeIter = clusters.size();
-                    changed = false;
-                    bool out1Changed = false;
-                    bool in1Changed = false;
-                    bool siblingsChanged = false;
-                    if (options.enableChainMerge)
+                    const std::size_t clustersBeforeOut1 = clusters.size();
+                    out1Changed = tryMergeNodeOut1(clusters,
+                                                   rewrite.computeDag,
+                                                   rewrite.computeNodes.size(),
+                                                   nodeTopoPos,
+                                                   nodeOpSizes,
+                                                   chainCoarsenMaxOps,
+                                                   rewrite,
+                                                   graph);
+                    if (out1Changed && perf)
                     {
-                        const std::size_t clustersBeforeOut1 = clusters.size();
-                        out1Changed = tryMergeNodeOut1(clusters,
+                        perf->coarsenOut1Merges += clustersBeforeOut1 >= clusters.size()
+                                                       ? clustersBeforeOut1 - clusters.size()
+                                                       : 0;
+                    }
+
+                    const std::size_t clustersBeforeIn1 = clusters.size();
+                    in1Changed = tryMergeNodeIn1(clusters,
+                                                 rewrite.computeDag,
+                                                 rewrite.computeNodes.size(),
+                                                 nodeTopoPos,
+                                                 nodeOpSizes,
+                                                 chainCoarsenMaxOps,
+                                                 rewrite,
+                                                 graph);
+                    if (in1Changed && perf)
+                    {
+                        perf->coarsenIn1Merges += clustersBeforeIn1 >= clusters.size()
+                                                      ? clustersBeforeIn1 - clusters.size()
+                                                      : 0;
+                    }
+                }
+                const std::size_t clustersBeforeSiblings = clusters.size();
+                siblingsChanged = tryMergeNodeSiblings(clusters,
                                                        rewrite.computeDag,
                                                        rewrite.computeNodes.size(),
                                                        nodeTopoPos,
                                                        nodeOpSizes,
-                                                       coarsenMaxOps,
+                                                       siblingCoarsenMaxOps,
                                                        rewrite,
                                                        graph);
-                        if (out1Changed && perf)
-                        {
-                            perf->coarsenOut1Merges += clustersBeforeOut1 >= clusters.size()
-                                                           ? clustersBeforeOut1 - clusters.size()
-                                                           : 0;
-                        }
-                        changed = out1Changed || changed;
-
-                        const std::size_t clustersBeforeIn1 = clusters.size();
-                        in1Changed = tryMergeNodeIn1(clusters,
-                                                     rewrite.computeDag,
-                                                     rewrite.computeNodes.size(),
-                                                     nodeTopoPos,
-                                                     nodeOpSizes,
-                                                     coarsenMaxOps,
-                                                     rewrite,
-                                                     graph);
-                        if (in1Changed && perf)
-                        {
-                            perf->coarsenIn1Merges += clustersBeforeIn1 >= clusters.size()
-                                                          ? clustersBeforeIn1 - clusters.size()
-                                                          : 0;
-                        }
-                        changed = in1Changed || changed;
-                    }
-                    const std::size_t clustersBeforeSiblings = clusters.size();
-                    siblingsChanged = tryMergeNodeSiblings(clusters,
-                                                           rewrite.computeDag,
-                                                           rewrite.computeNodes.size(),
-                                                           nodeTopoPos,
-                                                           nodeOpSizes,
-                                                           coarsenMaxOps,
-                                                           rewrite,
-                                                           graph);
-                    if (siblingsChanged && perf)
-                    {
-                        perf->coarsenSiblingMerges += clustersBeforeSiblings >= clusters.size()
-                                                          ? clustersBeforeSiblings - clusters.size()
-                                                          : 0;
-                    }
-                    changed = siblingsChanged || changed;
-                    if (perf)
-                    {
-                        const std::size_t clustersAfterIter = clusters.size();
-                        const std::size_t clusterDelta =
-                            clustersBeforeIter >= clustersAfterIter ? (clustersBeforeIter - clustersAfterIter) : 0;
-                        const bool smallDeltaTail =
-                            clustersBeforeIter >= kComputeNodeCoarsenTailLargeClusterThreshold &&
-                            clusterDelta < kComputeNodeCoarsenTailMaxClusterDeltaExclusive;
-                        if (changed && smallDeltaTail)
-                        {
-                            ++tailIterations;
-                        }
-                        else
-                        {
-                            tailIterations = 0;
-                        }
-                        const bool tailStopped =
-                            tailIterations >= kComputeNodeCoarsenTailMaxConsecutiveIters;
-                        if (tailStopped)
-                        {
-                            changed = false;
-                            perf->coarsenTailStopped = true;
-                            perf->coarsenTailIterations = tailIterations;
-                        }
-                        ++perf->coarsenIterations;
-                        perf->coarsenIterationStats.push_back({
-                            .iteration = perf->coarsenIterations,
-                            .clusters = clustersAfterIter,
-                            .clusterDelta = clusterDelta,
-                            .changed = changed,
-                            .out1Changed = out1Changed,
-                            .in1Changed = in1Changed,
-                            .siblingsChanged = siblingsChanged,
-                            .tailStopped = tailStopped,
-                            .elapsedMs = elapsedMs(iterStart),
-                        });
-                    }
-                    else
-                    {
-                        const std::size_t clustersAfterIter = clusters.size();
-                        const std::size_t clusterDelta =
-                            clustersBeforeIter >= clustersAfterIter ? (clustersBeforeIter - clustersAfterIter) : 0;
-                        const bool smallDeltaTail =
-                            clustersBeforeIter >= kComputeNodeCoarsenTailLargeClusterThreshold &&
-                            clusterDelta < kComputeNodeCoarsenTailMaxClusterDeltaExclusive;
-                        if (changed && smallDeltaTail)
-                        {
-                            ++tailIterations;
-                        }
-                        else
-                        {
-                            tailIterations = 0;
-                        }
-                        if (tailIterations >= kComputeNodeCoarsenTailMaxConsecutiveIters)
-                        {
-                            changed = false;
-                        }
-                    }
+                if (siblingsChanged && perf)
+                {
+                    perf->coarsenSiblingMerges += clustersBeforeSiblings >= clusters.size()
+                                                      ? clustersBeforeSiblings - clusters.size()
+                                                      : 0;
+                }
+                if (perf)
+                {
+                    const std::size_t clustersAfterIter = clusters.size();
+                    const std::size_t clusterDelta =
+                        clustersBeforeIter >= clustersAfterIter ? (clustersBeforeIter - clustersAfterIter) : 0;
+                    ++perf->coarsenIterations;
+                    perf->coarsenIterationStats.push_back({
+                        .iteration = perf->coarsenIterations,
+                        .clusters = clustersAfterIter,
+                        .clusterDelta = clusterDelta,
+                        .changed = out1Changed || in1Changed || siblingsChanged,
+                        .out1Changed = out1Changed,
+                        .in1Changed = in1Changed,
+                        .siblingsChanged = siblingsChanged,
+                        .tailStopped = false,
+                        .elapsedMs = elapsedMs(iterStart),
+                    });
                 }
             }
             if (perf)
@@ -5524,6 +5642,9 @@ namespace wolvrix::lib::transform
         setSessionValue(keyPrefix + "state_read_supernodes",
                         build.stateReadSupernodes,
                         "activity-schedule.state-read-supernodes");
+        setSessionValue(keyPrefix + "compute_node_out_degree",
+                        makeComputeNodeOutDegreeSessionStats(rewrite.stats),
+                        "activity-schedule.compute-node-out-degree");
         const std::uint64_t exportMs = elapsedMs(exportStart);
         logInfo("activity-schedule progress: export_session done elapsed_ms=" +
                 std::to_string(exportMs));
@@ -5572,6 +5693,16 @@ namespace wolvrix::lib::transform
                 " tail_iterations=" + std::to_string(materializePerf.coarsenTailIterations) +
                 " segments=" + std::to_string(materializePerf.segments) +
                 " compute_supernodes=" + std::to_string(materializePerf.computeSupernodes));
+        logInfo("activity-schedule compute-node out-degree detail: semantics=value_target_dedup" +
+                std::string(" nodes=") + std::to_string(rewrite.stats.computeNodes) +
+                " edges=" + std::to_string(rewrite.stats.computeNodeValueOutDegreeEdges) +
+                " mean_milli=" + std::to_string(rewrite.stats.computeNodeValueOutDegreeMeanMilli) +
+                " p50=" + std::to_string(rewrite.stats.computeNodeValueOutDegreeP50) +
+                " p90=" + std::to_string(rewrite.stats.computeNodeValueOutDegreeP90) +
+                " p99=" + std::to_string(rewrite.stats.computeNodeValueOutDegreeP99) +
+                " max=" + std::to_string(rewrite.stats.computeNodeValueOutDegreeMax) +
+                " buckets=" +
+                formatComputeNodeOutDegreeBuckets(rewrite.stats.computeNodeValueOutDegreeBuckets));
         for (const auto &iter : materializePerf.coarsenIterationStats)
         {
             logInfo("activity-schedule timing: compute_node_coarsen_iter=" +

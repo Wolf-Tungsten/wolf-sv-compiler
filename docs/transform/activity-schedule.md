@@ -72,23 +72,53 @@ schedule，并把结果写入 session。当前只保留 plain 调度路径；其
    `commitSupernode`，然后重建最终 `dag`、`value_fanout`、`topo_order` 和
    `state_read_supernodes`。
 
-plain coarsen 每轮按以下顺序尝试合并：
+plain coarsen 按以下顺序只执行一轮合并，然后直接进入 DP：
 
 - `out1`：producer 只有一个 compute successor
 - `in1`：consumer 只有一个 compute predecessor
 - `siblings`：拥有相同 predecessor 集合的 sibling clusters
 
-所有合并都受 `max-op-in-compute-supernode` 约束，并在批量合并后重新做 topo check。
+`out1` / `in1` 合并上限为 `16 * max-op-in-compute-supernode`；`siblings` 合并上限为
+`16 * max-op-in-compute-supernode`。`max-op-in-compute-supernode=0` 时这些 coarsen
+上限视为无限制。每个 stage 批量合并后都会重新做 topo check。
 `out1` / `in1` 受 `enableChainMerge` 控制；`siblings` 属于 plain coarsen 基础路径。
 
 连续分段只决定 topo 序列中相邻 cluster 如何切成 compute supernode，不做任意 DAG
-partition。分段成本是：
+partition。除单个 coarsen cluster 已经超过上限的情况外，分段上限仍为
+`max-op-in-compute-supernode`；DP 不会拆开单个 oversize cluster。分段成本是：
 
 ```text
 incoming_boundary_activation_edges + 1
 ```
 
 同成本时偏向更长 segment。
+
+## 结构统计口径
+
+pass 会在日志中输出 `activity-schedule compute-node out-degree detail`。
+同一份数据也会写入 Session key
+`<target>.activity_schedule.compute_node_out_degree`。
+
+该统计基于 coarsen 前的 compute-node DAG，口径为 `value_target_dedup`：
+
+- 节点是 `buildComputeNodeRewrite(...)` 生成并完成 cycle split 后的 compute node。
+- 若 compute node `cn1` 产生的一个或多个 value 被 compute node `cn2` 作为
+  boundary input 读取，则计一条 `cn1 -> cn2` 出边。
+- 同一对 `(cn1, cn2)` 即使由多个 value 连接，也只计一条出边。
+- 不统计 `cn -> cn` 自环；compute DAG 构造时会跳过同 node dependency。
+- 不统计 compute -> commit 边；该分布只描述 compute-node 之间的 value target。
+
+输出字段：
+
+- `nodes`：compute node 数。
+- `edges`：去重后的 compute-node DAG 边数，等于所有 node 出度之和。
+- `mean_milli`：平均出度乘以 1000 的整数值。
+- `p50` / `p90` / `p99` / `max`：出度分位数和最大值。
+- `buckets`：按出度 bucket 统计 node 数，bucket 为
+  `0,1,2,3-4,5-8,9-16,17-32,33-64,65-128,129-256,257-512,513-1024,>1024`。
+
+Session 中的类型为 `ActivityScheduleComputeNodeOutDegreeStats`；字段含义同日志，
+其中 `meanMilli` 对应日志字段 `mean_milli`。
 
 ## Session 输出
 
@@ -102,6 +132,7 @@ incoming_boundary_activation_edges + 1
 - `<target>.activity_schedule.value_fanout`
 - `<target>.activity_schedule.topo_order`
 - `<target>.activity_schedule.state_read_supernodes`
+- `<target>.activity_schedule.compute_node_out_degree`
 
 ## Compute DAG 导出
 

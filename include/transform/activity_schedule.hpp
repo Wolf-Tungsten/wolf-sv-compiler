@@ -4,6 +4,7 @@
 #include "core/grh.hpp"
 #include "core/transform.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -61,6 +62,25 @@ namespace wolvrix::lib::transform
     using ActivityScheduleStateReadSupernodes = std::unordered_map<std::string, std::vector<uint32_t>>;
     using ActivityScheduleSupernodeKinds = std::vector<ActivityScheduleSupernodeKind>;
     using ActivityScheduleComputeNodesBySupernode = std::vector<std::vector<uint32_t>>;
+
+    struct ActivityScheduleComputeNodeOutDegreeBucket
+    {
+        std::string label;
+        std::size_t count = 0;
+    };
+
+    struct ActivityScheduleComputeNodeOutDegreeStats
+    {
+        std::string semantics;
+        std::size_t nodes = 0;
+        std::size_t edges = 0;
+        std::size_t meanMilli = 0;
+        std::size_t p50 = 0;
+        std::size_t p90 = 0;
+        std::size_t p99 = 0;
+        std::size_t max = 0;
+        std::vector<ActivityScheduleComputeNodeOutDegreeBucket> buckets;
+    };
 
     inline constexpr uint32_t kInvalidActivitySupernodeId = std::numeric_limits<uint32_t>::max();
 
