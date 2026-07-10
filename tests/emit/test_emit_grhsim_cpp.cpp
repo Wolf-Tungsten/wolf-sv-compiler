@@ -966,7 +966,8 @@ namespace
                                   const std::filesystem::path &outDir,
                                   EmitDiagnostics &diag,
                                   EmitResult &result,
-                                  ActivityScheduleOptions scheduleOptions = {})
+                                  ActivityScheduleOptions scheduleOptions = {},
+                                  bool posedgeFullpassSpecialization = false)
     {
         SessionStore session;
         if (scheduleOptions.path.empty())
@@ -986,6 +987,10 @@ namespace
         options.attributes["sched_batch_max_ops"] = "8";
         options.attributes["sched_batch_max_estimated_lines"] = "96";
         options.attributes["emit_parallelism"] = "2";
+        if (posedgeFullpassSpecialization)
+        {
+            options.attributes["posedge_fullpass_specialization"] = "1";
+        }
 
         EmitGrhSimCpp emitter(&diag);
         result = emitter.emit(design, options);
@@ -3938,7 +3943,12 @@ int main()
         Design commitBatchDesign = buildCommitCondBatchDesign();
         EmitDiagnostics commitBatchDiag;
         EmitResult commitBatchResult;
-        if (!emitWithActivitySchedule(commitBatchDesign, commitBatchDir, commitBatchDiag, commitBatchResult))
+        if (!emitWithActivitySchedule(commitBatchDesign,
+                                      commitBatchDir,
+                                      commitBatchDiag,
+                                      commitBatchResult,
+                                      {},
+                                      true))
         {
             return fail("commit-cond-batch activity-schedule pass failed");
         }
@@ -3948,6 +3958,7 @@ int main()
         }
         const std::string commitBatchHeader = readFile(commitBatchDir / "grhsim_top.hpp");
         const std::string commitBatchRuntime = readFile(commitBatchDir / "grhsim_top_runtime.hpp");
+        const std::string commitBatchEval = readFile(commitBatchDir / "grhsim_top_eval.cpp");
         const std::string commitBatchSched =
             readFiles(collectSchedFiles(commitBatchDir, "grhsim_top_sched_"));
         if (commitBatchHeader.find("std::uint32_t condIndex = 0;") != std::string::npos ||
@@ -3960,6 +3971,22 @@ int main()
         if (countSubstring(commitBatchSched, "apply_commit_scalar_state_write_table(") != 0)
         {
             return fail("commit-cond-batch should not fall back to legacy commit tables");
+        }
+        const std::size_t eventFastPathBegin = commitBatchEval.find("    if (event_fullpass_candidate) {");
+        const std::size_t normalPathBegin = commitBatchEval.find("    while (pending_eval_round) {", eventFastPathBegin);
+        if (eventFastPathBegin == std::string::npos || normalPathBegin == std::string::npos)
+        {
+            return fail("commit-cond-batch should emit the posedge event fast path");
+        }
+        const std::string eventFastPath =
+            commitBatchEval.substr(eventFastPathBegin, normalPathBegin - eventFastPathBegin);
+        if (eventFastPath.find("Preserve the commit reader frontier for adaptive post-commit settling") ==
+                std::string::npos ||
+            eventFastPath.find("post_commit_active_count * 4u <=") == std::string::npos ||
+            eventFastPath.find("while (grhsim_any_active_flags(supernode_active_curr_))") == std::string::npos ||
+            eventFastPath.find("_fullpass();") == std::string::npos)
+        {
+            return fail("commit-cond-batch event fast path should select sparse active settle or dense fullpass");
         }
         if (countSubstring(commitBatchSched, "Commit writes update visible state directly") != 4 ||
             commitBatchSched.find("batch_reg0_write") == std::string::npos ||

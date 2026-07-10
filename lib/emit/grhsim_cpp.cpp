@@ -21090,17 +21090,32 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 }
                 *stream << "        const bool state_changed = commit_activated_readers_;\n";
                 *stream << "        commit_activated_readers_ = false;\n";
-                *stream << "        supernode_active_curr_.fill(0);\n";
+                *stream << "        // Preserve the commit reader frontier for adaptive post-commit settling.\n";
                 if (!model.allEventValues.empty())
                 {
                     *stream << "        // Event edges are per fixed-point round; post-commit settling must not see the consumed edge.\n";
                     emitClearAllEventEdges(*stream, model, "        ");
                 }
                 *stream << "        if (state_changed) {\n";
+                *stream << "            const std::size_t post_commit_active_count =\n";
+                *stream << "                grhsim_count_active_supernodes(supernode_active_curr_);\n";
+                *stream << "            if (post_commit_active_count * 4u <= "
+                        << model.computeSupernodeIds.size() << "u) {\n";
+                *stream << "                // Sparse frontier: settle only its dynamic reader closure.\n";
+                *stream << "                while (grhsim_any_active_flags(supernode_active_curr_)) {\n";
                 for (const auto &batch : computeScheduleBatches)
                 {
-                    *stream << "            this->" << scheduleBatchFullpassMethodName(batch) << "();\n";
+                    *stream << "                    this->" << scheduleBatchMethodName(batch) << "();\n";
                 }
+                *stream << "                }\n";
+                *stream << "            } else {\n";
+                *stream << "                // Dense frontier: avoid active/change propagation and run one full pass.\n";
+                *stream << "                supernode_active_curr_.fill(0);\n";
+                for (const auto &batch : computeScheduleBatches)
+                {
+                    *stream << "                this->" << scheduleBatchFullpassMethodName(batch) << "();\n";
+                }
+                *stream << "            }\n";
                 *stream << "        }\n";
                 *stream << "        supernode_active_curr_.fill(0);\n";
                 emitEvalEpilogue("        ");
