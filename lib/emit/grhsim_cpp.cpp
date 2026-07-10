@@ -965,6 +965,7 @@ namespace wolvrix::lib::emit
             std::unordered_map<ValueId, SupernodeLocalExpr, ValueIdHash> byValue;
             std::unordered_map<ValueId, std::string, ValueIdHash> storedValueRefByValue;
             std::unordered_map<std::string, std::string> stateRefBySymbol;
+            std::unordered_map<std::string, std::string> scalarStateReadChangedBySymbol;
             std::unordered_map<ValueId, std::size_t, ValueIdHash> useCountByValue;
         };
         bool isWritePortKind(OperationKind kind) noexcept;
@@ -13346,15 +13347,47 @@ namespace wolvrix::lib::emit
                         {
                             if (needChangeDetect)
                             {
-                                emitScalarChangedValueAssign(
-                                    stream,
-                                    model,
-                                    resultValue,
-                                    lhs,
-                                    stateExpr,
-                                    "            ",
-                                    &activationContext,
-                                    &deferredActivationContext);
+                                // Same-state scalar read slots in one supernode are assigned together,
+                                // so their changed predicates remain synchronized after initialization.
+                                const bool canReuseChangePredicate =
+                                    batch.phase == ScheduleBatch::Phase::kCompute &&
+                                    !isEventValue(model, resultValue);
+                                const auto cachedChangeIt =
+                                    canReuseChangePredicate
+                                        ? localExprContext.scalarStateReadChangedBySymbol.find(*targetSymbol)
+                                        : localExprContext.scalarStateReadChangedBySymbol.end();
+                                if (cachedChangeIt != localExprContext.scalarStateReadChangedBySymbol.end())
+                                {
+                                    stream << "            // same-state scalar read: reuse synchronized change predicate\n";
+                                    emitChangedValueEffectsForCondition(stream,
+                                                                       model,
+                                                                       resultValue,
+                                                                       lhs,
+                                                                       stateExpr,
+                                                                       cachedChangeIt->second,
+                                                                       "            ",
+                                                                       &activationContext,
+                                                                       &deferredActivationContext);
+                                    stream << "            " << lhs << " = " << stateExpr << ";\n";
+                                }
+                                else
+                                {
+                                    emitScalarChangedValueAssign(
+                                        stream,
+                                        model,
+                                        resultValue,
+                                        lhs,
+                                        stateExpr,
+                                        "            ",
+                                        &activationContext,
+                                        &deferredActivationContext);
+                                    if (canReuseChangePredicate)
+                                    {
+                                        localExprContext.scalarStateReadChangedBySymbol.emplace(
+                                            *targetSymbol,
+                                            "grhsim_changed_" + std::to_string(resultValue.index));
+                                    }
+                                }
                             }
                             else
                             {

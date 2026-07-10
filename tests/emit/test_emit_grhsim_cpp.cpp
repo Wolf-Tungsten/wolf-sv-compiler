@@ -1716,6 +1716,76 @@ namespace
         return design;
     }
 
+    Design buildRepeatedScalarStateReadDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        ValueId clk = makeLogicValue(graph, "clk", 1);
+        ValueId data = makeLogicValue(graph, "data", 8);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("data", data);
+
+        ValueId one = addConstant(graph, "repeated_const_one", "repeated_one", 1, "1'b1");
+        ValueId mask = addConstant(graph, "repeated_const_mask", "repeated_mask", 8, "8'hff");
+        std::string format = "\"";
+        constexpr std::size_t repeatCount = 16;
+        for (std::size_t index = 0; index < repeatCount; ++index)
+        {
+            if (index != 0)
+            {
+                format += ' ';
+            }
+            format += "%0d";
+        }
+        format += "\"";
+        ValueId fmt = addConstant(graph,
+                                  "repeated_const_fmt",
+                                  "repeated_fmt",
+                                  0,
+                                  std::move(format),
+                                  ValueType::String);
+
+        OperationId reg = graph.createOperation(OperationKind::kRegister,
+                                                graph.internSymbol("repeated_q"));
+        graph.setAttr(reg, "width", static_cast<int64_t>(8));
+        graph.setAttr(reg, "isSigned", false);
+        graph.setAttr(reg, "initValue", std::string("8'h03"));
+
+        ValueId q = makeLogicValue(graph, "repeated_q_read", 8);
+        OperationId read = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                 graph.internSymbol("repeated_q_read_op"));
+        graph.addResult(read, q);
+        graph.setAttr(read, "regSymbol", std::string("repeated_q"));
+        graph.bindOutputPort("q_out", q);
+
+        OperationId write = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                  graph.internSymbol("repeated_q_write"));
+        graph.addOperand(write, one);
+        graph.addOperand(write, data);
+        graph.addOperand(write, mask);
+        graph.addOperand(write, clk);
+        graph.setAttr(write, "regSymbol", std::string("repeated_q"));
+        graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+
+        OperationId display = graph.createOperation(OperationKind::kSystemTask,
+                                                    graph.internSymbol("repeated_q_display"));
+        graph.addOperand(display, one);
+        graph.addOperand(display, fmt);
+        for (std::size_t index = 0; index < repeatCount; ++index)
+        {
+            graph.addOperand(display, q);
+        }
+        graph.addOperand(display, clk);
+        graph.setAttr(display, "name", std::string("display"));
+        graph.setAttr(display, "procKind", std::string("always_ff"));
+        graph.setAttr(display, "hasTiming", false);
+        graph.setAttr(display, "eventEdge", std::vector<std::string>{"posedge"});
+
+        return design;
+    }
+
     Design buildTerminatingSystemTaskDesign(std::string_view taskName,
                                             int exitCode,
                                             std::string_view prefix)
@@ -4364,6 +4434,89 @@ int main()
         if (std::system(gatedHarnessExe.string().c_str()) != 0)
         {
             return fail("gated-clock harness failed to run");
+        }
+
+        const std::filesystem::path repeatedReadDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_repeated_state_read";
+        std::filesystem::remove_all(repeatedReadDir);
+        Design repeatedReadDesign = buildRepeatedScalarStateReadDesign();
+        ActivityScheduleOptions repeatedReadScheduleOptions;
+        repeatedReadScheduleOptions.maxOpInComputeSupernode = 4;
+        repeatedReadScheduleOptions.splitOversizeComputeNodes = true;
+        repeatedReadScheduleOptions.splitOversizeComputeNodeMaxOps = 4;
+        EmitDiagnostics repeatedReadDiag;
+        EmitResult repeatedReadResult;
+        if (!emitWithActivitySchedule(repeatedReadDesign,
+                                      repeatedReadDir,
+                                      repeatedReadDiag,
+                                      repeatedReadResult,
+                                      repeatedReadScheduleOptions))
+        {
+            return fail("repeated state-read activity-schedule pass failed");
+        }
+        if (!repeatedReadResult.success || repeatedReadDiag.hasError())
+        {
+            return fail("repeated state-read emit failed");
+        }
+        const std::vector<std::filesystem::path> repeatedReadStateFiles =
+            collectSchedFiles(repeatedReadDir, "grhsim_top_state");
+        const std::vector<std::filesystem::path> repeatedReadSchedFiles =
+            collectSchedFiles(repeatedReadDir, "grhsim_top_sched_");
+        const std::string repeatedReadSched = readFiles(repeatedReadSchedFiles);
+        if (countSubstring(repeatedReadSched,
+                           "same-state scalar read: reuse synchronized change predicate") == 0)
+        {
+            return fail("repeated scalar state reads should share one changed predicate per supernode");
+        }
+        const std::filesystem::path repeatedReadHarnessPath = repeatedReadDir / "grhsim_top_harness.cpp";
+        {
+            std::ofstream harness(repeatedReadHarnessPath);
+            if (!harness.is_open())
+            {
+                return fail("failed to create repeated state-read harness");
+            }
+            harness << "#include \"grhsim_top.hpp\"\n";
+            harness << "#include <cstdint>\n\n";
+            harness << "int main()\n";
+            harness << "{\n";
+            harness << "    GrhSIM_top sim;\n";
+            harness << "    sim.init();\n";
+            harness << "    sim.data = static_cast<std::uint8_t>(9);\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.q_out != static_cast<std::uint8_t>(3)) return 1;\n";
+            harness << "    sim.clk = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.q_out != static_cast<std::uint8_t>(9)) return 2;\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.q_out != static_cast<std::uint8_t>(9)) return 3;\n";
+            harness << "    return 0;\n";
+            harness << "}\n";
+        }
+        const std::filesystem::path repeatedReadHarnessExe = repeatedReadDir / "grhsim_top_harness";
+        std::string repeatedReadCompileCmd =
+            "clang++ " + std::string(kHarnessCompileFlags) + " -I" + repeatedReadDir.string();
+        for (const auto &stateFile : repeatedReadStateFiles)
+        {
+            repeatedReadCompileCmd += " " + stateFile.string();
+        }
+        repeatedReadCompileCmd += " " + (repeatedReadDir / "grhsim_top_eval.cpp").string();
+        for (const auto &schedFile : repeatedReadSchedFiles)
+        {
+            repeatedReadCompileCmd += " " + schedFile.string();
+        }
+        repeatedReadCompileCmd += " " + repeatedReadHarnessPath.string() + " -o " + repeatedReadHarnessExe.string();
+        if (std::system(repeatedReadCompileCmd.c_str()) != 0)
+        {
+            return fail("repeated state-read harness failed to compile");
+        }
+        const std::filesystem::path repeatedReadHarnessLog = repeatedReadDir / "grhsim_top_harness.log";
+        const std::string runRepeatedReadHarnessCmd =
+            repeatedReadHarnessExe.string() + " > " + repeatedReadHarnessLog.string() + " 2>&1";
+        if (std::system(runRepeatedReadHarnessCmd.c_str()) != 0)
+        {
+            return fail("repeated state-read harness failed to run");
         }
 
         const std::filesystem::path systemTaskDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_systemtask";
