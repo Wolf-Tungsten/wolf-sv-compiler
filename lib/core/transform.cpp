@@ -944,8 +944,7 @@ namespace wolvrix::lib::transform
                 }
                 else if (arg == "-max-op-in-compute-node")
                 {
-                    std::size_t ignored = 0;
-                    if (!parseSizeArg("-max-op-in-compute-node", ignored))
+                    if (!parseSizeArg("-max-op-in-compute-node", options.maxOpInComputeNode))
                     {
                         return nullptr;
                     }
@@ -954,8 +953,8 @@ namespace wolvrix::lib::transform
                 {
                     try
                     {
-                        (void)std::stoull(std::string(
-                            arg.substr(std::string_view("-max-op-in-compute-node=").size())));
+                        options.maxOpInComputeNode = static_cast<std::size_t>(
+                            std::stoull(std::string(arg.substr(std::string_view("-max-op-in-compute-node=").size()))));
                     }
                     catch (const std::exception &)
                     {
@@ -1124,14 +1123,7 @@ namespace wolvrix::lib::transform
                 }
                 else if (arg == "-split-oversize-compute-nodes")
                 {
-                    if (!parseBoolArg("-split-oversize-compute-nodes", options.splitOversizeComputeSupernodes))
-                    {
-                        return nullptr;
-                    }
-                }
-                else if (arg == "-split-oversize-compute-supernodes")
-                {
-                    if (!parseBoolArg("-split-oversize-compute-supernodes", options.splitOversizeComputeSupernodes))
+                    if (!parseBoolArg("-split-oversize-compute-nodes", options.splitOversizeComputeNodes))
                     {
                         return nullptr;
                     }
@@ -1142,11 +1134,11 @@ namespace wolvrix::lib::transform
                         arg.substr(std::string_view("-split-oversize-compute-nodes=").size());
                     if (text == "true" || text == "1" || text == "on")
                     {
-                        options.splitOversizeComputeSupernodes = true;
+                        options.splitOversizeComputeNodes = true;
                     }
                     else if (text == "false" || text == "0" || text == "off")
                     {
-                        options.splitOversizeComputeSupernodes = false;
+                        options.splitOversizeComputeNodes = false;
                     }
                     else
                     {
@@ -1154,36 +1146,10 @@ namespace wolvrix::lib::transform
                         return nullptr;
                     }
                 }
-                else if (arg.starts_with("-split-oversize-compute-supernodes="))
-                {
-                    const std::string_view text =
-                        arg.substr(std::string_view("-split-oversize-compute-supernodes=").size());
-                    if (text == "true" || text == "1" || text == "on")
-                    {
-                        options.splitOversizeComputeSupernodes = true;
-                    }
-                    else if (text == "false" || text == "0" || text == "off")
-                    {
-                        options.splitOversizeComputeSupernodes = false;
-                    }
-                    else
-                    {
-                        error = "invalid -split-oversize-compute-supernodes value";
-                        return nullptr;
-                    }
-                }
                 else if (arg == "-declared-value-compute-node-boundary")
                 {
                     if (!parseBoolArg("-declared-value-compute-node-boundary",
-                                      options.declaredValueComputeSupernodeBoundary))
-                    {
-                        return nullptr;
-                    }
-                }
-                else if (arg == "-declared-value-compute-supernode-boundary")
-                {
-                    if (!parseBoolArg("-declared-value-compute-supernode-boundary",
-                                      options.declaredValueComputeSupernodeBoundary))
+                                      options.declaredValueComputeNodeBoundary))
                     {
                         return nullptr;
                     }
@@ -1194,11 +1160,11 @@ namespace wolvrix::lib::transform
                         arg.substr(std::string_view("-declared-value-compute-node-boundary=").size());
                     if (text == "true" || text == "1" || text == "on")
                     {
-                        options.declaredValueComputeSupernodeBoundary = true;
+                        options.declaredValueComputeNodeBoundary = true;
                     }
                     else if (text == "false" || text == "0" || text == "off")
                     {
-                        options.declaredValueComputeSupernodeBoundary = false;
+                        options.declaredValueComputeNodeBoundary = false;
                     }
                     else
                     {
@@ -1206,36 +1172,10 @@ namespace wolvrix::lib::transform
                         return nullptr;
                     }
                 }
-                else if (arg.starts_with("-declared-value-compute-supernode-boundary="))
-                {
-                    const std::string_view text =
-                        arg.substr(std::string_view("-declared-value-compute-supernode-boundary=").size());
-                    if (text == "true" || text == "1" || text == "on")
-                    {
-                        options.declaredValueComputeSupernodeBoundary = true;
-                    }
-                    else if (text == "false" || text == "0" || text == "off")
-                    {
-                        options.declaredValueComputeSupernodeBoundary = false;
-                    }
-                    else
-                    {
-                        error = "invalid -declared-value-compute-supernode-boundary value";
-                        return nullptr;
-                    }
-                }
                 else if (arg == "-split-oversize-compute-node-max-ops")
                 {
                     if (!parseSizeArg("-split-oversize-compute-node-max-ops",
-                                      options.splitOversizeComputeSupernodeMaxOps))
-                    {
-                        return nullptr;
-                    }
-                }
-                else if (arg == "-split-oversize-compute-supernode-max-ops")
-                {
-                    if (!parseSizeArg("-split-oversize-compute-supernode-max-ops",
-                                      options.splitOversizeComputeSupernodeMaxOps))
+                                      options.splitOversizeComputeNodeMaxOps))
                     {
                         return nullptr;
                     }
@@ -1244,25 +1184,12 @@ namespace wolvrix::lib::transform
                 {
                     try
                     {
-                        options.splitOversizeComputeSupernodeMaxOps = static_cast<std::size_t>(std::stoull(std::string(
+                        options.splitOversizeComputeNodeMaxOps = static_cast<std::size_t>(std::stoull(std::string(
                             arg.substr(std::string_view("-split-oversize-compute-node-max-ops=").size()))));
                     }
                     catch (const std::exception &)
                     {
                         error = "invalid -split-oversize-compute-node-max-ops value";
-                        return nullptr;
-                    }
-                }
-                else if (arg.starts_with("-split-oversize-compute-supernode-max-ops="))
-                {
-                    try
-                    {
-                        options.splitOversizeComputeSupernodeMaxOps = static_cast<std::size_t>(std::stoull(std::string(
-                            arg.substr(std::string_view("-split-oversize-compute-supernode-max-ops=").size()))));
-                    }
-                    catch (const std::exception &)
-                    {
-                        error = "invalid -split-oversize-compute-supernode-max-ops value";
                         return nullptr;
                     }
                 }

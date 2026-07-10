@@ -19,7 +19,7 @@
 `source-class op` 只是 `activity-schedule` 的内部分类名。它当前包含
 `kConstant`、`kRegisterReadPort`、`kLatchReadPort`、`kMemoryReadPort`。
 其中 `kMemoryReadPort` 有地址、使能等 operand；这些 operand 仍然是依赖，
-仍然会被 compute supernode builder 处理。也就是说：
+仍然会被 compute node builder 处理。也就是说：
 
 ```text
 kMemoryReadPort 属于 ActivityOpClass::Source
@@ -77,9 +77,9 @@ defining op 的 value 通常来自 graph input、inout input 或外部边界。
 
 | Class | 当前包含 | 调度含义 |
 | --- | --- | --- |
-| `Source` | `kConstant`、`kRegisterReadPort`、`kLatchReadPort`、`kMemoryReadPort` | 本文称 `source-class op`。它的 result 在 compute 用户侧会被 clone；builder 可把它吸收到 compute supernode，或为它建立 owner compute supernode。这个名字不表示无 operand、无依赖。 |
+| `Source` | `kConstant`、`kRegisterReadPort`、`kLatchReadPort`、`kMemoryReadPort` | 本文称 `source-class op`。它的 result 在 compute 用户侧会被 clone；builder 可把它吸收到 compute node，或为它建立 owner compute node。这个名字不表示无 operand、无依赖。 |
 | `Sink` | `kRegisterWritePort`、`kLatchWritePort`、`kMemoryWritePort`、`kMemoryFillPort` | 本文称 `sink-class op`。只进入 commit node / commit supernode。 |
-| `Compute` | 普通组合 op、`kSystemTask`、`kDpicCall` 等 | 进入 compute supernode。是否有 side effect 由 builder 和 emitter 分别处理。 |
+| `Compute` | 普通组合 op、`kSystemTask`、`kDpicCall` 等 | 进入 compute node / compute supernode。是否有 side effect 由 builder 和 emitter 分别处理。 |
 | `Declaration` | `kRegister`、`kMemory`、`kLatch`、`kDpicImport`、层级/XMR 类 op | 不进入 schedule；目标 graph 中不能残留层级类 op。 |
 | `Unsupported` | 索引缺口或异常占位 | 不应作为正常 schedule 输入。 |
 
@@ -88,43 +88,42 @@ defining op 的 value 通常来自 graph input、inout input 或外部边界。
 - 它被分类为 `ActivityOpClass::Source`。
 - 它的 result 对 compute 用户会被 clone。
 - clone 出来的 memory read 保留原 memory read 的 operand。
-- clone 的 operand 依赖继续由 compute supernode builder 递归处理。
-- 如果 operand producer 不能被吸收到同一个 compute supernode，该 operand 会成为
+- clone 的 operand 依赖继续由 compute node builder 递归处理。
+- 如果 operand producer 不能被吸收到同一个 compute node，该 operand 会成为
   `boundaryInputs`。
 
-### 初始 compute supernode
+### Compute node
 
-初始 compute supernode 是 `activity-schedule` 直接从 op DAG 构造出的 MFFC 风格
-op 容器。它是 coarsen 和 DP 的输入单元；最终运行时 compute supernode 由一个或多个
-初始 compute supernode 合并得到。
+Compute node 是 `activity-schedule` 内部的中间调度原子，不是最终运行时
+supernode。
 
-一个初始 compute supernode 包含：
+一个 compute node 包含：
 
 - `ops`：该 node 内的 source-class op 和 compute op。
 - `boundaryInputs`：该 node 读取、但不由该 node 内部 op 产生的 value。
 - `commonExpr`：共享表达式 owner 标记。
 - `indivisible` / `intentGroup`：保护特定语义形态，例如 reg-to-mem intent。
 
-Builder 会从 root value 反向追依赖，尽量把局部组合 producer 吸收到当前初始
-compute supernode。初始 MFFC 不按 op 数截断；以下情况会停止吸收，并把 operand
-记为 boundary input：
+Builder 会从 root value 反向追依赖，尽量把局部组合 producer 吸收到当前
+compute node。以下情况会停止吸收，并把 operand 记为 boundary input：
 
-- producer 已经属于另一个 compute supernode。
+- producer 已经属于另一个 compute node。
 - producer 是共享表达式 owner，不能安全并入当前消费者。
 - 当前 node 是不可分 intent group。
+- 当前 node 达到 `maxOpInComputeNode`。
 - producer 不是可本地共享的 compute op，或有副作用。
 - producer 不在本 graph 内，或 classification 不可用于本地吸收。
 
 ### Commit node
 
-Commit node 是 sink-class op 的中间分组，不参与 compute-supernode coarsen 和 DP。
+Commit node 是 sink-class op 的中间分组，不参与 compute-node coarsen 和 DP。
 
 一个 commit node 包含：
 
 - `ops`：一组 sink-class op。
 - `inputValues`：这些 sink-class op 读取的数据、地址、mask、条件、event 等 value。
 
-Commit node 的 `inputValues` 会成为 compute supernode 构造的起始 value 集合，因为
+Commit node 的 `inputValues` 会成为 compute node 构造的起始 value 集合，因为
 commit phase 需要这些 value 在写状态前已经算好。
 
 ### Supernode
@@ -133,7 +132,7 @@ Supernode 是最终导出给 emitter 的静态执行单元。
 
 | Supernode 类型 | 来源 | 运行时语义 |
 | --- | --- | --- |
-| Compute supernode | 一个或多个初始 compute supernode 合并后形成 | batch 每轮被调用；supernode body 只有对应 active bit 置位时才执行。 |
+| Compute supernode | 一个或多个 compute node 展开后形成 | batch 每轮被调用；supernode body 只有对应 active bit 置位时才执行。 |
 | Commit supernode | 一个 commit node 形成 | batch 每轮被调用；sink op 是否执行由 event expression / update guard 决定。 |
 
 最终 supernode 不混合 compute 和 commit。Emitter 会检查这个不变量。
@@ -231,7 +230,7 @@ compute 用户改读 clone result。非 compute 用户不改写：
 | source-class result -> 其他非 compute 用户 | 原始 value |
 
 这样做的目的，是让 compute 用户侧的状态读、常量读等入口可以被局部吸收到
-compute supernode，或单独建立 owner compute supernode。它不改变 source-class op 自身的
+compute node，或单独建立 owner compute node。它不改变 source-class op 自身的
 operand 依赖。
 
 对 `kMemoryReadPort`，clone 后仍然有地址、使能等 operand；这些 operand 随后仍按
@@ -250,12 +249,12 @@ Commit node 由 sink-class op 形成。
 5. 每个 chunk 形成一个 commit node。
 
 Commit node 的 `inputValues` 包括 sink-class op 写入需要的 value，例如条件、
-data、mask、地址、event 相关 value。后续 compute supernode 构造会从这些 input value
+data、mask、地址、event 相关 value。后续 compute node 构造会从这些 input value
 反向追依赖。
 
-### 4. 构造 compute supernode
+### 4. 构造 compute node
 
-Compute supernode builder 的 root 包括：
+Compute node builder 的 root 包括：
 
 - 所有 commit node 的 `inputValues`。
 - graph output port value。
@@ -267,43 +266,33 @@ Compute supernode builder 的 root 包括：
 | Defining op 情况 | 处理 |
 | --- | --- |
 | 没有本 graph 内 def | 记录为 boundary input。 |
-| `ActivityOpClass::Source` | 尝试吸收到当前 compute supernode；如果不能吸收，则创建/复用 source-class owner compute supernode，并把该 value 作为 boundary input。该 source-class op 的 operand 继续递归处理。 |
+| `ActivityOpClass::Source` | 尝试吸收到当前 compute node；如果不能吸收，则创建/复用 source-class owner compute node，并把该 value 作为 boundary input。该 source-class op 的 operand 继续递归处理。 |
 | `ActivityOpClass::Sink` | 报错；compute 侧不应依赖 sink-class result。 |
-| 可本地共享的 compute op | 根据共享度、最早消费者、可达性、容量等规则决定吸收或建立 owner compute supernode。 |
-| 不可本地共享或带副作用 compute op | 建 owner compute supernode；当前 node 通过 boundary input 读取它的 result。 |
+| 可本地共享的 compute op | 根据共享度、最早消费者、可达性、容量等规则决定吸收或建立 owner compute node。 |
+| 不可本地共享或带副作用 compute op | 建 owner compute node；当前 node 通过 boundary input 读取它的 result。 |
 | declaration / unsupported | 作为 boundary input 或报错，取决于上下文。 |
 
-构造完 compute supernode 后，pass 根据 `boundaryInputs` 建 compute-supernode DAG：
+构造完 compute node 后，pass 根据 `boundaryInputs` 建 compute-node DAG：
 
 ```text
-producer compute supernode -> consumer compute supernode
+producer compute node -> consumer compute node
 ```
 
-如果 DAG 有 cycle，pass 会尝试把 cycle 中的多 op compute supernode 拆成 singleton，
+如果 DAG 有 cycle，pass 会尝试把 cycle 中的多 op compute node 拆成 singleton，
 然后重建 DAG。最多尝试 1024 次。
 
-日志中的 `activity-schedule compute-supernode out-degree detail` 统计该 DAG 的出度分布。
-口径为 `value_target_dedup`：若 `sn1` 产生的一个或多个 value 被 `sn2` 读取，
-则 `(sn1, sn2)` 只计 1 条 compute->compute 出边；多个 value 不重复计数。
-该分布不包含 compute->commit 边，也不包含同 compute supernode 内部依赖。
-同一统计也写入 Session key
-`<target>.activity_schedule.initial_compute_supernode_out_degree`。
-
-### 5. Compute-supernode coarsen
+### 5. Compute-node coarsen
 
 Materialize 阶段先创建初始 cluster：
 
 ```text
-一个 compute supernode -> 一个 cluster
+一个 compute node -> 一个 cluster
 ```
 
-然后在 compute-supernode cluster DAG 上做 coarsen。当前 coarsen 受
-`maxOpInComputeSupernode` 派生出的 stage 上限约束：
-`out1` / `in1` 的合并上限为 `16 * maxOpInComputeSupernode`，
-`siblings` 的合并上限为 `16 * maxOpInComputeSupernode`。
-`maxOpInComputeSupernode=0` 时这些 coarsen 上限视为无限制。
+然后在 compute-node cluster DAG 上做 coarsen。当前 coarsen 受
+`maxOpInComputeSupernode` 约束：两个 cluster 合并后的 op 数不能超过该值。
 
-Coarsen pipeline 按以下 stage 只执行一轮，然后直接进入 DP：
+Coarsen pipeline 每轮按以下 stage 执行：
 
 | Stage | 候选 | 排序/限制 |
 | --- | --- | --- |
@@ -315,6 +304,9 @@ Coarsen pipeline 按以下 stage 只执行一轮，然后直接进入 DP：
 不受 `enableChainMerge` 控制。每个 stage 使用 DSU 批量合并，合并后重新检查
 topo 合法性。
 
+性能保护：当 cluster 数不少于 100000，且连续 3 轮每轮减少的 cluster 数都小于
+1024 时，coarsen 提前停止。
+
 ### 6. DP 连续分段
 
 Coarsen 后，pass 在 topo-ordered cluster 序列上做连续分段 DP。这里不是任意 DAG
@@ -322,8 +314,7 @@ partition；它只决定 topo 序列中相邻 cluster 如何切成 compute super
 
 约束：
 
-- 除单个 cluster 已经超过上限的情况外，一个 segment 的 op 数不超过
-  `maxOpInComputeSupernode`。
+- 一个 segment 的 op 数不超过 `maxOpInComputeSupernode`。
 - 如果单个 cluster 已经超过上限，DP 不会把它和其他 cluster 合并。
 
 目标函数：
@@ -339,8 +330,7 @@ cost(segment) = incoming_boundary_activation_edges + 1
 - `+1`：轻量 segment 数惩罚。
 - 同成本时偏向更长 segment。
 
-DP 输出的 segment 会 flatten 成初始 compute supernode 列表，再展开成最终
-compute supernode。
+DP 输出的 segment 会 flatten 成 compute node 列表，再展开成 compute supernode。
 每个 compute supernode 内部还会按真实 op 依赖做 local topo sort。
 
 ### 7. 最终 materialize
@@ -359,10 +349,11 @@ compute supernode。
 | `op_to_supernode` | 每个 op 所在 supernode。 |
 | `dag` | supernode DAG。 |
 | `supernode_kind` | compute 或 commit。 |
+| `compute_nodes_by_supernode` | compute supernode 由哪些 compute node 展开得到；commit 对应空列表。 |
 | `value_fanout` | 跨 supernode value 到目标 supernode 的 fanout。 |
 | `topo_order` | supernode topo order。 |
 | `state_read_supernodes` | state symbol 到 reader compute supernode 的映射。 |
-| `initial_compute_supernode_out_degree` | coarsen 前初始 compute-supernode DAG 出度统计。 |
+| `summary_stats` | 统计信息 JSON。 |
 
 最终 DAG 的边来自跨 supernode operand def-use。Commit supernode 不作为 value
 producer 产生出边。
@@ -520,7 +511,7 @@ Commit sink 的效果：
 ### `ActivityOpClass::Source`
 
 `ActivityOpClass::Source` 是调度内部分类。`kMemoryReadPort` 属于这个分类，同时仍有
-地址、使能等 operand。这些 operand 参与 compute supernode 构造和 boundary 判定。
+地址、使能等 operand。这些 operand 参与 compute node 构造和 boundary 判定。
 
 ### Batch 调用和 body 执行
 
@@ -550,15 +541,12 @@ result 变化产生。
 
 | 选项 | 语义 |
 | --- | --- |
-| `maxOpInComputeSupernode` | compute-supernode coarsen 和 DP 分段的 op 数上限；不会拆开单个初始 MFFC compute supernode，也不是 emit 文件大小上限。 |
+| `maxOpInComputeSupernode` | compute-node coarsen 和 DP 分段的 op 数上限；不是 emit 文件大小上限。 |
+| `maxOpInComputeNode` | 单个 compute node 吸收 op 的上限。 |
 | `maxOpInCommitSupernode` | 单个 commit node / commit supernode chunk 的 sink-class op 上限。 |
-| `enableCoarsen` | 是否执行 compute-supernode cluster coarsen。 |
+| `enableCoarsen` | 是否执行 compute-node cluster coarsen。 |
 | `enableChainMerge` | 是否执行 `out1` / `in1`；`siblings` 仍属于 coarsen pipeline。 |
 | `commitGuardEventBuckets` | commit 分桶是否把 update guard 纳入 key。 |
-| `splitOversizeComputeSupernodes` | 是否在最终 materialize 时切开超大 compute supernode。 |
-| `splitOversizeComputeSupernodeMaxOps` | 超大 compute supernode split 的 chunk 上限；为 0 时使用 `maxOpInComputeSupernode`。 |
+| `splitOversizeComputeNodes` | 是否在最终 materialize 时切开超大 compute node。 |
+| `splitOversizeComputeNodeMaxOps` | 超大 compute node split 的 chunk 上限；为 0 时使用 `maxOpInComputeSupernode`。 |
 | `exportComputeDagPath` | 导出 compute op DAG JSON。 |
-
-兼容说明：旧 `maxOpInComputeNode` / `-max-op-in-compute-node` 已忽略；旧
-`compute-node` split / declared-boundary 选项名仍会映射到新的 compute-supernode
-选项。

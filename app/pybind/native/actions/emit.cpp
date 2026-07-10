@@ -147,9 +147,10 @@ namespace wolvrix::app::pybind
         PyObject *schedBatchTargetCountObj = Py_None;
         PyObject *schedBatchesPerCppObj = Py_None;
         PyObject *emitParallelismObj = Py_None;
-        PyObject *emitRuntimeStatsObj = Py_None;
         const char *waveformMode = nullptr;
         const char *perfMode = nullptr;
+        PyObject *inputFullpassSpecializationObj = Py_None;
+        PyObject *posedgeFullpassSpecializationObj = Py_None;
         static const char *kwlist[] = {"session",
                                        "design",
                                        "output",
@@ -162,9 +163,10 @@ namespace wolvrix::app::pybind
                                        "emit_parallelism",
                                        "waveform",
                                        "perf",
-                                       "emit_runtime_stats",
+                                       "input_fullpass_specialization",
+                                       "posedge_fullpass_specialization",
                                        nullptr};
-                        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|OOOOOOOssO", const_cast<char **>(kwlist),
+                        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|OOOOOOOssOO", const_cast<char **>(kwlist),
                                          &sessionObj,
                                          &designKey,
                                          &output,
@@ -177,7 +179,8 @@ namespace wolvrix::app::pybind
                                          &emitParallelismObj,
                                          &waveformMode,
                                          &perfMode,
-                                         &emitRuntimeStatsObj))
+                                         &inputFullpassSpecializationObj,
+                                         &posedgeFullpassSpecializationObj))
         {
             return nullptr;
         }
@@ -289,14 +292,23 @@ namespace wolvrix::app::pybind
         {
             options.attributes["perf"] = perfMode;
         }
-        if (emitRuntimeStatsObj != Py_None)
+        if (inputFullpassSpecializationObj != Py_None)
         {
-            const int enabled = PyObject_IsTrue(emitRuntimeStatsObj);
+            const int enabled = PyObject_IsTrue(inputFullpassSpecializationObj);
             if (enabled < 0)
             {
                 return nullptr;
             }
-            options.attributes["emit_runtime_stats"] = enabled ? "1" : "0";
+            options.attributes["input_fullpass_specialization"] = enabled != 0 ? "1" : "0";
+        }
+        if (posedgeFullpassSpecializationObj != Py_None)
+        {
+            const int enabled = PyObject_IsTrue(posedgeFullpassSpecializationObj);
+            if (enabled < 0)
+            {
+                return nullptr;
+            }
+            options.attributes["posedge_fullpass_specialization"] = enabled != 0 ? "1" : "0";
         }
 
         const auto result = emitter.emit(*design, options);

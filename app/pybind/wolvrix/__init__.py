@@ -297,14 +297,15 @@ class Session:
         sched_batches_per_cpp: int | None = None,
         emit_parallelism: int | None = None,
         perf: str | None = None,
-        emit_runtime_stats: bool | None = None,
+        input_fullpass_specialization: bool | None = None,
+        posedge_fullpass_specialization: bool | None = None,
         **named_args,
     ) -> list[dict]:
         self._ensure_open()
         if (max_cpp_file_bytes is not None or sched_batch_max_ops is not None or
                 sched_batch_max_estimated_lines is not None or sched_batch_target_count is not None or
                 sched_batches_per_cpp is not None or emit_parallelism is not None or perf is not None or
-                emit_runtime_stats is not None):
+                input_fullpass_specialization is not None or posedge_fullpass_specialization is not None):
             named_args = dict(named_args)
         if max_cpp_file_bytes is not None:
             named_args["max_cpp_file_bytes"] = max_cpp_file_bytes
@@ -320,8 +321,10 @@ class Session:
             named_args["emit_parallelism"] = emit_parallelism
         if perf is not None:
             named_args["perf"] = perf
-        if emit_runtime_stats is not None:
-            named_args["emit_runtime_stats"] = emit_runtime_stats
+        if input_fullpass_specialization is not None:
+            named_args["input_fullpass_specialization"] = input_fullpass_specialization
+        if posedge_fullpass_specialization is not None:
+            named_args["posedge_fullpass_specialization"] = posedge_fullpass_specialization
         _compile_emit_grhsim_cpp_kwargs(named_args)
         success, diagnostics = _native.session_emit_grhsim_cpp(
             self._capsule,
@@ -611,18 +614,16 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
     ]
     size_options = [
         ("max_op_in_compute_supernode", "-max-op-in-compute-supernode"),
+        ("max_op_in_compute_node", "-max-op-in-compute-node"),
         ("max_op_in_commit_supernode", "-max-op-in-commit-supernode"),
-        ("split_oversize_compute_supernode_max_ops", "-split-oversize-compute-supernode-max-ops"),
-        ("split_oversize_compute_node_max_ops", "-split-oversize-compute-supernode-max-ops"),
+        ("split_oversize_compute_node_max_ops", "-split-oversize-compute-node-max-ops"),
     ]
     bool_options = [
         ("enable_coarsen", "-enable-coarsen"),
         ("enable_chain_merge", "-enable-chain-merge"),
         ("commit_guard_event_buckets", "-commit-guard-event-buckets"),
-        ("split_oversize_compute_supernodes", "-split-oversize-compute-supernodes"),
-        ("split_oversize_compute_nodes", "-split-oversize-compute-supernodes"),
-        ("declared_value_compute_supernode_boundary", "-declared-value-compute-supernode-boundary"),
-        ("declared_value_compute_node_boundary", "-declared-value-compute-supernode-boundary"),
+        ("split_oversize_compute_nodes", "-split-oversize-compute-nodes"),
+        ("declared_value_compute_node_boundary", "-declared-value-compute-node-boundary"),
     ]
 
     for key, arg in string_options:
@@ -635,10 +636,6 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
             if not isinstance(value, int) or value < 0:
                 raise ValueError(f"activity-schedule {key} must be a non-negative integer")
             out.extend([arg, str(value)])
-    ignored_max_compute_node = _pop_named(local, "max_op_in_compute_node", None)
-    if ignored_max_compute_node is not None:
-        if not isinstance(ignored_max_compute_node, int) or ignored_max_compute_node < 0:
-            raise ValueError("activity-schedule max_op_in_compute_node must be a non-negative integer")
     for key, arg in bool_options:
         value = _pop_named(local, key, None)
         if value is not None:
@@ -696,9 +693,14 @@ def _compile_emit_grhsim_cpp_kwargs(named: dict[str, Any]) -> None:
             raise ValueError("emit_grhsim_cpp perf must be a string")
         if perf not in {"off", "eval"}:
             raise ValueError("emit_grhsim_cpp perf must be one of: off, eval")
-    emit_runtime_stats = local.pop("emit_runtime_stats", None)
-    if emit_runtime_stats is not None and not isinstance(emit_runtime_stats, bool):
-        raise ValueError("emit_grhsim_cpp emit_runtime_stats must be a bool")
+    input_fullpass_specialization = local.pop("input_fullpass_specialization", None)
+    if input_fullpass_specialization is not None:
+        if not isinstance(input_fullpass_specialization, bool):
+            raise ValueError("emit_grhsim_cpp input_fullpass_specialization must be a bool")
+    posedge_fullpass_specialization = local.pop("posedge_fullpass_specialization", None)
+    if posedge_fullpass_specialization is not None:
+        if not isinstance(posedge_fullpass_specialization, bool):
+            raise ValueError("emit_grhsim_cpp posedge_fullpass_specialization must be a bool")
     _ensure_no_extra_named("emit_grhsim_cpp", local)
 
 
