@@ -1097,11 +1097,13 @@ namespace
         ValueId b64 = makeLogicValue(graph, "b64", 64);
         ValueId wide96 = makeLogicValue(graph, "wide96", 96);
         ValueId tag8 = makeLogicValue(graph, "tag8", 8);
+        ValueId broadcastBit = makeLogicValue(graph, "broadcast_bit", 1);
         graph.bindInputPort("clk", clk);
         graph.bindInputPort("a64", a64);
         graph.bindInputPort("b64", b64);
         graph.bindInputPort("wide96", wide96);
         graph.bindInputPort("tag8", tag8);
+        graph.bindInputPort("broadcast_bit", broadcastBit);
 
         ValueId concat128 = makeLogicValue(graph, "concat128", 128);
         OperationId concat11 =
@@ -1125,6 +1127,22 @@ namespace
         graph.addResult(rep, rep96);
         graph.setAttr(rep, "rep", static_cast<int64_t>(12));
         graph.bindOutputPort("rep96", rep96);
+
+        ValueId rep65 = makeLogicValue(graph, "rep65", 65);
+        OperationId rep65Op =
+            graph.createOperation(OperationKind::kReplicate, graph.internSymbol("replicate_bit_65"));
+        graph.addOperand(rep65Op, broadcastBit);
+        graph.addResult(rep65Op, rep65);
+        graph.setAttr(rep65Op, "rep", static_cast<int64_t>(65));
+        graph.bindOutputPort("rep65", rep65);
+
+        ValueId rep256 = makeLogicValue(graph, "rep256", 256);
+        OperationId rep256Op =
+            graph.createOperation(OperationKind::kReplicate, graph.internSymbol("replicate_bit_256"));
+        graph.addOperand(rep256Op, broadcastBit);
+        graph.addResult(rep256Op, rep256);
+        graph.setAttr(rep256Op, "rep", static_cast<int64_t>(256));
+        graph.bindOutputPort("rep256", rep256);
 
         OperationId reg = graph.createOperation(OperationKind::kRegister, graph.internSymbol("two_word_reg"));
         graph.setAttr(reg, "width", static_cast<int64_t>(96));
@@ -2777,6 +2795,7 @@ int main()
         runtime.find("grhsim_add_words_2") == std::string::npos ||
         runtime.find("grhsim_concat_words_2_1_1") == std::string::npos ||
         runtime.find("grhsim_replicate_words_2_1") == std::string::npos ||
+        runtime.find("grhsim_replicate_bit_words") == std::string::npos ||
         runtime.find("grhsim_assign_words_2") == std::string::npos ||
         runtime.find("grhsim_clog2_words") == std::string::npos)
     {
@@ -4457,6 +4476,9 @@ int main()
         if (twoWordSched.find("grhsim_concat_words_2_1_1<") == std::string::npos ||
             twoWordSched.find("grhsim_concat_words_2_1_2<") == std::string::npos ||
             twoWordSched.find("grhsim_replicate_words_2_1<") == std::string::npos ||
+            twoWordSched.find("grhsim_replicate_bit_words<2, 65>") == std::string::npos ||
+            twoWordSched.find("grhsim_replicate_bit_words<4, 256>") == std::string::npos ||
+            twoWordSched.find("grhsim_replicate_words<4>") != std::string::npos ||
             twoWordSched.find("grhsim_assign_words_2<") == std::string::npos)
         {
             return fail("two-word-helper should instantiate fixed two-word helpers");
@@ -4488,21 +4510,28 @@ int main()
             harness << "    sim.b64 = UINT64_C(0x99AABBCCDDEEFF00);\n";
             harness << "    sim.wide96 = std::array<std::uint64_t, 2>{UINT64_C(0x0123456789ABCDEF), UINT64_C(0x0000000012345678)};\n";
             harness << "    sim.tag8 = static_cast<std::uint8_t>(0x5A);\n";
+            harness << "    sim.broadcast_bit = true;\n";
             harness << "    sim.eval();\n";
             harness << "    if (!same_words(sim.concat128, std::array<std::uint64_t, 2>{UINT64_C(0x99AABBCCDDEEFF00), UINT64_C(0x1122334455667788)})) return 1;\n";
             harness << "    if (!same_words(sim.concat104, std::array<std::uint64_t, 2>{UINT64_C(0x0123456789ABCDEF), UINT64_C(0x0000005A12345678)})) return 2;\n";
             harness << "    if (!same_words(sim.rep96, std::array<std::uint64_t, 2>{UINT64_C(0x5A5A5A5A5A5A5A5A), UINT64_C(0x000000005A5A5A5A)})) return 3;\n";
-            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0), UINT64_C(0)})) return 4;\n";
+            harness << "    if (!same_words(sim.rep65, std::array<std::uint64_t, 2>{UINT64_MAX, UINT64_C(1)})) return 4;\n";
+            harness << "    if (!same_words(sim.rep256, std::array<std::uint64_t, 4>{UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX})) return 5;\n";
+            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0), UINT64_C(0)})) return 6;\n";
+            harness << "    sim.broadcast_bit = false;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (!same_words(sim.rep65, std::array<std::uint64_t, 2>{UINT64_C(0), UINT64_C(0)})) return 7;\n";
+            harness << "    if (!same_words(sim.rep256, std::array<std::uint64_t, 4>{UINT64_C(0), UINT64_C(0), UINT64_C(0), UINT64_C(0)})) return 8;\n";
             harness << "    sim.clk = true;\n";
             harness << "    sim.eval();\n";
-            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0x0123456789ABCDEF), UINT64_C(0x0000000012345678)})) return 5;\n";
+            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0x0123456789ABCDEF), UINT64_C(0x0000000012345678)})) return 9;\n";
             harness << "    sim.clk = false;\n";
             harness << "    sim.wide96 = std::array<std::uint64_t, 2>{UINT64_C(0xFEEDFACECAFEBEEF), UINT64_C(0x00000000ABCDEF01)};\n";
             harness << "    sim.eval();\n";
-            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0x0123456789ABCDEF), UINT64_C(0x0000000012345678)})) return 6;\n";
+            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0x0123456789ABCDEF), UINT64_C(0x0000000012345678)})) return 10;\n";
             harness << "    sim.clk = true;\n";
             harness << "    sim.eval();\n";
-            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0xFEEDFACECAFEBEEF), UINT64_C(0x00000000ABCDEF01)})) return 7;\n";
+            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0xFEEDFACECAFEBEEF), UINT64_C(0x00000000ABCDEF01)})) return 11;\n";
             harness << "    return 0;\n";
             harness << "}\n";
         }

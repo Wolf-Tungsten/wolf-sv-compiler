@@ -9732,6 +9732,13 @@ namespace wolvrix::lib::emit
                                        int32_t resultWidth,
             std::size_t rep)
         {
+            if (operandWidth == 1 && resultWidth > 0 && rep == static_cast<std::size_t>(resultWidth))
+            {
+                std::ostringstream out;
+                out << "grhsim_replicate_bit_words<" << logicWordCount(resultWidth) << ", "
+                    << resultWidth << ">(" << valueExpr << ")";
+                return out.str();
+            }
             if (logicWordCount(resultWidth) == 2 && logicWordCount(operandWidth) == 1)
             {
                 std::ostringstream out;
@@ -15217,6 +15224,7 @@ namespace wolvrix::lib::emit
             *stream << "#include <cstring>\n";
             *stream << "#include <limits>\n";
             *stream << "#include <string>\n";
+            *stream << "#include <utility>\n";
             *stream << "#include <vector>\n\n";
             if (model.emitWaveform)
             {
@@ -15306,8 +15314,7 @@ namespace wolvrix::lib::emit
                 *stream << "#include <span>\n";
                 *stream << "#include <sstream>\n";
                 *stream << "#include <string_view>\n";
-                *stream << "#include <unordered_map>\n";
-                *stream << "#include <utility>\n\n";
+                *stream << "#include <unordered_map>\n\n";
             }
             *stream << "inline std::uint64_t grhsim_mask(std::size_t width)\n{\n";
             *stream << "    if (width == 0) return UINT64_C(0);\n";
@@ -16600,6 +16607,31 @@ inline std::array<std::uint64_t, 2> grhsim_replicate_words_2_1(const std::array<
         grhsim_replicate_words_2_1_impl<0, emitRep, ElemWidth, TotalWidth>(out, value);
     }
     return grhsim_trunc_words_2<TotalWidth>(out);
+}
+
+template <std::size_t DestN, std::size_t TotalWidth, std::size_t... Indices>
+inline std::array<std::uint64_t, DestN> grhsim_replicate_bit_words_impl(
+    const std::array<std::uint64_t, 1> &value,
+    std::index_sequence<Indices...>)
+{
+    static_assert(DestN > 0);
+    static_assert(TotalWidth > 0 && TotalWidth <= DestN * 64u);
+    static_assert((TotalWidth + 63u) / 64u == DestN);
+    const std::uint64_t fill = UINT64_C(0) - (value[0] & UINT64_C(1));
+    std::array<std::uint64_t, DestN> out{((void)Indices, fill)...};
+    if constexpr ((TotalWidth & 63u) != 0) {
+        out[DestN - 1u] &= (UINT64_C(1) << (TotalWidth & 63u)) - UINT64_C(1);
+    }
+    return out;
+}
+
+template <std::size_t DestN, std::size_t TotalWidth>
+inline std::array<std::uint64_t, DestN> grhsim_replicate_bit_words(
+    const std::array<std::uint64_t, 1> &value)
+{
+    return grhsim_replicate_bit_words_impl<DestN, TotalWidth>(
+        value,
+        std::make_index_sequence<DestN>{});
 }
 
 template <std::size_t DestN, std::size_t SrcN>
