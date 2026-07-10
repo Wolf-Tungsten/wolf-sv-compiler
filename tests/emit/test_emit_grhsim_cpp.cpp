@@ -967,7 +967,8 @@ namespace
                                   EmitDiagnostics &diag,
                                   EmitResult &result,
                                   ActivityScheduleOptions scheduleOptions = {},
-                                  bool posedgeFullpassSpecialization = false)
+                                  bool posedgeFullpassSpecialization = false,
+                                  bool perf = false)
     {
         SessionStore session;
         if (scheduleOptions.path.empty())
@@ -990,6 +991,10 @@ namespace
         if (posedgeFullpassSpecialization)
         {
             options.attributes["posedge_fullpass_specialization"] = "1";
+        }
+        if (perf)
+        {
+            options.attributes["perf"] = "eval";
         }
 
         EmitGrhSimCpp emitter(&diag);
@@ -3948,6 +3953,7 @@ int main()
                                       commitBatchDiag,
                                       commitBatchResult,
                                       {},
+                                      true,
                                       true))
         {
             return fail("commit-cond-batch activity-schedule pass failed");
@@ -3984,9 +3990,18 @@ int main()
                 std::string::npos ||
             eventFastPath.find("post_commit_active_count * 4u <=") == std::string::npos ||
             eventFastPath.find("while (grhsim_any_active_flags(supernode_active_curr_))") == std::string::npos ||
-            eventFastPath.find("_fullpass();") == std::string::npos)
+            eventFastPath.find("_fullpass();") == std::string::npos ||
+            eventFastPath.find("++perf_counters_.eventFastPathCount;") == std::string::npos ||
+            eventFastPath.find("++perf_counters_.eventSparseSettleCount;") == std::string::npos ||
+            eventFastPath.find("++perf_counters_.eventDenseSettleCount;") == std::string::npos)
         {
             return fail("commit-cond-batch event fast path should select sparse active settle or dense fullpass");
+        }
+        if (commitBatchHeader.find("eventPostCommitActiveSum") == std::string::npos ||
+            commitBatchHeader.find("eventPostCommitActiveMin") == std::string::npos ||
+            commitBatchHeader.find("eventPostCommitActiveMax") == std::string::npos)
+        {
+            return fail("commit-cond-batch perf counters should expose event settle density");
         }
         if (countSubstring(commitBatchSched, "Commit writes update visible state directly") != 4 ||
             commitBatchSched.find("batch_reg0_write") == std::string::npos ||
@@ -4065,6 +4080,16 @@ int main()
             harness << "    sim.eval();\n";
             harness << "    if (sim.y != static_cast<std::uint8_t>(29)) {\n";
             harness << "        return 2;\n";
+            harness << "    }\n";
+            harness << "    const auto counters = sim.perf_counters();\n";
+            harness << "    if (counters.eventFastPathCount != UINT64_C(2) ||\n";
+            harness << "        counters.eventStateChangedCount != UINT64_C(2) ||\n";
+            harness << "        counters.eventSparseSettleCount + counters.eventDenseSettleCount !=\n";
+            harness << "            counters.eventStateChangedCount ||\n";
+            harness << "        counters.eventPostCommitActiveSum == UINT64_C(0) ||\n";
+            harness << "        counters.eventPostCommitActiveMin == ~UINT64_C(0) ||\n";
+            harness << "        counters.eventPostCommitActiveMax < counters.eventPostCommitActiveMin) {\n";
+            harness << "        return 3;\n";
             harness << "    }\n";
             harness << "    return 0;\n";
             harness << "}\n";

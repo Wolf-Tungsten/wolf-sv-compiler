@@ -17903,6 +17903,13 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "        std::uint64_t commitBatchExecCount = UINT64_C(0);\n";
                 *stream << "        std::uint64_t touchedStateShadowCount = UINT64_C(0);\n";
                 *stream << "        std::uint64_t touchedWriteCount = UINT64_C(0);\n";
+                *stream << "        std::uint64_t eventFastPathCount = UINT64_C(0);\n";
+                *stream << "        std::uint64_t eventStateChangedCount = UINT64_C(0);\n";
+                *stream << "        std::uint64_t eventSparseSettleCount = UINT64_C(0);\n";
+                *stream << "        std::uint64_t eventDenseSettleCount = UINT64_C(0);\n";
+                *stream << "        std::uint64_t eventPostCommitActiveSum = UINT64_C(0);\n";
+                *stream << "        std::uint64_t eventPostCommitActiveMin = ~UINT64_C(0);\n";
+                *stream << "        std::uint64_t eventPostCommitActiveMax = UINT64_C(0);\n";
                 *stream << "    };\n";
                 *stream << "    [[nodiscard]] PerfCounters perf_counters() const;\n";
                 *stream << "    void reset_perf_counters();\n";
@@ -21072,6 +21079,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             if (emitPosedgeFullpassSpecialization)
             {
                 *stream << "    if (event_fullpass_candidate) {\n";
+                emitPerfCounterIncrement(*stream, model, "        ", "eventFastPathCount");
                 *stream << "        pending_eval_round = false;\n";
                 *stream << "        commit_activated_readers_ = false;\n";
                 *stream << "        // Event fast path: first run the normal active compute pass with the event edge visible.\n";
@@ -21097,10 +21105,25 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                     emitClearAllEventEdges(*stream, model, "        ");
                 }
                 *stream << "        if (state_changed) {\n";
+                emitPerfCounterIncrement(*stream, model, "            ", "eventStateChangedCount");
                 *stream << "            const std::size_t post_commit_active_count =\n";
                 *stream << "                grhsim_count_active_supernodes(supernode_active_curr_);\n";
+                if (model.emitPerf)
+                {
+                    *stream << "            perf_counters_.eventPostCommitActiveSum += "
+                               "static_cast<std::uint64_t>(post_commit_active_count);\n";
+                    *stream << "            if (perf_counters_.eventPostCommitActiveMin > post_commit_active_count) {\n";
+                    *stream << "                perf_counters_.eventPostCommitActiveMin = "
+                               "static_cast<std::uint64_t>(post_commit_active_count);\n";
+                    *stream << "            }\n";
+                    *stream << "            if (perf_counters_.eventPostCommitActiveMax < post_commit_active_count) {\n";
+                    *stream << "                perf_counters_.eventPostCommitActiveMax = "
+                               "static_cast<std::uint64_t>(post_commit_active_count);\n";
+                    *stream << "            }\n";
+                }
                 *stream << "            if (post_commit_active_count * 4u <= "
                         << model.computeSupernodeIds.size() << "u) {\n";
+                emitPerfCounterIncrement(*stream, model, "                ", "eventSparseSettleCount");
                 *stream << "                // Sparse frontier: settle only its dynamic reader closure.\n";
                 *stream << "                while (grhsim_any_active_flags(supernode_active_curr_)) {\n";
                 for (const auto &batch : computeScheduleBatches)
@@ -21109,6 +21132,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 }
                 *stream << "                }\n";
                 *stream << "            } else {\n";
+                emitPerfCounterIncrement(*stream, model, "                ", "eventDenseSettleCount");
                 *stream << "                // Dense frontier: avoid active/change propagation and run one full pass.\n";
                 *stream << "                supernode_active_curr_.fill(0);\n";
                 for (const auto &batch : computeScheduleBatches)
