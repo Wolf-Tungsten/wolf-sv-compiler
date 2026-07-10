@@ -611,16 +611,18 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
     ]
     size_options = [
         ("max_op_in_compute_supernode", "-max-op-in-compute-supernode"),
-        ("max_op_in_compute_node", "-max-op-in-compute-node"),
         ("max_op_in_commit_supernode", "-max-op-in-commit-supernode"),
-        ("split_oversize_compute_node_max_ops", "-split-oversize-compute-node-max-ops"),
+        ("split_oversize_compute_supernode_max_ops", "-split-oversize-compute-supernode-max-ops"),
+        ("split_oversize_compute_node_max_ops", "-split-oversize-compute-supernode-max-ops"),
     ]
     bool_options = [
         ("enable_coarsen", "-enable-coarsen"),
         ("enable_chain_merge", "-enable-chain-merge"),
         ("commit_guard_event_buckets", "-commit-guard-event-buckets"),
-        ("split_oversize_compute_nodes", "-split-oversize-compute-nodes"),
-        ("declared_value_compute_node_boundary", "-declared-value-compute-node-boundary"),
+        ("split_oversize_compute_supernodes", "-split-oversize-compute-supernodes"),
+        ("split_oversize_compute_nodes", "-split-oversize-compute-supernodes"),
+        ("declared_value_compute_supernode_boundary", "-declared-value-compute-supernode-boundary"),
+        ("declared_value_compute_node_boundary", "-declared-value-compute-supernode-boundary"),
     ]
 
     for key, arg in string_options:
@@ -633,6 +635,10 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
             if not isinstance(value, int) or value < 0:
                 raise ValueError(f"activity-schedule {key} must be a non-negative integer")
             out.extend([arg, str(value)])
+    ignored_max_compute_node = _pop_named(local, "max_op_in_compute_node", None)
+    if ignored_max_compute_node is not None:
+        if not isinstance(ignored_max_compute_node, int) or ignored_max_compute_node < 0:
+            raise ValueError("activity-schedule max_op_in_compute_node must be a non-negative integer")
     for key, arg in bool_options:
         value = _pop_named(local, key, None)
         if value is not None:

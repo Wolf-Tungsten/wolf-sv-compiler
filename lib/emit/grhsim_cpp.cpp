@@ -44,7 +44,6 @@ namespace wolvrix::lib::emit
         using wolvrix::lib::grh::ValueType;
         using wolvrix::lib::transform::ActivityScheduleStateReadSupernodes;
         using wolvrix::lib::transform::ActivityScheduleSupernodeKind;
-        using wolvrix::lib::transform::ActivityScheduleComputeNodesBySupernode;
         using wolvrix::lib::transform::ActivityScheduleSupernodeKinds;
         using wolvrix::lib::transform::ActivityScheduleSupernodeToOps;
         using wolvrix::lib::transform::ActivityScheduleTopoOrder;
@@ -2241,7 +2240,6 @@ namespace wolvrix::lib::emit
             const ActivityScheduleTopoOrder &topoOrder;
             const ActivityScheduleStateReadSupernodes &stateReadSupernodes;
             const ActivityScheduleSupernodeKinds *supernodeKinds = nullptr;
-            const ActivityScheduleComputeNodesBySupernode *computeNodesBySupernode = nullptr;
         };
 
         bool validateScheduleRefs(const Graph &graph,
@@ -14248,9 +14246,6 @@ namespace wolvrix::lib::emit
             getSessionValue<ActivityScheduleStateReadSupernodes>(options, sessionPrefix + "state_read_supernodes");
         const auto *supernodeKinds =
             getSessionValue<ActivityScheduleSupernodeKinds>(options, sessionPrefix + "supernode_kind");
-        const auto *computeNodesBySupernode =
-            getSessionValue<ActivityScheduleComputeNodesBySupernode>(options,
-                                                                     sessionPrefix + "compute_nodes_by_supernode");
         if (supernodeToOps == nullptr || valueFanout == nullptr || topoOrder == nullptr || stateReadSupernodes == nullptr)
         {
             reportError("missing activity-schedule session data", sessionPrefix);
@@ -14263,7 +14258,6 @@ namespace wolvrix::lib::emit
             .topoOrder = *topoOrder,
             .stateReadSupernodes = *stateReadSupernodes,
             .supernodeKinds = supernodeKinds,
-            .computeNodesBySupernode = computeNodesBySupernode,
         };
         std::string scheduleError;
         if (!validateScheduleRefs(graph, schedule, scheduleError))

@@ -32,17 +32,16 @@ namespace wolvrix::lib::transform
     {
         std::string path;
         std::size_t maxOpInComputeSupernode = 128;
-        std::size_t maxOpInComputeNode = 8192;
         std::size_t maxOpInCommitSupernode = 4096;
         std::size_t localSharedComputeMaxFanout = 4;
         std::size_t localSharedComputeMaxWidth = 256;
-        std::size_t splitOversizeComputeNodeMaxOps = 0;
+        std::size_t splitOversizeComputeSupernodeMaxOps = 0;
         bool enableCoarsen = true;
         bool enableChainMerge = true;
         bool enableLocalSharedCompute = false;
         bool commitGuardEventBuckets = true;
-        bool splitOversizeComputeNodes = false;
-        bool declaredValueComputeNodeBoundary = false;
+        bool splitOversizeComputeSupernodes = false;
+        bool declaredValueComputeSupernodeBoundary = false;
         std::string exportComputeDagPath;
     };
 
@@ -61,15 +60,14 @@ namespace wolvrix::lib::transform
     using ActivityScheduleTopoOrder = std::vector<uint32_t>;
     using ActivityScheduleStateReadSupernodes = std::unordered_map<std::string, std::vector<uint32_t>>;
     using ActivityScheduleSupernodeKinds = std::vector<ActivityScheduleSupernodeKind>;
-    using ActivityScheduleComputeNodesBySupernode = std::vector<std::vector<uint32_t>>;
 
-    struct ActivityScheduleComputeNodeOutDegreeBucket
+    struct ActivityScheduleComputeSupernodeOutDegreeBucket
     {
         std::string label;
         std::size_t count = 0;
     };
 
-    struct ActivityScheduleComputeNodeOutDegreeStats
+    struct ActivityScheduleComputeSupernodeOutDegreeStats
     {
         std::string semantics;
         std::size_t nodes = 0;
@@ -79,7 +77,7 @@ namespace wolvrix::lib::transform
         std::size_t p90 = 0;
         std::size_t p99 = 0;
         std::size_t max = 0;
-        std::vector<ActivityScheduleComputeNodeOutDegreeBucket> buckets;
+        std::vector<ActivityScheduleComputeSupernodeOutDegreeBucket> buckets;
     };
 
     inline constexpr uint32_t kInvalidActivitySupernodeId = std::numeric_limits<uint32_t>::max();

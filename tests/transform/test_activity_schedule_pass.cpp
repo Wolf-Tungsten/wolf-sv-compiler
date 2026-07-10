@@ -81,8 +81,7 @@ namespace
         const ActivityScheduleTopoOrder *topoOrder = nullptr;
         const ActivityScheduleStateReadSupernodes *stateReadSupernodes = nullptr;
         const ActivityScheduleSupernodeKinds *supernodeKinds = nullptr;
-        const ActivityScheduleComputeNodesBySupernode *computeNodesBySupernode = nullptr;
-        const ActivityScheduleComputeNodeOutDegreeStats *computeNodeOutDegree = nullptr;
+        const ActivityScheduleComputeSupernodeOutDegreeStats *initialComputeSupernodeOutDegree = nullptr;
     };
 
     ScheduleView loadSchedule(const SessionStore &session, const std::string &graphName)
@@ -96,8 +95,9 @@ namespace
             getSessionValue<ActivityScheduleTopoOrder>(session, prefix + "topo_order"),
             getSessionValue<ActivityScheduleStateReadSupernodes>(session, prefix + "state_read_supernodes"),
             getSessionValue<ActivityScheduleSupernodeKinds>(session, prefix + "supernode_kind"),
-            getSessionValue<ActivityScheduleComputeNodesBySupernode>(session, prefix + "compute_nodes_by_supernode"),
-            getSessionValue<ActivityScheduleComputeNodeOutDegreeStats>(session, prefix + "compute_node_out_degree"),
+            getSessionValue<ActivityScheduleComputeSupernodeOutDegreeStats>(
+                session,
+                prefix + "initial_compute_supernode_out_degree"),
         };
     }
 
@@ -158,23 +158,22 @@ namespace
         if (schedule.supernodeToOps == nullptr || schedule.opToSupernode == nullptr ||
             schedule.dag == nullptr || schedule.valueFanout == nullptr ||
             schedule.topoOrder == nullptr || schedule.stateReadSupernodes == nullptr ||
-            schedule.supernodeKinds == nullptr || schedule.computeNodesBySupernode == nullptr ||
-            schedule.computeNodeOutDegree == nullptr)
+            schedule.supernodeKinds == nullptr || schedule.initialComputeSupernodeOutDegree == nullptr)
         {
             return fail("Expected all activity-schedule session outputs to exist");
         }
-        if (schedule.computeNodeOutDegree->semantics != "value_target_dedup")
+        if (schedule.initialComputeSupernodeOutDegree->semantics != "value_target_dedup")
         {
-            return fail("Expected compute-node out-degree stats to use value_target_dedup semantics");
+            return fail("Expected initial compute-supernode out-degree stats to use value_target_dedup semantics");
         }
         std::size_t outDegreeBucketTotal = 0;
-        for (const auto &bucket : schedule.computeNodeOutDegree->buckets)
+        for (const auto &bucket : schedule.initialComputeSupernodeOutDegree->buckets)
         {
             outDegreeBucketTotal += bucket.count;
         }
-        if (outDegreeBucketTotal != schedule.computeNodeOutDegree->nodes)
+        if (outDegreeBucketTotal != schedule.initialComputeSupernodeOutDegree->nodes)
         {
-            return fail("Expected compute-node out-degree buckets to sum to node count");
+            return fail("Expected initial compute-supernode out-degree buckets to sum to node count");
         }
         if (schedule.supernodeToOps->size() != schedule.supernodeKinds->size() ||
             schedule.supernodeToOps->size() != schedule.topoOrder->size())
@@ -299,7 +298,6 @@ int main()
         manager.addPass(std::make_unique<ActivitySchedulePass>(
             ActivityScheduleOptions{.path = "intent_top",
                                     .maxOpInComputeSupernode = 64,
-                                    .maxOpInComputeNode = 2,
                                     .enableCoarsen = false}));
 
         PassDiagnostics diags;
@@ -463,7 +461,6 @@ int main()
         manager.addPass(std::make_unique<ActivitySchedulePass>(
             ActivityScheduleOptions{.path = "intent_dynamic",
                                     .maxOpInComputeSupernode = 6,
-                                    .maxOpInComputeNode = 2,
                                     .enableCoarsen = false}));
 
         PassDiagnostics diags;
@@ -582,7 +579,6 @@ int main()
         manager.addPass(std::make_unique<ActivitySchedulePass>(
             ActivityScheduleOptions{.path = "intent_dynamic_input",
                                     .maxOpInComputeSupernode = 6,
-                                    .maxOpInComputeNode = 2,
                                     .enableCoarsen = false}));
 
         PassDiagnostics diags;
@@ -840,7 +836,6 @@ int main()
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
             .path = "plain_trigger_equal_chain",
             .maxOpInComputeSupernode = 1,
-            .maxOpInComputeNode = 1,
             .enableCoarsen = false,
         }));
 
@@ -859,13 +854,13 @@ int main()
         const uint32_t secondSupernode = (*schedule.opToSupernode)[second.index - 1];
         if (firstSupernode == kInvalidActivitySupernodeId ||
             secondSupernode == kInvalidActivitySupernodeId ||
-            firstSupernode == secondSupernode)
+            firstSupernode != secondSupernode)
         {
-            return fail("Expected trigger chain ops to stay in distinct compute supernodes");
+            return fail("Expected initial MFFC to keep the direct trigger chain in one compute supernode");
         }
-        if (!hasFanoutTo(*schedule.valueFanout, mid, secondSupernode))
+        if (hasFanoutTo(*schedule.valueFanout, mid, secondSupernode))
         {
-            return fail("Expected trigger chain to expose one compute->compute value target");
+            return fail("Expected local trigger chain value to avoid compute->compute fanout");
         }
     }
 
@@ -897,7 +892,6 @@ int main()
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
             .path = "plain_coarsen_chain",
             .maxOpInComputeSupernode = 2,
-            .maxOpInComputeNode = 1,
             .enableCoarsen = true,
         }));
 
@@ -933,11 +927,13 @@ int main()
         graph.bindInputPort("b", b);
 
         const auto rootValue = makeValue(graph, "root_value", 1);
+        graph.addDeclaredSymbol(graph.getValue(rootValue).symbol());
         const auto root = graph.createOperation(wolvrix::lib::grh::OperationKind::kAnd,
                                                 graph.internSymbol("root_assign"));
         graph.addOperand(root, a);
         graph.addOperand(root, b);
         graph.addResult(root, rootValue);
+        graph.bindOutputPort("root_out", rootValue);
 
         const auto leftValue = makeValue(graph, "left_value", 1);
         const auto left = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
@@ -959,9 +955,9 @@ int main()
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
             .path = "plain_sibling_coarsen",
             .maxOpInComputeSupernode = 1,
-            .maxOpInComputeNode = 1,
             .enableCoarsen = true,
             .enableChainMerge = false,
+            .declaredValueComputeSupernodeBoundary = true,
         }));
 
         PassDiagnostics diags;
@@ -1245,7 +1241,7 @@ int main()
         const PassManagerResult runResult = manager.run(design, diags);
         if (!runResult.success || diags.hasError())
         {
-            return fail("Expected shared-condition feedback case to schedule without compute-node cycle");
+            return fail("Expected shared-condition feedback case to schedule without compute-supernode cycle");
         }
         const auto schedule = loadSchedule(session, "shared_condition_feedback_cycle");
         if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
@@ -1327,10 +1323,10 @@ int main()
     }
 
     {
-        currentCase = "declared_value_compute_node_boundary";
+        currentCase = "declared_value_compute_supernode_boundary";
         wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("declared_value_compute_node_boundary");
-        design.markAsTop("declared_value_compute_node_boundary");
+        auto &graph = design.createGraph("declared_value_compute_supernode_boundary");
+        design.markAsTop("declared_value_compute_supernode_boundary");
 
         const auto a = makeValue(graph, "a", 8);
         const auto b = makeValue(graph, "b", 8);
@@ -1360,21 +1356,20 @@ int main()
         PassManager manager;
         manager.options().session = &session;
         ActivityScheduleOptions options;
-        options.path = "declared_value_compute_node_boundary";
+        options.path = "declared_value_compute_supernode_boundary";
         options.maxOpInComputeSupernode = 1;
-        options.maxOpInComputeNode = 8;
         options.enableCoarsen = false;
         options.enableChainMerge = false;
-        options.declaredValueComputeNodeBoundary = true;
+        options.declaredValueComputeSupernodeBoundary = true;
         manager.addPass(std::make_unique<ActivitySchedulePass>(options));
 
         PassDiagnostics diags;
         const PassManagerResult runResult = manager.run(design, diags);
         if (!runResult.success || diags.hasError())
         {
-            return fail("Expected declared-value compute-node boundary schedule to succeed");
+            return fail("Expected declared-value compute-supernode boundary schedule to succeed");
         }
-        const auto schedule = loadSchedule(session, "declared_value_compute_node_boundary");
+        const auto schedule = loadSchedule(session, "declared_value_compute_supernode_boundary");
         if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
         {
             return rc;
@@ -1427,10 +1422,9 @@ int main()
         ActivityScheduleOptions options;
         options.path = "declared_source_clone_boundary";
         options.maxOpInComputeSupernode = 1;
-        options.maxOpInComputeNode = 8;
         options.enableCoarsen = false;
         options.enableChainMerge = false;
-        options.declaredValueComputeNodeBoundary = true;
+        options.declaredValueComputeSupernodeBoundary = true;
         manager.addPass(std::make_unique<ActivitySchedulePass>(options));
 
         PassDiagnostics diags;
@@ -1463,7 +1457,7 @@ int main()
             consumerSupernode == kInvalidActivitySupernodeId ||
             readSupernode == consumerSupernode)
         {
-            return fail("Expected declared canonical source clone to be a compute-node boundary");
+            return fail("Expected declared canonical source clone to be a compute-supernode boundary");
         }
         if (!hasFanoutTo(*schedule.valueFanout, clonedReadValue, consumerSupernode))
         {
@@ -1514,7 +1508,6 @@ int main()
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
             .path = "coarsen_allows_relaxed_chain_limit",
             .maxOpInComputeSupernode = 3,
-            .maxOpInComputeNode = 1,
             .enableCoarsen = true,
             .enableChainMerge = true,
         }));
@@ -1550,17 +1543,14 @@ int main()
         {
             return fail("Expected relaxed chain coarsen to allow compute supernodes above maxOpInComputeSupernode");
         }
-        if (schedule.computeNodeOutDegree->edges == 0)
-        {
-            return fail("Expected relaxed coarsen graph to report compute-node out-degree edges");
-        }
+        (void)schedule.initialComputeSupernodeOutDegree;
     }
 
     {
-        currentCase = "split_oversize_compute_node";
+        currentCase = "split_oversize_compute_supernode";
         wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("split_oversize_compute_node");
-        design.markAsTop("split_oversize_compute_node");
+        auto &graph = design.createGraph("split_oversize_compute_supernode");
+        design.markAsTop("split_oversize_compute_supernode");
 
         const auto a = makeValue(graph, "a", 8);
         const auto b = makeValue(graph, "b", 8);
@@ -1586,19 +1576,18 @@ int main()
         PassManager manager;
         manager.options().session = &session;
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
-            .path = "split_oversize_compute_node",
+            .path = "split_oversize_compute_supernode",
             .maxOpInComputeSupernode = 2,
-            .maxOpInComputeNode = 16,
             .enableCoarsen = false,
-            .splitOversizeComputeNodes = true,
+            .splitOversizeComputeSupernodes = true,
         }));
         PassDiagnostics diags;
         const PassManagerResult runResult = manager.run(design, diags);
         if (!runResult.success || diags.hasError())
         {
-            return fail("Expected oversize compute-node split schedule to succeed");
+            return fail("Expected oversize compute-supernode split schedule to succeed");
         }
-        const auto schedule = loadSchedule(session, "split_oversize_compute_node");
+        const auto schedule = loadSchedule(session, "split_oversize_compute_supernode");
         if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
         {
             return rc;
@@ -1609,7 +1598,7 @@ int main()
             lastSupernode == kInvalidActivitySupernodeId ||
             firstSupernode == lastSupernode)
         {
-            return fail("Expected oversize compute node to split into multiple final supernodes");
+            return fail("Expected oversize initial compute supernode to split into multiple final supernodes");
         }
         bool splitReachable = false;
         if (firstSupernode < schedule.dag->size())
@@ -1638,7 +1627,7 @@ int main()
         }
         if (!splitReachable)
         {
-            return fail("Expected split chunks from the same compute node to stay reachable in DAG");
+            return fail("Expected split chunks from the same initial compute supernode to stay reachable in DAG");
         }
         for (const auto &supernodeOps : *schedule.supernodeToOps)
         {

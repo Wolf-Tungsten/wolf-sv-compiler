@@ -2692,7 +2692,6 @@ int main()
                                   dynamicIntentResult,
                                   ActivityScheduleOptions{.path = "top",
                                                           .maxOpInComputeSupernode = 8,
-                                                          .maxOpInComputeNode = 2,
                                                           .enableCoarsen = false}))
     {
         return fail("dynamic input reg-to-mem intent activity-schedule pass failed");
@@ -2772,7 +2771,6 @@ int main()
                                   oneBitIntentResult,
                                   ActivityScheduleOptions{.path = "top",
                                                           .maxOpInComputeSupernode = 8,
-                                                          .maxOpInComputeNode = 2,
                                                           .enableCoarsen = false}))
     {
         return fail("one-bit dynamic reg-to-mem intent activity-schedule pass failed");
@@ -2855,7 +2853,6 @@ int main()
                                   middleSubsetIntentResult,
                                   ActivityScheduleOptions{.path = "top",
                                                           .maxOpInComputeSupernode = 8,
-                                                          .maxOpInComputeNode = 2,
                                                           .enableCoarsen = false}))
     {
         return fail("middle subset reg-to-mem intent activity-schedule pass failed");
