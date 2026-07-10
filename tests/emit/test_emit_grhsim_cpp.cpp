@@ -2065,6 +2065,145 @@ namespace
         return design;
     }
 
+    Design buildRegToMemTrueMultiWriteEmitDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        constexpr int32_t width = 8;
+        constexpr std::size_t rows = 4;
+        const ValueId clk = makeLogicValue(graph, "clk", 1);
+        const ValueId index = makeLogicValue(graph, "index", 2);
+        const ValueId addr = makeLogicValue(graph, "addr", 2);
+        const ValueId wen = makeLogicValue(graph, "wen", 1);
+        const ValueId data = makeLogicValue(graph, "data", width);
+        const ValueId addr2 = makeLogicValue(graph, "addr2", 2);
+        const ValueId wen2 = makeLogicValue(graph, "wen2", 1);
+        const ValueId data2 = makeLogicValue(graph, "data2", width);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("index", index);
+        graph.bindInputPort("addr", addr);
+        graph.bindInputPort("wen", wen);
+        graph.bindInputPort("data", data);
+        graph.bindInputPort("addr2", addr2);
+        graph.bindInputPort("wen2", wen2);
+        graph.bindInputPort("data2", data2);
+
+        std::vector<std::string> regSymbols;
+        std::vector<ValueId> readValues;
+        regSymbols.reserve(rows);
+        readValues.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            const std::string regSymbol = "multi_r" + std::to_string(row);
+            regSymbols.push_back(regSymbol);
+            const OperationId reg = graph.createOperation(OperationKind::kRegister,
+                                                          graph.internSymbol(regSymbol));
+            graph.setAttr(reg, "width", int64_t{width});
+            graph.setAttr(reg, "isSigned", false);
+            graph.setAttr(reg, "initValue", std::string("8'h00"));
+
+            const ValueId readValue = makeLogicValue(graph, regSymbol + "_read", width);
+            const OperationId read = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                           graph.internSymbol(regSymbol + "_read_op"));
+            graph.addResult(read, readValue);
+            graph.setAttr(read, "regSymbol", regSymbol);
+            readValues.push_back(readValue);
+        }
+
+        const ValueId packed = makeLogicValue(graph, "multi_packed", width * static_cast<int32_t>(rows));
+        const OperationId concat = graph.createOperation(OperationKind::kConcat,
+                                                         graph.internSymbol("multi_concat"));
+        for (std::size_t row = rows; row-- > 0;)
+        {
+            graph.addOperand(concat, readValues[row]);
+        }
+        graph.addResult(concat, packed);
+
+        const ValueId selected = makeLogicValue(graph, "selected", width);
+        const OperationId slice = graph.createOperation(OperationKind::kSliceArray,
+                                                        graph.internSymbol("multi_slice"));
+        graph.addOperand(slice, packed);
+        graph.addOperand(slice, index);
+        graph.addResult(slice, selected);
+        graph.setAttr(slice, "sliceWidth", int64_t{width});
+        graph.bindOutputPort("selected", selected);
+
+        const ValueId mask = addConstant(graph, "multi_mask_op", "multi_mask", width, "8'hff");
+        auto addBinaryValue = [&](OperationKind kind,
+                                  const std::string &base,
+                                  ValueId lhs,
+                                  ValueId rhs,
+                                  int32_t valueWidth) {
+            const ValueId out = makeLogicValue(graph, base + "_value", valueWidth);
+            const OperationId op = graph.createOperation(kind, graph.internSymbol(base + "_op"));
+            graph.addOperand(op, lhs);
+            graph.addOperand(op, rhs);
+            graph.addResult(op, out);
+            return out;
+        };
+        auto addUnaryValue = [&](OperationKind kind, const std::string &base, ValueId operand) {
+            const ValueId out = makeLogicValue(graph, base + "_value", 1);
+            const OperationId op = graph.createOperation(kind, graph.internSymbol(base + "_op"));
+            graph.addOperand(op, operand);
+            graph.addResult(op, out);
+            return out;
+        };
+        auto addMuxValue = [&](const std::string &base, ValueId cond, ValueId onTrue, ValueId onFalse) {
+            const ValueId out = makeLogicValue(graph, base + "_value", width);
+            const OperationId op = graph.createOperation(OperationKind::kMux, graph.internSymbol(base + "_op"));
+            graph.addOperand(op, cond);
+            graph.addOperand(op, onTrue);
+            graph.addOperand(op, onFalse);
+            graph.addResult(op, out);
+            return out;
+        };
+        const ValueId sharedEnable = addBinaryValue(OperationKind::kLogicAnd, "multi_shared_enable", wen, wen2, 1);
+        const ValueId fallback = addConstant(graph, "multi_fallback_op", "multi_fallback", width, "8'h00");
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            const std::string rowText = std::to_string(row);
+            const ValueId rowConst = addConstant(graph,
+                                                 "multi_first_const_" + rowText + "_op",
+                                                 "multi_first_const_" + rowText,
+                                                 2,
+                                                 "2'd" + rowText);
+            const ValueId rowConst2 = addConstant(graph,
+                                                  "multi_second_const_" + rowText + "_op",
+                                                  "multi_second_const_" + rowText,
+                                                  2,
+                                                  "2'd" + rowText);
+            const ValueId firstHit = addBinaryValue(
+                OperationKind::kEq, "multi_first_hit_" + rowText, addr, rowConst, 1);
+            const ValueId secondHit = addBinaryValue(
+                OperationKind::kEq, "multi_second_hit_" + rowText, addr2, rowConst2, 1);
+            const ValueId secondGuard = addBinaryValue(
+                OperationKind::kLogicAnd, "multi_second_guard_" + rowText, sharedEnable, secondHit, 1);
+            const ValueId notSecondHit = addUnaryValue(
+                OperationKind::kLogicNot, "multi_not_second_hit_" + rowText, secondHit);
+            const ValueId firstEligible = addBinaryValue(
+                OperationKind::kLogicAnd, "multi_first_eligible_" + rowText, sharedEnable, notSecondHit, 1);
+            const ValueId firstGuard = addBinaryValue(
+                OperationKind::kLogicAnd, "multi_first_guard_" + rowText, firstEligible, firstHit, 1);
+            const ValueId updateCond = addBinaryValue(
+                OperationKind::kLogicOr, "multi_update_" + rowText, firstGuard, secondGuard, 1);
+            const ValueId firstNext = addMuxValue(
+                "multi_first_mux_" + rowText, firstGuard, data, fallback);
+            const ValueId next = addMuxValue(
+                "multi_second_mux_" + rowText, secondGuard, data2, firstNext);
+            const OperationId write = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                            graph.internSymbol("multi_write_" + rowText));
+            graph.addOperand(write, updateCond);
+            graph.addOperand(write, next);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clk);
+            graph.setAttr(write, "regSymbol", regSymbols[row]);
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        }
+        return design;
+    }
+
     Design buildRegToMemDynamicInputIntentEmitDesign()
     {
         Design design;
@@ -2311,6 +2450,26 @@ namespace
             for (const auto &diag : diags.messages())
             {
                 std::cerr << "[emit_grhsim_cpp] reg-to-mem diagnostic: "
+                          << diag.message << '\n';
+            }
+        }
+        return result.success && !diags.hasError();
+    }
+
+    bool runRegToMemTruePass(Design &design)
+    {
+        PassManager manager;
+        RegToMemOptions options;
+        options.enableTrueMerge = true;
+        options.minElementCount = 4;
+        manager.addPass(std::make_unique<RegToMemPass>(options));
+        PassDiagnostics diags;
+        const PassManagerResult result = manager.run(design, diags);
+        if (!result.success || diags.hasError())
+        {
+            for (const auto &diag : diags.messages())
+            {
+                std::cerr << "[emit_grhsim_cpp] true reg-to-mem diagnostic: "
                           << diag.message << '\n';
             }
         }
@@ -2789,6 +2948,95 @@ int main()
         makefile.find("-include-pch $(PCH_FILE)") == std::string::npos)
     {
         return fail("Missing split state/schedule Makefile skeleton or PCH support");
+    }
+
+    const std::filesystem::path trueMultiWriteDir =
+        std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_reg_to_mem_true_multi_write";
+    std::filesystem::remove_all(trueMultiWriteDir);
+    Design trueMultiWriteDesign = buildRegToMemTrueMultiWriteEmitDesign();
+    if (!runRegToMemTruePass(trueMultiWriteDesign))
+    {
+        return fail("true reg-to-mem multi-write pass failed");
+    }
+    EmitDiagnostics trueMultiWriteDiag;
+    EmitResult trueMultiWriteResult;
+    if (!emitWithActivitySchedule(trueMultiWriteDesign,
+                                  trueMultiWriteDir,
+                                  trueMultiWriteDiag,
+                                  trueMultiWriteResult,
+                                  ActivityScheduleOptions{.path = "top",
+                                                          .maxOpInComputeSupernode = 8,
+                                                          .maxOpInComputeNode = 2,
+                                                          .enableCoarsen = false}))
+    {
+        return fail("true reg-to-mem multi-write activity-schedule pass failed");
+    }
+    if (!trueMultiWriteResult.success || trueMultiWriteDiag.hasError())
+    {
+        return fail("true reg-to-mem multi-write emit failed");
+    }
+    const std::string trueMultiWriteBuildCmd =
+        "make -C " + trueMultiWriteDir.string() + " CXX=clang++ CXXFLAGS='" +
+        std::string(kHarnessCompileFlags) + "'";
+    if (std::system(trueMultiWriteBuildCmd.c_str()) != 0)
+    {
+        return fail("true reg-to-mem multi-write archive failed to build");
+    }
+    const std::filesystem::path trueMultiWriteHarnessPath = trueMultiWriteDir / "grhsim_top_harness.cpp";
+    {
+        std::ofstream harness(trueMultiWriteHarnessPath);
+        if (!harness.is_open())
+        {
+            return fail("Failed to create true reg-to-mem multi-write harness");
+        }
+        harness << "#include \"grhsim_top.hpp\"\n";
+        harness << "#include <cstdint>\n\n";
+        harness << "int main()\n";
+        harness << "{\n";
+        harness << "    GrhSIM_top sim;\n";
+        harness << "    sim.init();\n";
+        harness << "    sim.clk = false;\n";
+        harness << "    sim.index = static_cast<std::uint8_t>(1);\n";
+        harness << "    sim.addr = static_cast<std::uint8_t>(1);\n";
+        harness << "    sim.addr2 = static_cast<std::uint8_t>(1);\n";
+        harness << "    sim.wen = true;\n";
+        harness << "    sim.wen2 = true;\n";
+        harness << "    sim.data = static_cast<std::uint8_t>(0x11);\n";
+        harness << "    sim.data2 = static_cast<std::uint8_t>(0x22);\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.clk = true;\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.selected != static_cast<std::uint8_t>(0x22)) return 1;\n";
+        harness << "    sim.clk = false;\n";
+        harness << "    sim.addr = static_cast<std::uint8_t>(0);\n";
+        harness << "    sim.addr2 = static_cast<std::uint8_t>(2);\n";
+        harness << "    sim.data = static_cast<std::uint8_t>(0x33);\n";
+        harness << "    sim.data2 = static_cast<std::uint8_t>(0x44);\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.clk = true;\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.index = static_cast<std::uint8_t>(0);\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.selected != static_cast<std::uint8_t>(0x33)) return 2;\n";
+        harness << "    sim.index = static_cast<std::uint8_t>(2);\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.selected != static_cast<std::uint8_t>(0x44)) return 3;\n";
+        harness << "    return 0;\n";
+        harness << "}\n";
+    }
+    const std::filesystem::path trueMultiWriteHarnessExe = trueMultiWriteDir / "grhsim_top_harness";
+    const std::string trueMultiWriteCompileCmd =
+        "clang++ " + std::string(kHarnessCompileFlags) + " -I" + trueMultiWriteDir.string() +
+        " -include-pch " + (trueMultiWriteDir / "grhsim_top.hpp.pch").string() + " " +
+        trueMultiWriteHarnessPath.string() + " " + (trueMultiWriteDir / "libgrhsim_top.a").string() +
+        " -o " + trueMultiWriteHarnessExe.string();
+    if (std::system(trueMultiWriteCompileCmd.c_str()) != 0)
+    {
+        return fail("true reg-to-mem multi-write harness failed to compile");
+    }
+    if (std::system(trueMultiWriteHarnessExe.string().c_str()) != 0)
+    {
+        return fail("true reg-to-mem multi-write collision priority is wrong");
     }
 
     const std::filesystem::path intentDir =

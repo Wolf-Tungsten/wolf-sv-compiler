@@ -242,7 +242,10 @@ namespace
         return getAttr<std::string>(graph.getOperation(opId), "regToMem.intent.group").has_value();
     }
 
-    Design buildTrueMergeDesign(bool multiAnchor, bool withReset, bool reduceAndLastRow = false)
+    Design buildTrueMergeDesign(bool multiAnchor,
+                                bool withReset,
+                                bool reduceAndLastRow = false,
+                                bool secondWriteFamily = false)
     {
         Design design;
         Graph &graph = design.createGraph("top");
@@ -252,6 +255,7 @@ namespace
         constexpr std::size_t rows = 4;
         std::vector<std::string> regs;
         regs.reserve(rows);
+        std::vector<ValueId> firstGuards(rows);
         for (std::size_t row = 0; row < rows; ++row)
         {
             const std::string reg = "r" + std::to_string(row);
@@ -264,6 +268,9 @@ namespace
         const ValueId addr = makeLogicValue(graph, "addr", 2);
         const ValueId wen = makeLogicValue(graph, "wen", 1);
         const ValueId data = makeLogicValue(graph, "data", width);
+        const ValueId addr2 = secondWriteFamily ? makeLogicValue(graph, "addr2", 2) : ValueId{};
+        const ValueId wen2 = secondWriteFamily ? makeLogicValue(graph, "wen2", 1) : ValueId{};
+        const ValueId data2 = secondWriteFamily ? makeLogicValue(graph, "data2", width) : ValueId{};
         const ValueId mask = addConstant(graph, "mask_op", "mask", width, "8'hff");
         const ValueId clk = makeLogicValue(graph, "clk", 1);
         graph.bindInputPort("index", index);
@@ -271,6 +278,12 @@ namespace
         graph.bindInputPort("wen", wen);
         graph.bindInputPort("data", data);
         graph.bindInputPort("clk", clk);
+        if (secondWriteFamily)
+        {
+            graph.bindInputPort("addr2", addr2);
+            graph.bindInputPort("wen2", wen2);
+            graph.bindInputPort("data2", data2);
+        }
 
         ValueId selected;
         addSliceArrayAnchor(graph, "a0", regs, index, width, selected);
@@ -317,16 +330,136 @@ namespace
                                             wen,
                                             hit,
                                             1);
-            addRegisterWrite(graph,
-                             "write" + std::to_string(row),
-                             regs[row],
-                             guard,
-                             data,
-                             mask,
-                             clk);
+            firstGuards[row] = guard;
+            if (!secondWriteFamily)
+            {
+                addRegisterWrite(graph,
+                                 "write" + std::to_string(row),
+                                 regs[row],
+                                 guard,
+                                 data,
+                                 mask,
+                                 clk);
+            }
         }
 
-        if (withReset)
+        if (secondWriteFamily)
+        {
+            const ValueId sharedEnable = addBinary(graph,
+                                                   OperationKind::kLogicAnd,
+                                                   "shared_write_enable_op",
+                                                   "shared_write_enable",
+                                                   wen,
+                                                   wen2,
+                                                   1);
+            ValueId consolidatedReset;
+            ValueId activeEnable = sharedEnable;
+            if (withReset)
+            {
+                consolidatedReset = makeLogicValue(graph, "priority_reset", 1);
+                graph.bindInputPort("priority_reset", consolidatedReset);
+                const ValueId notReset = addUnary(graph,
+                                                  OperationKind::kLogicNot,
+                                                  "priority_not_reset_op",
+                                                  "priority_not_reset",
+                                                  consolidatedReset);
+                activeEnable = addBinary(graph,
+                                         OperationKind::kLogicAnd,
+                                         "priority_active_enable_op",
+                                         "priority_active_enable",
+                                         sharedEnable,
+                                         notReset,
+                                         1);
+            }
+            const ValueId fallback = addConstant(graph, "write_fallback_op", "write_fallback", width, "8'h00");
+            for (std::size_t row = 0; row < rows; ++row)
+            {
+                const ValueId rowConst = addConstant(graph,
+                                                     "second_row" + std::to_string(row) + "_op",
+                                                     "second_row" + std::to_string(row),
+                                                     2,
+                                                     "2'd" + std::to_string(row));
+                const ValueId hit = addBinary(graph,
+                                              OperationKind::kEq,
+                                              "second_hit" + std::to_string(row) + "_op",
+                                              "second_hit" + std::to_string(row),
+                                              addr2,
+                                              rowConst,
+                                              1);
+                const ValueId secondGuard = addBinary(graph,
+                                                      OperationKind::kLogicAnd,
+                                                      "second_guard" + std::to_string(row) + "_op",
+                                                      "second_guard" + std::to_string(row),
+                                                      activeEnable,
+                                                      hit,
+                                                      1);
+                const ValueId notSecondHit = addUnary(graph,
+                                                      OperationKind::kLogicNot,
+                                                      "not_second_hit" + std::to_string(row) + "_op",
+                                                      "not_second_hit" + std::to_string(row),
+                                                      hit);
+                const ValueId firstEligible = addBinary(graph,
+                                                        OperationKind::kLogicAnd,
+                                                        "first_eligible" + std::to_string(row) + "_op",
+                                                        "first_eligible" + std::to_string(row),
+                                                        activeEnable,
+                                                        notSecondHit,
+                                                        1);
+                const ValueId firstGuard = addBinary(graph,
+                                                     OperationKind::kLogicAnd,
+                                                     "priority_first_guard" + std::to_string(row) + "_op",
+                                                     "priority_first_guard" + std::to_string(row),
+                                                     firstEligible,
+                                                     firstGuards[row],
+                                                     1);
+                ValueId updateCond = addBinary(graph,
+                                               OperationKind::kLogicOr,
+                                               "priority_update" + std::to_string(row) + "_op",
+                                               "priority_update" + std::to_string(row),
+                                               firstGuard,
+                                               secondGuard,
+                                               1);
+                ValueId rowFallback = fallback;
+                if (withReset)
+                {
+                    rowFallback = addConstant(graph,
+                                              "priority_reset_data" + std::to_string(row) + "_op",
+                                              "priority_reset_data" + std::to_string(row),
+                                              width,
+                                              "8'd" + std::to_string(0x10 + row));
+                    updateCond = addBinary(graph,
+                                           OperationKind::kLogicOr,
+                                           "priority_reset_update" + std::to_string(row) + "_op",
+                                           "priority_reset_update" + std::to_string(row),
+                                           consolidatedReset,
+                                           updateCond,
+                                           1);
+                }
+                const ValueId firstNext = addMux(graph,
+                                                 "priority_first_mux" + std::to_string(row) + "_op",
+                                                 "priority_first_mux" + std::to_string(row),
+                                                 firstGuard,
+                                                 data,
+                                                 rowFallback,
+                                                 width);
+                const ValueId next = addMux(graph,
+                                            "priority_second_mux" + std::to_string(row) + "_op",
+                                            "priority_second_mux" + std::to_string(row),
+                                            secondGuard,
+                                            data2,
+                                            firstNext,
+                                            width);
+                addRegisterWrite(graph,
+                                 "priority_write" + std::to_string(row),
+                                 regs[row],
+                                 updateCond,
+                                 next,
+                                 mask,
+                                 clk);
+            }
+        }
+
+        if (withReset && !secondWriteFamily)
         {
             const ValueId rstN = makeLogicValue(graph, "rst_n", 1);
             const ValueId rstMask = addConstant(graph, "rst_mask_op", "rst_mask", width, "8'hff");
@@ -1351,6 +1484,67 @@ namespace
         return 0;
     }
 
+    int testTrueMergeMultipleWriteFamilies()
+    {
+        Design design = buildTrueMergeDesign(false, false, false, true);
+        Graph &graph = *design.findGraph("top");
+        const ValueId addr = graph.inputPortValue("addr");
+        const ValueId data = graph.inputPortValue("data");
+        const ValueId addr2 = graph.inputPortValue("addr2");
+        const ValueId data2 = graph.inputPortValue("data2");
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 1 ||
+            countKind(graph, OperationKind::kMemoryReadPort) != 1 ||
+            countKind(graph, OperationKind::kMemoryWritePort) != 2 ||
+            countKind(graph, OperationKind::kRegister) != 0 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 0)
+        {
+            return fail("true merge multiple-write family shape is wrong");
+        }
+        const std::vector<OperationId> writes = opsOfKind(graph, OperationKind::kMemoryWritePort);
+        if (writes.size() != 2)
+        {
+            return fail("true merge multiple-write family count is wrong");
+        }
+        const Operation first = graph.getOperation(writes[0]);
+        const Operation second = graph.getOperation(writes[1]);
+        if (first.operands().size() < 4 || second.operands().size() < 4 ||
+            first.operands()[1] != addr2 || first.operands()[2] != data2 ||
+            second.operands()[1] != addr || second.operands()[2] != data)
+        {
+            return fail("true merge multiple-write family order or operands are wrong");
+        }
+        return 0;
+    }
+
+    int testTrueMergeConsolidatedWriteFamiliesWithReset()
+    {
+        Design design = buildTrueMergeDesign(false, true, false, true);
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 1 ||
+            countKind(graph, OperationKind::kMemoryReadPort) != 1 ||
+            countKind(graph, OperationKind::kMemoryWritePort) != 2 ||
+            countKind(graph, OperationKind::kMemoryFillPort) != 1 ||
+            countKind(graph, OperationKind::kRegister) != 0 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 0)
+        {
+            return fail("true merge consolidated write families with reset shape is wrong");
+        }
+        const Operation fill = graph.getOperation(opsOfKind(graph, OperationKind::kMemoryFillPort).front());
+        if (fill.operands().size() != 3 || graph.valueWidth(fill.operands()[1]) != 32)
+        {
+            return fail("true merge consolidated reset did not create packed fill data");
+        }
+        return 0;
+    }
+
     int testTrueMergeResetFill()
     {
         Design design = buildTrueMergeDesign(false, true);
@@ -1466,6 +1660,14 @@ int main()
             return rc;
         }
         if (const int rc = testTrueMergeMultiAnchor(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testTrueMergeMultipleWriteFamilies(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testTrueMergeConsolidatedWriteFamiliesWithReset(); rc != 0)
         {
             return rc;
         }

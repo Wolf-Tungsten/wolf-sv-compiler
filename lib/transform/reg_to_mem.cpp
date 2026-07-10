@@ -134,6 +134,14 @@ namespace wolvrix::lib::transform
             uint64_t row = 0;
         };
 
+        struct PriorityGuardMatch
+        {
+            ValueId addr;
+            std::vector<ValueId> commonTerms;
+            std::vector<ValueId> conflictAddrs;
+            uint64_t row = 0;
+        };
+
         struct RegularWriteFamily
         {
             std::vector<WritePortInfo> writes;
@@ -143,6 +151,7 @@ namespace wolvrix::lib::transform
             std::vector<ValueId> events;
             std::vector<std::string> eventEdges;
             std::vector<ValueId> commonTerms;
+            std::vector<ValueId> conflictAddrs;
         };
 
         struct CompoundWriteMatch
@@ -171,9 +180,27 @@ namespace wolvrix::lib::transform
             std::optional<ResetWriteFamily> splitReset;
         };
 
+        struct ConsolidatedWriteMatch
+        {
+            std::vector<RegularWriteFamily> regulars;
+            std::optional<ResetWriteFamily> reset;
+        };
+
+        struct MuxWriteBranch
+        {
+            ValueId guard;
+            ValueId data;
+        };
+
+        struct MuxWriteChain
+        {
+            std::vector<MuxWriteBranch> branches;
+            ValueId fallback;
+        };
+
         struct TrueMergeCandidate
         {
-            RegularWriteFamily regular;
+            std::vector<RegularWriteFamily> regulars;
             std::optional<ResetWriteFamily> reset;
             std::vector<OperationId> regOps;
             std::vector<std::optional<std::string>> initValues;
@@ -540,6 +567,26 @@ namespace wolvrix::lib::transform
             return out;
         }
 
+        ValueId createUnaryOp(Graph &graph,
+                              OperationKind kind,
+                              ValueId operand,
+                              int32_t outWidth,
+                              bool outSigned,
+                              std::string_view note)
+        {
+            const ValueId out = graph.createValue(graph.makeInternalValSym(),
+                                                  outWidth > 0 ? outWidth : 1,
+                                                  outSigned,
+                                                  ValueType::Logic);
+            const OperationId op = graph.createOperation(kind, graph.makeInternalOpSym());
+            graph.addOperand(op, operand);
+            graph.addResult(op, out);
+            const auto srcLoc = makeTransformSrcLoc(std::string(kPassId), note);
+            graph.setOpSrcLoc(op, srcLoc);
+            graph.setValueSrcLoc(out, srcLoc);
+            return out;
+        }
+
         ValueId createConcat(Graph &graph,
                              std::span<const ValueId> operands,
                              int32_t outWidth,
@@ -650,6 +697,48 @@ namespace wolvrix::lib::transform
             std::vector<ValueId> terms;
             std::unordered_set<ValueId, ValueIdHash> seen;
             flattenLogicAndTerms(graph, value, terms, seen);
+            return terms;
+        }
+
+        void flattenLogicOrTerms(const Graph &graph,
+                                 ValueId value,
+                                 std::vector<ValueId> &terms,
+                                 std::unordered_set<ValueId, ValueIdHash> &seen)
+        {
+            const auto unwrapped = unwrapAssign(graph, value);
+            if (!unwrapped)
+            {
+                terms.push_back(value);
+                return;
+            }
+            value = *unwrapped;
+            if (!seen.insert(value).second)
+            {
+                return;
+            }
+            const OperationId defOpId = graph.valueDef(value);
+            if (!defOpId.valid())
+            {
+                terms.push_back(value);
+                return;
+            }
+            const Operation defOp = graph.getOperation(defOpId);
+            if ((defOp.kind() == OperationKind::kLogicOr ||
+                 (defOp.kind() == OperationKind::kOr && graph.valueWidth(value) == 1)) &&
+                defOp.operands().size() == 2)
+            {
+                flattenLogicOrTerms(graph, defOp.operands()[0], terms, seen);
+                flattenLogicOrTerms(graph, defOp.operands()[1], terms, seen);
+                return;
+            }
+            terms.push_back(value);
+        }
+
+        std::vector<ValueId> flattenLogicOrTerms(const Graph &graph, ValueId value)
+        {
+            std::vector<ValueId> terms;
+            std::unordered_set<ValueId, ValueIdHash> seen;
+            flattenLogicOrTerms(graph, value, terms, seen);
             return terms;
         }
 
@@ -817,6 +906,77 @@ namespace wolvrix::lib::transform
                 return std::nullopt;
             }
             return GuardMatch{.addr = eq->addr, .commonTerms = std::move(commonTerms), .row = eq->row};
+        }
+
+        std::optional<EqualityTerm> matchNegatedEqualityTerm(const Graph &graph, ValueId term)
+        {
+            const auto unwrapped = unwrapAssign(graph, term);
+            if (!unwrapped)
+            {
+                return std::nullopt;
+            }
+            const OperationId opId = graph.valueDef(*unwrapped);
+            if (!opId.valid())
+            {
+                return std::nullopt;
+            }
+            const Operation op = graph.getOperation(opId);
+            if ((op.kind() != OperationKind::kLogicNot &&
+                 !(op.kind() == OperationKind::kNot && graph.valueWidth(*unwrapped) == 1)) ||
+                op.operands().size() != 1)
+            {
+                return std::nullopt;
+            }
+            return matchEqualityTerm(graph, op.operands().front());
+        }
+
+        std::optional<PriorityGuardMatch> matchPriorityGuard(const Graph &graph, ValueId guard)
+        {
+            const std::vector<ValueId> terms = flattenLogicAndTerms(graph, guard);
+            std::optional<EqualityTerm> positiveEq;
+            std::vector<std::pair<ValueId, EqualityTerm>> negativeEqs;
+            std::vector<ValueId> commonTerms;
+            commonTerms.reserve(terms.size());
+            for (ValueId term : terms)
+            {
+                if (auto eq = matchEqualityTerm(graph, term))
+                {
+                    if (positiveEq)
+                    {
+                        return std::nullopt;
+                    }
+                    positiveEq = std::move(*eq);
+                    continue;
+                }
+                if (auto negativeEq = matchNegatedEqualityTerm(graph, term))
+                {
+                    negativeEqs.emplace_back(term, std::move(*negativeEq));
+                    continue;
+                }
+                commonTerms.push_back(term);
+            }
+            if (!positiveEq)
+            {
+                return std::nullopt;
+            }
+
+            std::vector<ValueId> conflictAddrs;
+            conflictAddrs.reserve(negativeEqs.size());
+            for (const auto &[term, negativeEq] : negativeEqs)
+            {
+                if (negativeEq.row != positiveEq->row)
+                {
+                    commonTerms.push_back(term);
+                    continue;
+                }
+                conflictAddrs.push_back(negativeEq.addr);
+            }
+            return PriorityGuardMatch{
+                .addr = positiveEq->addr,
+                .commonTerms = std::move(commonTerms),
+                .conflictAddrs = std::move(conflictAddrs),
+                .row = positiveEq->row,
+            };
         }
 
         std::optional<CompoundWriteMatch> matchCompoundWrite(const Graph &graph, const WritePortInfo &write)
@@ -1676,6 +1836,213 @@ namespace wolvrix::lib::transform
             return family;
         }
 
+        std::optional<MuxWriteChain> matchMuxWriteChain(const Graph &graph, ValueId value)
+        {
+            MuxWriteChain chain;
+            std::unordered_set<ValueId, ValueIdHash> seen;
+            ValueId current = value;
+            while (true)
+            {
+                const auto unwrapped = unwrapAssign(graph, current);
+                if (!unwrapped || !seen.insert(*unwrapped).second)
+                {
+                    return std::nullopt;
+                }
+                current = *unwrapped;
+                const OperationId opId = graph.valueDef(current);
+                if (!opId.valid())
+                {
+                    chain.fallback = current;
+                    break;
+                }
+                const Operation op = graph.getOperation(opId);
+                if (op.kind() != OperationKind::kMux)
+                {
+                    chain.fallback = current;
+                    break;
+                }
+                if (op.operands().size() != 3)
+                {
+                    return std::nullopt;
+                }
+                chain.branches.push_back(MuxWriteBranch{
+                    .guard = op.operands()[0],
+                    .data = op.operands()[1],
+                });
+                current = op.operands()[2];
+            }
+            if (chain.branches.size() < 2 || !chain.fallback.valid())
+            {
+                return std::nullopt;
+            }
+            return chain;
+        }
+
+        std::optional<ConsolidatedWriteMatch> matchConsolidatedWriteFamilies(
+            const Graph &graph,
+            const GroupCandidate &group,
+            const std::unordered_map<std::string, std::vector<WritePortInfo>> &writesByReg)
+        {
+            if (group.regSymbols.empty() || group.elementCount != group.regSymbols.size())
+            {
+                return std::nullopt;
+            }
+
+            ConsolidatedWriteMatch result;
+            std::vector<std::string> commonKeys;
+            std::vector<std::string> conflictKeys;
+            std::optional<bool> hasReset;
+            for (std::size_t row = 0; row < group.regSymbols.size(); ++row)
+            {
+                const auto writeIt = writesByReg.find(group.regSymbols[row]);
+                if (writeIt == writesByReg.end() || writeIt->second.size() != 1)
+                {
+                    return std::nullopt;
+                }
+                const WritePortInfo &write = writeIt->second.front();
+                const auto chain = matchMuxWriteChain(graph, write.nextValue);
+                if (!chain)
+                {
+                    return std::nullopt;
+                }
+
+                std::vector<ValueId> updateTerms = flattenLogicOrTerms(graph, write.updateCond);
+                std::vector<uint8_t> consumed(updateTerms.size(), 0);
+                for (const MuxWriteBranch &branch : chain->branches)
+                {
+                    bool found = false;
+                    for (std::size_t termIndex = 0; termIndex < updateTerms.size(); ++termIndex)
+                    {
+                        if (consumed[termIndex] == 0 &&
+                            sameValueAfterAssign(graph, updateTerms[termIndex], branch.guard))
+                        {
+                            consumed[termIndex] = 1;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found)
+                    {
+                        return std::nullopt;
+                    }
+                }
+
+                std::vector<ValueId> resetTerms;
+                for (std::size_t termIndex = 0; termIndex < updateTerms.size(); ++termIndex)
+                {
+                    if (consumed[termIndex] == 0)
+                    {
+                        resetTerms.push_back(updateTerms[termIndex]);
+                    }
+                }
+                if (resetTerms.size() > 1)
+                {
+                    return std::nullopt;
+                }
+                const bool rowHasReset = resetTerms.size() == 1;
+                if (!hasReset)
+                {
+                    hasReset = rowHasReset;
+                }
+                else if (*hasReset != rowHasReset)
+                {
+                    return std::nullopt;
+                }
+
+                if (row == 0)
+                {
+                    result.regulars.resize(chain->branches.size());
+                    commonKeys.resize(chain->branches.size());
+                    conflictKeys.resize(chain->branches.size());
+                }
+                else if (result.regulars.size() != chain->branches.size())
+                {
+                    return std::nullopt;
+                }
+
+                for (std::size_t branchIndex = 0; branchIndex < chain->branches.size(); ++branchIndex)
+                {
+                    const MuxWriteBranch &branch = chain->branches[branchIndex];
+                    auto guard = matchPriorityGuard(graph, branch.guard);
+                    if (!guard || guard->row != row)
+                    {
+                        return std::nullopt;
+                    }
+                    if (rowHasReset && !commonTermsContainNegationOf(graph, guard->commonTerms, resetTerms.front()))
+                    {
+                        return std::nullopt;
+                    }
+
+                    RegularWriteFamily &family = result.regulars[branchIndex];
+                    const std::string commonKey = valueSetKey(guard->commonTerms);
+                    const std::string conflictKey = valueSetKey(guard->conflictAddrs);
+                    if (row == 0)
+                    {
+                        family.addr = guard->addr;
+                        family.data = branch.data;
+                        family.mask = write.mask;
+                        family.events = write.events;
+                        family.eventEdges = write.eventEdges;
+                        family.commonTerms = std::move(guard->commonTerms);
+                        family.conflictAddrs = std::move(guard->conflictAddrs);
+                        commonKeys[branchIndex] = commonKey;
+                        conflictKeys[branchIndex] = conflictKey;
+                    }
+                    else if (family.addr != guard->addr ||
+                             family.data != branch.data ||
+                             family.mask != write.mask ||
+                             !valueVectorsEqual(family.events, write.events) ||
+                             family.eventEdges != write.eventEdges ||
+                             commonKeys[branchIndex] != commonKey ||
+                             conflictKeys[branchIndex] != conflictKey)
+                    {
+                        return std::nullopt;
+                    }
+                    family.writes.push_back(write);
+                }
+
+                if (rowHasReset)
+                {
+                    if (!result.reset)
+                    {
+                        ResetWriteFamily reset;
+                        reset.guard = resetTerms.front();
+                        reset.mask = write.mask;
+                        reset.events = write.events;
+                        reset.eventEdges = write.eventEdges;
+                        result.reset = std::move(reset);
+                    }
+                    else if (!sameValueAfterAssign(graph, result.reset->guard, resetTerms.front()) ||
+                             result.reset->mask != write.mask ||
+                             !valueVectorsEqual(result.reset->events, write.events) ||
+                             result.reset->eventEdges != write.eventEdges)
+                    {
+                        return std::nullopt;
+                    }
+                    result.reset->writes.push_back(write);
+                    result.reset->rowData.push_back(chain->fallback);
+                }
+            }
+
+            if (result.regulars.empty())
+            {
+                return std::nullopt;
+            }
+            if (result.reset)
+            {
+                if (!isAllOnesMask(graph, result.reset->mask, group.elementWidth) && group.elementWidth != 1)
+                {
+                    return std::nullopt;
+                }
+                result.reset->data = result.reset->rowData.front();
+                result.reset->packed = std::any_of(
+                    result.reset->rowData.begin(), result.reset->rowData.end(), [&](ValueId value) {
+                        return value != result.reset->data;
+                    });
+            }
+            return result;
+        }
+
         std::optional<std::vector<std::optional<std::string>>> collectRegisterInits(const Graph &graph,
                                                                                     const GroupCandidate &group)
         {
@@ -1838,38 +2205,58 @@ namespace wolvrix::lib::transform
             {
                 return std::nullopt;
             }
+            std::vector<RegularWriteFamily> regulars;
             std::vector<WritePortInfo> leftoverWrites;
+            std::optional<ResetWriteFamily> reset;
             stageStart = ProfileClock::now();
-            auto regularMatch = matchRegularWriteFamily(graph, group, writesByReg, leftoverWrites, groupProfile);
-            const int64_t regularMatchMs = elapsedMs(stageStart);
+            auto consolidatedMatch = matchConsolidatedWriteFamilies(graph, group, writesByReg);
+            const int64_t consolidatedMatchMs = elapsedMs(stageStart);
             if (profile != nullptr)
             {
-                profile->regularWriteMatchMs += regularMatchMs;
+                profile->regularWriteMatchMs += consolidatedMatchMs;
             }
-            if (groupProfile != nullptr && groupProfile->verbose)
+            if (consolidatedMatch)
             {
-                profileLog("group_detail graph_index=" + std::to_string(groupProfile->graphIndex) +
-                           " group=" + std::to_string(groupProfile->groupIndex) +
-                           "/" + std::to_string(groupProfile->groupCount) +
-                           " stage=regular_write_match_outer_done ms=" + std::to_string(regularMatchMs) +
-                           " ok=" + std::to_string(regularMatch.has_value() ? 1 : 0) +
-                           " leftover=" + std::to_string(leftoverWrites.size()));
+                regulars = std::move(consolidatedMatch->regulars);
+                reset = std::move(consolidatedMatch->reset);
             }
-            if (!regularMatch)
+            else
             {
-                return std::nullopt;
-            }
-            RegularWriteFamily regular = std::move(regularMatch->family);
-            std::optional<ResetWriteFamily> reset;
-            if (regularMatch->splitReset)
-            {
-                reset = std::move(regularMatch->splitReset);
-                if (!leftoverWrites.empty())
+                stageStart = ProfileClock::now();
+                auto regularMatch = matchRegularWriteFamily(graph, group, writesByReg, leftoverWrites, groupProfile);
+                const int64_t regularMatchMs = elapsedMs(stageStart);
+                if (profile != nullptr)
+                {
+                    profile->regularWriteMatchMs += regularMatchMs;
+                }
+                if (groupProfile != nullptr && groupProfile->verbose)
+                {
+                    profileLog("group_detail graph_index=" + std::to_string(groupProfile->graphIndex) +
+                               " group=" + std::to_string(groupProfile->groupIndex) +
+                               "/" + std::to_string(groupProfile->groupCount) +
+                               " stage=regular_write_match_outer_done ms=" + std::to_string(regularMatchMs) +
+                               " ok=" + std::to_string(regularMatch.has_value() ? 1 : 0) +
+                               " leftover=" + std::to_string(leftoverWrites.size()));
+                }
+                if (!regularMatch)
                 {
                     return std::nullopt;
                 }
+                if (regularMatch->splitReset)
+                {
+                    if (!leftoverWrites.empty())
+                    {
+                        return std::nullopt;
+                    }
+                    reset = std::move(regularMatch->splitReset);
+                }
+                regulars.push_back(std::move(regularMatch->family));
             }
-            if (!leftoverWrites.empty())
+            if (regulars.empty())
+            {
+                return std::nullopt;
+            }
+            if (!reset && !leftoverWrites.empty())
             {
                 stageStart = ProfileClock::now();
                 reset = matchResetWriteFamily(graph, group, leftoverWrites);
@@ -1890,15 +2277,18 @@ namespace wolvrix::lib::transform
                 {
                     return std::nullopt;
                 }
-                if (valueVectorsEqual(reset->events, regular.events) &&
-                    reset->eventEdges == regular.eventEdges)
+                for (const RegularWriteFamily &regular : regulars)
                 {
-                    return std::nullopt;
+                    if (valueVectorsEqual(reset->events, regular.events) &&
+                        reset->eventEdges == regular.eventEdges)
+                    {
+                        return std::nullopt;
+                    }
                 }
             }
             stageStart = ProfileClock::now();
             TrueMergeCandidate candidate;
-            candidate.regular = std::move(regular);
+            candidate.regulars = std::move(regulars);
             candidate.reset = std::move(reset);
             candidate.initValues = std::move(*initValues);
             candidate.regOps.reserve(group.regSymbols.size());
@@ -1913,9 +2303,12 @@ namespace wolvrix::lib::transform
             }
 
             std::unordered_set<OperationId, OperationIdHash> selectedWriteOps;
-            for (const WritePortInfo &write : candidate.regular.writes)
+            for (const RegularWriteFamily &regular : candidate.regulars)
             {
-                selectedWriteOps.insert(write.op);
+                for (const WritePortInfo &write : regular.writes)
+                {
+                    selectedWriteOps.insert(write.op);
+                }
             }
             if (candidate.reset)
             {
@@ -2031,6 +2424,7 @@ namespace wolvrix::lib::transform
                            "/" + std::to_string(groupProfile->groupCount) +
                            " stage=rewrite_start anchors=" + std::to_string(group.anchors.size()) +
                            " members=" + std::to_string(group.regSymbols.size()) +
+                           " write_families=" + std::to_string(candidate.regulars.size()) +
                            " reset=" + std::to_string(candidate.reset.has_value() ? 1 : 0) +
                            " packed_reset=" + std::to_string(candidate.reset && candidate.reset->packed ? 1 : 0));
             }
@@ -2183,9 +2577,19 @@ namespace wolvrix::lib::transform
                                             false,
                                             "true_reset_packed");
                 }
+                ValueId fillGuard = candidate.reset->guard;
+                if (!isAllOnesMask(graph, candidate.reset->mask, group.elementWidth))
+                {
+                    if (group.elementWidth != 1)
+                    {
+                        return false;
+                    }
+                    const std::array<ValueId, 2> fillGuardTerms = {fillGuard, candidate.reset->mask};
+                    fillGuard = createAndChain(graph, fillGuardTerms, "true_reset_mask_guard");
+                }
                 const OperationId fillOp = graph.createOperation(OperationKind::kMemoryFillPort,
                                                                  graph.makeInternalOpSym());
-                graph.addOperand(fillOp, candidate.reset->guard);
+                graph.addOperand(fillOp, fillGuard);
                 graph.addOperand(fillOp, fillData);
                 for (ValueId event : candidate.reset->events)
                 {
@@ -2201,43 +2605,60 @@ namespace wolvrix::lib::transform
                                "reset=" + std::to_string(candidate.reset.has_value() ? 1 : 0));
 
             stageStart = ProfileClock::now();
-            std::vector<ValueId> writeGuardTerms = candidate.regular.commonTerms;
-            const ValueId inDomainGuard = buildInDomainGuard(graph, candidate.regular.addr, group.elementCount);
-            finishRewriteStage("domain_guard_done",
-                               stageStart,
-                               &RegToMemProfile::rewriteDomainGuardMs,
-                               "common_terms=" + std::to_string(candidate.regular.commonTerms.size()));
-
-            stageStart = ProfileClock::now();
-            writeGuardTerms.push_back(inDomainGuard);
-            const ValueId writeGuard = createAndChain(graph, writeGuardTerms, "true_write_guard");
-            const OperationId writeOp = graph.createOperation(OperationKind::kMemoryWritePort,
-                                                              graph.makeInternalOpSym());
-            graph.addOperand(writeOp, writeGuard);
-            graph.addOperand(writeOp, candidate.regular.addr);
-            graph.addOperand(writeOp, candidate.regular.data);
-            graph.addOperand(writeOp, candidate.regular.mask);
-            for (ValueId event : candidate.regular.events)
+            std::size_t emittedWritePorts = 0;
+            for (const RegularWriteFamily &regular : candidate.regulars)
             {
-                graph.addOperand(writeOp, event);
+                std::vector<ValueId> writeGuardTerms = regular.commonTerms;
+                for (ValueId conflictAddr : regular.conflictAddrs)
+                {
+                    const ValueId conflict = createBinaryOp(graph,
+                                                            OperationKind::kEq,
+                                                            conflictAddr,
+                                                            regular.addr,
+                                                            1,
+                                                            false,
+                                                            "true_write_conflict_eq");
+                    writeGuardTerms.push_back(createUnaryOp(graph,
+                                                            OperationKind::kLogicNot,
+                                                            conflict,
+                                                            1,
+                                                            false,
+                                                            "true_write_conflict_not"));
+                }
+                writeGuardTerms.push_back(buildInDomainGuard(graph, regular.addr, group.elementCount));
+                const ValueId writeGuard = createAndChain(graph, writeGuardTerms, "true_write_guard");
+                const OperationId writeOp = graph.createOperation(OperationKind::kMemoryWritePort,
+                                                                  graph.makeInternalOpSym());
+                graph.addOperand(writeOp, writeGuard);
+                graph.addOperand(writeOp, regular.addr);
+                graph.addOperand(writeOp, regular.data);
+                graph.addOperand(writeOp, regular.mask);
+                for (ValueId event : regular.events)
+                {
+                    graph.addOperand(writeOp, event);
+                }
+                graph.setAttr(writeOp, "memSymbol", memSymbol);
+                graph.setAttr(writeOp, "eventEdge", regular.eventEdges);
+                graph.setOpSrcLoc(writeOp, makeTransformSrcLoc(std::string(kPassId), "true_write"));
+                ++emittedWritePorts;
             }
-            graph.setAttr(writeOp, "memSymbol", memSymbol);
-            graph.setAttr(writeOp, "eventEdge", candidate.regular.eventEdges);
-            graph.setOpSrcLoc(writeOp, makeTransformSrcLoc(std::string(kPassId), "true_write"));
-            finishRewriteStage("write_port_done",
+            finishRewriteStage("write_ports_done",
                                stageStart,
                                &RegToMemProfile::rewriteWritePortMs,
-                               "events=" + std::to_string(candidate.regular.events.size()));
+                               "ports=" + std::to_string(emittedWritePorts));
 
             stageStart = ProfileClock::now();
             std::size_t erasedRegularWrites = 0;
-            for (const WritePortInfo &write : candidate.regular.writes)
+            for (const RegularWriteFamily &regular : candidate.regulars)
             {
-                if (!eraseOpOnce(write.op))
+                for (const WritePortInfo &write : regular.writes)
                 {
-                    return false;
+                    if (!eraseOpOnce(write.op))
+                    {
+                        return false;
+                    }
+                    ++erasedRegularWrites;
                 }
-                ++erasedRegularWrites;
             }
             std::size_t erasedResetWrites = 0;
             if (candidate.reset)
