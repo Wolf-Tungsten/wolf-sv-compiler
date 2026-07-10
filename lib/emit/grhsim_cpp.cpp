@@ -21073,15 +21073,14 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             {
                 *stream << "    if (event_fullpass_candidate) {\n";
                 *stream << "        pending_eval_round = false;\n";
-                *stream << "        supernode_active_curr_.fill(0);\n";
                 *stream << "        commit_activated_readers_ = false;\n";
-                *stream << "        // Event full-pass fast path: match the normal round order.\n";
-                *stream << "        // First settle compute with the event edge visible so commits read fresh values.\n";
+                *stream << "        // Event fast path: first run the normal active compute pass with the event edge visible.\n";
+                *stream << "        // This preserves fresh commit inputs without paying a pre-commit full-graph pass.\n";
                 for (const auto &batch : computeScheduleBatches)
                 {
-                    *stream << "        this->" << scheduleBatchFullpassMethodName(batch) << "();\n";
+                    *stream << "        this->" << scheduleBatchMethodName(batch) << "();\n";
                 }
-                *stream << "        // Full-pass compute may leave propagation bits behind; event commits are edge-scanned.\n";
+                *stream << "        // Compute propagation bits are irrelevant to edge-scanned event commits.\n";
                 *stream << "        supernode_active_curr_.fill(0);\n";
                 *stream << "        commit_activated_readers_ = false;\n";
                 *stream << "        // Then commit event-driven state updates.\n";
