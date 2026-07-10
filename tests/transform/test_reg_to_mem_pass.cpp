@@ -245,7 +245,9 @@ namespace
     Design buildTrueMergeDesign(bool multiAnchor,
                                 bool withReset,
                                 bool reduceAndLastRow = false,
-                                bool secondWriteFamily = false)
+                                bool secondWriteFamily = false,
+                                bool secondResetTerm = false,
+                                bool fallbackWriteFamily = false)
     {
         Design design;
         Graph &graph = design.createGraph("top");
@@ -256,6 +258,7 @@ namespace
         std::vector<std::string> regs;
         regs.reserve(rows);
         std::vector<ValueId> firstGuards(rows);
+        std::vector<ValueId> firstHits(rows);
         for (std::size_t row = 0; row < rows; ++row)
         {
             const std::string reg = "r" + std::to_string(row);
@@ -271,6 +274,8 @@ namespace
         const ValueId addr2 = secondWriteFamily ? makeLogicValue(graph, "addr2", 2) : ValueId{};
         const ValueId wen2 = secondWriteFamily ? makeLogicValue(graph, "wen2", 1) : ValueId{};
         const ValueId data2 = secondWriteFamily ? makeLogicValue(graph, "data2", width) : ValueId{};
+        const ValueId addr3 = fallbackWriteFamily ? makeLogicValue(graph, "addr3", 2) : ValueId{};
+        const ValueId wen3 = fallbackWriteFamily ? makeLogicValue(graph, "wen3", 1) : ValueId{};
         const ValueId mask = addConstant(graph, "mask_op", "mask", width, "8'hff");
         const ValueId clk = makeLogicValue(graph, "clk", 1);
         graph.bindInputPort("index", index);
@@ -283,6 +288,11 @@ namespace
             graph.bindInputPort("addr2", addr2);
             graph.bindInputPort("wen2", wen2);
             graph.bindInputPort("data2", data2);
+        }
+        if (fallbackWriteFamily)
+        {
+            graph.bindInputPort("addr3", addr3);
+            graph.bindInputPort("wen3", wen3);
         }
 
         ValueId selected;
@@ -330,6 +340,7 @@ namespace
                                             wen,
                                             hit,
                                             1);
+            firstHits[row] = hit;
             firstGuards[row] = guard;
             if (!secondWriteFamily)
             {
@@ -353,16 +364,31 @@ namespace
                                                    wen2,
                                                    1);
             ValueId consolidatedReset;
+            ValueId consolidatedReset2;
+            ValueId effectiveReset;
             ValueId activeEnable = sharedEnable;
             if (withReset)
             {
                 consolidatedReset = makeLogicValue(graph, "priority_reset", 1);
                 graph.bindInputPort("priority_reset", consolidatedReset);
+                effectiveReset = consolidatedReset;
+                if (secondResetTerm)
+                {
+                    consolidatedReset2 = makeLogicValue(graph, "priority_reset2", 1);
+                    graph.bindInputPort("priority_reset2", consolidatedReset2);
+                    effectiveReset = addBinary(graph,
+                                               OperationKind::kLogicOr,
+                                               "priority_combined_reset_op",
+                                               "priority_combined_reset",
+                                               consolidatedReset,
+                                               consolidatedReset2,
+                                               1);
+                }
                 const ValueId notReset = addUnary(graph,
                                                   OperationKind::kLogicNot,
                                                   "priority_not_reset_op",
                                                   "priority_not_reset",
-                                                  consolidatedReset);
+                                                  effectiveReset);
                 activeEnable = addBinary(graph,
                                          OperationKind::kLogicAnd,
                                          "priority_active_enable_op",
@@ -419,6 +445,64 @@ namespace
                                                firstGuard,
                                                secondGuard,
                                                1);
+                if (fallbackWriteFamily)
+                {
+                    const ValueId thirdRowConst = addConstant(
+                        graph,
+                        "third_row" + std::to_string(row) + "_op",
+                        "third_row" + std::to_string(row),
+                        2,
+                        "2'd" + std::to_string(row));
+                    const ValueId thirdHit = addBinary(graph,
+                                                       OperationKind::kEq,
+                                                       "third_hit" + std::to_string(row) + "_op",
+                                                       "third_hit" + std::to_string(row),
+                                                       addr3,
+                                                       thirdRowConst,
+                                                       1);
+                    const ValueId notFirstHit = addUnary(graph,
+                                                         OperationKind::kLogicNot,
+                                                         "not_first_hit" + std::to_string(row) + "_op",
+                                                         "not_first_hit" + std::to_string(row),
+                                                         firstHits[row]);
+                    const ValueId thirdEnable = addBinary(graph,
+                                                           OperationKind::kLogicAnd,
+                                                           "third_enable" + std::to_string(row) + "_op",
+                                                           "third_enable" + std::to_string(row),
+                                                           activeEnable,
+                                                           wen3,
+                                                           1);
+                    const ValueId thirdBelowSecond = addBinary(
+                        graph,
+                        OperationKind::kLogicAnd,
+                        "third_below_second" + std::to_string(row) + "_op",
+                        "third_below_second" + std::to_string(row),
+                        thirdEnable,
+                        notSecondHit,
+                        1);
+                    const ValueId thirdBelowFirst = addBinary(
+                        graph,
+                        OperationKind::kLogicAnd,
+                        "third_below_first" + std::to_string(row) + "_op",
+                        "third_below_first" + std::to_string(row),
+                        thirdBelowSecond,
+                        notFirstHit,
+                        1);
+                    const ValueId thirdGuard = addBinary(graph,
+                                                         OperationKind::kLogicAnd,
+                                                         "third_guard" + std::to_string(row) + "_op",
+                                                         "third_guard" + std::to_string(row),
+                                                         thirdBelowFirst,
+                                                         thirdHit,
+                                                         1);
+                    updateCond = addBinary(graph,
+                                           OperationKind::kLogicOr,
+                                           "third_update" + std::to_string(row) + "_op",
+                                           "third_update" + std::to_string(row),
+                                           updateCond,
+                                           thirdGuard,
+                                           1);
+                }
                 ValueId rowFallback = fallback;
                 if (withReset)
                 {
@@ -431,7 +515,7 @@ namespace
                                            OperationKind::kLogicOr,
                                            "priority_reset_update" + std::to_string(row) + "_op",
                                            "priority_reset_update" + std::to_string(row),
-                                           consolidatedReset,
+                                           effectiveReset,
                                            updateCond,
                                            1);
                 }
@@ -582,6 +666,92 @@ namespace
                              clk);
         }
 
+        return design;
+    }
+
+    Design buildTrueStorageOnlyDesign(bool completeWrites, std::size_t rows = 4)
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        constexpr int32_t width = 8;
+        std::vector<std::string> regs;
+        std::vector<ValueId> reads;
+        regs.reserve(rows);
+        reads.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            const std::string reg = "shared_r" + std::to_string(row);
+            regs.push_back(reg);
+            addRegister(graph, reg, width);
+            const ValueId readValue = makeLogicValue(graph, reg + "_read", width);
+            const OperationId read = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                           graph.internSymbol(reg + "_read_op"));
+            graph.addResult(read, readValue);
+            graph.setAttr(read, "regSymbol", reg);
+            reads.push_back(readValue);
+        }
+
+        const ValueId packed = makeLogicValue(graph, "shared_circular_packed", width * rows * 2);
+        const OperationId concat = graph.createOperation(OperationKind::kConcat,
+                                                         graph.internSymbol("shared_circular_concat"));
+        for (int repeat = 0; repeat < 2; ++repeat)
+        {
+            for (auto it = reads.rbegin(); it != reads.rend(); ++it)
+            {
+                graph.addOperand(concat, *it);
+            }
+        }
+        graph.addResult(concat, packed);
+        graph.bindOutputPort("packed", packed);
+
+        const ValueId extra = makeLogicValue(graph, "shared_extra", width);
+        const OperationId extraAssign = graph.createOperation(OperationKind::kAssign,
+                                                              graph.internSymbol("shared_extra_assign"));
+        graph.addOperand(extraAssign, reads.front());
+        graph.addResult(extraAssign, extra);
+        graph.bindOutputPort("extra", extra);
+
+        const ValueId addr = makeLogicValue(graph, "shared_addr", 2);
+        const ValueId wen = makeLogicValue(graph, "shared_wen", 1);
+        const ValueId data = makeLogicValue(graph, "shared_data", width);
+        const ValueId clk = makeLogicValue(graph, "shared_clk", 1);
+        const ValueId mask = addConstant(graph, "shared_mask_op", "shared_mask", width, "8'hff");
+        graph.bindInputPort("addr", addr);
+        graph.bindInputPort("wen", wen);
+        graph.bindInputPort("data", data);
+        graph.bindInputPort("clk", clk);
+        const std::size_t writeRows = completeWrites ? rows : rows - 1;
+        for (std::size_t row = 0; row < writeRows; ++row)
+        {
+            const ValueId rowConst = addConstant(graph,
+                                                 "shared_row" + std::to_string(row) + "_op",
+                                                 "shared_row" + std::to_string(row),
+                                                 2,
+                                                 "2'd" + std::to_string(row));
+            const ValueId hit = addBinary(graph,
+                                          OperationKind::kEq,
+                                          "shared_hit" + std::to_string(row) + "_op",
+                                          "shared_hit" + std::to_string(row),
+                                          addr,
+                                          rowConst,
+                                          1);
+            const ValueId guard = addBinary(graph,
+                                            OperationKind::kLogicAnd,
+                                            "shared_guard" + std::to_string(row) + "_op",
+                                            "shared_guard" + std::to_string(row),
+                                            wen,
+                                            hit,
+                                            1);
+            addRegisterWrite(graph,
+                             "shared_write" + std::to_string(row),
+                             regs[row],
+                             guard,
+                             data,
+                             mask,
+                             clk);
+        }
         return design;
     }
 
@@ -1545,6 +1715,135 @@ namespace
         return 0;
     }
 
+    int testTrueMergeConsolidatedWriteFamiliesWithMultipleResetTerms()
+    {
+        Design design = buildTrueMergeDesign(false, true, false, true, true);
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 1 ||
+            countKind(graph, OperationKind::kMemoryWritePort) != 2 ||
+            countKind(graph, OperationKind::kMemoryFillPort) != 1 ||
+            countKind(graph, OperationKind::kRegister) != 0 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 0)
+        {
+            return fail("true merge multiple-reset family shape is wrong");
+        }
+        const Operation fill = graph.getOperation(opsOfKind(graph, OperationKind::kMemoryFillPort).front());
+        if (fill.operands().empty() ||
+            graph.getOperation(graph.valueDef(fill.operands().front())).kind() != OperationKind::kLogicOr)
+        {
+            return fail("true merge multiple-reset family did not rebuild the fill guard OR");
+        }
+        return 0;
+    }
+
+    int testTrueMergeConsolidatedFallbackDataWriteFamily()
+    {
+        Design design = buildTrueMergeDesign(false, false, false, true, false, true);
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 1 ||
+            countKind(graph, OperationKind::kMemoryWritePort) != 3 ||
+            countKind(graph, OperationKind::kMemoryFillPort) != 0 ||
+            countKind(graph, OperationKind::kRegister) != 0 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 0)
+        {
+            return fail("true merge did not recover the fallback-data write family");
+        }
+        return 0;
+    }
+
+    int testTrueMergeStorageOnlySharedReads()
+    {
+        Design design = buildTrueStorageOnlyDesign(true);
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 1 ||
+            countKind(graph, OperationKind::kMemoryReadPort) != 4 ||
+            countKind(graph, OperationKind::kMemoryWritePort) != 1 ||
+            countKind(graph, OperationKind::kRegister) != 0 ||
+            countKind(graph, OperationKind::kRegisterReadPort) != 0 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 0 ||
+            countKind(graph, OperationKind::kConcat) != 1 ||
+            countKind(graph, OperationKind::kAssign) != 1)
+        {
+            return fail("true storage-only shared-read rewrite shape is wrong");
+        }
+        const ValueId packed = graph.outputPortValue("packed");
+        const ValueId extra = graph.outputPortValue("extra");
+        if (!packed.valid() || !extra.valid() ||
+            graph.getOperation(graph.valueDef(packed)).kind() != OperationKind::kConcat ||
+            graph.getOperation(graph.valueDef(extra)).kind() != OperationKind::kAssign)
+        {
+            return fail("true storage-only rewrite did not preserve circular concat and extra user");
+        }
+        return 0;
+    }
+
+    int testTrueMergeStorageOnlyNonPowerOfTwoDomainGuard()
+    {
+        Design design = buildTrueStorageOnlyDesign(true, 3);
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 1 ||
+            countKind(graph, OperationKind::kMemoryReadPort) != 3 ||
+            countKind(graph, OperationKind::kMemoryWritePort) != 1 ||
+            countKind(graph, OperationKind::kLt) != 1 ||
+            countKind(graph, OperationKind::kRegister) != 0)
+        {
+            return fail("non-power-of-two storage rewrite did not use one compact domain guard");
+        }
+        const Operation memory = graph.getOperation(opsOfKind(graph, OperationKind::kMemory).front());
+        if (getAttr<int64_t>(memory, "row").value_or(0) != 3)
+        {
+            return fail("non-power-of-two storage rewrite has wrong memory depth");
+        }
+        return 0;
+    }
+
+    int testTrueMergeStorageOnlyFailureDoesNotAnnotateIntent()
+    {
+        Design design = buildTrueStorageOnlyDesign(false);
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 0 ||
+            countKind(graph, OperationKind::kRegister) != 4 ||
+            countKind(graph, OperationKind::kRegisterReadPort) != 4 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 3)
+        {
+            return fail("failed true storage-only candidate changed scalar IR");
+        }
+        const OperationId concat = graph.findOperation("shared_circular_concat");
+        if (!concat.valid() || hasIntentGroup(graph, concat))
+        {
+            return fail("failed true storage-only candidate leaked intent attrs");
+        }
+        for (std::size_t row = 0; row < 4; ++row)
+        {
+            const OperationId reg = graph.findOperation("shared_r" + std::to_string(row));
+            if (!reg.valid() || hasIntentGroup(graph, reg))
+            {
+                return fail("failed true storage-only candidate annotated register intent");
+            }
+        }
+        return 0;
+    }
+
     int testTrueMergeResetFill()
     {
         Design design = buildTrueMergeDesign(false, true);
@@ -1668,6 +1967,26 @@ int main()
             return rc;
         }
         if (const int rc = testTrueMergeConsolidatedWriteFamiliesWithReset(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testTrueMergeConsolidatedWriteFamiliesWithMultipleResetTerms(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testTrueMergeConsolidatedFallbackDataWriteFamily(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testTrueMergeStorageOnlySharedReads(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testTrueMergeStorageOnlyNonPowerOfTwoDomainGuard(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testTrueMergeStorageOnlyFailureDoesNotAnnotateIntent(); rc != 0)
         {
             return rc;
         }
