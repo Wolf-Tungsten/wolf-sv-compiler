@@ -834,6 +834,74 @@ namespace wolvrix::lib::transform
             });
         }
 
+        bool commonTermsExcludeResetTermImpl(const Graph &graph,
+                                             std::span<const ValueId> commonTerms,
+                                             ValueId resetTerm,
+                                             std::unordered_set<ValueId, ValueIdHash> &seen)
+        {
+            // Prove exclusion through !term, !(A || B), or !A => !(A && B).
+            const auto unwrappedReset = unwrapAssign(graph, resetTerm);
+            if (!unwrappedReset || !seen.insert(*unwrappedReset).second)
+            {
+                return false;
+            }
+            resetTerm = *unwrappedReset;
+            if (commonTermsContainNegationOf(graph, commonTerms, resetTerm))
+            {
+                return true;
+            }
+            for (ValueId commonTerm : commonTerms)
+            {
+                const auto unwrapped = unwrapAssign(graph, commonTerm);
+                if (!unwrapped)
+                {
+                    continue;
+                }
+                const OperationId opId = graph.valueDef(*unwrapped);
+                if (!opId.valid())
+                {
+                    continue;
+                }
+                const Operation op = graph.getOperation(opId);
+                if ((op.kind() != OperationKind::kLogicNot &&
+                     !(op.kind() == OperationKind::kNot && graph.valueWidth(*unwrapped) == 1)) ||
+                    op.operands().size() != 1)
+                {
+                    continue;
+                }
+                const auto excludedTerms = flattenLogicOrTerms(graph, op.operands().front());
+                if (std::any_of(excludedTerms.begin(), excludedTerms.end(), [&](ValueId excluded) {
+                        return sameValueAfterAssign(graph, excluded, resetTerm);
+                    }))
+                {
+                    return true;
+                }
+            }
+
+            const OperationId resetOpId = graph.valueDef(resetTerm);
+            if (!resetOpId.valid())
+            {
+                return false;
+            }
+            const Operation resetOp = graph.getOperation(resetOpId);
+            if ((resetOp.kind() != OperationKind::kLogicAnd &&
+                 !(resetOp.kind() == OperationKind::kAnd && graph.valueWidth(resetTerm) == 1)) ||
+                resetOp.operands().size() != 2)
+            {
+                return false;
+            }
+            return commonTermsExcludeResetTermImpl(graph, commonTerms, resetOp.operands()[0], seen) ||
+                   commonTermsExcludeResetTermImpl(graph, commonTerms, resetOp.operands()[1], seen);
+        }
+
+        bool commonTermsExcludeResetTerm(const Graph &graph,
+                                         std::span<const ValueId> commonTerms,
+                                         ValueId resetTerm)
+        {
+            std::unordered_set<ValueId, ValueIdHash> seen;
+            return commonTermsExcludeResetTermImpl(graph, commonTerms, resetTerm, seen);
+        }
+
         bool commonTermsExcludeResetSet(const Graph &graph,
                                         std::span<const ValueId> commonTerms,
                                         std::span<const ValueId> resetTerms)
@@ -843,7 +911,7 @@ namespace wolvrix::lib::transform
                 return true;
             }
             if (std::all_of(resetTerms.begin(), resetTerms.end(), [&](ValueId resetTerm) {
-                    return commonTermsContainNegationOf(graph, commonTerms, resetTerm);
+                    return commonTermsExcludeResetTerm(graph, commonTerms, resetTerm);
                 }))
             {
                 return true;
@@ -1337,6 +1405,9 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
+                const auto packedUseIt = uses.find(concatOp.results().front());
+                const bool hasSharedPackedView =
+                    packedUseIt != uses.end() && packedUseIt->second.count > 1;
 
                 std::vector<std::string> operandRegSymbols;
                 std::vector<OperationId> operandReadOps;
@@ -1390,7 +1461,8 @@ namespace wolvrix::lib::transform
 
                 const std::size_t period = repeatedSequencePeriod(operandRegSymbols);
                 const bool repeatedLayout = period < operandRegSymbols.size();
-                if (period < minElementCount || (!repeatedLayout && !hasSharedRead))
+                if (period < minElementCount ||
+                    (!repeatedLayout && !hasSharedRead && !hasSharedPackedView))
                 {
                     continue;
                 }
@@ -2104,7 +2176,12 @@ namespace wolvrix::lib::transform
                 });
                 current = op.operands()[2];
             }
-            if (chain.branches.size() < 2 || !chain.fallback.valid())
+            while (!chain.branches.empty() &&
+                   sameValueAfterAssign(graph, chain.branches.back().data, chain.fallback))
+            {
+                chain.branches.pop_back();
+            }
+            if (chain.branches.empty() || !chain.fallback.valid())
             {
                 return std::nullopt;
             }
@@ -2150,11 +2227,11 @@ namespace wolvrix::lib::transform
                 return reject("invalid_group_shape", kNoIndex, kNoIndex);
             }
 
-            ConsolidatedWriteMatch result;
-            std::vector<std::string> commonKeys;
-            std::vector<std::string> conflictKeys;
-            std::optional<bool> hasReset;
-            std::optional<std::string> resetTermsKey;
+            std::vector<const WritePortInfo *> rowWrites;
+            std::vector<std::vector<ValueId>> rowUpdateTerms;
+            std::unordered_map<ValueId, std::size_t, ValueIdHash> updateTermRowCounts;
+            rowWrites.reserve(group.regSymbols.size());
+            rowUpdateTerms.reserve(group.regSymbols.size());
             for (std::size_t row = 0; row < group.regSymbols.size(); ++row)
             {
                 const auto writeIt = writesByReg.find(group.regSymbols[row]);
@@ -2163,14 +2240,36 @@ namespace wolvrix::lib::transform
                     const std::size_t writeCount = writeIt == writesByReg.end() ? 0 : writeIt->second.size();
                     return reject("write_count", row, kNoIndex, "writes=" + std::to_string(writeCount));
                 }
-                const WritePortInfo &write = writeIt->second.front();
+                rowWrites.push_back(&writeIt->second.front());
+                rowUpdateTerms.push_back(flattenLogicOrTerms(graph, writeIt->second.front().updateCond));
+
+                std::unordered_set<ValueId, ValueIdHash> seenTerms;
+                for (ValueId term : rowUpdateTerms.back())
+                {
+                    const auto unwrapped = unwrapAssign(graph, term);
+                    const ValueId canonical = unwrapped ? *unwrapped : term;
+                    if (seenTerms.insert(canonical).second)
+                    {
+                        ++updateTermRowCounts[canonical];
+                    }
+                }
+            }
+
+            ConsolidatedWriteMatch result;
+            std::vector<std::string> commonKeys;
+            std::vector<std::string> conflictKeys;
+            std::optional<bool> hasReset;
+            std::optional<std::string> resetTermsKey;
+            for (std::size_t row = 0; row < group.regSymbols.size(); ++row)
+            {
+                const WritePortInfo &write = *rowWrites[row];
                 const auto chain = matchMuxWriteChain(graph, write.nextValue);
                 if (!chain)
                 {
                     return reject("mux_chain", row, kNoIndex);
                 }
 
-                std::vector<ValueId> updateTerms = flattenLogicOrTerms(graph, write.updateCond);
+                const std::vector<ValueId> &updateTerms = rowUpdateTerms[row];
                 std::vector<uint8_t> consumed(updateTerms.size(), 0);
                 for (const MuxWriteBranch &branch : chain->branches)
                 {
@@ -2197,7 +2296,16 @@ namespace wolvrix::lib::transform
                 {
                     if (consumed[termIndex] == 0)
                     {
-                        auto fallbackGuard = matchPriorityGuard(graph, updateTerms[termIndex]);
+                        const auto unwrapped = unwrapAssign(graph, updateTerms[termIndex]);
+                        const ValueId canonical = unwrapped ? *unwrapped : updateTerms[termIndex];
+                        const auto termCountIt = updateTermRowCounts.find(canonical);
+                        const bool sharedAcrossRows =
+                            termCountIt != updateTermRowCounts.end() &&
+                            termCountIt->second == group.regSymbols.size();
+                        // A group-wide fill can contain an equality whose constant happens to match one row.
+                        auto fallbackGuard = sharedAcrossRows
+                                                 ? std::optional<PriorityGuardMatch>{}
+                                                 : matchPriorityGuard(graph, updateTerms[termIndex]);
                         if (fallbackGuard && fallbackGuard->row == row)
                         {
                             effectiveBranches.push_back(MuxWriteBranch{
@@ -2259,11 +2367,23 @@ namespace wolvrix::lib::transform
                                     termNames += ",";
                                 }
                                 termNames += graph.symbolText(graph.valueSymbol(resetTerm));
+                                termNames += commonTermsExcludeResetTerm(graph, guard->commonTerms, resetTerm)
+                                                 ? ":excluded"
+                                                 : ":live";
+                            }
+                            std::string commonNames;
+                            for (ValueId commonTerm : guard->commonTerms)
+                            {
+                                if (!commonNames.empty())
+                                {
+                                    commonNames += ",";
+                                }
+                                commonNames += graph.symbolText(graph.valueSymbol(commonTerm));
                             }
                             return reject("reset_negation",
                                           row,
                                           branchIndex,
-                                          "reset_terms=" + termNames);
+                                          "reset_terms=" + termNames + " common_terms=" + commonNames);
                         }
                     }
 
@@ -3373,7 +3493,9 @@ namespace wolvrix::lib::transform
                                "/" + std::to_string(groups.size()) +
                                " anchors=" + std::to_string(group.anchors.size()) +
                                " members=" + std::to_string(group.regSymbols.size()) +
-                               " element_width=" + std::to_string(group.elementWidth));
+                               " element_width=" + std::to_string(group.elementWidth) +
+                               " first_reg=" + group.regSymbols.front() +
+                               " last_reg=" + group.regSymbols.back());
                 }
                 bool trueMerged = false;
                 if (options_.enableTrueMerge && !group.sharesStorage && !group.overlapsOtherCandidate)

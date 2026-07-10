@@ -2,6 +2,7 @@
 #include "core/transform.hpp"
 #include "transform/reg_to_mem.hpp"
 
+#include <array>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -569,7 +570,7 @@ namespace
         return design;
     }
 
-    Design buildTrueMergeCompoundResetDesign()
+    Design buildTrueMergeCompoundResetDesign(bool trailingNoOpResetMux = false)
     {
         Design design;
         Graph &graph = design.createGraph("top");
@@ -590,6 +591,9 @@ namespace
         const ValueId addr = makeLogicValue(graph, "addr", 2);
         const ValueId wen = makeLogicValue(graph, "wen", 1);
         const ValueId reset = makeLogicValue(graph, "reset", 1);
+        const ValueId reset2 = trailingNoOpResetMux ? makeLogicValue(graph, "reset2", 1) : ValueId{};
+        const ValueId resetUsefulAddr = trailingNoOpResetMux ? makeLogicValue(graph, "reset_useful_addr", 2) : ValueId{};
+        const ValueId resetUsefulB = trailingNoOpResetMux ? makeLogicValue(graph, "reset_useful_b", 1) : ValueId{};
         const ValueId data = makeLogicValue(graph, "data", width);
         const ValueId mask = addConstant(graph, "mask_op", "mask", width, "8'hff");
         const ValueId clk = makeLogicValue(graph, "clk", 1);
@@ -597,6 +601,12 @@ namespace
         graph.bindInputPort("addr", addr);
         graph.bindInputPort("wen", wen);
         graph.bindInputPort("reset", reset);
+        if (trailingNoOpResetMux)
+        {
+            graph.bindInputPort("reset2", reset2);
+            graph.bindInputPort("reset_useful_addr", resetUsefulAddr);
+            graph.bindInputPort("reset_useful_b", resetUsefulB);
+        }
         graph.bindInputPort("data", data);
         graph.bindInputPort("clk", clk);
 
@@ -604,12 +614,81 @@ namespace
         addSliceArrayAnchor(graph, "a0", regs, index, width, selected);
         graph.bindOutputPort("selected", selected);
 
+        const ValueId effectiveReset = trailingNoOpResetMux
+                                           ? addBinary(graph,
+                                                       OperationKind::kLogicOr,
+                                                       "combined_reset_op",
+                                                       "combined_reset",
+                                                       reset,
+                                                       reset2,
+                                                       1)
+                                           : reset;
+        const ValueId resetUsefulRow = trailingNoOpResetMux
+                                           ? addConstant(graph,
+                                                         "reset_useful_row_op",
+                                                         "reset_useful_row",
+                                                         2,
+                                                         "2'd3")
+                                           : ValueId{};
+        const ValueId resetUsefulHit = trailingNoOpResetMux
+                                           ? addBinary(graph,
+                                                       OperationKind::kEq,
+                                                       "reset_useful_hit_op",
+                                                       "reset_useful_hit",
+                                                       resetUsefulAddr,
+                                                       resetUsefulRow,
+                                                       1)
+                                           : ValueId{};
+        const ValueId resetUseful = trailingNoOpResetMux
+                                        ? addBinary(graph,
+                                                    OperationKind::kAnd,
+                                                    "reset_useful_op",
+                                                    "reset_useful",
+                                                    resetUsefulHit,
+                                                    resetUsefulB,
+                                                    1)
+                                        : ValueId{};
         const ValueId notReset = addUnary(graph,
                                           OperationKind::kLogicNot,
                                           "not_reset_op",
                                           "not_reset",
-                                          reset,
+                                          effectiveReset,
                                           1);
+        const ValueId notResetUseful = trailingNoOpResetMux
+                                           ? addUnary(graph,
+                                                      OperationKind::kLogicNot,
+                                                      "not_reset_useful_op",
+                                                      "not_reset_useful",
+                                                      resetUseful,
+                                                      1)
+                                           : ValueId{};
+        const ValueId activeResetEnable = trailingNoOpResetMux
+                                              ? addBinary(graph,
+                                                          OperationKind::kLogicAnd,
+                                                          "active_reset_enable_op",
+                                                          "active_reset_enable",
+                                                          notReset,
+                                                          notResetUseful,
+                                                          1)
+                                              : notReset;
+        const ValueId resetUsefulGuard = trailingNoOpResetMux
+                                             ? addBinary(graph,
+                                                         OperationKind::kLogicAnd,
+                                                         "reset_useful_guard_op",
+                                                         "reset_useful_guard",
+                                                         notReset,
+                                                         resetUseful,
+                                                         1)
+                                             : ValueId{};
+        const ValueId fillGuard = trailingNoOpResetMux
+                                      ? addBinary(graph,
+                                                  OperationKind::kLogicOr,
+                                                  "fill_guard_op",
+                                                  "fill_guard",
+                                                  effectiveReset,
+                                                  resetUsefulGuard,
+                                                  1)
+                                      : effectiveReset;
         for (std::size_t row = 0; row < rows; ++row)
         {
             const ValueId rowConst = addConstant(graph,
@@ -635,14 +714,14 @@ namespace
                                              OperationKind::kLogicAnd,
                                              "active" + std::to_string(row) + "_op",
                                              "active" + std::to_string(row),
-                                             notReset,
+                                             activeResetEnable,
                                              wenHit,
                                              1);
             const ValueId update = addBinary(graph,
                                              OperationKind::kLogicOr,
                                              "update" + std::to_string(row) + "_op",
                                              "update" + std::to_string(row),
-                                             reset,
+                                             fillGuard,
                                              active,
                                              1);
             const ValueId resetData = addConstant(graph,
@@ -650,12 +729,21 @@ namespace
                                                   "rst_data" + std::to_string(row),
                                                   width,
                                                   "8'd" + std::to_string(0x20 + row));
+            const ValueId fallback = trailingNoOpResetMux
+                                         ? addMux(graph,
+                                                  "noop_reset_mux" + std::to_string(row) + "_op",
+                                                  "noop_reset_mux" + std::to_string(row),
+                                                  resetUsefulGuard,
+                                                  resetData,
+                                                  resetData,
+                                                  width)
+                                         : resetData;
             const ValueId next = addMux(graph,
                                         "next" + std::to_string(row) + "_op",
                                         "next" + std::to_string(row),
                                         active,
                                         data,
-                                        resetData,
+                                        fallback,
                                         width);
             addRegisterWrite(graph,
                              "write" + std::to_string(row),
@@ -669,7 +757,9 @@ namespace
         return design;
     }
 
-    Design buildTrueStorageOnlyDesign(bool completeWrites, std::size_t rows = 4)
+    Design buildTrueStorageOnlyDesign(bool completeWrites,
+                                      std::size_t rows = 4,
+                                      bool sharedPackedView = false)
     {
         Design design;
         Graph &graph = design.createGraph("top");
@@ -693,10 +783,11 @@ namespace
             reads.push_back(readValue);
         }
 
-        const ValueId packed = makeLogicValue(graph, "shared_circular_packed", width * rows * 2);
+        const std::size_t repeatCount = sharedPackedView ? 1 : 2;
+        const ValueId packed = makeLogicValue(graph, "shared_circular_packed", width * rows * repeatCount);
         const OperationId concat = graph.createOperation(OperationKind::kConcat,
                                                          graph.internSymbol("shared_circular_concat"));
-        for (int repeat = 0; repeat < 2; ++repeat)
+        for (std::size_t repeat = 0; repeat < repeatCount; ++repeat)
         {
             for (auto it = reads.rbegin(); it != reads.rend(); ++it)
             {
@@ -704,14 +795,17 @@ namespace
             }
         }
         graph.addResult(concat, packed);
-        graph.bindOutputPort("packed", packed);
+        if (!sharedPackedView)
+        {
+            graph.bindOutputPort("packed", packed);
 
-        const ValueId extra = makeLogicValue(graph, "shared_extra", width);
-        const OperationId extraAssign = graph.createOperation(OperationKind::kAssign,
-                                                              graph.internSymbol("shared_extra_assign"));
-        graph.addOperand(extraAssign, reads.front());
-        graph.addResult(extraAssign, extra);
-        graph.bindOutputPort("extra", extra);
+            const ValueId extra = makeLogicValue(graph, "shared_extra", width);
+            const OperationId extraAssign = graph.createOperation(OperationKind::kAssign,
+                                                                  graph.internSymbol("shared_extra_assign"));
+            graph.addOperand(extraAssign, reads.front());
+            graph.addResult(extraAssign, extra);
+            graph.bindOutputPort("extra", extra);
+        }
 
         const ValueId addr = makeLogicValue(graph, "shared_addr", 2);
         const ValueId wen = makeLogicValue(graph, "shared_wen", 1);
@@ -722,6 +816,24 @@ namespace
         graph.bindInputPort("wen", wen);
         graph.bindInputPort("data", data);
         graph.bindInputPort("clk", clk);
+        if (sharedPackedView)
+        {
+            const ValueId secondAddr = makeLogicValue(graph, "shared_addr_2", 2);
+            graph.bindInputPort("addr2", secondAddr);
+            const std::array<ValueId, 2> readAddresses{addr, secondAddr};
+            for (std::size_t readIndex = 0; readIndex < readAddresses.size(); ++readIndex)
+            {
+                const std::string suffix = std::to_string(readIndex);
+                const ValueId selected = makeLogicValue(graph, "shared_selected" + suffix, width);
+                const OperationId slice = graph.createOperation(OperationKind::kSliceArray,
+                                                                graph.internSymbol("shared_slice" + suffix));
+                graph.addOperand(slice, packed);
+                graph.addOperand(slice, readAddresses[readIndex]);
+                graph.addResult(slice, selected);
+                graph.setAttr(slice, "sliceWidth", int64_t{width});
+                graph.bindOutputPort("selected" + suffix, selected);
+            }
+        }
         const std::size_t writeRows = completeWrites ? rows : rows - 1;
         for (std::size_t row = 0; row < writeRows; ++row)
         {
@@ -1789,6 +1901,37 @@ namespace
         return 0;
     }
 
+    int testTrueMergeStorageOnlySharedPackedView()
+    {
+        Design design = buildTrueStorageOnlyDesign(true, 4, true);
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 1 ||
+            countKind(graph, OperationKind::kMemoryReadPort) != 4 ||
+            countKind(graph, OperationKind::kMemoryWritePort) != 1 ||
+            countKind(graph, OperationKind::kRegister) != 0 ||
+            countKind(graph, OperationKind::kRegisterReadPort) != 0 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 0 ||
+            countKind(graph, OperationKind::kConcat) != 1 ||
+            countKind(graph, OperationKind::kSliceArray) != 2)
+        {
+            return fail("true storage-only shared packed-view rewrite shape is wrong");
+        }
+        for (std::size_t readIndex = 0; readIndex < 2; ++readIndex)
+        {
+            const ValueId selected = graph.outputPortValue("selected" + std::to_string(readIndex));
+            if (!selected.valid() ||
+                graph.getOperation(graph.valueDef(selected)).kind() != OperationKind::kSliceArray)
+            {
+                return fail("true storage-only rewrite did not preserve shared packed-view slices");
+            }
+        }
+        return 0;
+    }
+
     int testTrueMergeStorageOnlyNonPowerOfTwoDomainGuard()
     {
         Design design = buildTrueStorageOnlyDesign(true, 3);
@@ -1900,6 +2043,25 @@ namespace
         }
         return 0;
     }
+
+    int testTrueMergeCompoundResetWithTrailingNoOpMux()
+    {
+        Design design = buildTrueMergeCompoundResetDesign(true);
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 1 ||
+            countKind(graph, OperationKind::kMemoryWritePort) != 1 ||
+            countKind(graph, OperationKind::kMemoryFillPort) != 1 ||
+            countKind(graph, OperationKind::kRegister) != 0 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 0)
+        {
+            return fail("trailing no-op reset mux blocked true merge");
+        }
+        return 0;
+    }
 } // namespace
 
 int main()
@@ -1982,6 +2144,10 @@ int main()
         {
             return rc;
         }
+        if (const int rc = testTrueMergeStorageOnlySharedPackedView(); rc != 0)
+        {
+            return rc;
+        }
         if (const int rc = testTrueMergeStorageOnlyNonPowerOfTwoDomainGuard(); rc != 0)
         {
             return rc;
@@ -1995,6 +2161,10 @@ int main()
             return rc;
         }
         if (const int rc = testTrueMergeCompoundResetFill(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testTrueMergeCompoundResetWithTrailingNoOpMux(); rc != 0)
         {
             return rc;
         }
