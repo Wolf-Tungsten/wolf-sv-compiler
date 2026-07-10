@@ -544,6 +544,28 @@ namespace
         graph.setAttr(write, "regSymbol", std::string("reg_q"));
         graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
 
+        OperationId maskedReg = graph.createOperation(OperationKind::kRegister,
+                                                      graph.internSymbol("masked_reg_q"));
+        graph.setAttr(maskedReg, "width", static_cast<int64_t>(8));
+        graph.setAttr(maskedReg, "isSigned", false);
+        graph.setAttr(maskedReg, "initValue", std::string("8'h0"));
+
+        ValueId maskedRegQ = makeLogicValue(graph, "masked_reg_q_read", 8);
+        OperationId maskedRegRead = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                          graph.internSymbol("masked_reg_q_read_op"));
+        graph.addResult(maskedRegRead, maskedRegQ);
+        graph.setAttr(maskedRegRead, "regSymbol", std::string("masked_reg_q"));
+        graph.bindOutputPort("masked_y", maskedRegQ);
+
+        OperationId maskedWrite = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                        graph.internSymbol("masked_reg_q_write"));
+        graph.addOperand(maskedWrite, en);
+        graph.addOperand(maskedWrite, a);
+        graph.addOperand(maskedWrite, b);
+        graph.addOperand(maskedWrite, clk);
+        graph.setAttr(maskedWrite, "regSymbol", std::string("masked_reg_q"));
+        graph.setAttr(maskedWrite, "eventEdge", std::vector<std::string>{"posedge"});
+
         OperationId wideReg = graph.createOperation(OperationKind::kRegister, graph.internSymbol("wide_reg_q"));
         graph.setAttr(wideReg, "width", static_cast<int64_t>(130));
         graph.setAttr(wideReg, "isSigned", false);
@@ -576,6 +598,28 @@ namespace
         graph.addOperand(wideRegWrite, clk);
         graph.setAttr(wideRegWrite, "regSymbol", std::string("wide_reg_q"));
         graph.setAttr(wideRegWrite, "eventEdge", std::vector<std::string>{"posedge"});
+
+        OperationId wideMaskedReg = graph.createOperation(OperationKind::kRegister,
+                                                          graph.internSymbol("wide_masked_reg_q"));
+        graph.setAttr(wideMaskedReg, "width", static_cast<int64_t>(130));
+        graph.setAttr(wideMaskedReg, "isSigned", false);
+        graph.setAttr(wideMaskedReg, "initValue", std::string("130'h0"));
+
+        ValueId wideMaskedRegQ = makeLogicValue(graph, "wide_masked_reg_q_read", 130);
+        OperationId wideMaskedRegRead = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                              graph.internSymbol("wide_masked_reg_q_read_op"));
+        graph.addResult(wideMaskedRegRead, wideMaskedRegQ);
+        graph.setAttr(wideMaskedRegRead, "regSymbol", std::string("wide_masked_reg_q"));
+        graph.bindOutputPort("wide_masked_reg_y", wideMaskedRegQ);
+
+        OperationId wideMaskedRegWrite = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                               graph.internSymbol("wide_masked_reg_q_write"));
+        graph.addOperand(wideMaskedRegWrite, en);
+        graph.addOperand(wideMaskedRegWrite, wideIn);
+        graph.addOperand(wideMaskedRegWrite, wideMaskDyn);
+        graph.addOperand(wideMaskedRegWrite, clk);
+        graph.setAttr(wideMaskedRegWrite, "regSymbol", std::string("wide_masked_reg_q"));
+        graph.setAttr(wideMaskedRegWrite, "eventEdge", std::vector<std::string>{"posedge"});
 
         OperationId wideMem = graph.createOperation(OperationKind::kMemory, graph.internSymbol("wide_mem"));
         graph.setAttr(wideMem, "width", static_cast<int64_t>(130));
@@ -2344,6 +2388,41 @@ int main()
         sched.find("// op sum_add [kAdd]") == std::string::npos)
     {
         return fail("schedule comments should include operation kind and storage target annotations");
+    }
+    const auto writeSnippet = [&](std::string_view opComment)
+    {
+        const std::size_t begin = sched.find(opComment);
+        if (begin == std::string::npos)
+        {
+            return std::string_view{};
+        }
+        const std::size_t end = sched.find("// op ", begin + opComment.size());
+        return std::string_view(sched).substr(begin, end == std::string::npos ? end : end - begin);
+    };
+    const std::string_view scalarFullMaskWrite =
+        writeSnippet("// op reg_q_write [kRegisterWritePort] reg=reg_q");
+    const std::string_view wideFullMaskWrite =
+        writeSnippet("// op wide_reg_q_write [kRegisterWritePort] reg=wide_reg_q");
+    const std::string_view dynamicMaskWrite =
+        writeSnippet("// op masked_reg_q_write [kRegisterWritePort] reg=masked_reg_q");
+    const std::string_view wideDynamicMaskWrite =
+        writeSnippet("// op wide_masked_reg_q_write [kRegisterWritePort] reg=wide_masked_reg_q");
+    if (scalarFullMaskWrite.find("constant all-ones mask: direct register update") == std::string_view::npos ||
+        wideFullMaskWrite.find("constant all-ones mask: direct register update") == std::string_view::npos)
+    {
+        return fail("constant full-mask register writes should bypass masked merge emission");
+    }
+    if (dynamicMaskWrite.empty() ||
+        dynamicMaskWrite.find("constant all-ones mask: direct register update") != std::string_view::npos ||
+        dynamicMaskWrite.find(" & ~") == std::string_view::npos)
+    {
+        return fail("dynamic register masks should retain masked merge emission");
+    }
+    if (wideDynamicMaskWrite.empty() ||
+        wideDynamicMaskWrite.find("constant all-ones mask: direct register update") != std::string_view::npos ||
+        wideDynamicMaskWrite.find("grhsim_merge_words_masked") == std::string_view::npos)
+    {
+        return fail("wide dynamic register masks should retain words masked merge emission");
     }
     if (header.find("static const char value_") != std::string::npos ||
         state.find("const char GrhSIM_top::value_") != std::string::npos ||

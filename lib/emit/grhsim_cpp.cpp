@@ -12660,28 +12660,52 @@ namespace wolvrix::lib::emit
             }
             else
             {
+                const bool hasConstAllOnesMask =
+                    isConstLogicAllOnes(graph, operands[2], state.width);
                 if (isWideLogicWidth(state.width))
                 {
-                    stream << innerIndent << "const auto next_value = grhsim_merge_words_masked("
-                           << resolvedStateRefExpr(state, context) << ", "
-                           << wordsExprForValue(graph, model, operands[1], state.width, context) << ", "
-                           << wordsExprForValue(graph, model, operands[2], state.width, context) << ", "
-                           << state.width << ");\n";
-                    stream << innerIndent << "if ("
-                           << assignWordsInlineExpr(resolvedStateRefExpr(state, context), "next_value", state.width)
-                           << ") {\n";
+                    if (hasConstAllOnesMask)
+                    {
+                        stream << innerIndent << "// constant all-ones mask: direct register update\n";
+                        stream << innerIndent << "if ("
+                               << assignWordsInlineExpr(
+                                      resolvedStateRefExpr(state, context),
+                                      wordsExprForValue(graph, model, operands[1], state.width, context),
+                                      state.width)
+                               << ") {\n";
+                    }
+                    else
+                    {
+                        stream << innerIndent << "const auto next_value = grhsim_merge_words_masked("
+                               << resolvedStateRefExpr(state, context) << ", "
+                               << wordsExprForValue(graph, model, operands[1], state.width, context) << ", "
+                               << wordsExprForValue(graph, model, operands[2], state.width, context) << ", "
+                               << state.width << ");\n";
+                        stream << innerIndent << "if ("
+                               << assignWordsInlineExpr(resolvedStateRefExpr(state, context), "next_value", state.width)
+                               << ") {\n";
+                    }
                     emitPerfCounterIncrement(stream, model, innerIndent + "    ", "touchedWriteCount");
                     emitReaderActivations(innerIndent + "    ");
                     stream << innerIndent << "}\n";
                 }
                 else
                 {
-                    stream << innerIndent << "const auto next_value = static_cast<" << state.cppType
-                           << ">((" << resolvedStateRefExpr(state, context) << " & ~"
-                           << resolvedScheduleValueExpr(model, operands[2], context)
-                           << ") | (" << resolvedScheduleValueExpr(model, operands[1], context) << " & "
-                           << resolvedScheduleValueExpr(model, operands[2], context)
-                           << "));\n";
+                    if (hasConstAllOnesMask)
+                    {
+                        stream << innerIndent << "// constant all-ones mask: direct register update\n";
+                        stream << innerIndent << "const auto next_value = static_cast<" << state.cppType
+                               << ">(" << resolvedScheduleValueExpr(model, operands[1], context) << ");\n";
+                    }
+                    else
+                    {
+                        stream << innerIndent << "const auto next_value = static_cast<" << state.cppType
+                               << ">((" << resolvedStateRefExpr(state, context) << " & ~"
+                               << resolvedScheduleValueExpr(model, operands[2], context)
+                               << ") | (" << resolvedScheduleValueExpr(model, operands[1], context) << " & "
+                               << resolvedScheduleValueExpr(model, operands[2], context)
+                               << "));\n";
+                    }
                     stream << innerIndent << "if (" << resolvedStateRefExpr(state, context) << " != next_value) {\n";
                     stream << innerIndent << "    " << resolvedStateRefExpr(state, context) << " = next_value;\n";
                     emitPerfCounterIncrement(stream, model, innerIndent + "    ", "touchedWriteCount");
