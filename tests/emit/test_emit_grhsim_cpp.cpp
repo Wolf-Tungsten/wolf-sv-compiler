@@ -2112,12 +2112,15 @@ namespace
             readValues.push_back(readValue);
         }
 
-        const ValueId packed = makeLogicValue(graph, "multi_packed", width * static_cast<int32_t>(rows));
+        const ValueId packed = makeLogicValue(graph, "multi_packed", width * static_cast<int32_t>(rows) * 2);
         const OperationId concat = graph.createOperation(OperationKind::kConcat,
                                                          graph.internSymbol("multi_concat"));
-        for (std::size_t row = rows; row-- > 0;)
+        for (int repeat = 0; repeat < 2; ++repeat)
         {
-            graph.addOperand(concat, readValues[row]);
+            for (std::size_t row = rows; row-- > 0;)
+            {
+                graph.addOperand(concat, readValues[row]);
+            }
         }
         graph.addResult(concat, packed);
 
@@ -2129,6 +2132,13 @@ namespace
         graph.addResult(slice, selected);
         graph.setAttr(slice, "sliceWidth", int64_t{width});
         graph.bindOutputPort("selected", selected);
+
+        const ValueId extra = makeLogicValue(graph, "extra", width);
+        const OperationId extraAssign = graph.createOperation(OperationKind::kAssign,
+                                                              graph.internSymbol("multi_extra_assign"));
+        graph.addOperand(extraAssign, readValues.front());
+        graph.addResult(extraAssign, extra);
+        graph.bindOutputPort("extra", extra);
 
         const ValueId mask = addConstant(graph, "multi_mask_op", "multi_mask", width, "8'hff");
         auto addBinaryValue = [&](OperationKind kind,
@@ -2201,6 +2211,86 @@ namespace
             graph.setAttr(write, "regSymbol", regSymbols[row]);
             graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
         }
+        return design;
+    }
+
+    Design buildMemoryRowReaderActivationDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        constexpr int32_t width = 8;
+        constexpr std::size_t rows = 64;
+        const ValueId clk = makeLogicValue(graph, "clk", 1);
+        const ValueId wen = makeLogicValue(graph, "wen", 1);
+        const ValueId writeAddr = makeLogicValue(graph, "write_addr", 6);
+        const ValueId writeData = makeLogicValue(graph, "write_data", width);
+        const ValueId readAddr = makeLogicValue(graph, "read_addr", 6);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("wen", wen);
+        graph.bindInputPort("write_addr", writeAddr);
+        graph.bindInputPort("write_data", writeData);
+        graph.bindInputPort("read_addr", readAddr);
+
+        const OperationId memory = graph.createOperation(OperationKind::kMemory,
+                                                         graph.internSymbol("row_activation_mem"));
+        graph.setAttr(memory, "width", int64_t{width});
+        graph.setAttr(memory, "row", static_cast<int64_t>(rows));
+        graph.setAttr(memory, "isSigned", false);
+        graph.setAttr(memory, "initKind", std::vector<std::string>{});
+        graph.setAttr(memory, "initFile", std::vector<std::string>{});
+        graph.setAttr(memory, "initValue", std::vector<std::string>{});
+        graph.setAttr(memory, "initStart", std::vector<int64_t>{});
+        graph.setAttr(memory, "initLen", std::vector<int64_t>{});
+
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            const std::string rowText = std::to_string(row);
+            const ValueId addr = addConstant(graph,
+                                             "row_activation_addr_" + rowText + "_op",
+                                             "row_activation_addr_" + rowText,
+                                             6,
+                                             "6'd" + rowText);
+            for (std::size_t copy = 0; copy < 2; ++copy)
+            {
+                const std::string copyText = std::to_string(copy);
+                const ValueId value = makeLogicValue(
+                    graph, "row_activation_value_" + rowText + "_" + copyText, width);
+                const OperationId read = graph.createOperation(
+                    OperationKind::kMemoryReadPort,
+                    graph.internSymbol("row_activation_read_" + rowText + "_" + copyText));
+                graph.addOperand(read, addr);
+                graph.addResult(read, value);
+                graph.setAttr(read, "memSymbol", std::string("row_activation_mem"));
+                graph.bindOutputPort(
+                    (copy == 0 ? "row_" : "row_mirror_") + rowText, value);
+            }
+        }
+
+        const ValueId dynamicValue = makeLogicValue(graph, "row_activation_dynamic_value", width);
+        const OperationId dynamicRead = graph.createOperation(OperationKind::kMemoryReadPort,
+                                                              graph.internSymbol("row_activation_dynamic_read"));
+        graph.addOperand(dynamicRead, readAddr);
+        graph.addResult(dynamicRead, dynamicValue);
+        graph.setAttr(dynamicRead, "memSymbol", std::string("row_activation_mem"));
+        graph.bindOutputPort("dynamic_value", dynamicValue);
+
+        const ValueId mask = addConstant(graph,
+                                         "row_activation_mask_op",
+                                         "row_activation_mask",
+                                         width,
+                                         "8'hff");
+        const OperationId write = graph.createOperation(OperationKind::kMemoryWritePort,
+                                                        graph.internSymbol("row_activation_write"));
+        graph.addOperand(write, wen);
+        graph.addOperand(write, writeAddr);
+        graph.addOperand(write, writeData);
+        graph.addOperand(write, mask);
+        graph.addOperand(write, clk);
+        graph.setAttr(write, "memSymbol", std::string("row_activation_mem"));
+        graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+
         return design;
     }
 
@@ -3007,6 +3097,9 @@ int main()
         harness << "    sim.clk = true;\n";
         harness << "    sim.eval();\n";
         harness << "    if (sim.selected != static_cast<std::uint8_t>(0x22)) return 1;\n";
+        harness << "    sim.index = static_cast<std::uint8_t>(0);\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.extra != static_cast<std::uint8_t>(0x00)) return 4;\n";
         harness << "    sim.clk = false;\n";
         harness << "    sim.addr = static_cast<std::uint8_t>(0);\n";
         harness << "    sim.addr2 = static_cast<std::uint8_t>(2);\n";
@@ -3018,6 +3111,7 @@ int main()
         harness << "    sim.index = static_cast<std::uint8_t>(0);\n";
         harness << "    sim.eval();\n";
         harness << "    if (sim.selected != static_cast<std::uint8_t>(0x33)) return 2;\n";
+        harness << "    if (sim.extra != static_cast<std::uint8_t>(0x33)) return 5;\n";
         harness << "    sim.index = static_cast<std::uint8_t>(2);\n";
         harness << "    sim.eval();\n";
         harness << "    if (sim.selected != static_cast<std::uint8_t>(0x44)) return 3;\n";
@@ -3037,6 +3131,101 @@ int main()
     if (std::system(trueMultiWriteHarnessExe.string().c_str()) != 0)
     {
         return fail("true reg-to-mem multi-write collision priority is wrong");
+    }
+
+    const std::filesystem::path rowActivationDir =
+        std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_memory_row_reader_activation";
+    std::filesystem::remove_all(rowActivationDir);
+    Design rowActivationDesign = buildMemoryRowReaderActivationDesign();
+    EmitDiagnostics rowActivationDiag;
+    EmitResult rowActivationResult;
+    if (!emitWithActivitySchedule(rowActivationDesign,
+                                  rowActivationDir,
+                                  rowActivationDiag,
+                                  rowActivationResult,
+                                  ActivityScheduleOptions{.path = "top",
+                                                          .maxOpInComputeSupernode = 8,
+                                                          .maxOpInComputeNode = 8,
+                                                          .enableCoarsen = false}))
+    {
+        return fail("memory row reader activation activity-schedule pass failed");
+    }
+    if (!rowActivationResult.success || rowActivationDiag.hasError())
+    {
+        return fail("memory row reader activation emit failed");
+    }
+    const std::string rowActivationHeader = readFile(rowActivationDir / "grhsim_top.hpp");
+    const std::string rowActivationState = readFile(rowActivationDir / "grhsim_top_state.cpp");
+    const std::string rowActivationSched =
+        readFiles(collectSchedFiles(rowActivationDir, "grhsim_top_sched_"));
+    if (rowActivationHeader.find("void activate_memory_row_readers_0(std::size_t row") == std::string::npos ||
+        rowActivationState.find("std::array<std::size_t, 65> kRowOffsets") == std::string::npos ||
+        rowActivationState.find("std::array<grhsim_active_mask_entry, 128> kRowReaders") == std::string::npos ||
+        rowActivationState.find("entryIndex < kRowOffsets[row + 1u]") == std::string::npos ||
+        rowActivationState.find("entry.word_index == localWordIndex") == std::string::npos ||
+        rowActivationSched.find("activate_memory_row_readers_0(") == std::string::npos)
+    {
+        return fail("large constant-address memory should emit row-specialized reader activation");
+    }
+    const std::string rowActivationBuildCmd =
+        "make -C " + rowActivationDir.string() + " CXX=clang++ CXXFLAGS='" +
+        std::string(kHarnessCompileFlags) + "'";
+    if (std::system(rowActivationBuildCmd.c_str()) != 0)
+    {
+        return fail("memory row reader activation archive failed to build");
+    }
+    const std::filesystem::path rowActivationHarnessPath = rowActivationDir / "grhsim_top_harness.cpp";
+    {
+        std::ofstream harness(rowActivationHarnessPath);
+        if (!harness.is_open())
+        {
+            return fail("Failed to create memory row reader activation harness");
+        }
+        harness << "#include \"grhsim_top.hpp\"\n";
+        harness << "#include <cstdint>\n\n";
+        harness << "int main()\n";
+        harness << "{\n";
+        harness << "    GrhSIM_top sim;\n";
+        harness << "    sim.init();\n";
+        harness << "    sim.clk = false;\n";
+        harness << "    sim.wen = true;\n";
+        harness << "    sim.write_addr = static_cast<std::uint8_t>(0);\n";
+        harness << "    sim.write_data = static_cast<std::uint8_t>(0x11);\n";
+        harness << "    sim.read_addr = static_cast<std::uint8_t>(0);\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.clk = true;\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.row_0 != static_cast<std::uint8_t>(0x11)) return 1;\n";
+        harness << "    if (sim.row_mirror_0 != static_cast<std::uint8_t>(0x11)) return 2;\n";
+        harness << "    if (sim.dynamic_value != static_cast<std::uint8_t>(0x11)) return 3;\n";
+        harness << "    sim.clk = false;\n";
+        harness << "    sim.write_addr = static_cast<std::uint8_t>(33);\n";
+        harness << "    sim.write_data = static_cast<std::uint8_t>(0x22);\n";
+        harness << "    sim.read_addr = static_cast<std::uint8_t>(33);\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.clk = true;\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.row_0 != static_cast<std::uint8_t>(0x11)) return 4;\n";
+        harness << "    if (sim.row_mirror_0 != static_cast<std::uint8_t>(0x11)) return 5;\n";
+        harness << "    if (sim.row_33 != static_cast<std::uint8_t>(0x22)) return 6;\n";
+        harness << "    if (sim.row_mirror_33 != static_cast<std::uint8_t>(0x22)) return 7;\n";
+        harness << "    if (sim.dynamic_value != static_cast<std::uint8_t>(0x22)) return 8;\n";
+        harness << "    return 0;\n";
+        harness << "}\n";
+    }
+    const std::filesystem::path rowActivationHarnessExe = rowActivationDir / "grhsim_top_harness";
+    const std::string rowActivationCompileCmd =
+        "clang++ " + std::string(kHarnessCompileFlags) + " -I" + rowActivationDir.string() +
+        " -include-pch " + (rowActivationDir / "grhsim_top.hpp.pch").string() + " " +
+        rowActivationHarnessPath.string() + " " + (rowActivationDir / "libgrhsim_top.a").string() +
+        " -o " + rowActivationHarnessExe.string();
+    if (std::system(rowActivationCompileCmd.c_str()) != 0)
+    {
+        return fail("memory row reader activation harness failed to compile");
+    }
+    if (std::system(rowActivationHarnessExe.string().c_str()) != 0)
+    {
+        return fail("memory row reader activation behavior is wrong");
     }
 
     const std::filesystem::path intentDir =

@@ -263,6 +263,7 @@ namespace wolvrix::lib::emit
         constexpr std::size_t kInvalidIndex = static_cast<std::size_t>(-1);
         constexpr std::size_t kActivationTableThreshold = 32;
         constexpr std::size_t kActiveFlagBitsPerWord = 8;
+        constexpr std::size_t kMemoryRowReaderActivationMinRows = 32;
 
         struct ActiveMaskEntry
         {
@@ -2484,6 +2485,15 @@ namespace wolvrix::lib::emit
             bool isMemoryFill = false;
         };
 
+        struct MemoryRowReaderActivationDecl
+        {
+            std::string symbol;
+            std::string methodName;
+            std::vector<std::size_t> rowEntryOffsets;
+            std::vector<ActiveMaskEntry> rowEntries;
+            std::vector<uint32_t> dynamicReaderActiveIds;
+        };
+
         struct StateShadowDecl
         {
             StateDecl::Kind kind = StateDecl::Kind::Register;
@@ -2602,6 +2612,8 @@ namespace wolvrix::lib::emit
             std::unordered_map<OperationId, std::string, OperationIdHash> regToMemIntentReadGroupByOp;
             std::unordered_set<OperationId, OperationIdHash> regToMemIntentBypassOps;
             std::unordered_map<std::string, std::vector<uint32_t>> stateHeadSupernodesBySymbol;
+            std::unordered_map<std::string, std::size_t> memoryRowReaderActivationBySymbol;
+            std::vector<MemoryRowReaderActivationDecl> memoryRowReaderActivations;
             std::unordered_map<OperationId, WriteDecl, OperationIdHash> writeByOp;
             std::unordered_map<std::string, StateShadowDecl> stateShadowBySymbol;
             std::unordered_map<OperationId, EventSampleDecl, OperationIdHash> eventSamplesByOp;
@@ -2675,6 +2687,73 @@ namespace wolvrix::lib::emit
             bool inputFullpassSpecialization = false;
             bool posedgeFullpassSpecialization = false;
         };
+
+        const MemoryRowReaderActivationDecl *memoryRowReaderActivationForSymbol(
+            const EmitModel &model,
+            std::string_view symbol) noexcept
+        {
+            const auto indexIt = model.memoryRowReaderActivationBySymbol.find(std::string(symbol));
+            if (indexIt == model.memoryRowReaderActivationBySymbol.end() ||
+                indexIt->second >= model.memoryRowReaderActivations.size())
+            {
+                return nullptr;
+            }
+            return &model.memoryRowReaderActivations[indexIt->second];
+        }
+
+        void emitStateReaderActivationStatements(
+            std::ostream &stream,
+            const EmitModel &model,
+            std::string_view symbol,
+            std::string_view indent,
+            const ActivationEmitContext *context = nullptr,
+            std::optional<std::string_view> memoryRowExpr = std::nullopt)
+        {
+            if (memoryRowExpr)
+            {
+                if (const auto *activation = memoryRowReaderActivationForSymbol(model, symbol))
+                {
+                    emitActivationStatements(stream,
+                                             "supernode_active_curr_",
+                                             "active_count_",
+                                             activation->dynamicReaderActiveIds,
+                                             indent,
+                                             context);
+
+                    std::size_t localWordIndex = 0;
+                    std::uint8_t localLaterMask = UINT8_C(0);
+                    std::string localActiveExpr = "nullptr";
+                    if (context != nullptr && !context->localActiveExpr.empty() &&
+                        context->currentActiveId != kInvalidIndex)
+                    {
+                        localWordIndex = context->currentWordIndex;
+                        const std::size_t currentBit = context->currentActiveId % kActiveFlagBitsPerWord;
+                        if (currentBit + 1u < kActiveFlagBitsPerWord)
+                        {
+                            localLaterMask = static_cast<std::uint8_t>(
+                                UINT8_C(0xff) << static_cast<unsigned>(currentBit + 1u));
+                        }
+                        localActiveExpr = "&" + std::string(context->localActiveExpr);
+                    }
+                    stream << indent << activation->methodName << "(" << *memoryRowExpr << ", "
+                           << localWordIndex << "u, UINT8_C(" << static_cast<unsigned>(localLaterMask)
+                           << "), " << localActiveExpr << ");\n";
+                    return;
+                }
+            }
+
+            const auto headIt = model.stateHeadSupernodesBySymbol.find(std::string(symbol));
+            if (headIt == model.stateHeadSupernodesBySymbol.end())
+            {
+                return;
+            }
+            emitActivationStatements(stream,
+                                     "supernode_active_curr_",
+                                     "active_count_",
+                                     headIt->second,
+                                     indent,
+                                     context);
+        }
 
         bool isStoredValue(const EmitModel &model, ValueId value) noexcept
         {
@@ -6485,6 +6564,9 @@ namespace wolvrix::lib::emit
             model.regToMemIntentConcatGroupByOp.clear();
             model.regToMemIntentReadGroupByOp.clear();
             model.regToMemIntentBypassOps.clear();
+            model.stateHeadSupernodesBySymbol.clear();
+            model.memoryRowReaderActivationBySymbol.clear();
+            model.memoryRowReaderActivations.clear();
             model.stateLogicScalarSlotCounts = {};
             model.stateLogicWideSlotCountsByWords.clear();
             model.packedArrayLaneViewByValue.clear();
@@ -7583,6 +7665,154 @@ namespace wolvrix::lib::emit
             {
                 (void)symbol;
                 sortUniqueVector(supernodes);
+            }
+
+            struct MemoryReaderActivationCandidate
+            {
+                std::unordered_map<std::size_t, std::vector<uint32_t>> constantActiveIdsByRow;
+                std::vector<uint32_t> dynamicActiveIds;
+                std::vector<uint32_t> representedActiveIds;
+            };
+            std::unordered_map<std::string, MemoryReaderActivationCandidate> activationCandidates;
+            for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps.size(); ++supernodeId)
+            {
+                if (!isComputeSupernode(model, supernodeId) ||
+                    supernodeId >= model.activeIdBySupernode.size() ||
+                    model.activeIdBySupernode[supernodeId] == kInvalidIndex)
+                {
+                    continue;
+                }
+                const uint32_t activeId = static_cast<uint32_t>(model.activeIdBySupernode[supernodeId]);
+                for (OperationId opId : schedule.supernodeToOps[supernodeId])
+                {
+                    const Operation op = graph.getOperation(opId);
+                    if (op.kind() != OperationKind::kMemoryReadPort || op.operands().empty())
+                    {
+                        continue;
+                    }
+                    const auto memSymbol = getAttribute<std::string>(op, "memSymbol");
+                    if (!memSymbol)
+                    {
+                        continue;
+                    }
+                    const auto stateIt = model.stateBySymbol.find(*memSymbol);
+                    if (stateIt == model.stateBySymbol.end() ||
+                        stateIt->second.kind != StateDecl::Kind::Memory ||
+                        stateIt->second.rowCount <= 0)
+                    {
+                        continue;
+                    }
+
+                    auto &candidate = activationCandidates[*memSymbol];
+                    candidate.representedActiveIds.push_back(activeId);
+                    const ValueId addrValue = op.operands().front();
+                    const int32_t addrWidth = graph.valueWidth(addrValue);
+                    const auto constAddr = constLogicValue(graph, addrValue, addrWidth);
+                    if (!constAddr)
+                    {
+                        candidate.dynamicActiveIds.push_back(activeId);
+                        continue;
+                    }
+
+                    const std::size_t rowCount = static_cast<std::size_t>(stateIt->second.rowCount);
+                    const std::uint64_t *rawWords = constAddr->getRawPtr();
+                    const std::size_t wordCount = logicWordCount(addrWidth);
+                    const std::uint64_t lowWord = wordCount == 0 ? UINT64_C(0) : rawWords[0];
+                    std::optional<std::size_t> row;
+                    if (isPowerOfTwoU64(static_cast<std::uint64_t>(rowCount)))
+                    {
+                        row = static_cast<std::size_t>(lowWord & static_cast<std::uint64_t>(rowCount - 1u));
+                    }
+                    else
+                    {
+                        bool highWordsZero = true;
+                        for (std::size_t word = 1; word < wordCount; ++word)
+                        {
+                            if (rawWords[word] != UINT64_C(0))
+                            {
+                                highWordsZero = false;
+                                break;
+                            }
+                        }
+                        if (highWordsZero && lowWord < static_cast<std::uint64_t>(rowCount))
+                        {
+                            row = static_cast<std::size_t>(lowWord);
+                        }
+                    }
+                    if (row)
+                    {
+                        candidate.constantActiveIdsByRow[*row].push_back(activeId);
+                    }
+                }
+            }
+
+            for (const std::string &symbol : model.stateOrder)
+            {
+                const auto candidateIt = activationCandidates.find(symbol);
+                if (candidateIt == activationCandidates.end())
+                {
+                    continue;
+                }
+                const StateDecl &state = model.stateBySymbol.at(symbol);
+                const std::size_t rowCount = static_cast<std::size_t>(state.rowCount);
+                auto &candidate = candidateIt->second;
+                sortUniqueVector(candidate.dynamicActiveIds);
+                sortUniqueVector(candidate.representedActiveIds);
+
+                const auto fullReadersIt = model.stateHeadSupernodesBySymbol.find(symbol);
+                if (fullReadersIt == model.stateHeadSupernodesBySymbol.end() ||
+                    candidate.representedActiveIds != fullReadersIt->second ||
+                    candidate.constantActiveIdsByRow.size() < kMemoryRowReaderActivationMinRows ||
+                    candidate.constantActiveIdsByRow.size() * 2u < rowCount)
+                {
+                    continue;
+                }
+
+                std::vector<std::size_t> rowEntryOffsets;
+                rowEntryOffsets.reserve(rowCount + 1u);
+                std::vector<ActiveMaskEntry> rowEntries;
+                std::vector<uint32_t> distinctConstantActiveIds;
+                for (std::size_t row = 0; row < rowCount; ++row)
+                {
+                    rowEntryOffsets.push_back(rowEntries.size());
+                    const auto rowIt = candidate.constantActiveIdsByRow.find(row);
+                    if (rowIt == candidate.constantActiveIdsByRow.end())
+                    {
+                        continue;
+                    }
+                    auto &activeIds = rowIt->second;
+                    sortUniqueVector(activeIds);
+                    activeIds.erase(
+                        std::remove_if(activeIds.begin(),
+                                       activeIds.end(),
+                                       [&](uint32_t activeId)
+                                       {
+                                           return std::binary_search(candidate.dynamicActiveIds.begin(),
+                                                                     candidate.dynamicActiveIds.end(),
+                                                                     activeId);
+                                       }),
+                        activeIds.end());
+                    distinctConstantActiveIds.insert(
+                        distinctConstantActiveIds.end(), activeIds.begin(), activeIds.end());
+                    const auto entries = buildActiveMaskEntries(activeIds);
+                    rowEntries.insert(rowEntries.end(), entries.begin(), entries.end());
+                }
+                rowEntryOffsets.push_back(rowEntries.size());
+                sortUniqueVector(distinctConstantActiveIds);
+                if (distinctConstantActiveIds.size() < 2)
+                {
+                    continue;
+                }
+
+                const std::size_t activationIndex = model.memoryRowReaderActivations.size();
+                model.memoryRowReaderActivationBySymbol.emplace(symbol, activationIndex);
+                model.memoryRowReaderActivations.push_back(MemoryRowReaderActivationDecl{
+                    .symbol = symbol,
+                    .methodName = "activate_memory_row_readers_" + std::to_string(activationIndex),
+                    .rowEntryOffsets = std::move(rowEntryOffsets),
+                    .rowEntries = std::move(rowEntries),
+                    .dynamicReaderActiveIds = std::move(candidate.dynamicActiveIds),
+                });
             }
             sortUniqueValueIds(model.commitInputValues);
 
@@ -12475,7 +12705,8 @@ namespace wolvrix::lib::emit
             const std::string innerIndent = std::string(indent) + "    ";
             const auto headIt = model.stateHeadSupernodesBySymbol.find(write.symbol);
             const bool hasReaders = headIt != model.stateHeadSupernodesBySymbol.end() && !headIt->second.empty();
-            auto emitReaderActivations = [&](std::string_view activationIndent)
+            auto emitReaderActivations = [&](std::string_view activationIndent,
+                                             std::optional<std::string_view> memoryRowExpr = std::nullopt)
             {
                 if (!hasReaders)
                 {
@@ -12485,13 +12716,12 @@ namespace wolvrix::lib::emit
                 {
                     stream << activationIndent << "commit_activated_readers_ = true;\n";
                 }
-                emitActivationStatements(
-                    stream,
-                    "supernode_active_curr_",
-                    "active_count_",
-                    headIt->second,
-                    activationIndent,
-                    activationContext);
+                emitStateReaderActivationStatements(stream,
+                                                    model,
+                                                    write.symbol,
+                                                    activationIndent,
+                                                    activationContext,
+                                                    memoryRowExpr);
             };
             stream << indent << "{\n";
             if (write.kind == StateDecl::Kind::Memory)
@@ -12596,7 +12826,7 @@ namespace wolvrix::lib::emit
                                           state.width)
                                    << ") {\n";
                             emitPerfCounterIncrement(stream, model, innerIndent + "    ", "touchedWriteCount");
-                            emitReaderActivations(innerIndent + "    ");
+                            emitReaderActivations(innerIndent + "    ", rowAccess.rowExpr);
                             stream << innerIndent << "}\n";
                         }
                         else
@@ -12613,7 +12843,7 @@ namespace wolvrix::lib::emit
                             stream << rowRef << " != next_value) {\n";
                             stream << innerIndent << "    " << rowRef << " = next_value;\n";
                             emitPerfCounterIncrement(stream, model, innerIndent + "    ", "touchedWriteCount");
-                            emitReaderActivations(innerIndent + "    ");
+                            emitReaderActivations(innerIndent + "    ", rowAccess.rowExpr);
                             stream << innerIndent << "}\n";
                         }
                     }
@@ -12631,7 +12861,7 @@ namespace wolvrix::lib::emit
                                    << wordsExprForValue(graph, model, operands[3], state.width, context) << ", "
                                    << state.width << ")) {\n";
                             emitPerfCounterIncrement(stream, model, innerIndent + "    ", "touchedWriteCount");
-                            emitReaderActivations(innerIndent + "    ");
+                            emitReaderActivations(innerIndent + "    ", rowAccess.rowExpr);
                             stream << innerIndent << "}\n";
                         }
                         else
@@ -12653,7 +12883,7 @@ namespace wolvrix::lib::emit
                             stream << rowRef << " != merged) {\n";
                             stream << innerIndent << "    " << rowRef << " = merged;\n";
                             emitPerfCounterIncrement(stream, model, innerIndent + "    ", "touchedWriteCount");
-                            emitReaderActivations(innerIndent + "    ");
+                            emitReaderActivations(innerIndent + "    ", rowAccess.rowExpr);
                             stream << innerIndent << "}\n";
                         }
                     }
@@ -18052,6 +18282,13 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             {
                 *stream << "    void " << chunk.methodName << "(std::uint32_t writeIndex, bool &activatedReaders);\n";
             }
+            for (const auto &activation : model.memoryRowReaderActivations)
+            {
+                *stream << "    void " << activation.methodName << "(std::size_t row,\n";
+                *stream << "                                      std::size_t localWordIndex,\n";
+                *stream << "                                      std::uint8_t localLaterMask,\n";
+                *stream << "                                      std::uint8_t *localActive);\n";
+            }
             if (model.needsSystemTaskRuntime)
             {
                 *stream << "    struct PendingSystemTaskText {\n";
@@ -18633,6 +18870,21 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             const std::string stateExpr = stateRef(state);
             const auto headIt = model.stateHeadSupernodesBySymbol.find(write.symbol);
             const bool hasReaders = headIt != model.stateHeadSupernodesBySymbol.end() && !headIt->second.empty();
+            auto emitChangedReaderActivations = [&](std::string_view activationIndent)
+            {
+                if (!hasReaders)
+                {
+                    return;
+                }
+                stream << activationIndent << "activatedReaders = true;\n";
+                stream << activationIndent << "commit_activated_readers_ = true;\n";
+                emitStateReaderActivationStatements(stream,
+                                                    model,
+                                                    write.symbol,
+                                                    activationIndent,
+                                                    nullptr,
+                                                    writeAddrRef);
+            };
             if (state.kind == StateDecl::Kind::Memory)
             {
                 const std::string rowRef = stateExpr + "[" + writeAddrRef + "]";
@@ -18643,17 +18895,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                         stream << indent << "if (" << writeAddrRef << " < " << state.rowCount << "u && "
                                << assignWordsInlineExpr(rowRef, writeDataRef, state.width)
                                << ") {\n";
-                        if (hasReaders)
-                        {
-                            stream << indent << "    activatedReaders = true;\n";
-                            stream << indent << "    commit_activated_readers_ = true;\n";
-                            emitActivationStatements(
-                                stream,
-                                "supernode_active_curr_",
-                                "active_count_",
-                                headIt->second,
-                                std::string(indent) + "    ");
-                        }
+                        emitChangedReaderActivations(std::string(indent) + "    ");
                         stream << indent << "}\n";
                     }
                     else
@@ -18663,17 +18905,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                                << state.width << "));\n";
                         stream << indent << "if (" << writeAddrRef << " < " << state.rowCount << "u && " << rowRef << " != next_value) {\n";
                         stream << indent << "    " << rowRef << " = next_value;\n";
-                        if (hasReaders)
-                        {
-                            stream << indent << "    activatedReaders = true;\n";
-                            stream << indent << "    commit_activated_readers_ = true;\n";
-                            emitActivationStatements(
-                                stream,
-                                "supernode_active_curr_",
-                                "active_count_",
-                                headIt->second,
-                                std::string(indent) + "    ");
-                        }
+                        emitChangedReaderActivations(std::string(indent) + "    ");
                         stream << indent << "}\n";
                     }
                 }
@@ -18684,17 +18916,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                         stream << indent << "if (" << writeAddrRef << " < " << state.rowCount << "u && grhsim_apply_masked_words_inplace(" << rowRef << ", "
                                << writeDataRef << ", " << writeMaskRef << ", " << state.width
                                << ")) {\n";
-                        if (hasReaders)
-                        {
-                            stream << indent << "    activatedReaders = true;\n";
-                            stream << indent << "    commit_activated_readers_ = true;\n";
-                            emitActivationStatements(
-                                stream,
-                                "supernode_active_curr_",
-                                "active_count_",
-                                headIt->second,
-                                std::string(indent) + "    ");
-                        }
+                        emitChangedReaderActivations(std::string(indent) + "    ");
                         stream << indent << "}\n";
                     }
                     else
@@ -18708,17 +18930,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                                << state.width << ")) & mask));\n";
                         stream << indent << "if (" << writeAddrRef << " < " << state.rowCount << "u && " << rowRef << " != merged) {\n";
                         stream << indent << "    " << rowRef << " = merged;\n";
-                        if (hasReaders)
-                        {
-                            stream << indent << "    activatedReaders = true;\n";
-                            stream << indent << "    commit_activated_readers_ = true;\n";
-                            emitActivationStatements(
-                                stream,
-                                "supernode_active_curr_",
-                                "active_count_",
-                                headIt->second,
-                                std::string(indent) + "    ");
-                        }
+                        emitChangedReaderActivations(std::string(indent) + "    ");
                         stream << indent << "}\n";
                     }
                 }
@@ -18746,6 +18958,62 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             {
                 *stream << "#include <filesystem>\n";
                 *stream << "#include <system_error>\n\n";
+            }
+            for (const auto &activation : model.memoryRowReaderActivations)
+            {
+                *stream << "void " << className << "::" << activation.methodName << "(std::size_t row,\n";
+                *stream << "                                                    std::size_t localWordIndex,\n";
+                *stream << "                                                    std::uint8_t localLaterMask,\n";
+                *stream << "                                                    std::uint8_t *localActive)\n";
+                *stream << "{\n";
+                *stream << "    static constexpr std::array<std::size_t, "
+                        << activation.rowEntryOffsets.size() << "> kRowOffsets{{";
+                for (std::size_t index = 0; index < activation.rowEntryOffsets.size(); ++index)
+                {
+                    if ((index % 12u) == 0u)
+                    {
+                        *stream << "\n        ";
+                    }
+                    *stream << activation.rowEntryOffsets[index] << "u";
+                    if (index + 1u != activation.rowEntryOffsets.size())
+                    {
+                        *stream << ", ";
+                    }
+                }
+                *stream << "\n    }};\n";
+                *stream << "    static constexpr std::array<grhsim_active_mask_entry, "
+                        << activation.rowEntries.size() << "> kRowReaders{{";
+                for (std::size_t index = 0; index < activation.rowEntries.size(); ++index)
+                {
+                    if ((index % 8u) == 0u)
+                    {
+                        *stream << "\n        ";
+                    }
+                    const ActiveMaskEntry &entry = activation.rowEntries[index];
+                    *stream << "{" << entry.wordIndex << "u, UINT8_C("
+                            << static_cast<unsigned>(entry.mask) << ")}";
+                    if (index + 1u != activation.rowEntries.size())
+                    {
+                        *stream << ", ";
+                    }
+                }
+                *stream << "\n    }};\n";
+                *stream << "    if (row + 1u >= kRowOffsets.size()) {\n";
+                *stream << "        return;\n";
+                *stream << "    }\n";
+                *stream << "    for (std::size_t entryIndex = kRowOffsets[row];\n";
+                *stream << "         entryIndex < kRowOffsets[row + 1u]; ++entryIndex) {\n";
+                *stream << "        const grhsim_active_mask_entry entry = kRowReaders[entryIndex];\n";
+                *stream << "        std::uint8_t globalMask = entry.mask;\n";
+                *stream << "        if (localActive != nullptr && entry.word_index == localWordIndex) {\n";
+                *stream << "            *localActive = static_cast<std::uint8_t>(*localActive | (entry.mask & localLaterMask));\n";
+                *stream << "            globalMask = static_cast<std::uint8_t>(globalMask & static_cast<std::uint8_t>(~localLaterMask));\n";
+                *stream << "        }\n";
+                *stream << "        if (globalMask != UINT8_C(0)) {\n";
+                *stream << "            supernode_active_curr_[entry.word_index] |= globalMask;\n";
+                *stream << "        }\n";
+                *stream << "    }\n";
+                *stream << "}\n\n";
             }
             *stream << className << "::" << className << "()\n";
             *stream << "{\n";
