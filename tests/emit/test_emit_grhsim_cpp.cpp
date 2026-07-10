@@ -2988,6 +2988,13 @@ int main()
     {
         return fail("Missing supernode activity runtime helpers");
     }
+    if (runtime.find("for (; index + 32u <= byteCount; index += 32u)") == std::string::npos ||
+        runtime.find("(word0 | word1 | word2 | word3) != UINT64_C(0)") == std::string::npos ||
+        runtime.find("for (; index + 8u <= byteCount; index += 8u)") == std::string::npos ||
+        runtime.find("\"+r\"(word0), \"+r\"(word1), \"+r\"(word2), \"+r\"(word3)") == std::string::npos)
+    {
+        return fail("Activity pending checks should scan packed words instead of individual bytes");
+    }
     if (eval.find("kBatchEvalFns") != std::string::npos ||
         eval.find("kComputeActiveWordBatchOffsets") != std::string::npos ||
         eval.find("kCommitActiveWordBatchOffsets") != std::string::npos ||
