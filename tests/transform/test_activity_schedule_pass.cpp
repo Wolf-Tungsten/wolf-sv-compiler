@@ -297,6 +297,82 @@ namespace
         return 0;
     }
 
+    int validateReadyOpTopoOrder(const ScheduleView &schedule)
+    {
+        const auto &supernodeToOps = *schedule.supernodeToOps;
+        const auto &dag = *schedule.dag;
+        const auto &topoOrder = *schedule.topoOrder;
+        std::vector<std::size_t> minOpIndex(supernodeToOps.size(),
+                                            std::numeric_limits<std::size_t>::max());
+        for (std::size_t supernodeId = 0; supernodeId < supernodeToOps.size(); ++supernodeId)
+        {
+            for (const auto opId : supernodeToOps[supernodeId])
+            {
+                minOpIndex[supernodeId] =
+                    std::min(minOpIndex[supernodeId], static_cast<std::size_t>(opId.index));
+            }
+        }
+        auto lessByKey = [&](uint32_t lhs, uint32_t rhs)
+        {
+            if (minOpIndex[lhs] != minOpIndex[rhs])
+            {
+                return minOpIndex[lhs] < minOpIndex[rhs];
+            }
+            return lhs < rhs;
+        };
+
+        std::vector<uint32_t> indegree(dag.size(), 0);
+        for (const auto &succs : dag)
+        {
+            for (const uint32_t succ : succs)
+            {
+                if (succ >= indegree.size())
+                {
+                    return fail("Expected ready-op DAG successors to be in range");
+                }
+                ++indegree[succ];
+            }
+        }
+        std::vector<uint32_t> readyStack;
+        for (uint32_t node = 0; node < indegree.size(); ++node)
+        {
+            if (indegree[node] == 0)
+            {
+                readyStack.push_back(node);
+            }
+        }
+        std::sort(readyStack.begin(), readyStack.end(), lessByKey);
+
+        std::size_t topoOffset = 0;
+        while (!readyStack.empty())
+        {
+            const uint32_t node = readyStack.back();
+            readyStack.pop_back();
+            if (topoOffset >= topoOrder.size() || topoOrder[topoOffset++] != node)
+            {
+                return fail("Expected ready-op final topo to follow stable ready-stack order");
+            }
+            std::vector<uint32_t> orderedSuccs = dag[node];
+            std::sort(orderedSuccs.begin(), orderedSuccs.end(), lessByKey);
+            for (const uint32_t succ : orderedSuccs)
+            {
+                if (indegree[succ] == 0)
+                {
+                    return fail("Expected ready-op DAG edges to be unique");
+                }
+                if (--indegree[succ] == 0)
+                {
+                    readyStack.push_back(succ);
+                }
+            }
+        }
+        if (topoOffset != topoOrder.size())
+        {
+            return fail("Expected ready-op final topo to contain every supernode");
+        }
+        return 0;
+    }
+
     std::string readFile(const std::filesystem::path &path)
     {
         std::ifstream in(path);
@@ -2147,21 +2223,28 @@ int main()
 
         const auto a = makeValue(graph, "a", 8);
         const auto b = makeValue(graph, "b", 8);
-        const auto c = makeValue(graph, "c", 8);
         graph.bindInputPort("a", a);
         graph.bindInputPort("b", b);
-        graph.bindInputPort("c", c);
-        for (const auto &[name, input] :
-             std::vector<std::pair<std::string, wolvrix::lib::grh::ValueId>>{
-                 {"not_a", a}, {"not_b", b}, {"not_c", c}})
-        {
-            const auto result = makeValue(graph, name + "_value", 8);
-            const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
-                                                  graph.internSymbol(name));
-            graph.addOperand(op, input);
-            graph.addResult(op, result);
-            graph.bindOutputPort(name, result);
-        }
+        const auto notAValue = makeValue(graph, "not_a_value", 8);
+        const auto notA = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                graph.internSymbol("not_a"));
+        graph.addOperand(notA, a);
+        graph.addResult(notA, notAValue);
+        graph.bindOutputPort("not_a", notAValue);
+
+        const auto notBValue = makeValue(graph, "not_b_value", 8);
+        const auto notB = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                graph.internSymbol("not_b"));
+        graph.addOperand(notB, b);
+        graph.addResult(notB, notBValue);
+        graph.bindOutputPort("not_b", notBValue);
+
+        const auto notCValue = makeValue(graph, "not_c_value", 8);
+        const auto notC = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                graph.internSymbol("not_c"));
+        graph.addOperand(notC, notBValue);
+        graph.addResult(notC, notCValue);
+        graph.bindOutputPort("not_c", notCValue);
 
         const auto runSchedule = [&](const std::string &policy, SessionStore &session) -> bool
         {
@@ -2189,13 +2272,23 @@ int main()
         {
             return fail("Expected level-op final topo schedule to succeed");
         }
+        SessionStore readyOpSession;
+        if (!runSchedule("ready-op", readyOpSession))
+        {
+            return fail("Expected ready-op final topo schedule to succeed");
+        }
         const auto levelId = loadSchedule(levelIdSession, "final_topo_level_op");
         const auto levelOp = loadSchedule(levelOpSession, "final_topo_level_op");
+        const auto readyOp = loadSchedule(readyOpSession, "final_topo_level_op");
         if (const int rc = validateCommonScheduleShape(graph, levelId); rc != 0)
         {
             return rc;
         }
         if (const int rc = validateCommonScheduleShape(graph, levelOp); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = validateCommonScheduleShape(graph, readyOp); rc != 0)
         {
             return rc;
         }
@@ -2209,9 +2302,27 @@ int main()
         {
             return fail("Expected final topo policy to leave schedule structure unchanged");
         }
+        if (*levelId.supernodeToOps != *readyOp.supernodeToOps ||
+            *levelId.opToSupernode != *readyOp.opToSupernode ||
+            *levelId.dag != *readyOp.dag ||
+            *levelId.valueFanout != *readyOp.valueFanout ||
+            *levelId.supernodeKinds != *readyOp.supernodeKinds ||
+            *levelId.computeNodesBySupernode != *readyOp.computeNodesBySupernode ||
+            *levelId.summaryStats != *readyOp.summaryStats)
+        {
+            return fail("Expected ready-op final topo policy to leave schedule structure unchanged");
+        }
         if (const int rc = validateLevelOpTopoOrder(levelOp); rc != 0)
         {
             return rc;
+        }
+        if (const int rc = validateReadyOpTopoOrder(readyOp); rc != 0)
+        {
+            return rc;
+        }
+        if (*levelOp.topoOrder == *readyOp.topoOrder)
+        {
+            return fail("Expected ready-op to cross a complete Kahn layer boundary");
         }
     }
 

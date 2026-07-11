@@ -3134,6 +3134,77 @@ namespace wolvrix::lib::transform
             return keys;
         }
 
+        std::vector<uint32_t> topoOrderForDagReadyStack(
+            const std::vector<std::vector<uint32_t>> &dag,
+            const std::vector<std::size_t> &orderKeys)
+        {
+            if (orderKeys.size() != dag.size())
+            {
+                throw std::runtime_error("toposort failed: ready-stack key count mismatch");
+            }
+            auto lessByKey = [&](uint32_t lhs, uint32_t rhs)
+            {
+                if (orderKeys[lhs] != orderKeys[rhs])
+                {
+                    return orderKeys[lhs] < orderKeys[rhs];
+                }
+                return lhs < rhs;
+            };
+
+            std::vector<uint32_t> indegree(dag.size(), 0);
+            for (const auto &succs : dag)
+            {
+                for (const uint32_t succ : succs)
+                {
+                    if (succ >= indegree.size())
+                    {
+                        throw std::runtime_error("toposort failed: ready-stack successor out of range");
+                    }
+                    ++indegree[succ];
+                }
+            }
+
+            std::vector<uint32_t> readyStack;
+            readyStack.reserve(dag.size());
+            for (uint32_t node = 0; node < indegree.size(); ++node)
+            {
+                if (indegree[node] == 0)
+                {
+                    readyStack.push_back(node);
+                }
+            }
+            std::sort(readyStack.begin(), readyStack.end(), lessByKey);
+
+            std::vector<uint32_t> out;
+            out.reserve(dag.size());
+            while (!readyStack.empty())
+            {
+                const uint32_t node = readyStack.back();
+                readyStack.pop_back();
+                out.push_back(node);
+
+                std::vector<uint32_t> orderedSuccs = dag[node];
+                std::sort(orderedSuccs.begin(), orderedSuccs.end(), lessByKey);
+                for (const uint32_t succ : orderedSuccs)
+                {
+                    if (indegree[succ] == 0)
+                    {
+                        throw std::runtime_error("toposort failed: duplicate ready-stack edge");
+                    }
+                    --indegree[succ];
+                    if (indegree[succ] == 0)
+                    {
+                        readyStack.push_back(succ);
+                    }
+                }
+            }
+            if (out.size() != dag.size())
+            {
+                throw std::runtime_error("toposort failed: graph contains cycle");
+            }
+            return out;
+        }
+
         std::vector<uint32_t> topoOrderForDagValueLocal(const std::vector<std::vector<uint32_t>> &dag,
                                                         const ClusterValueEdges *valueEdges)
         {
@@ -5768,10 +5839,17 @@ namespace wolvrix::lib::transform
             const auto finalTopoStart = std::chrono::steady_clock::now();
             try
             {
-                if (options.finalTopoPolicy == "level-op")
+                if (options.finalTopoPolicy == "level-op" || options.finalTopoPolicy == "ready-op")
                 {
                     const std::vector<std::size_t> layerOrderKeys = minOpIndexBySupernode(build);
-                    build.topoOrder = topoOrderForDag(build.dag, &layerOrderKeys);
+                    if (options.finalTopoPolicy == "ready-op")
+                    {
+                        build.topoOrder = topoOrderForDagReadyStack(build.dag, layerOrderKeys);
+                    }
+                    else
+                    {
+                        build.topoOrder = topoOrderForDag(build.dag, &layerOrderKeys);
+                    }
                 }
                 else
                 {
@@ -5829,9 +5907,11 @@ namespace wolvrix::lib::transform
             result.failed = true;
             return result;
         }
-        if (options_.finalTopoPolicy != "level-id" && options_.finalTopoPolicy != "level-op")
+        if (options_.finalTopoPolicy != "level-id" &&
+            options_.finalTopoPolicy != "level-op" &&
+            options_.finalTopoPolicy != "ready-op")
         {
-            error("activity-schedule final_topo_policy must be level-id or level-op");
+            error("activity-schedule final_topo_policy must be level-id, level-op, or ready-op");
             result.failed = true;
             return result;
         }
