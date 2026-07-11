@@ -2232,6 +2232,92 @@ namespace
         return design;
     }
 
+    Design buildOrderedMemoryWriteAffineEmitDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        constexpr int32_t width = 8;
+        constexpr std::size_t rows = 4;
+        constexpr std::size_t writerCount = 16;
+        const ValueId clk = makeLogicValue(graph, "clk", 1);
+        const ValueId readAddr = makeLogicValue(graph, "read_addr", 2);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("read_addr", readAddr);
+
+        const OperationId memory = graph.createOperation(OperationKind::kMemory,
+                                                         graph.internSymbol("ordered_mem"));
+        graph.setAttr(memory, "width", int64_t{width});
+        graph.setAttr(memory, "row", static_cast<int64_t>(rows));
+        graph.setAttr(memory, "isSigned", false);
+        graph.setAttr(memory, "initKind", std::vector<std::string>{});
+        graph.setAttr(memory, "initFile", std::vector<std::string>{});
+        graph.setAttr(memory, "initValue", std::vector<std::string>{});
+        graph.setAttr(memory, "initStart", std::vector<int64_t>{});
+        graph.setAttr(memory, "initLen", std::vector<int64_t>{});
+
+        const ValueId readValue = makeLogicValue(graph, "ordered_read_value", width);
+        const OperationId read = graph.createOperation(OperationKind::kMemoryReadPort,
+                                                       graph.internSymbol("ordered_read"));
+        graph.addOperand(read, readAddr);
+        graph.addResult(read, readValue);
+        graph.setAttr(read, "memSymbol", std::string("ordered_mem"));
+        graph.bindOutputPort("selected", readValue);
+
+        const ValueId mask = addConstant(graph,
+                                         "ordered_mask_op",
+                                         "ordered_mask",
+                                         width,
+                                         "8'hff");
+        for (std::size_t writer = 0; writer < writerCount; ++writer)
+        {
+            const std::string writerText = std::to_string(writer);
+            const ValueId enable = makeLogicValue(graph, "ordered_wen_" + writerText, 1);
+            const ValueId addr = makeLogicValue(graph, "ordered_addr_" + writerText, 2);
+            const ValueId data = makeLogicValue(graph, "ordered_data_" + writerText, width);
+            graph.bindInputPort("ordered_wen_" + writerText, enable);
+            graph.bindInputPort("ordered_addr_" + writerText, addr);
+            graph.bindInputPort("ordered_data_" + writerText, data);
+
+            const ValueId materializedEnable =
+                makeLogicValue(graph, "ordered_wen_materialized_" + writerText, 1);
+            const OperationId enableAssign = graph.createOperation(
+                OperationKind::kAssign, graph.internSymbol("ordered_wen_assign_" + writerText));
+            graph.addOperand(enableAssign, enable);
+            graph.addResult(enableAssign, materializedEnable);
+            const ValueId materializedAddr =
+                makeLogicValue(graph, "ordered_addr_materialized_" + writerText, 2);
+            const OperationId addrAssign = graph.createOperation(
+                OperationKind::kAssign, graph.internSymbol("ordered_addr_assign_" + writerText));
+            graph.addOperand(addrAssign, addr);
+            graph.addResult(addrAssign, materializedAddr);
+            const ValueId materializedData =
+                makeLogicValue(graph, "ordered_data_materialized_" + writerText, width);
+            const OperationId dataAssign = graph.createOperation(
+                OperationKind::kAssign, graph.internSymbol("ordered_data_assign_" + writerText));
+            graph.addOperand(dataAssign, data);
+            graph.addResult(dataAssign, materializedData);
+
+            const OperationId write = graph.createOperation(OperationKind::kMemoryWritePort,
+                                                            graph.internSymbol("ordered_write_" + writerText));
+            graph.addOperand(write, materializedEnable);
+            graph.addOperand(write, materializedAddr);
+            graph.addOperand(write, materializedData);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clk);
+            graph.setAttr(write, "memSymbol", std::string("ordered_mem"));
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+            graph.setAttr(write,
+                          wolvrix::lib::grh::kMemoryWritePriorityGroupAttr,
+                          std::string("ordered_mem_writes"));
+            graph.setAttr(write,
+                          wolvrix::lib::grh::kMemoryWritePriorityAttr,
+                          static_cast<int64_t>(writer));
+        }
+        return design;
+    }
+
     Design buildMemoryRowReaderActivationDesign()
     {
         Design design;
@@ -2569,6 +2655,7 @@ namespace
         PassManager manager;
         RegToMemOptions options;
         options.enableTrueMerge = true;
+        options.enableOrderedWrites = true;
         options.minElementCount = 4;
         manager.addPass(std::make_unique<RegToMemPass>(options));
         PassDiagnostics diags;
@@ -2760,6 +2847,45 @@ int main()
         wideDynamicMaskWrite.find("grhsim_merge_words_masked") == std::string_view::npos)
     {
         return fail("wide dynamic register masks should retain words masked merge emission");
+    }
+    if (scalarFullMaskWrite.find("if (unlikely(") == std::string_view::npos ||
+        wideFullMaskWrite.find("if (unlikely(") == std::string_view::npos ||
+        dynamicMaskWrite.find("if (unlikely(") == std::string_view::npos ||
+        wideDynamicMaskWrite.find("if (unlikely(") == std::string_view::npos)
+    {
+        return fail("commit state-change hint should cover scalar and wide register writes");
+    }
+    {
+        EmitOptions unhintedOptions = options;
+        const std::filesystem::path unhintedOutDir =
+            std::filesystem::path(std::string(WOLF_SV_EMIT_ARTIFACT_DIR)) / "grhsim_cpp_unhinted_commit";
+        unhintedOptions.outputDir = unhintedOutDir.string();
+        unhintedOptions.attributes["commit_state_change_unlikely"] = "0";
+        EmitDiagnostics unhintedDiag;
+        EmitGrhSimCpp unhintedEmitter(&unhintedDiag);
+        const EmitResult unhintedResult = unhintedEmitter.emit(design, unhintedOptions);
+        if (!unhintedResult.success || unhintedDiag.hasError())
+        {
+            return fail("unhinted commit EmitGrhSimCpp failed");
+        }
+        const std::string unhintedSched = readFiles(collectSchedFiles(unhintedOutDir, "grhsim_top_sched_"));
+        const std::size_t unhintedWriteBegin =
+            unhintedSched.find("// op reg_q_write [kRegisterWritePort] reg=reg_q");
+        if (unhintedWriteBegin == std::string::npos)
+        {
+            return fail("unhinted commit emit should contain the scalar register write");
+        }
+        const std::size_t unhintedWriteEnd =
+            unhintedSched.find("// op ", unhintedWriteBegin + 1);
+        const std::string_view unhintedWrite =
+            std::string_view(unhintedSched).substr(
+                unhintedWriteBegin,
+                unhintedWriteEnd == std::string::npos ? unhintedWriteEnd : unhintedWriteEnd - unhintedWriteBegin);
+        if (unhintedWrite.find("if (unlikely(") != std::string_view::npos ||
+            unhintedWrite.find(" != next_value") == std::string_view::npos)
+        {
+            return fail("commit state-change hint disable switch should preserve the unhinted condition");
+        }
     }
     if (header.find("static const char value_") != std::string::npos ||
         state.find("const char GrhSIM_top::value_") != std::string::npos ||
@@ -3157,6 +3283,103 @@ int main()
     if (std::system(trueMultiWriteHarnessExe.string().c_str()) != 0)
     {
         return fail("true reg-to-mem multi-write collision priority is wrong");
+    }
+
+    const std::filesystem::path orderedAffineDir =
+        std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_ordered_memory_write_affine";
+    std::filesystem::remove_all(orderedAffineDir);
+    Design orderedAffineDesign = buildOrderedMemoryWriteAffineEmitDesign();
+    EmitDiagnostics orderedAffineDiag;
+    EmitResult orderedAffineResult;
+    if (!emitWithActivitySchedule(orderedAffineDesign,
+                                  orderedAffineDir,
+                                  orderedAffineDiag,
+                                  orderedAffineResult,
+                                  ActivityScheduleOptions{.path = "top",
+                                                          .maxOpInCommitSupernode = 1,
+                                                          .enableCoarsen = false,
+                                                          .commitGuardEventBuckets = false}))
+    {
+        return fail("ordered memory write affine activity-schedule pass failed");
+    }
+    if (!orderedAffineResult.success || orderedAffineDiag.hasError())
+    {
+        return fail("ordered memory write affine emit failed");
+    }
+    const std::string orderedAffineSched =
+        readFiles(collectSchedFiles(orderedAffineDir, "grhsim_top_sched_"));
+    if (orderedAffineSched.find("Ordered memory write affine group: 16 writers in ") ==
+            std::string::npos ||
+        orderedAffineSched.find("for (std::size_t ordered_write_index_") == std::string::npos)
+    {
+        return fail("ordered memory write group was not emitted as affine loops");
+    }
+    if (orderedAffineSched.find("[kMemoryWritePort] mem=ordered_mem") != std::string::npos)
+    {
+        return fail("ordered memory write affine group retained per-writer commit bodies");
+    }
+    const std::string orderedAffineBuildCmd =
+        "make -C " + orderedAffineDir.string() + " CXX=clang++ CXXFLAGS='" +
+        std::string(kHarnessCompileFlags) + "'";
+    if (std::system(orderedAffineBuildCmd.c_str()) != 0)
+    {
+        return fail("ordered memory write affine archive failed to build");
+    }
+    const std::filesystem::path orderedAffineHarnessPath = orderedAffineDir / "grhsim_top_harness.cpp";
+    {
+        std::ofstream harness(orderedAffineHarnessPath);
+        if (!harness.is_open())
+        {
+            return fail("Failed to create ordered memory write affine harness");
+        }
+        harness << "#include \"grhsim_top.hpp\"\n";
+        harness << "#include <cstdint>\n\n";
+        harness << "int main()\n";
+        harness << "{\n";
+        harness << "    GrhSIM_top sim;\n";
+        harness << "    sim.init();\n";
+        harness << "    sim.clk = false;\n";
+        harness << "    sim.read_addr = static_cast<std::uint8_t>(1);\n";
+        harness << "    sim.ordered_wen_15 = true;\n";
+        harness << "    sim.ordered_addr_15 = static_cast<std::uint8_t>(1);\n";
+        harness << "    sim.ordered_data_15 = static_cast<std::uint8_t>(0x11);\n";
+        harness << "    sim.ordered_wen_0 = true;\n";
+        harness << "    sim.ordered_addr_0 = static_cast<std::uint8_t>(1);\n";
+        harness << "    sim.ordered_data_0 = static_cast<std::uint8_t>(0x22);\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.clk = true;\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.selected != static_cast<std::uint8_t>(0x22)) return 1;\n";
+        harness << "    sim.clk = false;\n";
+        harness << "    sim.ordered_addr_15 = static_cast<std::uint8_t>(0);\n";
+        harness << "    sim.ordered_data_15 = static_cast<std::uint8_t>(0x33);\n";
+        harness << "    sim.ordered_addr_0 = static_cast<std::uint8_t>(2);\n";
+        harness << "    sim.ordered_data_0 = static_cast<std::uint8_t>(0x44);\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.clk = true;\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.read_addr = static_cast<std::uint8_t>(0);\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.selected != static_cast<std::uint8_t>(0x33)) return 2;\n";
+        harness << "    sim.read_addr = static_cast<std::uint8_t>(2);\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.selected != static_cast<std::uint8_t>(0x44)) return 3;\n";
+        harness << "    return 0;\n";
+        harness << "}\n";
+    }
+    const std::filesystem::path orderedAffineHarnessExe = orderedAffineDir / "grhsim_top_harness";
+    const std::string orderedAffineCompileCmd =
+        "clang++ " + std::string(kHarnessCompileFlags) + " -I" + orderedAffineDir.string() +
+        " -include-pch " + (orderedAffineDir / "grhsim_top.hpp.pch").string() + " " +
+        orderedAffineHarnessPath.string() + " " + (orderedAffineDir / "libgrhsim_top.a").string() +
+        " -o " + orderedAffineHarnessExe.string();
+    if (std::system(orderedAffineCompileCmd.c_str()) != 0)
+    {
+        return fail("ordered memory write affine harness failed to compile");
+    }
+    if (std::system(orderedAffineHarnessExe.string().c_str()) != 0)
+    {
+        return fail("ordered memory write affine priority or row update is wrong");
     }
 
     const std::filesystem::path rowActivationDir =
@@ -4940,6 +5163,11 @@ int main()
                            "same-state scalar read: reuse synchronized change predicate") == 0)
         {
             return fail("repeated scalar state reads should share one changed predicate per supernode");
+        }
+        if (countSubstring(repeatedReadSched,
+                           "same-state scalar read: reuse consolidated storage slot") == 0)
+        {
+            return fail("repeated scalar state reads should share one materialized slot per supernode");
         }
         const std::filesystem::path repeatedReadHarnessPath = repeatedReadDir / "grhsim_top_harness.cpp";
         {

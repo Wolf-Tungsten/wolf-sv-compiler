@@ -937,6 +937,178 @@ namespace wolvrix::lib::transform
             return key.str();
         }
 
+        struct MemoryWritePriority
+        {
+            std::string group;
+            int64_t priority = 0;
+        };
+
+        std::optional<MemoryWritePriority> memoryWritePriority(
+            const wolvrix::lib::grh::Operation &op)
+        {
+            const auto group = getAttrString(op, wolvrix::lib::grh::kMemoryWritePriorityGroupAttr);
+            const auto priority = getAttrValue<int64_t>(op, wolvrix::lib::grh::kMemoryWritePriorityAttr);
+            if (!group || !priority)
+            {
+                return std::nullopt;
+            }
+            return MemoryWritePriority{.group = *group, .priority = *priority};
+        }
+
+        bool validateMemoryWritePriorityGroups(const wolvrix::lib::grh::Graph &graph,
+                                               std::string &error)
+        {
+            struct GroupInfo
+            {
+                std::string memSymbol;
+                std::string eventKey;
+                std::set<int64_t> priorities;
+            };
+            std::unordered_map<std::string, GroupInfo> groups;
+            for (const auto opId : graph.operations())
+            {
+                const auto op = graph.getOperation(opId);
+                const auto group = getAttrString(op, wolvrix::lib::grh::kMemoryWritePriorityGroupAttr);
+                const auto priority = getAttrValue<int64_t>(op, wolvrix::lib::grh::kMemoryWritePriorityAttr);
+                if (!group && !priority)
+                {
+                    continue;
+                }
+                if (op.kind() != wolvrix::lib::grh::OperationKind::kMemoryWritePort ||
+                    !group || group->empty() || !priority || *priority < 0)
+                {
+                    error = "activity-schedule invalid ordered memory write attrs: " + describeOp(graph, opId);
+                    return false;
+                }
+                const auto memSymbol = getAttrString(op, "memSymbol");
+                if (!memSymbol || memSymbol->empty())
+                {
+                    error = "activity-schedule ordered memory write missing memSymbol: " + describeOp(graph, opId);
+                    return false;
+                }
+                const std::string eventKey = normalizedSinkEventKey(graph, op, nullptr);
+                auto [it, inserted] = groups.try_emplace(*group);
+                if (inserted)
+                {
+                    it->second.memSymbol = *memSymbol;
+                    it->second.eventKey = eventKey;
+                }
+                else if (it->second.memSymbol != *memSymbol || it->second.eventKey != eventKey)
+                {
+                    error = "activity-schedule ordered memory write group crosses memory or event: " + *group;
+                    return false;
+                }
+                if (!it->second.priorities.insert(*priority).second)
+                {
+                    error = "activity-schedule duplicate ordered memory write priority: " + *group;
+                    return false;
+                }
+            }
+            for (const auto &[group, info] : groups)
+            {
+                int64_t expected = 0;
+                for (const int64_t priority : info.priorities)
+                {
+                    if (priority != expected++)
+                    {
+                        error = "activity-schedule non-contiguous ordered memory write priorities: " + group;
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        void orderMemoryWritePriorityGroups(const wolvrix::lib::grh::Graph &graph,
+                                            const ActivityOpData &opData,
+                                            std::vector<uint32_t> &positions)
+        {
+            struct Entry
+            {
+                std::size_t slot = 0;
+                uint32_t topoPosition = 0;
+                int64_t priority = 0;
+            };
+            std::unordered_map<std::string, std::vector<Entry>> entriesByGroup;
+            for (std::size_t slot = 0; slot < positions.size(); ++slot)
+            {
+                const uint32_t topoPosition = positions[slot];
+                const auto op = graph.getOperation(opData.topoOps[topoPosition]);
+                const auto ordered = memoryWritePriority(op);
+                if (!ordered)
+                {
+                    continue;
+                }
+                entriesByGroup[ordered->group].push_back(Entry{
+                    .slot = slot,
+                    .topoPosition = topoPosition,
+                    .priority = ordered->priority,
+                });
+            }
+            for (auto &[group, entries] : entriesByGroup)
+            {
+                (void)group;
+                std::vector<std::size_t> slots;
+                slots.reserve(entries.size());
+                for (const Entry &entry : entries)
+                {
+                    slots.push_back(entry.slot);
+                }
+                std::sort(entries.begin(), entries.end(), [](const Entry &lhs, const Entry &rhs) {
+                    if (lhs.priority != rhs.priority)
+                    {
+                        return lhs.priority > rhs.priority;
+                    }
+                    return lhs.topoPosition < rhs.topoPosition;
+                });
+                for (std::size_t index = 0; index < entries.size(); ++index)
+                {
+                    positions[slots[index]] = entries[index].topoPosition;
+                }
+            }
+        }
+
+        std::vector<std::vector<uint32_t>> buildAtomicSinkUnits(
+            const wolvrix::lib::grh::Graph &graph,
+            const ActivityOpData &opData,
+            const std::vector<uint32_t> &positions)
+        {
+            std::unordered_map<std::string, std::vector<uint32_t>> orderedGroups;
+            for (const uint32_t topoPosition : positions)
+            {
+                const auto op = graph.getOperation(opData.topoOps[topoPosition]);
+                if (const auto ordered = memoryWritePriority(op))
+                {
+                    orderedGroups[ordered->group].push_back(topoPosition);
+                }
+            }
+            for (auto &[group, groupPositions] : orderedGroups)
+            {
+                (void)group;
+                orderMemoryWritePriorityGroups(graph, opData, groupPositions);
+            }
+
+            std::vector<std::vector<uint32_t>> units;
+            units.reserve(positions.size());
+            std::unordered_set<std::string> emittedGroups;
+            for (const uint32_t topoPosition : positions)
+            {
+                const auto op = graph.getOperation(opData.topoOps[topoPosition]);
+                const auto ordered = memoryWritePriority(op);
+                if (!ordered)
+                {
+                    units.push_back(std::vector<uint32_t>{topoPosition});
+                    continue;
+                }
+                if (!emittedGroups.insert(ordered->group).second)
+                {
+                    continue;
+                }
+                units.push_back(orderedGroups.at(ordered->group));
+            }
+            return units;
+        }
+
         std::optional<wolvrix::lib::grh::ValueId> sinkUpdateCondValue(const wolvrix::lib::grh::Operation &op)
         {
             switch (op.kind())
@@ -964,6 +1136,11 @@ namespace wolvrix::lib::transform
         {
             std::ostringstream key;
             key << normalizedSinkEventKey(graph, op, canonicalValues);
+            if (const auto ordered = memoryWritePriority(op))
+            {
+                key << "|ordered:" << ordered->group.size() << ':' << ordered->group;
+                return key.str();
+            }
             const auto updateCond = sinkUpdateCondValue(op);
             if (!updateCond)
             {
@@ -1061,11 +1238,12 @@ namespace wolvrix::lib::transform
                         {
                             continue;
                         }
-                        const auto &guardPositions = guardIt->second;
+                        std::vector<uint32_t> guardPositions = guardIt->second;
                         if (guardPositions.empty())
                         {
                             continue;
                         }
+                        orderMemoryWritePriorityGroups(graph, opData, guardPositions);
                         if (guardPositions.size() > mergeLimit)
                         {
                             flushPositions();
@@ -1111,13 +1289,31 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
-                const auto &positions = it->second;
-                for (std::size_t offset = 0; offset < positions.size(); offset += chunkSize)
+                std::vector<uint32_t> cluster;
+                auto flushCluster = [&]()
                 {
-                    const std::size_t end = std::min(offset + chunkSize, positions.size());
-                    partition.clusters.emplace_back(positions.begin() + static_cast<std::ptrdiff_t>(offset),
-                                                    positions.begin() + static_cast<std::ptrdiff_t>(end));
+                    if (cluster.empty())
+                    {
+                        return;
+                    }
+                    partition.clusters.push_back(std::move(cluster));
+                    cluster = {};
+                };
+                for (auto &unit : buildAtomicSinkUnits(graph, opData, it->second))
+                {
+                    if (unit.size() > chunkSize)
+                    {
+                        flushCluster();
+                        partition.clusters.push_back(std::move(unit));
+                        continue;
+                    }
+                    if (!cluster.empty() && cluster.size() + unit.size() > chunkSize)
+                    {
+                        flushCluster();
+                    }
+                    cluster.insert(cluster.end(), unit.begin(), unit.end());
                 }
+                flushCluster();
             }
 
             return partition;
@@ -4512,6 +4708,11 @@ namespace wolvrix::lib::transform
             out.declaredValueComputeNodeBoundary = options.declaredValueComputeNodeBoundary;
             out.computeNodeOfOp.assign(opClasses.size(), kInvalidActivitySupernodeId);
             ComputeNodeBuilder builder(graph, options, opData, opClasses, out, error);
+
+            if (!validateMemoryWritePriorityGroups(graph, error))
+            {
+                return false;
+            }
 
             std::vector<uint32_t> intentNodeIds;
             for (auto &intentGroup : collectRegToMemIntentComputeGroups(graph, opClasses))

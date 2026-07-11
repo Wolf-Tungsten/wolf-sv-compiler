@@ -1614,6 +1614,14 @@ namespace wolvrix::lib::transform
                 {
                     options.enableTrueMerge = false;
                 }
+                else if (arg == "-ordered-writes")
+                {
+                    options.enableOrderedWrites = true;
+                }
+                else if (arg == "-no-ordered-writes")
+                {
+                    options.enableOrderedWrites = false;
+                }
                 else if (arg == "-min-element-count")
                 {
                     if (i + 1 >= args.size())

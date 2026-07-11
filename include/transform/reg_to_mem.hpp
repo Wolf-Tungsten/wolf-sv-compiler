@@ -10,6 +10,7 @@ namespace wolvrix::lib::transform
     {
         bool enableIntent = true;
         bool enableTrueMerge = true;
+        bool enableOrderedWrites = false;
         std::size_t minElementCount = 4;
     };
 

@@ -1886,6 +1886,89 @@ int main()
     }
 
     {
+        currentCase = "ordered_memory_write_atomic_chunk";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("ordered_memory_write_atomic_chunk");
+        design.markAsTop("ordered_memory_write_atomic_chunk");
+
+        const auto clk = makeValue(graph, "clk", 1);
+        const auto en = makeValue(graph, "en", 1);
+        const auto addr = makeValue(graph, "addr", 2);
+        const auto mask = makeValue(graph, "mask", 8);
+        const auto highData = makeValue(graph, "high_data", 8);
+        const auto lowData = makeValue(graph, "low_data", 8);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("en", en);
+        graph.bindInputPort("addr", addr);
+        graph.bindInputPort("mask", mask);
+        graph.bindInputPort("high_data", highData);
+        graph.bindInputPort("low_data", lowData);
+
+        const auto memory = graph.createOperation(wolvrix::lib::grh::OperationKind::kMemory,
+                                                  graph.internSymbol("mem"));
+        graph.setAttr(memory, "width", int64_t{8});
+        graph.setAttr(memory, "row", int64_t{4});
+        graph.setAttr(memory, "isSigned", false);
+
+        const auto addWrite = [&](std::string_view name,
+                                  wolvrix::lib::grh::ValueId data,
+                                  int64_t priority)
+        {
+            const auto write = graph.createOperation(wolvrix::lib::grh::OperationKind::kMemoryWritePort,
+                                                     graph.internSymbol(name));
+            graph.addOperand(write, en);
+            graph.addOperand(write, addr);
+            graph.addOperand(write, data);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clk);
+            graph.setAttr(write, "memSymbol", std::string("mem"));
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+            graph.setAttr(write,
+                          wolvrix::lib::grh::kMemoryWritePriorityGroupAttr,
+                          std::string("mem_writes"));
+            graph.setAttr(write, wolvrix::lib::grh::kMemoryWritePriorityAttr, priority);
+            return write;
+        };
+        const auto highWrite = addWrite("high_write", highData, 0);
+        const auto lowWrite = addWrite("low_write", lowData, 1);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
+            .path = "ordered_memory_write_atomic_chunk",
+            .maxOpInComputeSupernode = 1,
+            .maxOpInCommitSupernode = 1,
+            .enableCoarsen = false,
+            .commitGuardEventBuckets = false,
+        }));
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected ordered memory write schedule to succeed");
+        }
+        const auto schedule = loadSchedule(session, "ordered_memory_write_atomic_chunk");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        const uint32_t highSupernode = (*schedule.opToSupernode)[highWrite.index - 1];
+        const uint32_t lowSupernode = (*schedule.opToSupernode)[lowWrite.index - 1];
+        if (highSupernode != lowSupernode)
+        {
+            return fail("Ordered memory write group was split by the commit chunk limit");
+        }
+        const auto &commitOps = (*schedule.supernodeToOps)[highSupernode];
+        const auto lowIt = std::find(commitOps.begin(), commitOps.end(), lowWrite);
+        const auto highIt = std::find(commitOps.begin(), commitOps.end(), highWrite);
+        if (lowIt == commitOps.end() || highIt == commitOps.end() || lowIt >= highIt)
+        {
+            return fail("Ordered memory writes were not scheduled from low to high priority");
+        }
+    }
+
+    {
         currentCase = "commit_guard_event_oversize_bucket";
         wolvrix::lib::grh::Design design;
         auto &graph = design.createGraph("commit_guard_event_oversize_bucket");

@@ -55,6 +55,9 @@ Design buildDesign()
     const auto latchData = graph.createValue(graph.internSymbol("latch_data"), 4, false);
     const auto wideData = graph.createValue(graph.internSymbol("wide_data"), 32, false);
     const auto narrowMask = graph.createValue(graph.internSymbol("narrow_mask"), 3, false);
+    const auto orderedAddr = graph.createValue(graph.internSymbol("ordered_addr"), 2, false);
+    const auto orderedHighData = graph.createValue(graph.internSymbol("ordered_high_data"), 8, false);
+    const auto orderedLowData = graph.createValue(graph.internSymbol("ordered_low_data"), 8, false);
 
     graph.bindInputPort("clk", clk);
     graph.bindInputPort("en", en);
@@ -64,6 +67,9 @@ Design buildDesign()
     graph.bindInputPort("latch_data", latchData);
     graph.bindInputPort("wide_data", wideData);
     graph.bindInputPort("narrow_mask", narrowMask);
+    graph.bindInputPort("ordered_addr", orderedAddr);
+    graph.bindInputPort("ordered_high_data", orderedHighData);
+    graph.bindInputPort("ordered_low_data", orderedLowData);
 
     const auto fullMask = addConstant(graph, "mask_full", 8, "8'hFF");
     const auto halfMask = addConstant(graph, "mask_half", 8, "8'h0F");
@@ -84,6 +90,12 @@ Design buildDesign()
                                              graph.internSymbol("lat_a"));
     graph.setAttr(latch, "width", static_cast<int64_t>(4));
     graph.setAttr(latch, "isSigned", false);
+
+    const auto orderedMemory = graph.createOperation(OperationKind::kMemory,
+                                                     graph.internSymbol("ordered_mem"));
+    graph.setAttr(orderedMemory, "width", static_cast<int64_t>(8));
+    graph.setAttr(orderedMemory, "row", static_cast<int64_t>(4));
+    graph.setAttr(orderedMemory, "isSigned", false);
 
     const auto regRead = graph.createOperation(OperationKind::kRegisterReadPort,
                                                graph.internSymbol("_op_emit_reg_read"));
@@ -125,6 +137,30 @@ Design buildDesign()
     graph.addOperand(regMaskWrite, clk);
     graph.setAttr(regMaskWrite, "regSymbol", std::string("reg_mask"));
     graph.setAttr(regMaskWrite, "eventEdge", std::vector<std::string>{"posedge"});
+
+    const auto orderedHighWrite = graph.createOperation(OperationKind::kMemoryWritePort,
+                                                        graph.internSymbol("_op_ordered_high_write"));
+    graph.addOperand(orderedHighWrite, en);
+    graph.addOperand(orderedHighWrite, orderedAddr);
+    graph.addOperand(orderedHighWrite, orderedHighData);
+    graph.addOperand(orderedHighWrite, fullMask);
+    graph.addOperand(orderedHighWrite, clk);
+    graph.setAttr(orderedHighWrite, "memSymbol", std::string("ordered_mem"));
+    graph.setAttr(orderedHighWrite, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(orderedHighWrite, kMemoryWritePriorityGroupAttr, std::string("ordered_mem_writes"));
+    graph.setAttr(orderedHighWrite, kMemoryWritePriorityAttr, int64_t{0});
+
+    const auto orderedLowWrite = graph.createOperation(OperationKind::kMemoryWritePort,
+                                                       graph.internSymbol("_op_ordered_low_write"));
+    graph.addOperand(orderedLowWrite, en);
+    graph.addOperand(orderedLowWrite, orderedAddr);
+    graph.addOperand(orderedLowWrite, orderedLowData);
+    graph.addOperand(orderedLowWrite, fullMask);
+    graph.addOperand(orderedLowWrite, clk);
+    graph.setAttr(orderedLowWrite, "memSymbol", std::string("ordered_mem"));
+    graph.setAttr(orderedLowWrite, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(orderedLowWrite, kMemoryWritePriorityGroupAttr, std::string("ordered_mem_writes"));
+    graph.setAttr(orderedLowWrite, kMemoryWritePriorityAttr, int64_t{1});
 
     const auto latchWrite = graph.createOperation(OperationKind::kLatchWritePort,
                                                   graph.internSymbol("_op_emit_latch_write"));
@@ -217,6 +253,12 @@ int main()
     if (output.find("assign masked_narrow = wide_data[2:0] & narrow_mask;") == std::string::npos)
     {
         return fail("Missing width-trimmed bitwise and emit");
+    }
+    const std::size_t lowWrite = output.find("ordered_mem[ordered_addr] <= ordered_low_data;");
+    const std::size_t highWrite = output.find("ordered_mem[ordered_addr] <= ordered_high_data;");
+    if (lowWrite == std::string::npos || highWrite == std::string::npos || lowWrite >= highWrite)
+    {
+        return fail("Ordered memory writes were not emitted from low to high priority");
     }
 
     return 0;

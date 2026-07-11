@@ -52,6 +52,7 @@ namespace wolvrix::lib::emit
 
         constexpr std::size_t kInlineSystemTaskArgLimit = 16;
         constexpr std::size_t kRegToMemIntentIndexInlineOpLimit = 32;
+        constexpr std::size_t kOrderedMemoryWriteAffineMinWrites = 16;
 
         template <typename T>
         std::optional<T> getAttribute(const Operation &op, std::string_view key)
@@ -1396,6 +1397,18 @@ namespace wolvrix::lib::emit
             return false;
         }
 
+        bool emitSameSupernodeStateReadSlotAliasesEnabled()
+        {
+            if (const char *env = std::getenv("WOLVRIX_GRHSIM_STATE_READ_SLOT_ALIASES"))
+            {
+                const std::string_view value(env);
+                return !(value == "0" || value == "false" || value == "False" || value == "FALSE" ||
+                         value == "off" || value == "Off" || value == "OFF" ||
+                         value == "no" || value == "No" || value == "NO");
+            }
+            return true;
+        }
+
         enum class WaveformMode
         {
             kOff,
@@ -2601,6 +2614,7 @@ namespace wolvrix::lib::emit
             std::unordered_map<ValueId, std::size_t, ValueIdHash> valueRealSlotByValue;
             std::unordered_map<ValueId, std::size_t, ValueIdHash> valueStringSlotByValue;
             std::unordered_set<ValueId, ValueIdHash> materializedValues;
+            std::unordered_map<ValueId, ValueId, ValueIdHash> materializedValueAliasByValue;
             std::unordered_map<ValueId, std::vector<uint32_t>, ValueIdHash> inputHeadSupernodesByValue;
             std::unordered_map<ValueId, std::vector<uint32_t>, ValueIdHash> boundaryFanoutByValue;
             std::vector<ValueId> commitInputValues;
@@ -2650,6 +2664,8 @@ namespace wolvrix::lib::emit
             std::map<std::size_t, std::size_t> valueWideSlotCountsByWords;
             std::size_t valueRealSlotCount = 0;
             std::size_t valueStringSlotCount = 0;
+            std::size_t sameSupernodeStateReadSlotAliasCount = 0;
+            std::size_t sameSupernodeStateReadSlotAliasGroupCount = 0;
             std::size_t eventEdgeSlotCount = 0;
             std::array<std::size_t, static_cast<std::size_t>(ValueSlotScalarKind::kCount)> stateLogicScalarSlotCounts{};
             std::array<std::size_t, static_cast<std::size_t>(ValueSlotScalarKind::kCount)> stateLogicScalarBaseOffsets{};
@@ -2686,7 +2702,14 @@ namespace wolvrix::lib::emit
             bool emitWaveform = false;
             bool inputFullpassSpecialization = false;
             bool posedgeFullpassSpecialization = false;
+            bool commitStateChangeUnlikely = false;
         };
+
+        ValueId canonicalMaterializedStorageValue(const EmitModel &model, ValueId value) noexcept
+        {
+            const auto aliasIt = model.materializedValueAliasByValue.find(value);
+            return aliasIt == model.materializedValueAliasByValue.end() ? value : aliasIt->second;
+        }
 
         const MemoryRowReaderActivationDecl *memoryRowReaderActivationForSymbol(
             const EmitModel &model,
@@ -3799,6 +3822,10 @@ namespace wolvrix::lib::emit
                 {
                     continue;
                 }
+                if (model.materializedValueAliasByValue.contains(valueId))
+                {
+                    continue;
+                }
                 if (const auto staticExpr = staticConstStringExpr(graph, valueId))
                 {
                     model.staticConstStringFieldByValue.emplace(valueId, *staticExpr);
@@ -3857,6 +3884,32 @@ namespace wolvrix::lib::emit
                     break;
                 }
                 }
+            }
+
+            std::vector<ValueId> unresolvedAliases;
+            for (const auto &[aliasValue, canonicalValue] : model.materializedValueAliasByValue)
+            {
+                const auto scalarIt = model.valueScalarSlotByValue.find(canonicalValue);
+                const auto fieldIt = model.valueFieldByValue.find(canonicalValue);
+                if (scalarIt == model.valueScalarSlotByValue.end() || fieldIt == model.valueFieldByValue.end())
+                {
+                    unresolvedAliases.push_back(aliasValue);
+                    continue;
+                }
+                model.valueScalarSlotByValue.emplace(aliasValue, scalarIt->second);
+                model.valueFieldByValue.emplace(aliasValue, fieldIt->second);
+            }
+            for (ValueId aliasValue : unresolvedAliases)
+            {
+                model.materializedValueAliasByValue.erase(aliasValue);
+                const ValueSlotScalarKind slotKind = valueScalarSlotKindForWidth(graph.valueWidth(aliasValue));
+                const std::size_t kindIndex = static_cast<std::size_t>(slotKind);
+                const std::size_t slotIndex = model.valueScalarSlotCounts[kindIndex]++;
+                model.valueScalarSlotByValue.emplace(
+                    aliasValue,
+                    ValueScalarSlotRef{.kind = slotKind, .slotIndex = slotIndex});
+                model.valueFieldByValue.emplace(aliasValue,
+                                                valueScalarSlotRefExpr(slotKind, std::to_string(slotIndex)));
             }
             for (std::size_t kindIndex = 0; kindIndex < static_cast<std::size_t>(ValueSlotScalarKind::kCount); ++kindIndex)
             {
@@ -4586,6 +4639,7 @@ namespace wolvrix::lib::emit
             std::size_t nextTouchOrder = 0;
 
             const auto noteValue = [&](ValueId value, std::size_t weight = 1) {
+                value = canonicalMaterializedStorageValue(model, value);
                 if (!model.valueScalarSlotByValue.contains(value) && !model.valueWideSlotByValue.contains(value))
                 {
                     return;
@@ -6548,6 +6602,96 @@ namespace wolvrix::lib::emit
             return true;
         }
 
+        void buildSameSupernodeStateReadSlotAliases(
+            const Graph &graph,
+            const ScheduleRefs &schedule,
+            const std::unordered_set<ValueId, ValueIdHash> &waveformValueIds,
+            EmitModel &model)
+        {
+            model.materializedValueAliasByValue.clear();
+            model.sameSupernodeStateReadSlotAliasCount = 0;
+            model.sameSupernodeStateReadSlotAliasGroupCount = 0;
+            if (!emitSameSupernodeStateReadSlotAliasesEnabled())
+            {
+                return;
+            }
+
+            std::unordered_set<ValueId, ValueIdHash> protectedValues = waveformValueIds;
+            for (const auto &port : graph.outputPorts())
+            {
+                protectedValues.insert(port.value);
+            }
+            for (const auto &port : graph.inoutPorts())
+            {
+                protectedValues.insert(port.out);
+                protectedValues.insert(port.oe);
+            }
+            for (const auto &[value, _] : model.eventEdgeFieldByValue)
+            {
+                (void)_;
+                protectedValues.insert(value);
+            }
+
+            std::unordered_set<ValueId, ValueIdHash> aliasedCanonicalValues;
+            for (uint32_t supernodeId : model.computeSupernodeIds)
+            {
+                if (supernodeId >= schedule.supernodeToOps.size())
+                {
+                    continue;
+                }
+                std::unordered_map<std::string, ValueId> canonicalValueByState;
+                for (OperationId opId : schedule.supernodeToOps[supernodeId])
+                {
+                    const Operation op = graph.getOperation(opId);
+                    if ((op.kind() != OperationKind::kRegisterReadPort &&
+                         op.kind() != OperationKind::kLatchReadPort) ||
+                        op.results().size() != 1 || isRegToMemIntentBypassOp(model, opId))
+                    {
+                        continue;
+                    }
+
+                    const ValueId resultValue = op.results().front();
+                    if (!model.materializedValues.contains(resultValue) ||
+                        graph.valueType(resultValue) != ValueType::Logic ||
+                        isWideLogicValue(graph, resultValue) ||
+                        !valueNeedsChangeDetect(model, resultValue) ||
+                        protectedValues.contains(resultValue) ||
+                        model.packedArrayLaneViewByValue.contains(resultValue))
+                    {
+                        continue;
+                    }
+
+                    const char *symbolAttr =
+                        op.kind() == OperationKind::kRegisterReadPort ? "regSymbol" : "latchSymbol";
+                    const auto targetSymbol = getAttribute<std::string>(op, symbolAttr);
+                    if (!targetSymbol)
+                    {
+                        continue;
+                    }
+                    const auto stateIt = model.stateBySymbol.find(*targetSymbol);
+                    if (stateIt == model.stateBySymbol.end() ||
+                        stateIt->second.kind == StateDecl::Kind::Memory ||
+                        isWideLogicWidth(stateIt->second.width) ||
+                        graph.valueWidth(resultValue) != stateIt->second.width ||
+                        graph.valueSigned(resultValue) != stateIt->second.isSigned)
+                    {
+                        continue;
+                    }
+
+                    const auto [canonicalIt, inserted] =
+                        canonicalValueByState.emplace(*targetSymbol, resultValue);
+                    if (inserted || canonicalIt->second == resultValue)
+                    {
+                        continue;
+                    }
+                    model.materializedValueAliasByValue.emplace(resultValue, canonicalIt->second);
+                    aliasedCanonicalValues.insert(canonicalIt->second);
+                }
+            }
+            model.sameSupernodeStateReadSlotAliasCount = model.materializedValueAliasByValue.size();
+            model.sameSupernodeStateReadSlotAliasGroupCount = aliasedCanonicalValues.size();
+        }
+
         bool buildModel(const Graph &graph,
                         const ScheduleRefs &schedule,
                         const std::vector<ScheduleBatch> &scheduleBatches,
@@ -6578,6 +6722,9 @@ namespace wolvrix::lib::emit
             model.commitInputValues.clear();
             model.localValueNameByValue.clear();
             model.materializedValues.clear();
+            model.materializedValueAliasByValue.clear();
+            model.sameSupernodeStateReadSlotAliasCount = 0;
+            model.sameSupernodeStateReadSlotAliasGroupCount = 0;
             model.eventEdgeFieldByValue.clear();
             model.allEventValues.clear();
             model.inputEventValues.clear();
@@ -7511,6 +7658,7 @@ namespace wolvrix::lib::emit
                 model.materializedValues.insert(valueId);
             }
             collectRegToMemIntentBypassOps(graph, model);
+            buildSameSupernodeStateReadSlotAliases(graph, schedule, waveformValueIds, model);
             if (emitMaterializedValueStatsEnabled())
             {
                 std::map<std::string, std::size_t> reasonCounts;
@@ -7598,6 +7746,10 @@ namespace wolvrix::lib::emit
                              materializedBoundaryValues,
                              materializedBoundaryEdges,
                              materializedTrackedChangeValues);
+                std::fprintf(stderr,
+                             "[GRHSIM_MATERIALIZED_VALUE_STATS] same_supernode_state_read_slot_aliases=%zu groups=%zu\n",
+                             model.sameSupernodeStateReadSlotAliasCount,
+                             model.sameSupernodeStateReadSlotAliasGroupCount);
                 emitTopCounts("reason", reasonCounts);
                 emitTopCounts("source_kind", sourceKindCounts);
             }
@@ -7897,6 +8049,12 @@ namespace wolvrix::lib::emit
                 {
                     return storedIt->second;
                 }
+                const ValueId canonicalValue = canonicalMaterializedStorageValue(model, value);
+                const auto canonicalStoredIt = context->storedValueRefByValue.find(canonicalValue);
+                if (canonicalStoredIt != context->storedValueRefByValue.end())
+                {
+                    return canonicalStoredIt->second;
+                }
             }
             if (const auto *expr = findSupernodeLocalExpr(context, value); expr != nullptr)
             {
@@ -7915,6 +8073,12 @@ namespace wolvrix::lib::emit
                 if (it != context->storedValueRefByValue.end())
                 {
                     return it->second;
+                }
+                const ValueId canonicalValue = canonicalMaterializedStorageValue(model, value);
+                const auto canonicalIt = context->storedValueRefByValue.find(canonicalValue);
+                if (canonicalIt != context->storedValueRefByValue.end())
+                {
+                    return canonicalIt->second;
                 }
             }
             return valueRef(model, value);
@@ -12095,6 +12259,31 @@ namespace wolvrix::lib::emit
             std::vector<std::size_t> runIndices;
         };
 
+        struct OrderedMemoryWriteSlotIndices
+        {
+            std::uint32_t cond = 0;
+            std::uint32_t addr = 0;
+            std::uint32_t data = 0;
+        };
+
+        struct OrderedMemoryWriteAffineRange
+        {
+            OrderedMemoryWriteSlotIndices first;
+            std::int64_t condStep = 0;
+            std::int64_t addrStep = 0;
+            std::int64_t dataStep = 0;
+            std::size_t count = 0;
+        };
+
+        struct OrderedMemoryWriteAffineGroup
+        {
+            std::string priorityGroup;
+            std::string stateSymbol;
+            std::size_t firstGuardGroupIndex = 0;
+            std::vector<OperationId> opIds;
+            std::vector<OrderedMemoryWriteAffineRange> ranges;
+        };
+
         struct TableCompressibleScalarStateWriteDesc
         {
             ValueSlotScalarKind kind = ValueSlotScalarKind::kBool;
@@ -12182,6 +12371,239 @@ namespace wolvrix::lib::emit
                     continue;
                 }
                 groupIt->runIndices.push_back(keyIndex);
+            }
+            return groups;
+        }
+
+        std::vector<OrderedMemoryWriteAffineRange> buildOrderedMemoryWriteAffineRanges(
+            std::span<const OrderedMemoryWriteSlotIndices> entries)
+        {
+            std::vector<OrderedMemoryWriteAffineRange> ranges;
+            std::size_t start = 0;
+            while (start < entries.size())
+            {
+                std::size_t end = start + 1u;
+                std::int64_t condStep = 0;
+                std::int64_t addrStep = 0;
+                std::int64_t dataStep = 0;
+                if (end < entries.size())
+                {
+                    condStep = static_cast<std::int64_t>(entries[end].cond) - entries[start].cond;
+                    addrStep = static_cast<std::int64_t>(entries[end].addr) - entries[start].addr;
+                    dataStep = static_cast<std::int64_t>(entries[end].data) - entries[start].data;
+                    ++end;
+                    while (end < entries.size())
+                    {
+                        const auto &lhs = entries[end - 1u];
+                        const auto &rhs = entries[end];
+                        if (static_cast<std::int64_t>(rhs.cond) - lhs.cond != condStep ||
+                            static_cast<std::int64_t>(rhs.addr) - lhs.addr != addrStep ||
+                            static_cast<std::int64_t>(rhs.data) - lhs.data != dataStep)
+                        {
+                            break;
+                        }
+                        ++end;
+                    }
+                }
+                ranges.push_back(OrderedMemoryWriteAffineRange{
+                    .first = entries[start],
+                    .condStep = condStep,
+                    .addrStep = addrStep,
+                    .dataStep = dataStep,
+                    .count = end - start,
+                });
+                start = end;
+            }
+            return ranges;
+        }
+
+        std::vector<OrderedMemoryWriteAffineGroup> buildOrderedMemoryWriteAffineGroups(
+            const Graph &graph,
+            const EmitModel &model,
+            std::span<const OperationId> runOpIds,
+            std::span<const CommitWriteGuardGroup> guardGroups)
+        {
+            std::vector<OrderedMemoryWriteAffineGroup> groups;
+            std::size_t runIndex = 0;
+            while (runIndex < runOpIds.size())
+            {
+                const Operation firstOp = graph.getOperation(runOpIds[runIndex]);
+                const auto priorityGroup = getAttribute<std::string>(
+                    firstOp, wolvrix::lib::grh::kMemoryWritePriorityGroupAttr);
+                if (!priorityGroup)
+                {
+                    ++runIndex;
+                    continue;
+                }
+
+                const std::size_t firstRunIndex = runIndex;
+                while (runIndex < runOpIds.size())
+                {
+                    const Operation candidateOp = graph.getOperation(runOpIds[runIndex]);
+                    const auto candidateGroup = getAttribute<std::string>(
+                        candidateOp, wolvrix::lib::grh::kMemoryWritePriorityGroupAttr);
+                    if (!candidateGroup || *candidateGroup != *priorityGroup)
+                    {
+                        break;
+                    }
+                    ++runIndex;
+                }
+                const std::size_t writeCount = runIndex - firstRunIndex;
+                if (writeCount < kOrderedMemoryWriteAffineMinWrites)
+                {
+                    continue;
+                }
+
+                bool valid = true;
+                for (std::size_t otherIndex = 0; otherIndex < runOpIds.size(); ++otherIndex)
+                {
+                    if (otherIndex >= firstRunIndex && otherIndex < runIndex)
+                    {
+                        continue;
+                    }
+                    const Operation otherOp = graph.getOperation(runOpIds[otherIndex]);
+                    const auto otherGroup = getAttribute<std::string>(
+                        otherOp, wolvrix::lib::grh::kMemoryWritePriorityGroupAttr);
+                    if (otherGroup && *otherGroup == *priorityGroup)
+                    {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (!valid)
+                {
+                    continue;
+                }
+
+                std::string stateSymbol;
+                std::vector<OperationId> opIds;
+                std::vector<OrderedMemoryWriteSlotIndices> entries;
+                opIds.reserve(writeCount);
+                entries.reserve(writeCount);
+                for (std::size_t offset = 0; offset < writeCount; ++offset)
+                {
+                    const OperationId opId = runOpIds[firstRunIndex + offset];
+                    const Operation op = graph.getOperation(opId);
+                    const auto priority = getAttribute<int64_t>(
+                        op, wolvrix::lib::grh::kMemoryWritePriorityAttr);
+                    if (op.kind() != OperationKind::kMemoryWritePort || !priority ||
+                        *priority != static_cast<int64_t>(writeCount - 1u - offset))
+                    {
+                        valid = false;
+                        break;
+                    }
+                    const auto writeIt = model.writeByOp.find(opId);
+                    if (writeIt == model.writeByOp.end() ||
+                        writeIt->second.kind != StateDecl::Kind::Memory ||
+                        writeIt->second.isMemoryFill ||
+                        writeIt->second.memoryMaskMode != WriteDecl::MemoryMaskMode::kConstAllOnes)
+                    {
+                        valid = false;
+                        break;
+                    }
+                    const WriteDecl &write = writeIt->second;
+                    if (offset == 0)
+                    {
+                        stateSymbol = write.symbol;
+                    }
+                    else if (write.symbol != stateSymbol)
+                    {
+                        valid = false;
+                        break;
+                    }
+                    const auto stateIt = model.stateBySymbol.find(write.symbol);
+                    if (stateIt == model.stateBySymbol.end())
+                    {
+                        valid = false;
+                        break;
+                    }
+                    const StateDecl &state = stateIt->second;
+                    if (state.kind != StateDecl::Kind::Memory || state.width <= 0 || state.width > 8 ||
+                        state.scalarKind != ValueSlotScalarKind::kU8 || state.rowCount <= 0 ||
+                        state.rowCount > 64 || !isPowerOfTwoU64(static_cast<std::uint64_t>(state.rowCount)))
+                    {
+                        valid = false;
+                        break;
+                    }
+                    const auto operands = op.operands();
+                    if (operands.size() < 4 || graph.valueWidth(operands[0]) != 1 ||
+                        graph.valueWidth(operands[1]) <= 0 || graph.valueWidth(operands[1]) > 8 ||
+                        graph.valueWidth(operands[2]) != state.width)
+                    {
+                        valid = false;
+                        break;
+                    }
+                    const auto condIt = model.valueScalarSlotByValue.find(operands[0]);
+                    const auto addrIt = model.valueScalarSlotByValue.find(operands[1]);
+                    const auto dataIt = model.valueScalarSlotByValue.find(operands[2]);
+                    if (condIt == model.valueScalarSlotByValue.end() ||
+                        condIt->second.kind != ValueSlotScalarKind::kBool ||
+                        addrIt == model.valueScalarSlotByValue.end() ||
+                        addrIt->second.kind != ValueSlotScalarKind::kU8 ||
+                        dataIt == model.valueScalarSlotByValue.end() ||
+                        dataIt->second.kind != ValueSlotScalarKind::kU8 ||
+                        condIt->second.slotIndex > std::numeric_limits<std::uint32_t>::max() ||
+                        addrIt->second.slotIndex > std::numeric_limits<std::uint32_t>::max() ||
+                        dataIt->second.slotIndex > std::numeric_limits<std::uint32_t>::max())
+                    {
+                        valid = false;
+                        break;
+                    }
+                    opIds.push_back(opId);
+                    entries.push_back(OrderedMemoryWriteSlotIndices{
+                        .cond = static_cast<std::uint32_t>(condIt->second.slotIndex),
+                        .addr = static_cast<std::uint32_t>(addrIt->second.slotIndex),
+                        .data = static_cast<std::uint32_t>(dataIt->second.slotIndex),
+                    });
+                }
+                if (!valid)
+                {
+                    continue;
+                }
+
+                std::size_t firstGuardGroupIndex = kInvalidIndex;
+                for (std::size_t guardIndex = 0; guardIndex < guardGroups.size(); ++guardIndex)
+                {
+                    if (guardGroups[guardIndex].runIndices.size() == 1u &&
+                        guardGroups[guardIndex].runIndices.front() == firstRunIndex)
+                    {
+                        firstGuardGroupIndex = guardIndex;
+                        break;
+                    }
+                }
+                if (firstGuardGroupIndex == kInvalidIndex ||
+                    firstGuardGroupIndex + writeCount > guardGroups.size())
+                {
+                    continue;
+                }
+                for (std::size_t offset = 0; offset < writeCount; ++offset)
+                {
+                    const CommitWriteGuardGroup &guardGroup = guardGroups[firstGuardGroupIndex + offset];
+                    if (guardGroup.runIndices.size() != 1u ||
+                        guardGroup.runIndices.front() != firstRunIndex + offset)
+                    {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (!valid)
+                {
+                    continue;
+                }
+
+                std::vector<OrderedMemoryWriteAffineRange> ranges =
+                    buildOrderedMemoryWriteAffineRanges(entries);
+                if (ranges.size() * 4u > writeCount)
+                {
+                    continue;
+                }
+                groups.push_back(OrderedMemoryWriteAffineGroup{
+                    .priorityGroup = *priorityGroup,
+                    .stateSymbol = std::move(stateSymbol),
+                    .firstGuardGroupIndex = firstGuardGroupIndex,
+                    .opIds = std::move(opIds),
+                    .ranges = std::move(ranges),
+                });
             }
             return groups;
         }
@@ -12730,6 +13152,14 @@ namespace wolvrix::lib::emit
                                                     activationContext,
                                                     memoryRowExpr);
             };
+            auto commitChangeCondition = [&](std::string condition)
+            {
+                if (model.commitStateChangeUnlikely)
+                {
+                    return std::string("unlikely(") + condition + ")";
+                }
+                return condition;
+            };
             stream << indent << "{\n";
             if (write.kind == StateDecl::Kind::Memory)
             {
@@ -12906,10 +13336,10 @@ namespace wolvrix::lib::emit
                     {
                         stream << innerIndent << "// constant all-ones mask: direct register update\n";
                         stream << innerIndent << "if ("
-                               << assignWordsInlineExpr(
+                               << commitChangeCondition(assignWordsInlineExpr(
                                       resolvedStateRefExpr(state, context),
                                       wordsExprForValue(graph, model, operands[1], state.width, context),
-                                      state.width)
+                                      state.width))
                                << ") {\n";
                     }
                     else
@@ -12920,7 +13350,8 @@ namespace wolvrix::lib::emit
                                << wordsExprForValue(graph, model, operands[2], state.width, context) << ", "
                                << state.width << ");\n";
                         stream << innerIndent << "if ("
-                               << assignWordsInlineExpr(resolvedStateRefExpr(state, context), "next_value", state.width)
+                               << commitChangeCondition(
+                                      assignWordsInlineExpr(resolvedStateRefExpr(state, context), "next_value", state.width))
                                << ") {\n";
                     }
                     emitPerfCounterIncrement(stream, model, innerIndent + "    ", "touchedWriteCount");
@@ -12944,7 +13375,9 @@ namespace wolvrix::lib::emit
                                << resolvedScheduleValueExpr(model, operands[2], context)
                                << "));\n";
                     }
-                    stream << innerIndent << "if (" << resolvedStateRefExpr(state, context) << " != next_value) {\n";
+                    stream << innerIndent << "if ("
+                           << commitChangeCondition(resolvedStateRefExpr(state, context) + " != next_value")
+                           << ") {\n";
                     stream << innerIndent << "    " << resolvedStateRefExpr(state, context) << " = next_value;\n";
                     emitPerfCounterIncrement(stream, model, innerIndent + "    ", "touchedWriteCount");
                     emitReaderActivations(innerIndent + "    ");
@@ -12952,6 +13385,132 @@ namespace wolvrix::lib::emit
                 }
             }
             stream << indent << "}\n";
+            return std::nullopt;
+        }
+
+        std::string orderedMemoryWriteAffineIndexExpr(std::uint32_t first,
+                                                      std::int64_t step,
+                                                      std::string_view indexExpr)
+        {
+            if (step == 0)
+            {
+                return std::to_string(first) + "u";
+            }
+            if (step == 1)
+            {
+                return "(" + std::to_string(first) + "u + " + std::string(indexExpr) + ")";
+            }
+            if (step == -1)
+            {
+                return "(" + std::to_string(first) + "u - " + std::string(indexExpr) + ")";
+            }
+            if (step > 0)
+            {
+                return "(" + std::to_string(first) + "u + " + std::string(indexExpr) + " * " +
+                       std::to_string(step) + "u)";
+            }
+            return "(" + std::to_string(first) + "u - " + std::string(indexExpr) + " * " +
+                   std::to_string(-static_cast<std::int64_t>(step)) + "u)";
+        }
+
+        std::optional<std::string> emitOrderedMemoryWriteAffineGroup(
+            std::ostream &stream,
+            const Graph &graph,
+            const EmitModel &model,
+            const OrderedMemoryWriteAffineGroup &group,
+            std::string_view indent,
+            const ActivationEmitContext *activationContext = nullptr,
+            const SupernodeLocalExprContext *context = nullptr,
+            bool trackCommitActivation = false)
+        {
+            if (group.opIds.empty() || group.ranges.empty())
+            {
+                return "ordered memory write affine group is empty";
+            }
+            const OperationId firstOpId = group.opIds.front();
+            const auto writeIt = model.writeByOp.find(firstOpId);
+            const auto stateIt = model.stateBySymbol.find(group.stateSymbol);
+            if (writeIt == model.writeByOp.end() || stateIt == model.stateBySymbol.end())
+            {
+                return "ordered memory write affine metadata is missing";
+            }
+            const StateDecl &state = stateIt->second;
+            const auto headIt = model.stateHeadSupernodesBySymbol.find(group.stateSymbol);
+            const bool hasReaders = headIt != model.stateHeadSupernodesBySymbol.end() && !headIt->second.empty();
+            const std::string suffix = std::to_string(firstOpId.index);
+            const std::string changedRowsName = "ordered_changed_rows_" + suffix;
+            const std::string stateRefExpr = resolvedStateRefExpr(state, context);
+            const std::string innerIndent = std::string(indent) + "    ";
+
+            stream << indent << "// Ordered memory write affine group: " << group.opIds.size()
+                   << " writers in " << group.ranges.size() << " ranges.\n";
+            stream << indent << "{\n";
+            if (hasReaders)
+            {
+                stream << innerIndent << "std::uint64_t " << changedRowsName << " = UINT64_C(0);\n";
+            }
+            for (std::size_t rangeIndex = 0; rangeIndex < group.ranges.size(); ++rangeIndex)
+            {
+                const OrderedMemoryWriteAffineRange &range = group.ranges[rangeIndex];
+                const std::string loopIndexName =
+                    "ordered_write_index_" + suffix + "_" + std::to_string(rangeIndex);
+                const std::string rowName = "ordered_write_row_" + suffix + "_" + std::to_string(rangeIndex);
+                const std::string nextName = "ordered_next_value_" + suffix + "_" + std::to_string(rangeIndex);
+                const std::string condIndexExpr =
+                    orderedMemoryWriteAffineIndexExpr(range.first.cond, range.condStep, loopIndexName);
+                const std::string addrIndexExpr =
+                    orderedMemoryWriteAffineIndexExpr(range.first.addr, range.addrStep, loopIndexName);
+                const std::string dataIndexExpr =
+                    orderedMemoryWriteAffineIndexExpr(range.first.data, range.dataStep, loopIndexName);
+                stream << innerIndent << "for (std::size_t " << loopIndexName << " = 0; "
+                       << loopIndexName << " < " << range.count << "u; ++" << loopIndexName << ") {\n";
+                stream << innerIndent << "    if (value_bool_slots_[" << condIndexExpr << "] == 0) {\n";
+                stream << innerIndent << "        continue;\n";
+                stream << innerIndent << "    }\n";
+                stream << innerIndent << "    const std::size_t " << rowName
+                       << " = static_cast<std::size_t>(value_u8_slots_[" << addrIndexExpr << "]) & "
+                       << (static_cast<std::size_t>(state.rowCount) - 1u) << "u;\n";
+                stream << innerIndent << "    const auto " << nextName << " = static_cast<" << logicCppType(state.width)
+                       << ">(grhsim_trunc_u64(static_cast<std::uint64_t>(value_u8_slots_[" << dataIndexExpr
+                       << "]), " << state.width << "));\n";
+                stream << innerIndent << "    if (" << stateRefExpr << "[" << rowName << "] != " << nextName
+                       << ") {\n";
+                stream << innerIndent << "        " << stateRefExpr << "[" << rowName << "] = " << nextName
+                       << ";\n";
+                emitPerfCounterIncrement(stream, model, innerIndent + "        ", "touchedWriteCount");
+                if (hasReaders)
+                {
+                    stream << innerIndent << "        " << changedRowsName << " |= UINT64_C(1) << " << rowName
+                           << ";\n";
+                }
+                stream << innerIndent << "    }\n";
+                stream << innerIndent << "}\n";
+            }
+            if (hasReaders)
+            {
+                const std::string changedRowName = "ordered_changed_row_" + suffix;
+                stream << innerIndent << "if (" << changedRowsName << " != UINT64_C(0)) {\n";
+                if (trackCommitActivation)
+                {
+                    stream << innerIndent << "    commit_activated_readers_ = true;\n";
+                }
+                stream << innerIndent << "    for (std::size_t " << changedRowName << " = 0; "
+                       << changedRowName << " < " << state.rowCount << "u; ++" << changedRowName << ") {\n";
+                stream << innerIndent << "        if ((" << changedRowsName << " & (UINT64_C(1) << "
+                       << changedRowName << ")) == 0) {\n";
+                stream << innerIndent << "            continue;\n";
+                stream << innerIndent << "        }\n";
+                emitStateReaderActivationStatements(stream,
+                                                    model,
+                                                    group.stateSymbol,
+                                                    innerIndent + "        ",
+                                                    activationContext,
+                                                    changedRowName);
+                stream << innerIndent << "    }\n";
+                stream << innerIndent << "}\n";
+            }
+            stream << indent << "}\n";
+            (void)graph;
             return std::nullopt;
         }
 
@@ -13347,12 +13906,43 @@ namespace wolvrix::lib::emit
                             const std::vector<CommitWriteGuardGroup> guardGroups =
                                 buildCommitWriteGuardGroups(
                                     std::span<const WritePortGuardKey>(guardKeys.data(), guardKeys.size()));
+                            const std::vector<OrderedMemoryWriteAffineGroup> orderedAffineGroups =
+                                buildOrderedMemoryWriteAffineGroups(
+                                    graph,
+                                    model,
+                                    std::span<const OperationId>(supernodeOps.data() + opIndex, runEnd - opIndex),
+                                    std::span<const CommitWriteGuardGroup>(guardGroups.data(), guardGroups.size()));
                             if (effectiveEventExpr != "true")
                             {
                                 stream << "            if (" << effectiveEventExpr << ") {\n";
                             }
-                            for (const CommitWriteGuardGroup &guardGroup : guardGroups)
+                            std::size_t guardGroupIndex = 0;
+                            while (guardGroupIndex < guardGroups.size())
                             {
+                                const auto orderedGroupIt = std::find_if(
+                                    orderedAffineGroups.begin(),
+                                    orderedAffineGroups.end(),
+                                    [&](const OrderedMemoryWriteAffineGroup &candidate)
+                                    {
+                                        return candidate.firstGuardGroupIndex == guardGroupIndex;
+                                    });
+                                if (orderedGroupIt != orderedAffineGroups.end())
+                                {
+                                    if (auto error = emitOrderedMemoryWriteAffineGroup(stream,
+                                                                                       graph,
+                                                                                       model,
+                                                                                       *orderedGroupIt,
+                                                                                       "            ",
+                                                                                       &activationContext,
+                                                                                       &localExprContext,
+                                                                                       true))
+                                    {
+                                        return emitError(*error, orderedGroupIt->stateSymbol);
+                                    }
+                                    guardGroupIndex += orderedGroupIt->opIds.size();
+                                    continue;
+                                }
+                                const CommitWriteGuardGroup &guardGroup = guardGroups[guardGroupIndex];
                                 const bool needCondGuard = guardGroup.condExpr != "true";
                                 if (needCondGuard)
                                 {
@@ -13381,6 +13971,7 @@ namespace wolvrix::lib::emit
                                 {
                                     stream << "            }\n";
                                 }
+                                ++guardGroupIndex;
                             }
                             if (effectiveEventExpr != "true")
                             {
@@ -13605,7 +14196,14 @@ namespace wolvrix::lib::emit
                                                                        "            ",
                                                                        &activationContext,
                                                                        &deferredActivationContext);
-                                    stream << "            " << lhs << " = " << stateExpr << ";\n";
+                                    if (model.materializedValueAliasByValue.contains(resultValue))
+                                    {
+                                        stream << "            // same-state scalar read: reuse consolidated storage slot\n";
+                                    }
+                                    else
+                                    {
+                                        stream << "            " << lhs << " = " << stateExpr << ";\n";
+                                    }
                                 }
                                 else
                                 {
@@ -14623,6 +15221,11 @@ namespace wolvrix::lib::emit
             parseBooleanEmitOption(options,
                                    "posedge_fullpass_specialization",
                                    "GRHSIM_POSEDGE_FULLPASS_SPECIALIZATION");
+        const bool commitStateChangeUnlikely =
+            parseBooleanEmitOption(options,
+                                   "commit_state_change_unlikely",
+                                   "WOLVRIX_GRHSIM_COMMIT_STATE_CHANGE_UNLIKELY",
+                                   true);
         const std::size_t schedBatchesPerCpp = parseScheduleBatchesPerCpp(options);
         const std::unordered_set<ValueId, ValueIdHash> waveformValueIds =
             waveformMode == WaveformMode::kDeclaredSymbols ? collectDeclaredSymbolWaveformValueIds(graph)
@@ -14650,6 +15253,7 @@ namespace wolvrix::lib::emit
         model.emitRuntimeProfile = emitRuntimeProfile;
         model.inputFullpassSpecialization = inputFullpassSpecialization;
         model.posedgeFullpassSpecialization = posedgeFullpassSpecialization;
+        model.commitStateChangeUnlikely = commitStateChangeUnlikely;
         if (model.emitRuntimeProfile)
         {
             buildRuntimeProfileWeights(graph, schedule, model);

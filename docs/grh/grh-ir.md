@@ -1120,6 +1120,10 @@ res[0] = <memSymbol>[addr]
 **attrs**:
 - `memSymbol` (string): 指向目标 kMemory 的 symbol
 - `eventEdge` (string[]): 触发边沿列表，长度等于事件信号数
+- `memoryWrite.priorityGroup` (string, optional): 有序写组名称；同组写端口必须指向同一 kMemory，并使用相同的事件与边沿
+- `memoryWrite.priority` (int64_t, optional): 组内优先级，`0` 为最高优先级
+
+两个 `memoryWrite.priority*` 属性必须同时出现。同组 priority 必须唯一、非负且连续，即恰好为 `[0, N)`。调度与 emitter 必须将同组端口保留在同一顺序域，并按 priority 从大到小执行，使 priority `0` 最后写入。这样，同地址且掩码重叠时由最高优先级端口获胜；地址不同或掩码不重叠的 enabled writes 均生效。没有这两个属性的多个写端口不提供基于普通 Operation 顺序的碰撞优先级保证。
 
 **语义**:
 
@@ -1153,6 +1157,20 @@ always @(posedge clk)
             if (mask[i])
                 mem[addr][i] <= data[i];
 ```
+
+**两个有序写端口**：
+- low port: `memoryWrite.priorityGroup` = `"writes"`, `memoryWrite.priority` = 1
+- high port: `memoryWrite.priorityGroup` = `"writes"`, `memoryWrite.priority` = 0
+```sv
+always @(posedge clk) begin
+    if (low_wen)
+        mem[low_addr] <= low_data;
+    if (high_wen)
+        mem[high_addr] <= high_data;
+end
+```
+
+若两个地址相同，后执行的 high port 覆盖 low port；若地址不同，两次写入都保留。
 
 ## 6.6 层次结构
 

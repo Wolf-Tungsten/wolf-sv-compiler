@@ -540,6 +540,11 @@ def _compile_reg_to_mem_kwargs(named: dict[str, Any]) -> list[str]:
         out.append("-true-merge")
     elif true_merge is False:
         out.append("-no-true-merge")
+    ordered_writes = _pop_named(local, "ordered_writes", None)
+    if ordered_writes is True:
+        out.append("-ordered-writes")
+    elif ordered_writes is False:
+        out.append("-no-ordered-writes")
     min_element_count = _pop_named(local, "min_element_count", None)
     if min_element_count is not None:
         out.extend(["-min-element-count", str(min_element_count)])

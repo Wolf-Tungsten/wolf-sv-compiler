@@ -100,6 +100,7 @@ namespace wolvrix::lib::transform
             bool overlapsOtherCandidate = false;
             bool trueOnlyStorage = false;
             bool edgePaddedStorage = false;
+            bool decodedWriteStorage = false;
         };
 
         struct GroupAnchorsResult
@@ -1160,6 +1161,14 @@ namespace wolvrix::lib::transform
             return width >= 64 || rowCount <= (UINT64_C(1) << static_cast<uint32_t>(width));
         }
 
+        bool equalityCanSelectStorageRow(const Graph &graph,
+                                         const EqualityTerm &equality,
+                                         std::size_t rowCount)
+        {
+            return addressCoversRows(graph, equality.addr, rowCount) &&
+                   (rowCount == 0 || equality.row < rowCount);
+        }
+
         std::optional<PriorityGuardMatch> matchPriorityGuardTerms(
             const Graph &graph,
             std::span<const ValueId> terms,
@@ -1189,7 +1198,7 @@ namespace wolvrix::lib::transform
             std::optional<EqualityTerm> positiveEq;
             for (const auto &[term, eq] : positiveEqs)
             {
-                if (!addressCoversRows(graph, eq.addr, rowCount))
+                if (!equalityCanSelectStorageRow(graph, eq, rowCount))
                 {
                     commonTerms.push_back(term);
                     continue;
@@ -1210,7 +1219,7 @@ namespace wolvrix::lib::transform
             for (const auto &[term, negativeEq] : negativeEqs)
             {
                 if (negativeEq.row != positiveEq->row ||
-                    !addressCoversRows(graph, negativeEq.addr, rowCount))
+                    !equalityCanSelectStorageRow(graph, negativeEq, rowCount))
                 {
                     commonTerms.push_back(term);
                     continue;
@@ -1246,7 +1255,7 @@ namespace wolvrix::lib::transform
                 for (ValueId conflictTerm : conflictTerms)
                 {
                     auto eq = matchEqualityTerm(graph, conflictTerm);
-                    if (!eq || !addressCoversRows(graph, eq->addr, rowCount))
+                    if (!eq || !equalityCanSelectStorageRow(graph, *eq, rowCount))
                     {
                         hasNarrowSelector |= eq.has_value();
                         conflictCommonTerms.push_back(conflictTerm);
@@ -1289,9 +1298,14 @@ namespace wolvrix::lib::transform
         std::optional<std::vector<PriorityGuardMatch>> matchPriorityGuardAlternatives(
             const Graph &graph,
             ValueId guard,
-            std::size_t rowCount)
+            std::size_t rowCount,
+            bool allowCompoundConflictWithoutNarrowSelector = false)
         {
-            if (auto direct = matchPriorityGuard(graph, guard, rowCount))
+            const std::vector<ValueId> directTerms = flattenLogicAndTerms(graph, guard);
+            if (auto direct = matchPriorityGuardTerms(graph,
+                                                      directTerms,
+                                                      rowCount,
+                                                      allowCompoundConflictWithoutNarrowSelector))
             {
                 std::vector<PriorityGuardMatch> result;
                 result.push_back(std::move(*direct));
@@ -2132,6 +2146,229 @@ namespace wolvrix::lib::transform
             return writesByReg;
         }
 
+        struct DecodedWriteRowCandidate
+        {
+            std::string regSymbol;
+            std::string familyKey;
+            uint64_t row = 0;
+            int32_t elementWidth = 0;
+        };
+
+        struct DecodedWriteDiscoveryStats
+        {
+            std::size_t singleWriteRegs = 0;
+            std::size_t validRegisterRegs = 0;
+            std::size_t wideUpdateRegs = 0;
+            std::size_t guardRejectedRegs = 0;
+            std::size_t insufficientGuardRegs = 0;
+            std::size_t rowRejectedRegs = 0;
+            std::size_t addrRejectedRegs = 0;
+            std::size_t matchedRows = 0;
+            std::size_t families = 0;
+            std::size_t maxUpdateTerms = 0;
+            std::size_t maxMatchedGuardTerms = 0;
+            std::size_t maxUnmatchedGuardTerms = 0;
+            std::size_t maxFamilyRows = 0;
+        };
+
+        constexpr std::size_t kMinDecodedWriteAlternatives = 64;
+
+        std::optional<DecodedWriteRowCandidate> matchDecodedWriteRowCandidate(
+            const Graph &graph,
+            const std::string &regSymbol,
+            const WritePortInfo &write,
+            DecodedWriteDiscoveryStats &stats)
+        {
+            const OperationId regOpId = graph.findOperation(regSymbol);
+            if (!regOpId.valid())
+            {
+                return std::nullopt;
+            }
+            const Operation regOp = graph.getOperation(regOpId);
+            const auto width = getAttr<int64_t>(regOp, "width");
+            if (regOp.kind() != OperationKind::kRegister || !width || *width <= 0 || *width > INT32_MAX)
+            {
+                return std::nullopt;
+            }
+            ++stats.validRegisterRegs;
+
+            const std::vector<ValueId> updateTerms = flattenLogicOrTerms(graph, write.updateCond);
+            stats.maxUpdateTerms = std::max(stats.maxUpdateTerms, updateTerms.size());
+            if (updateTerms.size() < kMinDecodedWriteAlternatives)
+            {
+                return std::nullopt;
+            }
+            ++stats.wideUpdateRegs;
+
+            std::optional<uint64_t> decodedRow;
+            std::vector<std::string> guardFamilyKeys;
+            guardFamilyKeys.reserve(updateTerms.size());
+            std::size_t matchedGuardTerms = 0;
+            std::size_t unmatchedGuardTerms = 0;
+            for (ValueId updateTerm : updateTerms)
+            {
+                const std::vector<ValueId> guardTerms = flattenLogicAndTerms(graph, updateTerm);
+                auto guard = matchPriorityGuardTerms(graph, guardTerms, 0, true);
+                if (!guard)
+                {
+                    ++unmatchedGuardTerms;
+                    continue;
+                }
+                if (decodedRow && *decodedRow != guard->row)
+                {
+                    ++stats.rowRejectedRegs;
+                    stats.maxMatchedGuardTerms =
+                        std::max(stats.maxMatchedGuardTerms, matchedGuardTerms);
+                    return std::nullopt;
+                }
+                decodedRow = guard->row;
+
+                const int32_t addrWidth = graph.valueWidth(guard->addr);
+                if (addrWidth <= 0 ||
+                    (addrWidth < 64 && guard->row >= (UINT64_C(1) << static_cast<uint32_t>(addrWidth))))
+                {
+                    ++stats.addrRejectedRegs;
+                    stats.maxMatchedGuardTerms =
+                        std::max(stats.maxMatchedGuardTerms, matchedGuardTerms);
+                    return std::nullopt;
+                }
+
+                const std::string addressKey = valueIdentityKey(graph, guard->addr);
+                const std::string conflictKey = priorityConflictSetKey(guard->conflicts);
+                std::ostringstream family;
+                family << addressKey.size() << ':' << addressKey << ';';
+                family << conflictKey.size() << ':' << conflictKey << ';';
+                guardFamilyKeys.push_back(std::move(family).str());
+                ++matchedGuardTerms;
+            }
+            stats.maxMatchedGuardTerms = std::max(stats.maxMatchedGuardTerms, matchedGuardTerms);
+            stats.maxUnmatchedGuardTerms = std::max(stats.maxUnmatchedGuardTerms, unmatchedGuardTerms);
+            if (unmatchedGuardTerms != 0)
+            {
+                ++stats.guardRejectedRegs;
+            }
+            if (!decodedRow || matchedGuardTerms < kMinDecodedWriteAlternatives)
+            {
+                ++stats.insufficientGuardRegs;
+                return std::nullopt;
+            }
+            ++stats.matchedRows;
+
+            std::sort(guardFamilyKeys.begin(), guardFamilyKeys.end());
+            std::ostringstream key;
+            key << *width << ':' << getAttr<bool>(regOp, "isSigned").value_or(false) << ';';
+            const std::string maskKey = valueIdentityKey(graph, write.mask);
+            key << maskKey.size() << ':' << maskKey << ';';
+            for (std::size_t eventIndex = 0; eventIndex < write.events.size(); ++eventIndex)
+            {
+                const std::string eventKey = valueIdentityKey(graph, write.events[eventIndex]);
+                key << eventKey.size() << ':' << eventKey << ':'
+                    << write.eventEdges[eventIndex].size() << ':' << write.eventEdges[eventIndex] << ';';
+            }
+            for (const std::string &familyKey : guardFamilyKeys)
+            {
+                key << familyKey.size() << ':' << familyKey << ';';
+            }
+            return DecodedWriteRowCandidate{
+                .regSymbol = regSymbol,
+                .familyKey = std::move(key).str(),
+                .row = *decodedRow,
+                .elementWidth = static_cast<int32_t>(*width),
+            };
+        }
+
+        std::vector<GroupCandidate> discoverDecodedWriteStorageGroups(
+            const Graph &graph,
+            const std::unordered_map<std::string, std::vector<WritePortInfo>> &writesByReg,
+            std::size_t minElementCount)
+        {
+            std::unordered_map<std::string, std::vector<DecodedWriteRowCandidate>> rowsByFamily;
+            DecodedWriteDiscoveryStats stats;
+            for (const auto &[regSymbol, writes] : writesByReg)
+            {
+                if (writes.size() != 1)
+                {
+                    continue;
+                }
+                ++stats.singleWriteRegs;
+                auto row = matchDecodedWriteRowCandidate(graph, regSymbol, writes.front(), stats);
+                if (!row)
+                {
+                    continue;
+                }
+                rowsByFamily[row->familyKey].push_back(std::move(*row));
+            }
+            stats.families = rowsByFamily.size();
+            for (const auto &[familyKey, rows] : rowsByFamily)
+            {
+                (void)familyKey;
+                stats.maxFamilyRows = std::max(stats.maxFamilyRows, rows.size());
+            }
+            profileLog("decoded_write_discovery single_write_regs=" +
+                       std::to_string(stats.singleWriteRegs) +
+                       " valid_register_regs=" + std::to_string(stats.validRegisterRegs) +
+                       " wide_update_regs=" + std::to_string(stats.wideUpdateRegs) +
+                       " guard_rejected_regs=" + std::to_string(stats.guardRejectedRegs) +
+                       " insufficient_guard_regs=" + std::to_string(stats.insufficientGuardRegs) +
+                       " row_rejected_regs=" + std::to_string(stats.rowRejectedRegs) +
+                       " addr_rejected_regs=" + std::to_string(stats.addrRejectedRegs) +
+                       " matched_rows=" + std::to_string(stats.matchedRows) +
+                       " families=" + std::to_string(stats.families) +
+                       " max_update_terms=" + std::to_string(stats.maxUpdateTerms) +
+                       " max_matched_guard_terms=" + std::to_string(stats.maxMatchedGuardTerms) +
+                       " max_unmatched_guard_terms=" + std::to_string(stats.maxUnmatchedGuardTerms) +
+                       " max_family_rows=" + std::to_string(stats.maxFamilyRows));
+
+            std::vector<GroupCandidate> groups;
+            for (auto &[familyKey, rows] : rowsByFamily)
+            {
+                (void)familyKey;
+                if (rows.size() < minElementCount)
+                {
+                    continue;
+                }
+                std::sort(rows.begin(), rows.end(), [](const DecodedWriteRowCandidate &lhs,
+                                                       const DecodedWriteRowCandidate &rhs) {
+                    if (lhs.row != rhs.row)
+                    {
+                        return lhs.row < rhs.row;
+                    }
+                    return lhs.regSymbol < rhs.regSymbol;
+                });
+                bool contiguous = rows.front().row <= static_cast<uint64_t>(std::numeric_limits<std::size_t>::max());
+                for (std::size_t index = 1; index < rows.size() && contiguous; ++index)
+                {
+                    contiguous = rows[index].row == rows.front().row + index &&
+                                 rows[index].elementWidth == rows.front().elementWidth;
+                }
+                if (!contiguous ||
+                    rows.back().row >= static_cast<uint64_t>(std::numeric_limits<std::size_t>::max()))
+                {
+                    continue;
+                }
+
+                GroupCandidate group;
+                group.elementWidth = rows.front().elementWidth;
+                group.elementCount = rows.size();
+                group.storageRowOffset = static_cast<std::size_t>(rows.front().row);
+                group.storageElementCount = static_cast<std::size_t>(rows.back().row) + 1;
+                group.storageGroupName = "rtm_decoded_write";
+                group.trueOnlyStorage = true;
+                group.decodedWriteStorage = true;
+                group.regSymbols.reserve(rows.size());
+                for (DecodedWriteRowCandidate &row : rows)
+                {
+                    group.regSymbols.push_back(std::move(row.regSymbol));
+                }
+                group.storageRegSymbols = group.regSymbols;
+                groups.push_back(std::move(group));
+            }
+            std::sort(groups.begin(), groups.end(), [](const GroupCandidate &lhs, const GroupCandidate &rhs) {
+                return lhs.regSymbols.front() < rhs.regSymbols.front();
+            });
+            return groups;
+        }
+
         bool isAllOnesMask(const Graph &graph, ValueId value, int32_t width)
         {
             if (width <= 0)
@@ -2842,11 +3079,32 @@ namespace wolvrix::lib::transform
                 }
                 return std::nullopt;
             };
+            auto valueList = [&](std::span<const ValueId> values) {
+                std::string names;
+                const std::size_t limit = std::min<std::size_t>(values.size(), 8);
+                for (std::size_t index = 0; index < limit; ++index)
+                {
+                    if (!names.empty())
+                    {
+                        names += ',';
+                    }
+                    names += graph.symbolText(graph.valueSymbol(values[index]));
+                    names += '@';
+                    names += valueIdentityKey(graph, values[index]);
+                }
+                if (values.size() > limit)
+                {
+                    names += ",...";
+                }
+                return names;
+            };
             constexpr std::size_t kNoIndex = std::numeric_limits<std::size_t>::max();
             if (group.regSymbols.empty() || group.elementCount != group.regSymbols.size())
             {
                 return reject("invalid_group_shape", kNoIndex, kNoIndex);
             }
+            const std::size_t storageElementCount =
+                group.storageElementCount == 0 ? group.elementCount : group.storageElementCount;
 
             std::vector<const WritePortInfo *> rowWrites;
             std::vector<std::vector<ValueId>> rowUpdateTerms;
@@ -2888,6 +3146,7 @@ namespace wolvrix::lib::transform
             };
             for (std::size_t row = 0; row < group.regSymbols.size(); ++row)
             {
+                const std::size_t logicalRow = group.storageRowOffset + row;
                 const WritePortInfo &write = *rowWrites[row];
                 auto chain = matchMuxWriteChain(graph, write.nextValue);
                 if (!chain)
@@ -2937,8 +3196,8 @@ namespace wolvrix::lib::transform
                                                  ? std::optional<PriorityGuardMatch>{}
                                                  : matchPriorityGuard(graph,
                                                                       updateTerms[termIndex],
-                                                                      group.elementCount);
-                        if (fallbackGuard && fallbackGuard->row == row)
+                                                                      storageElementCount);
+                        if (fallbackGuard && fallbackGuard->row == logicalRow)
                         {
                             effectiveBranches.push_back(MuxWriteBranch{
                                 .guard = updateTerms[termIndex],
@@ -2969,7 +3228,8 @@ namespace wolvrix::lib::transform
                     const MuxWriteBranch &branch = effectiveBranches[sourceBranchIndex];
                     auto guards = matchPriorityGuardAlternatives(graph,
                                                                  branch.guard,
-                                                                 group.elementCount);
+                                                                 storageElementCount,
+                                                                 group.decodedWriteStorage);
                     if (!guards)
                     {
                         return reject("priority_guard",
@@ -2979,7 +3239,7 @@ namespace wolvrix::lib::transform
                     }
                     for (PriorityGuardMatch &guard : *guards)
                     {
-                        if (guard.row != row)
+                        if (guard.row != logicalRow)
                         {
                             return reject("priority_guard",
                                           row,
@@ -3067,19 +3327,25 @@ namespace wolvrix::lib::transform
                              commonKeys[branchIndex] != commonKey ||
                              conflictKeys[branchIndex] != conflictKey)
                     {
+                        std::string extra =
+                            "addr=" + std::to_string(family.addr == guard.addr) +
+                            " data=" + std::to_string(sameWriteData(graph, family.data, branch.data)) +
+                            " mask=" + std::to_string(family.mask == write.mask) +
+                            " events=" +
+                            std::to_string(valueVectorsEqual(family.events, write.events)) +
+                            " edges=" + std::to_string(family.eventEdges == write.eventEdges) +
+                            " common=" + std::to_string(commonKeys[branchIndex] == commonKey) +
+                            " conflicts=" +
+                            std::to_string(conflictKeys[branchIndex] == conflictKey);
+                        if (group.decodedWriteStorage && commonKeys[branchIndex] != commonKey)
+                        {
+                            extra += " first_common=" + valueList(family.commonTerms) +
+                                     " current_common=" + valueList(guard.commonTerms);
+                        }
                         return reject("family_mismatch",
                                       row,
                                       branchIndex,
-                                      "addr=" + std::to_string(family.addr == guard.addr) +
-                                          " data=" + std::to_string(sameWriteData(graph, family.data, branch.data)) +
-                                          " mask=" + std::to_string(family.mask == write.mask) +
-                                          " events=" +
-                                          std::to_string(valueVectorsEqual(family.events, write.events)) +
-                                          " edges=" + std::to_string(family.eventEdges == write.eventEdges) +
-                                          " common=" +
-                                          std::to_string(commonKeys[branchIndex] == commonKey) +
-                                          " conflicts=" +
-                                          std::to_string(conflictKeys[branchIndex] == conflictKey));
+                                      extra);
                     }
                     family.writes.push_back(write);
                 }
@@ -3329,6 +3595,10 @@ namespace wolvrix::lib::transform
                 regulars = std::move(consolidatedMatch->regulars);
                 reset = std::move(consolidatedMatch->reset);
             }
+            else if (group.decodedWriteStorage)
+            {
+                return std::nullopt;
+            }
             else
             {
                 stageStart = ProfileClock::now();
@@ -3483,32 +3753,55 @@ namespace wolvrix::lib::transform
             return candidate;
         }
 
-        ValueId buildInDomainGuard(Graph &graph, ValueId addr, std::size_t rowCount)
+        ValueId buildInDomainGuard(Graph &graph,
+                                   ValueId addr,
+                                   std::size_t rowOffset,
+                                   std::size_t rowCount)
         {
             if (rowCount == 0)
             {
                 return createConstantValue(graph, 1, false, "1'b0", "empty_in_domain");
             }
+            const std::size_t rowLimit = rowOffset + rowCount;
             const int32_t addrWidth = graph.valueWidth(addr);
             if (addrWidth > 0)
             {
-                if (addrWidth < 64 &&
-                    rowCount >= (UINT64_C(1) << static_cast<uint32_t>(addrWidth)))
+                std::vector<ValueId> terms;
+                if (rowOffset != 0)
+                {
+                    const ValueId lower = createConstantValue(graph,
+                                                               addrWidth,
+                                                               false,
+                                                               makeIntLiteral(addrWidth, rowOffset),
+                                                               "write_domain_lower");
+                    terms.push_back(createBinaryOp(graph,
+                                                   OperationKind::kGe,
+                                                   addr,
+                                                   lower,
+                                                   1,
+                                                   false,
+                                                   "write_in_domain_ge"));
+                }
+                if (addrWidth >= 64 || rowLimit < (UINT64_C(1) << static_cast<uint32_t>(addrWidth)))
+                {
+                    const ValueId limit = createConstantValue(graph,
+                                                               addrWidth,
+                                                               false,
+                                                               makeIntLiteral(addrWidth, rowLimit),
+                                                               "write_domain_limit");
+                    terms.push_back(createBinaryOp(graph,
+                                                   OperationKind::kLt,
+                                                   addr,
+                                                   limit,
+                                                   1,
+                                                   false,
+                                                   "write_in_domain_lt"));
+                }
+                if (terms.empty())
                 {
                     return createConstantValue(graph, 1, false, "1'b1", "full_addr_domain");
                 }
-                const ValueId limit = createConstantValue(graph,
-                                                           addrWidth,
-                                                           false,
-                                                           makeIntLiteral(addrWidth, rowCount),
-                                                           "write_domain_limit");
-                return createBinaryOp(graph,
-                                      OperationKind::kLt,
-                                      addr,
-                                      limit,
-                                      1,
-                                      false,
-                                      "write_in_domain_lt");
+                return createAndChain(graph, terms, "write_in_domain_and");
             }
             std::vector<ValueId> hits;
             hits.reserve(rowCount);
@@ -3517,7 +3810,7 @@ namespace wolvrix::lib::transform
                 const ValueId rowConst = createConstantValue(graph,
                                                              graph.valueWidth(addr),
                                                              graph.valueSigned(addr),
-                                                             makeIntLiteral(graph.valueWidth(addr), row),
+                                                             makeIntLiteral(graph.valueWidth(addr), rowOffset + row),
                                                              "write_row_const");
                 hits.push_back(createBinaryOp(graph, OperationKind::kEq, addr, rowConst, 1, false, "write_in_domain_eq"));
             }
@@ -3527,6 +3820,7 @@ namespace wolvrix::lib::transform
         bool rewriteTrueMerge(Graph &graph,
                               const GroupCandidate &group,
                               const TrueMergeCandidate &candidate,
+                              bool enableOrderedWrites,
                               RegToMemProfile *profile = nullptr,
                               const GroupProfileContext *groupProfile = nullptr)
         {
@@ -3552,6 +3846,36 @@ namespace wolvrix::lib::transform
                            " ms=" + std::to_string(ms) +
                            (extra.empty() ? "" : " " + extra));
             };
+            const std::size_t priorityConflictCount = std::accumulate(
+                candidate.regulars.begin(),
+                candidate.regulars.end(),
+                std::size_t{0},
+                [](std::size_t count, const RegularWriteFamily &regular) {
+                    return count + regular.conflicts.size();
+                });
+            std::size_t priorityIndexMismatches = 0;
+            std::size_t priorityRankDistinct = 0;
+            std::size_t priorityRankMin = candidate.regulars.size();
+            std::size_t priorityRankMax = 0;
+            std::vector<uint8_t> seenPriorityRanks(candidate.regulars.size(), 0);
+            for (std::size_t regularIndex = 0; regularIndex < candidate.regulars.size(); ++regularIndex)
+            {
+                const std::size_t priorityRank = candidate.regulars[regularIndex].conflicts.size();
+                priorityIndexMismatches += priorityRank != regularIndex ? 1 : 0;
+                priorityRankMin = std::min(priorityRankMin, priorityRank);
+                priorityRankMax = std::max(priorityRankMax, priorityRank);
+                if (priorityRank < seenPriorityRanks.size() && seenPriorityRanks[priorityRank] == 0)
+                {
+                    seenPriorityRanks[priorityRank] = 1;
+                    ++priorityRankDistinct;
+                }
+            }
+            const bool orderedRankValid = priorityRankDistinct == candidate.regulars.size() &&
+                                          priorityRankMin == 0 &&
+                                          priorityRankMax + 1 == candidate.regulars.size();
+            const bool orderedWrites = enableOrderedWrites &&
+                                       candidate.regulars.size() > 1 &&
+                                       orderedRankValid;
             if (groupProfile != nullptr && groupProfile->verbose)
             {
                 profileLog("group_detail graph_index=" + std::to_string(groupProfile->graphIndex) +
@@ -3560,6 +3884,13 @@ namespace wolvrix::lib::transform
                            " stage=rewrite_start anchors=" + std::to_string(group.anchors.size()) +
                            " members=" + std::to_string(group.regSymbols.size()) +
                            " write_families=" + std::to_string(candidate.regulars.size()) +
+                           " ordered_writes=" + std::to_string(orderedWrites ? 1 : 0) +
+                           " priority_conflicts=" + std::to_string(priorityConflictCount) +
+                           " priority_rank_min=" + std::to_string(priorityRankMin) +
+                           " priority_rank_max=" + std::to_string(priorityRankMax) +
+                           " priority_rank_distinct=" + std::to_string(priorityRankDistinct) +
+                           " priority_rank_valid=" + std::to_string(orderedRankValid ? 1 : 0) +
+                           " priority_index_mismatches=" + std::to_string(priorityIndexMismatches) +
                            " reset=" + std::to_string(candidate.reset.has_value() ? 1 : 0) +
                            " packed_reset=" + std::to_string(candidate.reset && candidate.reset->packed ? 1 : 0));
             }
@@ -3567,10 +3898,12 @@ namespace wolvrix::lib::transform
             const std::string memSymbol = makeUniqueMemoryName(graph, group.regSymbols);
             const Operation firstReg = graph.getOperation(candidate.regOps.front());
             const bool isSigned = getAttr<bool>(firstReg, "isSigned").value_or(false);
+            const std::size_t storageElementCount =
+                group.storageElementCount == 0 ? group.elementCount : group.storageElementCount;
 
             const OperationId memOp = graph.createOperation(OperationKind::kMemory, graph.internSymbol(memSymbol));
             graph.setAttr(memOp, "width", static_cast<int64_t>(group.elementWidth));
-            graph.setAttr(memOp, "row", static_cast<int64_t>(group.elementCount));
+            graph.setAttr(memOp, "row", static_cast<int64_t>(storageElementCount));
             graph.setAttr(memOp, "isSigned", isSigned);
             std::vector<std::string> initKinds;
             std::vector<std::string> initFiles;
@@ -3586,7 +3919,7 @@ namespace wolvrix::lib::transform
                 initKinds.push_back("literal");
                 initFiles.emplace_back();
                 initValues.push_back(*candidate.initValues[row]);
-                initStarts.push_back(static_cast<int64_t>(row));
+                initStarts.push_back(static_cast<int64_t>(group.storageRowOffset + row));
                 initLens.push_back(1);
             }
             if (!initKinds.empty())
@@ -3619,7 +3952,7 @@ namespace wolvrix::lib::transform
                 }
                 int32_t addrWidth = 1;
                 std::size_t addressSpace = 2;
-                while (addressSpace < group.elementCount)
+                while (addressSpace < storageElementCount)
                 {
                     ++addrWidth;
                     addressSpace <<= 1;
@@ -3638,7 +3971,7 @@ namespace wolvrix::lib::transform
                     const ValueId rowConst = createConstantValue(graph,
                                                                  addrWidth,
                                                                  false,
-                                                                 makeIntLiteral(addrWidth, row),
+                                                                 makeIntLiteral(addrWidth, group.storageRowOffset + row),
                                                                  "true_storage_read_row");
                     const ValueId readResult = graph.createValue(
                         graph.makeInternalValSym(),
@@ -3784,7 +4117,11 @@ namespace wolvrix::lib::transform
                 if (candidate.reset->packed)
                 {
                     std::vector<ValueId> concatOperands;
-                    concatOperands.reserve(candidate.reset->rowData.size());
+                    if (group.storageRowOffset + candidate.reset->rowData.size() != storageElementCount)
+                    {
+                        return false;
+                    }
+                    concatOperands.reserve(storageElementCount);
                     for (auto it = candidate.reset->rowData.rbegin(); it != candidate.reset->rowData.rend(); ++it)
                     {
                         const ValueId rowData = materializeWriteData(graph, *it, "true_reset_row_data");
@@ -3794,9 +4131,17 @@ namespace wolvrix::lib::transform
                         }
                         concatOperands.push_back(rowData);
                     }
+                    for (std::size_t row = 0; row < group.storageRowOffset; ++row)
+                    {
+                        concatOperands.push_back(createConstantValue(graph,
+                                                                     group.elementWidth,
+                                                                     false,
+                                                                     makeIntLiteral(group.elementWidth, 0),
+                                                                     "true_reset_padding"));
+                    }
                     fillData = createConcat(graph,
                                             concatOperands,
-                                            static_cast<int32_t>(group.elementWidth * group.elementCount),
+                                            static_cast<int32_t>(group.elementWidth * storageElementCount),
                                             false,
                                             "true_reset_packed");
                 }
@@ -3841,31 +4186,38 @@ namespace wolvrix::lib::transform
 
             stageStart = ProfileClock::now();
             std::size_t emittedWritePorts = 0;
-            for (const RegularWriteFamily &regular : candidate.regulars)
+            for (std::size_t regularIndex = 0; regularIndex < candidate.regulars.size(); ++regularIndex)
             {
+                const RegularWriteFamily &regular = candidate.regulars[regularIndex];
                 std::vector<ValueId> writeGuardTerms = regular.commonTerms;
-                for (const PriorityConflict &conflict : regular.conflicts)
+                if (!orderedWrites)
                 {
-                    const ValueId conflictHit = createBinaryOp(graph,
-                                                               OperationKind::kEq,
-                                                               conflict.addr,
-                                                               regular.addr,
-                                                               1,
-                                                               false,
-                                                               "true_write_conflict_eq");
-                    std::vector<ValueId> conflictTerms = conflict.commonTerms;
-                    conflictTerms.push_back(conflictHit);
-                    const ValueId blocked = createAndChain(graph,
-                                                           conflictTerms,
-                                                           "true_write_conflict_and");
-                    writeGuardTerms.push_back(createUnaryOp(graph,
-                                                            OperationKind::kLogicNot,
-                                                            blocked,
-                                                            1,
-                                                            false,
-                                                            "true_write_conflict_not"));
+                    for (const PriorityConflict &conflict : regular.conflicts)
+                    {
+                        const ValueId conflictHit = createBinaryOp(graph,
+                                                                   OperationKind::kEq,
+                                                                   conflict.addr,
+                                                                   regular.addr,
+                                                                   1,
+                                                                   false,
+                                                                   "true_write_conflict_eq");
+                        std::vector<ValueId> conflictTerms = conflict.commonTerms;
+                        conflictTerms.push_back(conflictHit);
+                        const ValueId blocked = createAndChain(graph,
+                                                               conflictTerms,
+                                                               "true_write_conflict_and");
+                        writeGuardTerms.push_back(createUnaryOp(graph,
+                                                                OperationKind::kLogicNot,
+                                                                blocked,
+                                                                1,
+                                                                false,
+                                                                "true_write_conflict_not"));
+                    }
                 }
-                writeGuardTerms.push_back(buildInDomainGuard(graph, regular.addr, group.elementCount));
+                writeGuardTerms.push_back(buildInDomainGuard(graph,
+                                                             regular.addr,
+                                                             group.storageRowOffset,
+                                                             group.elementCount));
                 const ValueId writeGuard = createAndChain(graph, writeGuardTerms, "true_write_guard");
                 const OperationId writeOp = graph.createOperation(OperationKind::kMemoryWritePort,
                                                                   graph.makeInternalOpSym());
@@ -3884,6 +4236,13 @@ namespace wolvrix::lib::transform
                 }
                 graph.setAttr(writeOp, "memSymbol", memSymbol);
                 graph.setAttr(writeOp, "eventEdge", regular.eventEdges);
+                if (orderedWrites)
+                {
+                    graph.setAttr(writeOp, wolvrix::lib::grh::kMemoryWritePriorityGroupAttr, memSymbol);
+                    graph.setAttr(writeOp,
+                                  wolvrix::lib::grh::kMemoryWritePriorityAttr,
+                                  static_cast<int64_t>(regular.conflicts.size()));
+                }
                 graph.setOpSrcLoc(writeOp, makeTransformSrcLoc(std::string(kPassId), "true_write"));
                 ++emittedWritePorts;
             }
@@ -4075,11 +4434,32 @@ namespace wolvrix::lib::transform
                                        : std::vector<AnchorCandidate>{};
             const int64_t discoverAnchorsMs = elapsedMs(stageStart);
             profile.discoverAnchorsMs += discoverAnchorsMs;
+
+            stageStart = ProfileClock::now();
+            const auto writesByReg = options_.enableTrueMerge
+                                         ? collectRegisterWrites(graph)
+                                         : std::unordered_map<std::string, std::vector<WritePortInfo>>{};
+            const int64_t collectWritesMs = elapsedMs(stageStart);
+            profile.collectWritesMs += collectWritesMs;
             profileLog("graph_stage index=" + std::to_string(graphIndex) +
-                       " stage=discover_intent_anchors ms=" + std::to_string(discoverAnchorsMs) +
+                       " stage=collect_writes ms=" + std::to_string(collectWritesMs) +
+                       " regs_with_writes=" + std::to_string(writesByReg.size()));
+
+            stageStart = ProfileClock::now();
+            auto decodedWriteGroups = options_.enableTrueMerge
+                                          ? discoverDecodedWriteStorageGroups(graph,
+                                                                              writesByReg,
+                                                                              options_.minElementCount)
+                                          : std::vector<GroupCandidate>{};
+            const int64_t discoverDecodedWritesMs = elapsedMs(stageStart);
+            profile.discoverAnchorsMs += discoverDecodedWritesMs;
+            profileLog("graph_stage index=" + std::to_string(graphIndex) +
+                       " stage=discover_anchors ms=" +
+                       std::to_string(discoverAnchorsMs + discoverDecodedWritesMs) +
                        " intent_anchors=" + std::to_string(anchors.size()) +
-                       " true_only_anchors=" + std::to_string(trueOnlyAnchors.size()));
-            if (anchors.empty() && trueOnlyAnchors.empty())
+                       " true_only_anchors=" + std::to_string(trueOnlyAnchors.size()) +
+                       " decoded_write_groups=" + std::to_string(decodedWriteGroups.size()));
+            if (anchors.empty() && trueOnlyAnchors.empty() && decodedWriteGroups.empty())
             {
                 profileLog("graph_done index=" + std::to_string(graphIndex) +
                            " total_ms=" + std::to_string(elapsedMs(graphStart)) +
@@ -4114,6 +4494,24 @@ namespace wolvrix::lib::transform
                 groups.push_back(std::move(trueOnlyGroup));
                 ++acceptedTrueOnlyGroups;
             }
+            std::unordered_set<std::string> claimedGroupRegs;
+            for (const GroupCandidate &group : groups)
+            {
+                claimedGroupRegs.insert(group.regSymbols.begin(), group.regSymbols.end());
+            }
+            std::size_t acceptedDecodedWriteGroups = 0;
+            for (GroupCandidate &decodedWriteGroup : decodedWriteGroups)
+            {
+                if (std::any_of(decodedWriteGroup.regSymbols.begin(),
+                                decodedWriteGroup.regSymbols.end(),
+                                [&](const std::string &symbol) { return claimedGroupRegs.contains(symbol); }))
+                {
+                    continue;
+                }
+                claimedGroupRegs.insert(decodedWriteGroup.regSymbols.begin(), decodedWriteGroup.regSymbols.end());
+                groups.push_back(std::move(decodedWriteGroup));
+                ++acceptedDecodedWriteGroups;
+            }
             const int64_t groupAnchorsMs = elapsedMs(stageStart);
             profile.groupAnchorsMs += groupAnchorsMs;
             const std::size_t edgePaddedGroups = std::count_if(groups.begin(), groups.end(), [](const GroupCandidate &group) {
@@ -4128,6 +4526,7 @@ namespace wolvrix::lib::transform
                        " candidate_groups=" + std::to_string(groupedAnchors.candidateGroups) +
                        " groups=" + std::to_string(groups.size()) +
                        " true_only_groups=" + std::to_string(acceptedTrueOnlyGroups) +
+                       " decoded_write_groups=" + std::to_string(acceptedDecodedWriteGroups) +
                        " edge_padded_groups=" + std::to_string(edgePaddedGroups) +
                        " edge_padded_anchors=" + std::to_string(edgePaddedAnchors) +
                        " conflict_groups=" + std::to_string(groupedAnchors.conflictGroups) +
@@ -4143,16 +4542,6 @@ namespace wolvrix::lib::transform
                        " stage=build_read_index ms=" + std::to_string(buildReadIndexMs) +
                        " regs_with_reads=" + std::to_string(readsByReg.size()));
 
-            stageStart = ProfileClock::now();
-            const auto writesByReg = options_.enableTrueMerge
-                                         ? collectRegisterWrites(graph)
-                                         : std::unordered_map<std::string, std::vector<WritePortInfo>>{};
-            const int64_t collectWritesMs = elapsedMs(stageStart);
-            profile.collectWritesMs += collectWritesMs;
-            profileLog("graph_stage index=" + std::to_string(graphIndex) +
-                       " stage=collect_writes ms=" + std::to_string(collectWritesMs) +
-                       " regs_with_writes=" + std::to_string(writesByReg.size()));
-
             std::size_t localGroupIndex = 0;
             std::size_t visitedGroups = 0;
             std::size_t graphTrueGroups = 0;
@@ -4164,12 +4553,12 @@ namespace wolvrix::lib::transform
             for (auto &group : groups)
             {
                 ++visitedGroups;
-                if (group.anchors.empty())
+                if (group.anchors.empty() && !group.trueOnlyStorage)
                 {
                     continue;
                 }
                 const bool verboseGroup = visitedGroups <= 20 || visitedGroups % 100 == 0 ||
-                                          group.regSymbols.size() >= 500;
+                                          group.regSymbols.size() >= 500 || group.decodedWriteStorage;
                 GroupProfileContext groupProfile{
                     .graphIndex = graphIndex,
                     .groupIndex = visitedGroups,
@@ -4184,6 +4573,12 @@ namespace wolvrix::lib::transform
                                " anchors=" + std::to_string(group.anchors.size()) +
                                " members=" + std::to_string(group.regSymbols.size()) +
                                " element_width=" + std::to_string(group.elementWidth) +
+                               " storage_rows=" +
+                               std::to_string(group.storageElementCount == 0
+                                                  ? group.elementCount
+                                                  : group.storageElementCount) +
+                               " row_offset=" + std::to_string(group.storageRowOffset) +
+                               " decoded_write=" + std::to_string(group.decodedWriteStorage ? 1 : 0) +
                                " first_reg=" + group.regSymbols.front() +
                                " last_reg=" + group.regSymbols.back());
                 }
@@ -4208,7 +4603,12 @@ namespace wolvrix::lib::transform
                                        " stage=rewrite_true_start anchors=" + std::to_string(group.anchors.size()) +
                                        " members=" + std::to_string(group.regSymbols.size()));
                         }
-                        const bool rewriteOk = rewriteTrueMerge(graph, group, *trueCandidate, &profile, &groupProfile);
+                        const bool rewriteOk = rewriteTrueMerge(graph,
+                                                                group,
+                                                                *trueCandidate,
+                                                                options_.enableOrderedWrites,
+                                                                &profile,
+                                                                &groupProfile);
                         const int64_t rewriteMs = elapsedMs(stageStart);
                         profile.rewriteTrueMs += rewriteMs;
                         if (verboseGroup)
