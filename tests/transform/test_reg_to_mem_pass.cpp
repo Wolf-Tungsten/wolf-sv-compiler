@@ -189,13 +189,17 @@ namespace
         return slice;
     }
 
-    int runPass(Design &design, bool trueMerge, bool orderedWrites = false)
+    int runPass(Design &design,
+                bool trueMerge,
+                bool orderedWrites = false,
+                bool decodedWriteStorage = true)
     {
         PassManager manager;
         RegToMemOptions options;
         options.minElementCount = 2;
         options.enableTrueMerge = trueMerge;
         options.enableOrderedWrites = orderedWrites;
+        options.enableDecodedWriteStorage = decodedWriteStorage;
         manager.addPass(std::make_unique<RegToMemPass>(options));
         PassDiagnostics diags;
         const PassManagerResult result = manager.run(design, diags);
@@ -2897,6 +2901,24 @@ namespace
         return 0;
     }
 
+    int testTrueMergeWriteOnlyDecodedStorageCanBeDisabled()
+    {
+        Design design = buildWriteOnlyDecodedStorageDesign();
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runPass(design, true, false, false); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 0 ||
+            countKind(graph, OperationKind::kRegister) != 4 ||
+            countKind(graph, OperationKind::kRegisterReadPort) != 4 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 4)
+        {
+            return fail("disabled write-only decoded storage changed scalar IR");
+        }
+        return 0;
+    }
+
     int testTrueMergeWriteOnlyDecodedStorageOrderedWrites()
     {
         constexpr std::size_t writers = 65;
@@ -3081,6 +3103,10 @@ int main()
             return rc;
         }
         if (const int rc = testTrueMergeWriteOnlyDecodedStorageRejectsSmallFamily(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testTrueMergeWriteOnlyDecodedStorageCanBeDisabled(); rc != 0)
         {
             return rc;
         }

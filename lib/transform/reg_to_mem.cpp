@@ -4446,7 +4446,7 @@ namespace wolvrix::lib::transform
                        " regs_with_writes=" + std::to_string(writesByReg.size()));
 
             stageStart = ProfileClock::now();
-            auto decodedWriteGroups = options_.enableTrueMerge
+            auto decodedWriteGroups = options_.enableTrueMerge && options_.enableDecodedWriteStorage
                                           ? discoverDecodedWriteStorageGroups(graph,
                                                                               writesByReg,
                                                                               options_.minElementCount)

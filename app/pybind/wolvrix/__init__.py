@@ -545,6 +545,11 @@ def _compile_reg_to_mem_kwargs(named: dict[str, Any]) -> list[str]:
         out.append("-ordered-writes")
     elif ordered_writes is False:
         out.append("-no-ordered-writes")
+    decoded_write_storage = _pop_named(local, "decoded_write_storage", None)
+    if decoded_write_storage is True:
+        out.append("-decoded-write-storage")
+    elif decoded_write_storage is False:
+        out.append("-no-decoded-write-storage")
     min_element_count = _pop_named(local, "min_element_count", None)
     if min_element_count is not None:
         out.extend(["-min-element-count", str(min_element_count)])
@@ -616,6 +621,7 @@ def _compile_activity_schedule_kwargs(named: dict[str, Any]) -> list[str]:
     string_options = [
         ("path", "-path"),
         ("export_compute_dag", "-export-compute-dag"),
+        ("final_topo_policy", "-final-topo-policy"),
     ]
     size_options = [
         ("max_op_in_compute_supernode", "-max-op-in-compute-supernode"),

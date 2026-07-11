@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -215,6 +216,83 @@ namespace
                     return fail("Expected explicit supernode_kind to match contained ops");
                 }
             }
+        }
+        return 0;
+    }
+
+    int validateLevelOpTopoOrder(const ScheduleView &schedule)
+    {
+        const auto &supernodeToOps = *schedule.supernodeToOps;
+        const auto &dag = *schedule.dag;
+        const auto &topoOrder = *schedule.topoOrder;
+        std::vector<std::size_t> minOpIndex(supernodeToOps.size(),
+                                            std::numeric_limits<std::size_t>::max());
+        for (std::size_t supernodeId = 0; supernodeId < supernodeToOps.size(); ++supernodeId)
+        {
+            for (const auto opId : supernodeToOps[supernodeId])
+            {
+                minOpIndex[supernodeId] =
+                    std::min(minOpIndex[supernodeId], static_cast<std::size_t>(opId.index));
+            }
+        }
+
+        std::vector<uint32_t> indegree(dag.size(), 0);
+        for (const auto &succs : dag)
+        {
+            for (const uint32_t succ : succs)
+            {
+                if (succ >= indegree.size())
+                {
+                    return fail("Expected final topo DAG successors to be in range");
+                }
+                ++indegree[succ];
+            }
+        }
+        std::vector<uint32_t> frontier;
+        for (uint32_t node = 0; node < indegree.size(); ++node)
+        {
+            if (indegree[node] == 0)
+            {
+                frontier.push_back(node);
+            }
+        }
+
+        std::size_t topoOffset = 0;
+        while (!frontier.empty())
+        {
+            std::sort(frontier.begin(),
+                      frontier.end(),
+                      [&](uint32_t lhs, uint32_t rhs)
+                      {
+                          if (minOpIndex[lhs] != minOpIndex[rhs])
+                          {
+                              return minOpIndex[lhs] < minOpIndex[rhs];
+                          }
+                          return lhs < rhs;
+                      });
+            if (topoOffset + frontier.size() > topoOrder.size() ||
+                !std::equal(frontier.begin(), frontier.end(), topoOrder.begin() + topoOffset))
+            {
+                return fail("Expected level-op final topo to sort each Kahn layer by minimum op index");
+            }
+
+            std::vector<uint32_t> nextFrontier;
+            for (const uint32_t node : frontier)
+            {
+                for (const uint32_t succ : dag[node])
+                {
+                    if (--indegree[succ] == 0)
+                    {
+                        nextFrontier.push_back(succ);
+                    }
+                }
+            }
+            topoOffset += frontier.size();
+            frontier = std::move(nextFrontier);
+        }
+        if (topoOffset != topoOrder.size())
+        {
+            return fail("Expected level-op final topo to contain every supernode");
         }
         return 0;
     }
@@ -2058,6 +2136,82 @@ int main()
             std::find(commitOps.begin(), commitOps.end(), write2) == commitOps.end())
         {
             return fail("Expected oversized guard bucket supernode to contain exactly the same-guard writes");
+        }
+    }
+
+    {
+        currentCase = "final_topo_level_op";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("final_topo_level_op");
+        design.markAsTop("final_topo_level_op");
+
+        const auto a = makeValue(graph, "a", 8);
+        const auto b = makeValue(graph, "b", 8);
+        const auto c = makeValue(graph, "c", 8);
+        graph.bindInputPort("a", a);
+        graph.bindInputPort("b", b);
+        graph.bindInputPort("c", c);
+        for (const auto &[name, input] :
+             std::vector<std::pair<std::string, wolvrix::lib::grh::ValueId>>{
+                 {"not_a", a}, {"not_b", b}, {"not_c", c}})
+        {
+            const auto result = makeValue(graph, name + "_value", 8);
+            const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                  graph.internSymbol(name));
+            graph.addOperand(op, input);
+            graph.addResult(op, result);
+            graph.bindOutputPort(name, result);
+        }
+
+        const auto runSchedule = [&](const std::string &policy, SessionStore &session) -> bool
+        {
+            PassManager manager;
+            manager.options().session = &session;
+            manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
+                .path = "final_topo_level_op",
+                .maxOpInComputeSupernode = 1,
+                .maxOpInComputeNode = 1,
+                .enableCoarsen = false,
+                .finalTopoPolicy = policy,
+            }));
+            PassDiagnostics diags;
+            const PassManagerResult runResult = manager.run(design, diags);
+            return runResult.success && !diags.hasError();
+        };
+
+        SessionStore levelIdSession;
+        if (!runSchedule("level-id", levelIdSession))
+        {
+            return fail("Expected level-id final topo schedule to succeed");
+        }
+        SessionStore levelOpSession;
+        if (!runSchedule("level-op", levelOpSession))
+        {
+            return fail("Expected level-op final topo schedule to succeed");
+        }
+        const auto levelId = loadSchedule(levelIdSession, "final_topo_level_op");
+        const auto levelOp = loadSchedule(levelOpSession, "final_topo_level_op");
+        if (const int rc = validateCommonScheduleShape(graph, levelId); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = validateCommonScheduleShape(graph, levelOp); rc != 0)
+        {
+            return rc;
+        }
+        if (*levelId.supernodeToOps != *levelOp.supernodeToOps ||
+            *levelId.opToSupernode != *levelOp.opToSupernode ||
+            *levelId.dag != *levelOp.dag ||
+            *levelId.valueFanout != *levelOp.valueFanout ||
+            *levelId.supernodeKinds != *levelOp.supernodeKinds ||
+            *levelId.computeNodesBySupernode != *levelOp.computeNodesBySupernode ||
+            *levelId.summaryStats != *levelOp.summaryStats)
+        {
+            return fail("Expected final topo policy to leave schedule structure unchanged");
+        }
+        if (const int rc = validateLevelOpTopoOrder(levelOp); rc != 0)
+        {
+            return rc;
         }
     }
 

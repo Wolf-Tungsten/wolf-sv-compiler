@@ -3076,7 +3076,8 @@ namespace wolvrix::lib::transform
             return total;
         }
 
-        std::vector<uint32_t> topoOrderForDag(const std::vector<std::vector<uint32_t>> &dag)
+        std::vector<uint32_t> topoOrderForDag(const std::vector<std::vector<uint32_t>> &dag,
+                                              const std::vector<std::size_t> *layerOrderKeys = nullptr)
         {
             wolvrix::lib::toposort::TopoDag<uint32_t> topoDag;
             topoDag.reserveNodes(dag.size());
@@ -3096,10 +3097,41 @@ namespace wolvrix::lib::transform
             for (const auto &layer : layers)
             {
                 std::vector<uint32_t> ordered(layer.begin(), layer.end());
-                std::sort(ordered.begin(), ordered.end());
+                std::sort(ordered.begin(),
+                          ordered.end(),
+                          [&](uint32_t lhs, uint32_t rhs)
+                          {
+                              if (layerOrderKeys != nullptr &&
+                                  lhs < layerOrderKeys->size() &&
+                                  rhs < layerOrderKeys->size())
+                              {
+                                  const std::size_t lhsKey = (*layerOrderKeys)[lhs];
+                                  const std::size_t rhsKey = (*layerOrderKeys)[rhs];
+                                  if (lhsKey != rhsKey)
+                                  {
+                                      return lhsKey < rhsKey;
+                                  }
+                              }
+                              return lhs < rhs;
+                          });
                 out.insert(out.end(), ordered.begin(), ordered.end());
             }
             return out;
+        }
+
+        std::vector<std::size_t> minOpIndexBySupernode(const ActivityScheduleBuild &build)
+        {
+            std::vector<std::size_t> keys(build.supernodeToOps.size(),
+                                          std::numeric_limits<std::size_t>::max());
+            for (std::size_t supernodeId = 0; supernodeId < build.supernodeToOps.size(); ++supernodeId)
+            {
+                for (const auto opId : build.supernodeToOps[supernodeId])
+                {
+                    keys[supernodeId] =
+                        std::min(keys[supernodeId], static_cast<std::size_t>(opId.index));
+                }
+            }
+            return keys;
         }
 
         std::vector<uint32_t> topoOrderForDagValueLocal(const std::vector<std::vector<uint32_t>> &dag,
@@ -5736,7 +5768,15 @@ namespace wolvrix::lib::transform
             const auto finalTopoStart = std::chrono::steady_clock::now();
             try
             {
-                build.topoOrder = topoOrderForDag(build.dag);
+                if (options.finalTopoPolicy == "level-op")
+                {
+                    const std::vector<std::size_t> layerOrderKeys = minOpIndexBySupernode(build);
+                    build.topoOrder = topoOrderForDag(build.dag, &layerOrderKeys);
+                }
+                else
+                {
+                    build.topoOrder = topoOrderForDag(build.dag);
+                }
             }
             catch (const std::exception &ex)
             {
@@ -5786,6 +5826,12 @@ namespace wolvrix::lib::transform
         if (options_.path.empty())
         {
             error("activity-schedule requires -path");
+            result.failed = true;
+            return result;
+        }
+        if (options_.finalTopoPolicy != "level-id" && options_.finalTopoPolicy != "level-op")
+        {
+            error("activity-schedule final_topo_policy must be level-id or level-op");
             result.failed = true;
             return result;
         }
@@ -6039,6 +6085,7 @@ namespace wolvrix::lib::transform
                 std::to_string(materializePerf.splitOversizeComputeNodes) +
                 " split_supernodes=" +
                 std::to_string(materializePerf.splitOversizeComputeNodeSupernodes));
+        logInfo("activity-schedule final topo policy: " + options_.finalTopoPolicy);
         logInfo("activity-schedule compute-node coarsen detail: enabled=" +
                 std::string(options_.enableCoarsen ? "true" : "false") +
                 " chain_merge=" + std::string(options_.enableChainMerge ? "true" : "false") +
@@ -6143,6 +6190,7 @@ namespace wolvrix::lib::transform
                 << " local_shared_compute_clones=" << rewrite.stats.localSharedComputeClonesInComputeNodes
                 << " eligible_ops=" << opData.topoOps.size()
                 << " state_read_sets=" << build.stateReadSupernodes.size()
+                << " final_topo_policy=" << options_.finalTopoPolicy
                 << " graph_changed=" << (graphChanged ? "true" : "false");
         logInfo(summary.str());
 
