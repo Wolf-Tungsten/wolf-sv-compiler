@@ -126,6 +126,11 @@ Commit node 是 sink-class op 的中间分组，不参与 compute-node coarsen �
 Commit node 的 `inputValues` 会成为 compute node 构造的起始 value 集合，因为
 commit phase 需要这些 value 在写状态前已经算好。
 
+若 commit operand 由 `kConstant` 定义，且它不是 event operand，schedule 不为该常量
+建立 source compute node 或 compute-to-commit value edge。Emitter 在 commit body 中直接
+使用常量 literal，因此不需要跨 supernode value storage。event operand 例外：它必须保留
+source 和依赖，以维护 round-local edge slot。
+
 ### Supernode
 
 Supernode 是最终导出给 emitter 的静态执行单元。

@@ -1847,6 +1847,21 @@ namespace wolvrix::lib::emit
             }
         }
 
+        std::optional<std::string> staticConstantValueExpr(const Graph &graph, ValueId value)
+        {
+            const OperationId defOpId = graph.valueDef(value);
+            if (!defOpId.valid())
+            {
+                return std::nullopt;
+            }
+            const Operation defOp = graph.getOperation(defOpId);
+            if (defOp.kind() != OperationKind::kConstant)
+            {
+                return std::nullopt;
+            }
+            return constantExpr(graph, defOp, value);
+        }
+
         std::optional<slang::SVInt> parseConstLiteral(std::string_view literal)
         {
             std::string compact;
@@ -7308,7 +7323,13 @@ namespace wolvrix::lib::emit
                 }
                 for (ValueId operand : op.operands())
                 {
-                    markPersistent(operand, kPersistentCommitOperand);
+                    const bool inlineableStaticConstant =
+                        staticConstantValueExpr(graph, operand).has_value() &&
+                        !model.eventEdgeFieldByValue.contains(operand);
+                    if (!inlineableStaticConstant)
+                    {
+                        markPersistent(operand, kPersistentCommitOperand);
+                    }
                 }
             }
 
@@ -7331,6 +7352,9 @@ namespace wolvrix::lib::emit
                 if (defOpId.valid())
                 {
                     const OperationKind defKind = graph.getOperation(defOpId).kind();
+                    const bool inlineableStaticConstant =
+                        staticConstantValueExpr(graph, valueId).has_value() &&
+                        !model.eventEdgeFieldByValue.contains(valueId);
                     if (defKind == OperationKind::kDpicCall || defKind == OperationKind::kSystemFunction)
                     {
                         markPersistent(valueId, kPersistentSideEffectResult);
@@ -7345,7 +7369,7 @@ namespace wolvrix::lib::emit
                             continue;
                         }
                         const bool userCommitPhase = isCommitPhaseOp(graph.getOperation(userOpId));
-                        if (userCommitPhase != defCommitPhase)
+                        if (!inlineableStaticConstant && userCommitPhase != defCommitPhase)
                         {
                             markPersistent(valueId, kPersistentPhaseCrossing);
                             break;
@@ -7672,6 +7696,18 @@ namespace wolvrix::lib::emit
                 return "(" + expr->expr + ")";
             }
             return valueRef(model, value);
+        }
+
+        std::string resolvedCommitValueExpr(const Graph &graph,
+                                            const EmitModel &model,
+                                            ValueId value,
+                                            const SupernodeLocalExprContext *context = nullptr)
+        {
+            if (const auto expr = staticConstantValueExpr(graph, value))
+            {
+                return *expr;
+            }
+            return resolvedScheduleValueExpr(model, value, context);
         }
 
         std::string resolvedStoredValueRefExpr(const EmitModel &model,
@@ -8583,17 +8619,9 @@ namespace wolvrix::lib::emit
 
         std::optional<std::string> stableValueExpr(const Graph &graph, const EmitModel &model, ValueId value)
         {
-            const OperationId defOpId = graph.valueDef(value);
-            if (defOpId.valid())
+            if (const auto expr = staticConstantValueExpr(graph, value))
             {
-                const Operation defOp = graph.getOperation(defOpId);
-                if (defOp.kind() == OperationKind::kConstant)
-                {
-                    if (auto expr = constantExpr(graph, defOp, value))
-                    {
-                        return expr;
-                    }
-                }
+                return expr;
             }
             if (auto it = model.inputFieldByValue.find(value); it != model.inputFieldByValue.end())
             {
@@ -8629,6 +8657,20 @@ namespace wolvrix::lib::emit
                        std::to_string(graph.valueWidth(value)) + ")";
             }
             return "(" + resolvedScheduleValueExpr(model, value, context) + ") != 0";
+        }
+
+        std::string truthyCommitLogicValueExpr(const Graph &graph,
+                                               const EmitModel &model,
+                                               ValueId value,
+                                               const SupernodeLocalExprContext *context)
+        {
+            const std::string valueExpr = resolvedCommitValueExpr(graph, model, value, context);
+            if (isWideLogicValue(graph, value))
+            {
+                return "grhsim_any_bits_words(" + valueExpr + ", " +
+                       std::to_string(graph.valueWidth(value)) + ")";
+            }
+            return "(" + valueExpr + ") != 0";
         }
 
         std::string truthyLogicValueExpr(const Graph &graph, const EmitModel &model, ValueId value)
@@ -9383,6 +9425,15 @@ namespace wolvrix::lib::emit
                                       const SupernodeLocalExprContext *context)
         {
             return castWordsExprForValue(graph, value, resolvedScheduleValueExpr(model, value, context), destWidth);
+        }
+
+        std::string commitWordsExprForValue(const Graph &graph,
+                                            const EmitModel &model,
+                                            ValueId value,
+                                            int32_t destWidth,
+                                            const SupernodeLocalExprContext *context)
+        {
+            return castWordsExprForValue(graph, value, resolvedCommitValueExpr(graph, model, value, context), destWidth);
         }
 
         std::string sliceWordsExpr(const std::string &srcExpr,
@@ -11910,7 +11961,7 @@ namespace wolvrix::lib::emit
         {
             const auto operands = op.operands();
             const std::string condExpr =
-                operands.empty() ? "true" : truthyLogicValueExpr(graph, model, operands[0], context);
+                operands.empty() ? "true" : truthyCommitLogicValueExpr(graph, model, operands[0], context);
             const auto eventExpr = exactEventExpr(graph, model, opId, op);
             if (!eventExpr)
             {
@@ -12436,12 +12487,12 @@ namespace wolvrix::lib::emit
             const StateShadowDecl &shadow = model.stateShadows[write.shadowIndex];
             emitOpComment(stream, op, indent);
             stream << indent << scalarStateWriteHelperName(write.shadowScalarKind) << "("
-                   << truthyLogicValueExpr(graph, model, operands[0], context) << ", "
+                   << truthyCommitLogicValueExpr(graph, model, operands[0], context) << ", "
                    << stateShadowTouchedRef(shadow) << ", "
                    << stateShadowDataRef(shadow, state) << ", "
                    << resolvedStateRefExpr(state, context) << ", "
-                   << resolvedScheduleValueExpr(model, operands[1], context) << ", "
-                   << resolvedScheduleValueExpr(model, operands[2], context) << ", "
+                   << resolvedCommitValueExpr(graph, model, operands[1], context) << ", "
+                   << resolvedCommitValueExpr(graph, model, operands[2], context) << ", "
                    << write.shadowIndex << "u);\n";
             return std::nullopt;
         }
@@ -12512,14 +12563,14 @@ namespace wolvrix::lib::emit
                         if (isPackedFill)
                         {
                             rowWordsExpr = sliceWordsExpr(
-                                wordsExprForValue(graph, model, dataValue, dataWidth, context),
+                                commitWordsExprForValue(graph, model, dataValue, dataWidth, context),
                                 dataWidth,
                                 "fill_row * " + std::to_string(state.width) + "u",
                                 state.width);
                         }
                         else
                         {
-                            rowWordsExpr = wordsExprForValue(graph, model, dataValue, state.width, context);
+                            rowWordsExpr = commitWordsExprForValue(graph, model, dataValue, state.width, context);
                         }
                         stream << innerIndent << "    if ("
                                << assignWordsInlineExpr(
@@ -12538,7 +12589,7 @@ namespace wolvrix::lib::emit
                             {
                                 fillExpr = "(" +
                                            sliceWordsExpr(
-                                               wordsExprForValue(graph, model, dataValue, dataWidth, context),
+                                               commitWordsExprForValue(graph, model, dataValue, dataWidth, context),
                                                dataWidth,
                                                startExpr,
                                                state.width) +
@@ -12547,7 +12598,7 @@ namespace wolvrix::lib::emit
                             else
                             {
                                 fillExpr = "grhsim_slice_dynamic_u64(static_cast<std::uint64_t>(" +
-                                           resolvedScheduleValueExpr(model, dataValue, context) + "), "
+                                           resolvedCommitValueExpr(graph, model, dataValue, context) + "), "
                                            "static_cast<std::uint64_t>(" + startExpr + "), " +
                                            std::to_string(state.width) + ")";
                             }
@@ -12555,7 +12606,7 @@ namespace wolvrix::lib::emit
                         else
                         {
                             fillExpr = "static_cast<std::uint64_t>(" +
-                                       resolvedScheduleValueExpr(model, dataValue, context) + ")";
+                                       resolvedCommitValueExpr(graph, model, dataValue, context) + ")";
                         }
                         stream << innerIndent << "    const auto fill_value = static_cast<" << logicCppType(state.width)
                                << ">(grhsim_trunc_u64(" << fillExpr << ", "
@@ -12573,7 +12624,7 @@ namespace wolvrix::lib::emit
                 }
                 else
                 {
-                    const std::string addrExpr = resolvedScheduleValueExpr(model, operands[1], context);
+                    const std::string addrExpr = resolvedCommitValueExpr(graph, model, operands[1], context);
                     const MemoryRowAccessExpr rowAccess = memoryRowAccessExpr(graph, operands[1], addrExpr, state.rowCount);
                     const std::string rowRef = resolvedStateRefExpr(state, context) + "[" + rowAccess.rowExpr + "]";
                     if (write.memoryMaskMode == WriteDecl::MemoryMaskMode::kConstZero)
@@ -12591,7 +12642,7 @@ namespace wolvrix::lib::emit
                             }
                             stream << assignWordsInlineExpr(
                                           rowRef,
-                                          wordsExprForValue(graph, model, operands[2], state.width, context),
+                                          commitWordsExprForValue(graph, model, operands[2], state.width, context),
                                           state.width)
                                    << ") {\n";
                             emitPerfCounterIncrement(stream, model, innerIndent + "    ", "touchedWriteCount");
@@ -12602,7 +12653,7 @@ namespace wolvrix::lib::emit
                         {
                             stream << innerIndent << "const auto next_value = static_cast<" << logicCppType(state.width)
                                    << ">(grhsim_trunc_u64(static_cast<std::uint64_t>("
-                                   << resolvedScheduleValueExpr(model, operands[2], context) << "), "
+                                   << resolvedCommitValueExpr(graph, model, operands[2], context) << "), "
                                    << state.width << "));\n";
                             stream << innerIndent << "if (";
                             if (!rowAccess.alwaysInRange)
@@ -12626,8 +12677,8 @@ namespace wolvrix::lib::emit
                                 stream << rowAccess.inRangeExpr << " && ";
                             }
                             stream << "grhsim_apply_masked_words_inplace(" << rowRef << ", "
-                                   << wordsExprForValue(graph, model, operands[2], state.width, context) << ", "
-                                   << wordsExprForValue(graph, model, operands[3], state.width, context) << ", "
+                                   << commitWordsExprForValue(graph, model, operands[2], state.width, context) << ", "
+                                   << commitWordsExprForValue(graph, model, operands[3], state.width, context) << ", "
                                    << state.width << ")) {\n";
                             emitPerfCounterIncrement(stream, model, innerIndent + "    ", "touchedWriteCount");
                             emitReaderActivations(innerIndent + "    ");
@@ -12637,12 +12688,12 @@ namespace wolvrix::lib::emit
                         {
                             stream << innerIndent << "const auto mask = static_cast<" << logicCppType(state.width)
                                    << ">(grhsim_trunc_u64(static_cast<std::uint64_t>("
-                                   << resolvedScheduleValueExpr(model, operands[3], context) << "), "
+                                   << resolvedCommitValueExpr(graph, model, operands[3], context) << "), "
                                    << state.width << "));\n";
                             stream << innerIndent << "const auto merged = static_cast<" << logicCppType(state.width)
                                    << ">((" << rowRef << " & ~mask) | (static_cast<"
                                    << logicCppType(state.width) << ">(grhsim_trunc_u64(static_cast<std::uint64_t>("
-                                   << resolvedScheduleValueExpr(model, operands[2], context) << "), "
+                                   << resolvedCommitValueExpr(graph, model, operands[2], context) << "), "
                                    << state.width << ")) & mask));\n";
                             stream << innerIndent << "if (";
                             if (!rowAccess.alwaysInRange)
@@ -12670,7 +12721,7 @@ namespace wolvrix::lib::emit
                         stream << innerIndent << "if ("
                                << assignWordsInlineExpr(
                                       resolvedStateRefExpr(state, context),
-                                      wordsExprForValue(graph, model, operands[1], state.width, context),
+                                      commitWordsExprForValue(graph, model, operands[1], state.width, context),
                                       state.width)
                                << ") {\n";
                     }
@@ -12678,8 +12729,8 @@ namespace wolvrix::lib::emit
                     {
                         stream << innerIndent << "const auto next_value = grhsim_merge_words_masked("
                                << resolvedStateRefExpr(state, context) << ", "
-                               << wordsExprForValue(graph, model, operands[1], state.width, context) << ", "
-                               << wordsExprForValue(graph, model, operands[2], state.width, context) << ", "
+                               << commitWordsExprForValue(graph, model, operands[1], state.width, context) << ", "
+                               << commitWordsExprForValue(graph, model, operands[2], state.width, context) << ", "
                                << state.width << ");\n";
                         stream << innerIndent << "if ("
                                << assignWordsInlineExpr(resolvedStateRefExpr(state, context), "next_value", state.width)
@@ -12695,15 +12746,15 @@ namespace wolvrix::lib::emit
                     {
                         stream << innerIndent << "// constant all-ones mask: direct register update\n";
                         stream << innerIndent << "const auto next_value = static_cast<" << state.cppType
-                               << ">(" << resolvedScheduleValueExpr(model, operands[1], context) << ");\n";
+                               << ">(" << resolvedCommitValueExpr(graph, model, operands[1], context) << ");\n";
                     }
                     else
                     {
                         stream << innerIndent << "const auto next_value = static_cast<" << state.cppType
                                << ">((" << resolvedStateRefExpr(state, context) << " & ~"
-                               << resolvedScheduleValueExpr(model, operands[2], context)
-                               << ") | (" << resolvedScheduleValueExpr(model, operands[1], context) << " & "
-                               << resolvedScheduleValueExpr(model, operands[2], context)
+                               << resolvedCommitValueExpr(graph, model, operands[2], context)
+                               << ") | (" << resolvedCommitValueExpr(graph, model, operands[1], context) << " & "
+                               << resolvedCommitValueExpr(graph, model, operands[2], context)
                                << "));\n";
                     }
                     stream << innerIndent << "if (" << resolvedStateRefExpr(state, context) << " != next_value) {\n";

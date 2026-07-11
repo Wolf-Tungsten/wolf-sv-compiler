@@ -1364,7 +1364,7 @@ namespace
         graph.bindInputPort("d2", d2);
         graph.bindInputPort("d3", d3);
 
-        ValueId mask = addConstant(graph, "const_mask_commit_batch", "mask_commit_batch", 8, "8'hFF");
+        ValueId mask = addConstant(graph, "const_mask_commit_batch", "mask_commit_batch", 8, "8'h0F");
         ValueId one = addConstant(graph, "const_one_commit_batch", "one_commit_batch", 8, "8'h01");
         ValueId zero = addConstant(graph, "const_zero_commit_batch", "zero_commit_batch", 8, "8'h00");
 
@@ -4046,6 +4046,8 @@ int main()
         const std::string commitBatchEval = readFile(commitBatchDir / "grhsim_top_eval.cpp");
         const std::string commitBatchSched =
             readFiles(collectSchedFiles(commitBatchDir, "grhsim_top_sched_"));
+        const std::string commitBatchState =
+            readFiles(collectSchedFiles(commitBatchDir, "grhsim_top_state"));
         if (commitBatchHeader.find("std::uint32_t condIndex = 0;") != std::string::npos ||
             commitBatchHeader.find("std::uint32_t condBase = 0;") != std::string::npos ||
             commitBatchRuntime.find("struct grhsim_active_mask_entry") == std::string::npos ||
@@ -4056,6 +4058,12 @@ int main()
         if (countSubstring(commitBatchSched, "apply_commit_scalar_state_write_table(") != 0)
         {
             return fail("commit-cond-batch should not fall back to legacy commit tables");
+        }
+        if (commitBatchSched.find("grhsim_value_10_0_slot") != std::string::npos ||
+            commitBatchSched.find("UINT64_C(15)") == std::string::npos ||
+            commitBatchState.find("UINT64_C(15)") != std::string::npos)
+        {
+            return fail("commit-cond-batch should inline static mask constants without materializing them");
         }
         const std::size_t eventFastPathBegin = commitBatchEval.find("    if (event_fullpass_candidate) {");
         const std::size_t normalPathBegin = commitBatchEval.find("    while (pending_eval_round) {", eventFastPathBegin);
@@ -4153,11 +4161,11 @@ int main()
             harness << "    sim.fire1 = static_cast<std::uint8_t>(1);\n";
             harness << "    sim.fire2 = static_cast<std::uint8_t>(0);\n";
             harness << "    sim.fire3 = static_cast<std::uint8_t>(0);\n";
-            harness << "    sim.d1 = static_cast<std::uint8_t>(16);\n";
+            harness << "    sim.d1 = static_cast<std::uint8_t>(17);\n";
             harness << "    sim.eval();\n";
             harness << "    sim.clk = true;\n";
             harness << "    sim.eval();\n";
-            harness << "    if (sim.y != static_cast<std::uint8_t>(29)) {\n";
+            harness << "    if (sim.y != static_cast<std::uint8_t>(14)) {\n";
             harness << "        return 2;\n";
             harness << "    }\n";
             harness << "    const auto counters = sim.perf_counters();\n";

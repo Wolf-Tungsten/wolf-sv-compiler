@@ -625,6 +625,7 @@ namespace wolvrix::lib::transform
                 std::size_t clusters = 0;
                 std::size_t clusterDelta = 0;
                 bool changed = false;
+                bool preSiblingsChanged = false;
                 bool out1Changed = false;
                 bool in1Changed = false;
                 bool siblingsChanged = false;
@@ -646,6 +647,7 @@ namespace wolvrix::lib::transform
             std::size_t clustersBeforeCoarsen = 0;
             std::size_t clustersAfterCoarsen = 0;
             std::size_t coarsenIterations = 0;
+            std::size_t coarsenPreSiblingMerges = 0;
             std::size_t coarsenOut1Merges = 0;
             std::size_t coarsenIn1Merges = 0;
             std::size_t coarsenSiblingMerges = 0;
@@ -709,16 +711,22 @@ namespace wolvrix::lib::transform
         }
 
 
-        constexpr std::size_t kComputeNodeCoarsenTailLargeClusterThreshold = 100000;
-        constexpr std::size_t kComputeNodeCoarsenTailMaxClusterDeltaExclusive = 1024;
-        constexpr std::size_t kComputeNodeCoarsenTailMaxConsecutiveIters = 3;
-
         std::uint64_t elapsedMs(const std::chrono::steady_clock::time_point &start) noexcept
         {
             return static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - start)
                     .count());
+        }
+
+        std::size_t scaledCoarsenMaxOps(std::size_t maxOps, std::size_t scale) noexcept
+        {
+            const std::size_t unlimited = std::numeric_limits<std::size_t>::max();
+            if (maxOps == 0 || maxOps > unlimited / scale)
+            {
+                return unlimited;
+            }
+            return maxOps * scale;
         }
 
         struct DisjointSet
@@ -935,6 +943,55 @@ namespace wolvrix::lib::transform
                 key << "|" << part;
             }
             return key.str();
+        }
+
+        bool isSinkEventOperand(const wolvrix::lib::grh::Operation &op, std::size_t operandIndex)
+        {
+            const auto edges =
+                getAttrValue<std::vector<std::string>>(op, "eventEdge").value_or(std::vector<std::string>{});
+            if (edges.empty())
+            {
+                return false;
+            }
+
+            const auto operands = op.operands();
+            std::size_t eventStart = operands.size();
+            switch (op.kind())
+            {
+            case wolvrix::lib::grh::OperationKind::kRegisterWritePort:
+            case wolvrix::lib::grh::OperationKind::kLatchWritePort:
+                eventStart = 3;
+                break;
+            case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
+                eventStart = 4;
+                break;
+            case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
+                eventStart = 2;
+                break;
+            default:
+                return false;
+            }
+
+            const std::size_t safeStart = std::min(eventStart, operands.size());
+            const std::size_t eventCount = std::min(edges.size(), operands.size() - safeStart);
+            return operandIndex >= safeStart && operandIndex < safeStart + eventCount;
+        }
+
+        bool isImmediateCommitConstant(const wolvrix::lib::grh::Graph &graph,
+                                       wolvrix::lib::grh::ValueId value)
+        {
+            if (!value.valid())
+            {
+                return false;
+            }
+            const auto defOpId = graph.valueDef(value);
+            if (!defOpId.valid())
+            {
+                return false;
+            }
+            const auto defOp = graph.getOperation(defOpId);
+            return defOp.kind() == wolvrix::lib::grh::OperationKind::kConstant &&
+                   getAttrValue<std::string>(defOp, "constValue").has_value();
         }
 
         std::optional<wolvrix::lib::grh::ValueId> sinkUpdateCondValue(const wolvrix::lib::grh::Operation &op)
@@ -1178,6 +1235,8 @@ namespace wolvrix::lib::transform
         {
             std::vector<wolvrix::lib::grh::OperationId> ops;
             std::vector<wolvrix::lib::grh::ValueId> inputValues;
+            std::vector<wolvrix::lib::grh::ValueId> eventInputValues;
+            std::vector<wolvrix::lib::grh::ValueId> immediateConstantInputs;
         };
 
         struct ComputeRewriteBuild
@@ -4571,13 +4630,28 @@ namespace wolvrix::lib::transform
                 {
                     const auto sinkOp = opData.topoOps[topoPos];
                     commit.ops.push_back(sinkOp);
-                    for (const auto operand : graph.opOperands(sinkOp))
+                    const auto operands = graph.opOperands(sinkOp);
+                    for (std::size_t operandIndex = 0; operandIndex < operands.size(); ++operandIndex)
                     {
+                        const auto operand = operands[operandIndex];
                         if (!vectorContainsValue(commit.inputValues, operand))
                         {
                             commit.inputValues.push_back(operand);
                             ++out.stats.commitInputRootValues;
                         }
+                        if (isSinkEventOperand(graph.getOperation(sinkOp), operandIndex) &&
+                            !vectorContainsValue(commit.eventInputValues, operand))
+                        {
+                            commit.eventInputValues.push_back(operand);
+                        }
+                    }
+                }
+                for (const auto input : commit.inputValues)
+                {
+                    if (isImmediateCommitConstant(graph, input) &&
+                        !vectorContainsValue(commit.eventInputValues, input))
+                    {
+                        commit.immediateConstantInputs.push_back(input);
                     }
                 }
                 out.commitNodes.push_back(std::move(commit));
@@ -4633,6 +4707,10 @@ namespace wolvrix::lib::transform
             {
                 for (const auto input : commit.inputValues)
                 {
+                    if (vectorContainsValue(commit.immediateConstantInputs, input))
+                    {
+                        continue;
+                    }
                     ensureRootValue(input, true);
                     if (!error.empty())
                     {
@@ -5049,129 +5127,99 @@ namespace wolvrix::lib::transform
             const auto coarsenStart = std::chrono::steady_clock::now();
             if (options.enableCoarsen)
             {
-                const std::size_t coarsenMaxOps =
-                    maxOpsPerComputeSupernode == 0 ? std::numeric_limits<std::size_t>::max()
-                                                   : maxOpsPerComputeSupernode;
-                bool changed = true;
-                std::size_t tailIterations = 0;
-                while (changed)
+                const std::size_t chainCoarsenMaxOps =
+                    scaledCoarsenMaxOps(maxOpsPerComputeSupernode, 32);
+                const std::size_t siblingCoarsenMaxOps =
+                    scaledCoarsenMaxOps(maxOpsPerComputeSupernode, 16);
+                const auto iterStart = std::chrono::steady_clock::now();
+                const std::size_t clustersBeforeIter = clusters.size();
+                bool preSiblingsChanged = false;
+                bool out1Changed = false;
+                bool in1Changed = false;
+                bool siblingsChanged = false;
+                if (options.enableChainMerge)
                 {
-                    const auto iterStart = std::chrono::steady_clock::now();
-                    const std::size_t clustersBeforeIter = clusters.size();
-                    changed = false;
-                    bool out1Changed = false;
-                    bool in1Changed = false;
-                    bool siblingsChanged = false;
-                    if (options.enableChainMerge)
+                    const std::size_t clustersBeforePreSiblings = clusters.size();
+                    preSiblingsChanged = tryMergeNodeSiblings(clusters,
+                                                              rewrite.computeDag,
+                                                              rewrite.computeNodes.size(),
+                                                              nodeTopoPos,
+                                                              nodeOpSizes,
+                                                              siblingCoarsenMaxOps,
+                                                              rewrite,
+                                                              graph);
+                    if (preSiblingsChanged && perf)
                     {
-                        const std::size_t clustersBeforeOut1 = clusters.size();
-                        out1Changed = tryMergeNodeOut1(clusters,
+                        perf->coarsenPreSiblingMerges += clustersBeforePreSiblings >= clusters.size()
+                                                             ? clustersBeforePreSiblings - clusters.size()
+                                                             : 0;
+                    }
+
+                    const std::size_t clustersBeforeOut1 = clusters.size();
+                    out1Changed = tryMergeNodeOut1(clusters,
+                                                   rewrite.computeDag,
+                                                   rewrite.computeNodes.size(),
+                                                   nodeTopoPos,
+                                                   nodeOpSizes,
+                                                   chainCoarsenMaxOps,
+                                                   rewrite,
+                                                   graph);
+                    if (out1Changed && perf)
+                    {
+                        perf->coarsenOut1Merges += clustersBeforeOut1 >= clusters.size()
+                                                       ? clustersBeforeOut1 - clusters.size()
+                                                       : 0;
+                    }
+
+                    const std::size_t clustersBeforeIn1 = clusters.size();
+                    in1Changed = tryMergeNodeIn1(clusters,
+                                                 rewrite.computeDag,
+                                                 rewrite.computeNodes.size(),
+                                                 nodeTopoPos,
+                                                 nodeOpSizes,
+                                                 chainCoarsenMaxOps,
+                                                 rewrite,
+                                                 graph);
+                    if (in1Changed && perf)
+                    {
+                        perf->coarsenIn1Merges += clustersBeforeIn1 >= clusters.size()
+                                                      ? clustersBeforeIn1 - clusters.size()
+                                                      : 0;
+                    }
+                }
+                const std::size_t clustersBeforeSiblings = clusters.size();
+                siblingsChanged = tryMergeNodeSiblings(clusters,
                                                        rewrite.computeDag,
                                                        rewrite.computeNodes.size(),
                                                        nodeTopoPos,
                                                        nodeOpSizes,
-                                                       coarsenMaxOps,
+                                                       siblingCoarsenMaxOps,
                                                        rewrite,
                                                        graph);
-                        if (out1Changed && perf)
-                        {
-                            perf->coarsenOut1Merges += clustersBeforeOut1 >= clusters.size()
-                                                           ? clustersBeforeOut1 - clusters.size()
-                                                           : 0;
-                        }
-                        changed = out1Changed || changed;
-
-                        const std::size_t clustersBeforeIn1 = clusters.size();
-                        in1Changed = tryMergeNodeIn1(clusters,
-                                                     rewrite.computeDag,
-                                                     rewrite.computeNodes.size(),
-                                                     nodeTopoPos,
-                                                     nodeOpSizes,
-                                                     coarsenMaxOps,
-                                                     rewrite,
-                                                     graph);
-                        if (in1Changed && perf)
-                        {
-                            perf->coarsenIn1Merges += clustersBeforeIn1 >= clusters.size()
-                                                          ? clustersBeforeIn1 - clusters.size()
-                                                          : 0;
-                        }
-                        changed = in1Changed || changed;
-                    }
-                    const std::size_t clustersBeforeSiblings = clusters.size();
-                    siblingsChanged = tryMergeNodeSiblings(clusters,
-                                                           rewrite.computeDag,
-                                                           rewrite.computeNodes.size(),
-                                                           nodeTopoPos,
-                                                           nodeOpSizes,
-                                                           coarsenMaxOps,
-                                                           rewrite,
-                                                           graph);
-                    if (siblingsChanged && perf)
-                    {
-                        perf->coarsenSiblingMerges += clustersBeforeSiblings >= clusters.size()
-                                                          ? clustersBeforeSiblings - clusters.size()
-                                                          : 0;
-                    }
-                    changed = siblingsChanged || changed;
-                    if (perf)
-                    {
-                        const std::size_t clustersAfterIter = clusters.size();
-                        const std::size_t clusterDelta =
-                            clustersBeforeIter >= clustersAfterIter ? (clustersBeforeIter - clustersAfterIter) : 0;
-                        const bool smallDeltaTail =
-                            clustersBeforeIter >= kComputeNodeCoarsenTailLargeClusterThreshold &&
-                            clusterDelta < kComputeNodeCoarsenTailMaxClusterDeltaExclusive;
-                        if (changed && smallDeltaTail)
-                        {
-                            ++tailIterations;
-                        }
-                        else
-                        {
-                            tailIterations = 0;
-                        }
-                        const bool tailStopped =
-                            tailIterations >= kComputeNodeCoarsenTailMaxConsecutiveIters;
-                        if (tailStopped)
-                        {
-                            changed = false;
-                            perf->coarsenTailStopped = true;
-                            perf->coarsenTailIterations = tailIterations;
-                        }
-                        ++perf->coarsenIterations;
-                        perf->coarsenIterationStats.push_back({
-                            .iteration = perf->coarsenIterations,
-                            .clusters = clustersAfterIter,
-                            .clusterDelta = clusterDelta,
-                            .changed = changed,
-                            .out1Changed = out1Changed,
-                            .in1Changed = in1Changed,
-                            .siblingsChanged = siblingsChanged,
-                            .tailStopped = tailStopped,
-                            .elapsedMs = elapsedMs(iterStart),
-                        });
-                    }
-                    else
-                    {
-                        const std::size_t clustersAfterIter = clusters.size();
-                        const std::size_t clusterDelta =
-                            clustersBeforeIter >= clustersAfterIter ? (clustersBeforeIter - clustersAfterIter) : 0;
-                        const bool smallDeltaTail =
-                            clustersBeforeIter >= kComputeNodeCoarsenTailLargeClusterThreshold &&
-                            clusterDelta < kComputeNodeCoarsenTailMaxClusterDeltaExclusive;
-                        if (changed && smallDeltaTail)
-                        {
-                            ++tailIterations;
-                        }
-                        else
-                        {
-                            tailIterations = 0;
-                        }
-                        if (tailIterations >= kComputeNodeCoarsenTailMaxConsecutiveIters)
-                        {
-                            changed = false;
-                        }
-                    }
+                if (siblingsChanged && perf)
+                {
+                    perf->coarsenSiblingMerges += clustersBeforeSiblings >= clusters.size()
+                                                      ? clustersBeforeSiblings - clusters.size()
+                                                      : 0;
+                }
+                if (perf)
+                {
+                    const std::size_t clustersAfterIter = clusters.size();
+                    const std::size_t clusterDelta =
+                        clustersBeforeIter >= clustersAfterIter ? (clustersBeforeIter - clustersAfterIter) : 0;
+                    ++perf->coarsenIterations;
+                    perf->coarsenIterationStats.push_back({
+                        .iteration = perf->coarsenIterations,
+                        .clusters = clustersAfterIter,
+                        .clusterDelta = clusterDelta,
+                        .changed = preSiblingsChanged || out1Changed || in1Changed || siblingsChanged,
+                        .preSiblingsChanged = preSiblingsChanged,
+                        .out1Changed = out1Changed,
+                        .in1Changed = in1Changed,
+                        .siblingsChanged = siblingsChanged,
+                        .tailStopped = false,
+                        .elapsedMs = elapsedMs(iterStart),
+                    });
                 }
             }
             if (perf)
@@ -5421,8 +5469,19 @@ namespace wolvrix::lib::transform
                 for (const auto toOpId : build.supernodeToOps[supernodeId])
                 {
                     const auto toOp = graph.getOperation(toOpId);
-                    for (const auto operand : toOp.operands())
+                    const auto operands = toOp.operands();
+                    for (std::size_t operandIndex = 0; operandIndex < operands.size(); ++operandIndex)
                     {
+                        const auto operand = operands[operandIndex];
+                        const bool isImmediateCommitOperand =
+                            supernodeId < build.supernodeKinds.size() &&
+                            build.supernodeKinds[supernodeId] == ActivityScheduleSupernodeKind::Commit &&
+                            isImmediateCommitConstant(graph, operand) &&
+                            !isSinkEventOperand(toOp, operandIndex);
+                        if (isImmediateCommitOperand)
+                        {
+                            continue;
+                        }
                         const auto defOp = graph.valueDef(operand);
                         if (!defOp.valid() || defOp.index >= supernodeOfOp.size())
                         {
@@ -5841,7 +5900,13 @@ namespace wolvrix::lib::transform
         logInfo("activity-schedule compute-node coarsen detail: enabled=" +
                 std::string(options_.enableCoarsen ? "true" : "false") +
                 " chain_merge=" + std::string(options_.enableChainMerge ? "true" : "false") +
+                " mode=single_pass" +
+                " chain_max_ops=" +
+                std::to_string(scaledCoarsenMaxOps(options_.maxOpInComputeSupernode, 32)) +
+                " sibling_max_ops=" +
+                std::to_string(scaledCoarsenMaxOps(options_.maxOpInComputeSupernode, 16)) +
                 " iterations=" + std::to_string(materializePerf.coarsenIterations) +
+                " pre_sibling_merges=" + std::to_string(materializePerf.coarsenPreSiblingMerges) +
                 " out1_merges=" + std::to_string(materializePerf.coarsenOut1Merges) +
                 " in1_merges=" + std::to_string(materializePerf.coarsenIn1Merges) +
                 " sibling_merges=" + std::to_string(materializePerf.coarsenSiblingMerges) +
@@ -5858,6 +5923,7 @@ namespace wolvrix::lib::transform
                     " clusters=" + std::to_string(iter.clusters) +
                     " cluster_delta=" + std::to_string(iter.clusterDelta) +
                     " changed=" + (iter.changed ? std::string("true") : std::string("false")) +
+                    " pre_siblings=" + (iter.preSiblingsChanged ? std::string("1") : std::string("0")) +
                     " out1=" + (iter.out1Changed ? std::string("1") : std::string("0")) +
                     " in1=" + (iter.in1Changed ? std::string("1") : std::string("0")) +
                     " siblings=" + (iter.siblingsChanged ? std::string("1") : std::string("0")) +
