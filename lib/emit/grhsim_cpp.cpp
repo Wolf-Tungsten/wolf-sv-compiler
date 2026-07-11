@@ -8623,6 +8623,212 @@ namespace wolvrix::lib::emit
             return true;
         }
 
+        std::string sanitizeTsvField(std::string_view text)
+        {
+            std::string out(text);
+            for (char &ch : out)
+            {
+                if (ch == '\t' || ch == '\n' || ch == '\r')
+                {
+                    ch = ' ';
+                }
+            }
+            return out;
+        }
+
+        bool emitStateReadLocalityStatsFile(const Graph &graph,
+                                            const EmitModel &model,
+                                            const ScheduleRefs &schedule,
+                                            const std::vector<ScheduleBatch> &scheduleBatches,
+                                            const std::filesystem::path &path,
+                                            std::string &error)
+        {
+            constexpr uint32_t kNoSupernode = std::numeric_limits<uint32_t>::max();
+            std::vector<uint32_t> supernodeByOp;
+            if (!graph.operations().empty())
+            {
+                supernodeByOp.assign(graph.operations().back().index + 1u, kNoSupernode);
+            }
+            std::vector<std::size_t> batchBySupernode(schedule.supernodeToOps.size(), kInvalidIndex);
+            std::vector<std::size_t> readOpsBySupernode(schedule.supernodeToOps.size(), 0);
+            for (std::size_t batchIndex = 0; batchIndex < scheduleBatches.size(); ++batchIndex)
+            {
+                for (uint32_t supernodeId : scheduleBatches[batchIndex].supernodeIds)
+                {
+                    if (supernodeId < batchBySupernode.size())
+                    {
+                        batchBySupernode[supernodeId] = batchIndex;
+                    }
+                }
+            }
+            for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps.size(); ++supernodeId)
+            {
+                for (OperationId opId : schedule.supernodeToOps[supernodeId])
+                {
+                    if (opId.index >= supernodeByOp.size())
+                    {
+                        supernodeByOp.resize(opId.index + 1u, kNoSupernode);
+                    }
+                    supernodeByOp[opId.index] = supernodeId;
+                    const OperationKind kind = graph.opKind(opId);
+                    if (kind == OperationKind::kRegisterReadPort || kind == OperationKind::kLatchReadPort)
+                    {
+                        ++readOpsBySupernode[supernodeId];
+                    }
+                }
+            }
+
+            if (auto dirError = ensureOutputDirectory(path))
+            {
+                error = *dirError;
+                return false;
+            }
+            std::ofstream stream(path, std::ios::out | std::ios::trunc);
+            if (!stream.is_open())
+            {
+                error = "failed to open output file";
+                return false;
+            }
+            stream << "op_id\tvalue_id\tkind\tstate_prefix\tstate_symbol\twidth\tscalar"
+                      "\tsource_supernode\tsource_batch\tsupernode_ops\tsupernode_read_ops"
+                      "\tsupernode_only_state_reads\tmaterialized\talias\tcanonical_value_id"
+                      "\ttracked_change\tboundary_fanout\tgraph_user_edges\tsame_supernode_user_edges"
+                      "\tsame_batch_user_edges\tcross_batch_user_edges\tunscheduled_user_edges"
+                      "\tunique_user_supernodes\tunique_user_batches\n";
+
+            const auto indexText = [](std::size_t index) {
+                return index == kInvalidIndex ? std::string("-1") : std::to_string(index);
+            };
+            std::size_t rowCount = 0;
+            std::size_t scalarRowCount = 0;
+            std::size_t materializedRowCount = 0;
+            std::size_t aliasRowCount = 0;
+            std::size_t pureSupernodeRowCount = 0;
+            std::unordered_set<uint32_t> pureSupernodes;
+            for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps.size(); ++supernodeId)
+            {
+                const auto &supernodeOps = schedule.supernodeToOps[supernodeId];
+                const bool onlyStateReads =
+                    !supernodeOps.empty() && readOpsBySupernode[supernodeId] == supernodeOps.size();
+                for (OperationId opId : supernodeOps)
+                {
+                    const Operation op = graph.getOperation(opId);
+                    if ((op.kind() != OperationKind::kRegisterReadPort &&
+                         op.kind() != OperationKind::kLatchReadPort) ||
+                        op.results().size() != 1)
+                    {
+                        continue;
+                    }
+                    const ValueId valueId = op.results().front();
+                    const char *symbolAttr =
+                        op.kind() == OperationKind::kRegisterReadPort ? "regSymbol" : "latchSymbol";
+                    const std::string stateSymbol = getAttribute<std::string>(op, symbolAttr).value_or(std::string());
+                    const std::size_t separator = stateSymbol.find('$');
+                    const std::string statePrefix =
+                        separator == std::string::npos ? stateSymbol : stateSymbol.substr(0, separator);
+                    const bool scalar =
+                        graph.valueType(valueId) == ValueType::Logic && !isWideLogicValue(graph, valueId);
+                    const bool materialized = isMaterializedValue(model, valueId);
+                    const bool alias = model.materializedValueAliasByValue.contains(valueId);
+                    const ValueId canonicalValue = canonicalMaterializedStorageValue(model, valueId);
+                    const auto boundaryIt = model.boundaryFanoutByValue.find(valueId);
+                    const std::size_t boundaryFanout =
+                        boundaryIt == model.boundaryFanoutByValue.end() ? 0 : boundaryIt->second.size();
+                    const std::size_t sourceBatch =
+                        supernodeId < batchBySupernode.size() ? batchBySupernode[supernodeId] : kInvalidIndex;
+
+                    std::size_t graphUserEdges = 0;
+                    std::size_t sameSupernodeUserEdges = 0;
+                    std::size_t sameBatchUserEdges = 0;
+                    std::size_t crossBatchUserEdges = 0;
+                    std::size_t unscheduledUserEdges = 0;
+                    std::unordered_set<uint32_t> userSupernodes;
+                    std::unordered_set<std::size_t> userBatches;
+                    for (const auto &user : graph.getValue(valueId).users())
+                    {
+                        ++graphUserEdges;
+                        const OperationId userOpId = user.operation;
+                        const uint32_t userSupernode =
+                            userOpId.valid() && userOpId.index < supernodeByOp.size()
+                                ? supernodeByOp[userOpId.index]
+                                : kNoSupernode;
+                        if (userSupernode == kNoSupernode || userSupernode >= batchBySupernode.size())
+                        {
+                            ++unscheduledUserEdges;
+                            continue;
+                        }
+                        const std::size_t userBatch = batchBySupernode[userSupernode];
+                        userSupernodes.insert(userSupernode);
+                        if (userBatch != kInvalidIndex)
+                        {
+                            userBatches.insert(userBatch);
+                        }
+                        if (userSupernode == supernodeId)
+                        {
+                            ++sameSupernodeUserEdges;
+                        }
+                        else if (sourceBatch != kInvalidIndex && userBatch == sourceBatch)
+                        {
+                            ++sameBatchUserEdges;
+                        }
+                        else
+                        {
+                            ++crossBatchUserEdges;
+                        }
+                    }
+
+                    stream << opId.index << '\t'
+                           << valueId.index << '\t'
+                           << toString(op.kind()) << '\t'
+                           << sanitizeTsvField(statePrefix) << '\t'
+                           << sanitizeTsvField(stateSymbol) << '\t'
+                           << graph.valueWidth(valueId) << '\t'
+                           << (scalar ? 1 : 0) << '\t'
+                           << supernodeId << '\t'
+                           << indexText(sourceBatch) << '\t'
+                           << supernodeOps.size() << '\t'
+                           << readOpsBySupernode[supernodeId] << '\t'
+                           << (onlyStateReads ? 1 : 0) << '\t'
+                           << (materialized ? 1 : 0) << '\t'
+                           << (alias ? 1 : 0) << '\t'
+                           << canonicalValue.index << '\t'
+                           << (valueNeedsTrackedChange(model, valueId) ? 1 : 0) << '\t'
+                           << boundaryFanout << '\t'
+                           << graphUserEdges << '\t'
+                           << sameSupernodeUserEdges << '\t'
+                           << sameBatchUserEdges << '\t'
+                           << crossBatchUserEdges << '\t'
+                           << unscheduledUserEdges << '\t'
+                           << userSupernodes.size() << '\t'
+                           << userBatches.size() << '\n';
+                    ++rowCount;
+                    scalarRowCount += scalar ? 1u : 0u;
+                    materializedRowCount += materialized ? 1u : 0u;
+                    aliasRowCount += alias ? 1u : 0u;
+                    if (onlyStateReads)
+                    {
+                        ++pureSupernodeRowCount;
+                        pureSupernodes.insert(supernodeId);
+                    }
+                }
+            }
+            if (!stream.good())
+            {
+                error = "failed while writing output file";
+                return false;
+            }
+            std::fprintf(stderr,
+                         "[GRHSIM_STATE_READ_LOCALITY] path=%s rows=%zu scalar=%zu materialized=%zu aliases=%zu pure_supernodes=%zu pure_rows=%zu\n",
+                         path.string().c_str(),
+                         rowCount,
+                         scalarRowCount,
+                         materializedRowCount,
+                         aliasRowCount,
+                         pureSupernodes.size(),
+                         pureSupernodeRowCount);
+            return true;
+        }
+
         bool collectDeclaredSymbolWaveformSignals(const Graph &graph,
                                                   const EmitModel &model,
                                                   std::vector<WaveformSignalDecl> &outSignals)
@@ -15213,6 +15419,10 @@ namespace wolvrix::lib::emit
         const PerfMode perfMode = parsePerfMode(options);
         const bool emitRuntimeProfile =
             parseBooleanEmitOption(options, "emit_runtime_profile", "GRHSIM_EMIT_RUNTIME_PROFILE");
+        const bool emitStateReadLocalityStats =
+            parseBooleanEmitOption(options,
+                                   "state_read_locality_stats",
+                                   "WOLVRIX_GRHSIM_STATE_READ_LOCALITY_STATS");
         const bool inputFullpassSpecialization =
             parseBooleanEmitOption(options,
                                    "input_fullpass_specialization",
@@ -15355,6 +15565,19 @@ namespace wolvrix::lib::emit
         const std::filesystem::path makefilePath = outDir / "Makefile";
         const std::filesystem::path emitStatsPath = outDir / "grhsim_emit_stats.json";
         const std::uint64_t maxOutputFileBytes = effectiveMaxOutputFileBytes(options);
+
+        if (emitStateReadLocalityStats)
+        {
+            const std::filesystem::path localityPath = outDir / "grhsim_state_read_locality.tsv";
+            std::string localityError;
+            if (!emitStateReadLocalityStatsFile(
+                    graph, model, schedule, scheduleBatches, localityPath, localityError))
+            {
+                reportError(localityError, localityPath.string());
+                result.success = false;
+                return result;
+            }
+        }
 
         // NO0190 §10.1: EMIT-time output — STATIC per-supernode cost columns, written host-side
         // (not baked into generated code). Kept separate from the runtime fire-count output

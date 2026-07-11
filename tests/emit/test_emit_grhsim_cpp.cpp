@@ -10,6 +10,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1012,7 +1014,8 @@ namespace
                                   EmitResult &result,
                                   ActivityScheduleOptions scheduleOptions = {},
                                   bool posedgeFullpassSpecialization = false,
-                                  bool perf = false)
+                                  bool perf = false,
+                                  bool stateReadLocalityStats = false)
     {
         SessionStore session;
         if (scheduleOptions.path.empty())
@@ -1039,6 +1042,10 @@ namespace
         if (perf)
         {
             options.attributes["perf"] = "eval";
+        }
+        if (stateReadLocalityStats)
+        {
+            options.attributes["state_read_locality_stats"] = "1";
         }
 
         EmitGrhSimCpp emitter(&diag);
@@ -5146,7 +5153,10 @@ int main()
                                       repeatedReadDir,
                                       repeatedReadDiag,
                                       repeatedReadResult,
-                                      repeatedReadScheduleOptions))
+                                      repeatedReadScheduleOptions,
+                                      false,
+                                      false,
+                                      true))
         {
             return fail("repeated state-read activity-schedule pass failed");
         }
@@ -5168,6 +5178,57 @@ int main()
                            "same-state scalar read: reuse consolidated storage slot") == 0)
         {
             return fail("repeated scalar state reads should share one materialized slot per supernode");
+        }
+        const std::filesystem::path repeatedReadLocalityPath =
+            repeatedReadDir / "grhsim_state_read_locality.tsv";
+        const std::string repeatedReadLocality = readFile(repeatedReadLocalityPath);
+        std::istringstream localityStream(repeatedReadLocality);
+        std::string localityLine;
+        if (!std::getline(localityStream, localityLine))
+        {
+            return fail("repeated state-read locality TSV is missing");
+        }
+        const std::vector<std::string_view> localityHeader = splitTabs(localityLine);
+        const auto columnIndex = [&](std::string_view name) {
+            const auto it = std::find(localityHeader.begin(), localityHeader.end(), name);
+            return it == localityHeader.end()
+                       ? std::numeric_limits<std::size_t>::max()
+                       : static_cast<std::size_t>(std::distance(localityHeader.begin(), it));
+        };
+        const std::size_t stateSymbolColumn = columnIndex("state_symbol");
+        const std::size_t materializedColumn = columnIndex("materialized");
+        const std::size_t aliasColumn = columnIndex("alias");
+        const std::size_t onlyReadsColumn = columnIndex("supernode_only_state_reads");
+        if (stateSymbolColumn == std::numeric_limits<std::size_t>::max() ||
+            materializedColumn == std::numeric_limits<std::size_t>::max() ||
+            aliasColumn == std::numeric_limits<std::size_t>::max() ||
+            onlyReadsColumn == std::numeric_limits<std::size_t>::max())
+        {
+            return fail("repeated state-read locality TSV schema is incomplete");
+        }
+        std::size_t repeatedReadRows = 0;
+        bool foundRepeatedState = false;
+        bool foundMaterialized = false;
+        bool foundAlias = false;
+        bool foundPureOrMixedClassification = false;
+        while (std::getline(localityStream, localityLine))
+        {
+            const std::vector<std::string_view> fields = splitTabs(localityLine);
+            if (fields.size() != localityHeader.size())
+            {
+                return fail("repeated state-read locality TSV row width mismatch");
+            }
+            ++repeatedReadRows;
+            foundRepeatedState = foundRepeatedState || fields[stateSymbolColumn] == "repeated_q";
+            foundMaterialized = foundMaterialized || fields[materializedColumn] == "1";
+            foundAlias = foundAlias || fields[aliasColumn] == "1";
+            foundPureOrMixedClassification =
+                foundPureOrMixedClassification || fields[onlyReadsColumn] == "0" || fields[onlyReadsColumn] == "1";
+        }
+        if (repeatedReadRows == 0 || !foundRepeatedState || !foundMaterialized || !foundAlias ||
+            !foundPureOrMixedClassification)
+        {
+            return fail("repeated state-read locality TSV contents are incomplete");
         }
         const std::filesystem::path repeatedReadHarnessPath = repeatedReadDir / "grhsim_top_harness.cpp";
         {
