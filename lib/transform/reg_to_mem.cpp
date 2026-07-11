@@ -1160,11 +1160,12 @@ namespace wolvrix::lib::transform
             return width >= 64 || rowCount <= (UINT64_C(1) << static_cast<uint32_t>(width));
         }
 
-        std::optional<PriorityGuardMatch> matchPriorityGuard(const Graph &graph,
-                                                             ValueId guard,
-                                                             std::size_t rowCount = 0)
+        std::optional<PriorityGuardMatch> matchPriorityGuardTerms(
+            const Graph &graph,
+            std::span<const ValueId> terms,
+            std::size_t rowCount,
+            bool allowCompoundConflictWithoutNarrowSelector = false)
         {
-            const std::vector<ValueId> terms = flattenLogicAndTerms(graph, guard);
             std::vector<std::pair<ValueId, EqualityTerm>> positiveEqs;
             std::vector<std::pair<ValueId, EqualityTerm>> negativeEqs;
             std::vector<ValueId> otherTerms;
@@ -1258,7 +1259,8 @@ namespace wolvrix::lib::transform
                     }
                     conflictEq = std::move(*eq);
                 }
-                if (!validConflict || !conflictEq || !hasNarrowSelector)
+                if (!validConflict || !conflictEq ||
+                    (!hasNarrowSelector && !allowCompoundConflictWithoutNarrowSelector))
                 {
                     commonTerms.push_back(term);
                     continue;
@@ -1274,6 +1276,76 @@ namespace wolvrix::lib::transform
                 .conflicts = std::move(conflicts),
                 .row = positiveEq->row,
             };
+        }
+
+        std::optional<PriorityGuardMatch> matchPriorityGuard(const Graph &graph,
+                                                             ValueId guard,
+                                                             std::size_t rowCount = 0)
+        {
+            const std::vector<ValueId> terms = flattenLogicAndTerms(graph, guard);
+            return matchPriorityGuardTerms(graph, terms, rowCount);
+        }
+
+        std::optional<std::vector<PriorityGuardMatch>> matchPriorityGuardAlternatives(
+            const Graph &graph,
+            ValueId guard,
+            std::size_t rowCount)
+        {
+            if (auto direct = matchPriorityGuard(graph, guard, rowCount))
+            {
+                std::vector<PriorityGuardMatch> result;
+                result.push_back(std::move(*direct));
+                return result;
+            }
+
+            const std::vector<ValueId> outerTerms = flattenLogicAndTerms(graph, guard);
+            std::optional<std::size_t> disjunctionIndex;
+            std::vector<ValueId> alternatives;
+            for (std::size_t index = 0; index < outerTerms.size(); ++index)
+            {
+                std::vector<ValueId> candidate = flattenLogicOrTerms(graph, outerTerms[index]);
+                if (candidate.size() <= 1)
+                {
+                    continue;
+                }
+                if (disjunctionIndex)
+                {
+                    return std::nullopt;
+                }
+                disjunctionIndex = index;
+                alternatives = std::move(candidate);
+            }
+            if (!disjunctionIndex || alternatives.size() > 32)
+            {
+                return std::nullopt;
+            }
+
+            std::vector<PriorityGuardMatch> result;
+            result.reserve(alternatives.size());
+            for (ValueId alternative : alternatives)
+            {
+                std::vector<ValueId> terms;
+                terms.reserve(outerTerms.size() + 4);
+                for (std::size_t index = 0; index < outerTerms.size(); ++index)
+                {
+                    if (index != *disjunctionIndex)
+                    {
+                        terms.push_back(outerTerms[index]);
+                    }
+                }
+                std::vector<ValueId> alternativeTerms = flattenLogicAndTerms(graph, alternative);
+                terms.insert(terms.end(), alternativeTerms.begin(), alternativeTerms.end());
+                auto matched = matchPriorityGuardTerms(graph,
+                                                       terms,
+                                                       rowCount,
+                                                       true);
+                if (!matched)
+                {
+                    return std::nullopt;
+                }
+                result.push_back(std::move(*matched));
+            }
+            return result;
         }
 
         std::string priorityConflictSetKey(const std::vector<PriorityConflict> &conflicts)
@@ -2809,6 +2881,11 @@ namespace wolvrix::lib::transform
             std::vector<std::string> conflictKeys;
             std::optional<bool> hasReset;
             std::optional<std::string> resetTermsKey;
+            struct MatchedBranch
+            {
+                PriorityGuardMatch guard;
+                WriteData data;
+            };
             for (std::size_t row = 0; row < group.regSymbols.size(); ++row)
             {
                 const WritePortInfo &write = *rowWrites[row];
@@ -2884,35 +2961,33 @@ namespace wolvrix::lib::transform
                     return reject("reset_presence_mismatch", row, kNoIndex);
                 }
 
-                if (row == 0)
+                std::vector<MatchedBranch> matchedBranches;
+                for (std::size_t sourceBranchIndex = 0;
+                     sourceBranchIndex < effectiveBranches.size();
+                     ++sourceBranchIndex)
                 {
-                    result.regulars.resize(effectiveBranches.size());
-                    commonKeys.resize(effectiveBranches.size());
-                    conflictKeys.resize(effectiveBranches.size());
-                }
-                else if (result.regulars.size() != effectiveBranches.size())
-                {
-                    return reject("branch_count_mismatch",
-                                  row,
-                                  kNoIndex,
-                                  "expected=" + std::to_string(result.regulars.size()) +
-                                      " actual=" + std::to_string(effectiveBranches.size()));
-                }
-
-                for (std::size_t branchIndex = 0; branchIndex < effectiveBranches.size(); ++branchIndex)
-                {
-                    const MuxWriteBranch &branch = effectiveBranches[branchIndex];
-                    auto guard = matchPriorityGuard(graph, branch.guard, group.elementCount);
-                    if (!guard || guard->row != row)
+                    const MuxWriteBranch &branch = effectiveBranches[sourceBranchIndex];
+                    auto guards = matchPriorityGuardAlternatives(graph,
+                                                                 branch.guard,
+                                                                 group.elementCount);
+                    if (!guards)
                     {
                         return reject("priority_guard",
                                       row,
-                                      branchIndex,
-                                      guard ? "guard_row=" + std::to_string(guard->row) : "unmatched=1");
+                                      sourceBranchIndex,
+                                      "unmatched=1");
                     }
-                    if (rowHasReset)
+                    for (PriorityGuardMatch &guard : *guards)
                     {
-                        if (!commonTermsExcludeResetSet(graph, guard->commonTerms, resetTerms))
+                        if (guard.row != row)
+                        {
+                            return reject("priority_guard",
+                                          row,
+                                          sourceBranchIndex,
+                                          "guard_row=" + std::to_string(guard.row));
+                        }
+                        if (rowHasReset &&
+                            !commonTermsExcludeResetSet(graph, guard.commonTerms, resetTerms))
                         {
                             std::string termNames;
                             for (ValueId resetTerm : resetTerms)
@@ -2922,12 +2997,14 @@ namespace wolvrix::lib::transform
                                     termNames += ",";
                                 }
                                 termNames += graph.symbolText(graph.valueSymbol(resetTerm));
-                                termNames += commonTermsExcludeResetTerm(graph, guard->commonTerms, resetTerm)
+                                termNames += commonTermsExcludeResetTerm(graph,
+                                                                        guard.commonTerms,
+                                                                        resetTerm)
                                                  ? ":excluded"
                                                  : ":live";
                             }
                             std::string commonNames;
-                            for (ValueId commonTerm : guard->commonTerms)
+                            for (ValueId commonTerm : guard.commonTerms)
                             {
                                 if (!commonNames.empty())
                                 {
@@ -2937,27 +3014,52 @@ namespace wolvrix::lib::transform
                             }
                             return reject("reset_negation",
                                           row,
-                                          branchIndex,
+                                          sourceBranchIndex,
                                           "reset_terms=" + termNames + " common_terms=" + commonNames);
                         }
+                        matchedBranches.push_back(MatchedBranch{
+                            .guard = std::move(guard),
+                            .data = branch.data,
+                        });
                     }
+                }
+
+                if (row == 0)
+                {
+                    result.regulars.resize(matchedBranches.size());
+                    commonKeys.resize(matchedBranches.size());
+                    conflictKeys.resize(matchedBranches.size());
+                }
+                else if (result.regulars.size() != matchedBranches.size())
+                {
+                    return reject("branch_count_mismatch",
+                                  row,
+                                  kNoIndex,
+                                  "expected=" + std::to_string(result.regulars.size()) +
+                                      " actual=" + std::to_string(matchedBranches.size()));
+                }
+
+                for (std::size_t branchIndex = 0; branchIndex < matchedBranches.size(); ++branchIndex)
+                {
+                    MatchedBranch &branch = matchedBranches[branchIndex];
+                    PriorityGuardMatch &guard = branch.guard;
 
                     RegularWriteFamily &family = result.regulars[branchIndex];
-                    const std::string commonKey = valueSetKey(guard->commonTerms);
-                    const std::string conflictKey = priorityConflictSetKey(guard->conflicts);
+                    const std::string commonKey = valueSetKey(guard.commonTerms);
+                    const std::string conflictKey = priorityConflictSetKey(guard.conflicts);
                     if (row == 0)
                     {
-                        family.addr = guard->addr;
+                        family.addr = guard.addr;
                         family.data = branch.data;
                         family.mask = write.mask;
                         family.events = write.events;
                         family.eventEdges = write.eventEdges;
-                        family.commonTerms = std::move(guard->commonTerms);
-                        family.conflicts = std::move(guard->conflicts);
+                        family.commonTerms = std::move(guard.commonTerms);
+                        family.conflicts = std::move(guard.conflicts);
                         commonKeys[branchIndex] = commonKey;
                         conflictKeys[branchIndex] = conflictKey;
                     }
-                    else if (family.addr != guard->addr ||
+                    else if (family.addr != guard.addr ||
                              !sameWriteData(graph, family.data, branch.data) ||
                              family.mask != write.mask ||
                              !valueVectorsEqual(family.events, write.events) ||
@@ -2968,7 +3070,7 @@ namespace wolvrix::lib::transform
                         return reject("family_mismatch",
                                       row,
                                       branchIndex,
-                                      "addr=" + std::to_string(family.addr == guard->addr) +
+                                      "addr=" + std::to_string(family.addr == guard.addr) +
                                           " data=" + std::to_string(sameWriteData(graph, family.data, branch.data)) +
                                           " mask=" + std::to_string(family.mask == write.mask) +
                                           " events=" +

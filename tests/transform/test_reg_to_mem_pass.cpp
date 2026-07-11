@@ -1025,6 +1025,165 @@ namespace
         return design;
     }
 
+    Design buildTrueMergeOrDecodedPriorityDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        constexpr int32_t width = 3;
+        constexpr std::size_t rows = 4;
+        constexpr std::size_t writers = 3;
+        std::vector<std::string> regs;
+        regs.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            const std::string reg = "decoded_r" + std::to_string(row);
+            regs.push_back(reg);
+            addRegister(graph, reg, width);
+        }
+
+        const ValueId index = makeLogicValue(graph, "decoded_index", 2);
+        const ValueId reset = makeLogicValue(graph, "decoded_reset", 1);
+        const ValueId highEnable = makeLogicValue(graph, "decoded_high_enable", 1);
+        const ValueId highAddr = makeLogicValue(graph, "decoded_high_addr", 2);
+        const ValueId clk = makeLogicValue(graph, "decoded_clk", 1);
+        graph.bindInputPort("decoded_index", index);
+        graph.bindInputPort("decoded_reset", reset);
+        graph.bindInputPort("decoded_high_enable", highEnable);
+        graph.bindInputPort("decoded_high_addr", highAddr);
+        graph.bindInputPort("decoded_clk", clk);
+
+        std::array<ValueId, writers> enables;
+        std::array<ValueId, writers> addresses;
+        for (std::size_t writer = 0; writer < writers; ++writer)
+        {
+            enables[writer] = makeLogicValue(graph,
+                                             "decoded_enable_" + std::to_string(writer),
+                                             1);
+            addresses[writer] = makeLogicValue(graph,
+                                               "decoded_addr_" + std::to_string(writer),
+                                               2);
+            graph.bindInputPort("decoded_enable_" + std::to_string(writer), enables[writer]);
+            graph.bindInputPort("decoded_addr_" + std::to_string(writer), addresses[writer]);
+        }
+
+        ValueId selected;
+        addSliceArrayAnchor(graph, "decoded", regs, index, width, selected);
+        graph.bindOutputPort("decoded_selected", selected);
+
+        const ValueId mask = addConstant(graph,
+                                         "decoded_mask_op",
+                                         "decoded_mask",
+                                         width,
+                                         "3'b111");
+        const ValueId writeData = addConstant(graph,
+                                              "decoded_data_op",
+                                              "decoded_data",
+                                              width,
+                                              "3'd5");
+        const ValueId resetData = addConstant(graph,
+                                              "decoded_reset_data_op",
+                                              "decoded_reset_data",
+                                              width,
+                                              "3'd0");
+        const ValueId notReset = addUnary(graph,
+                                          OperationKind::kLogicNot,
+                                          "decoded_not_reset_op",
+                                          "decoded_not_reset",
+                                          reset);
+
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            const std::string suffix = std::to_string(row);
+            const ValueId rowConst = addConstant(graph,
+                                                 "decoded_row_" + suffix + "_op",
+                                                 "decoded_row_" + suffix,
+                                                 2,
+                                                 "2'd" + suffix);
+            const ValueId highHit = addBinary(graph,
+                                              OperationKind::kEq,
+                                              "decoded_high_hit_" + suffix + "_op",
+                                              "decoded_high_hit_" + suffix,
+                                              highAddr,
+                                              rowConst);
+            const ValueId highGuard = addBinary(graph,
+                                                OperationKind::kLogicAnd,
+                                                "decoded_high_guard_" + suffix + "_op",
+                                                "decoded_high_guard_" + suffix,
+                                                highEnable,
+                                                highHit);
+            const ValueId notHighGuard = addUnary(graph,
+                                                  OperationKind::kLogicNot,
+                                                  "decoded_not_high_guard_" + suffix + "_op",
+                                                  "decoded_not_high_guard_" + suffix,
+                                                  highGuard);
+
+            std::array<ValueId, writers> writerGuards;
+            for (std::size_t writer = 0; writer < writers; ++writer)
+            {
+                const std::string writerSuffix = suffix + "_" + std::to_string(writer);
+                const ValueId hit = addBinary(graph,
+                                              OperationKind::kEq,
+                                              "decoded_hit_" + writerSuffix + "_op",
+                                              "decoded_hit_" + writerSuffix,
+                                              addresses[writer],
+                                              rowConst);
+                writerGuards[writer] = addBinary(graph,
+                                                 OperationKind::kLogicAnd,
+                                                 "decoded_writer_guard_" + writerSuffix + "_op",
+                                                 "decoded_writer_guard_" + writerSuffix,
+                                                 enables[writer],
+                                                 hit);
+            }
+            const ValueId firstOr = addBinary(graph,
+                                              OperationKind::kLogicOr,
+                                              "decoded_first_or_" + suffix + "_op",
+                                              "decoded_first_or_" + suffix,
+                                              writerGuards[0],
+                                              writerGuards[1]);
+            const ValueId anyWriter = addBinary(graph,
+                                                OperationKind::kLogicOr,
+                                                "decoded_any_writer_" + suffix + "_op",
+                                                "decoded_any_writer_" + suffix,
+                                                firstOr,
+                                                writerGuards[2]);
+            const ValueId priorityAllowed = addBinary(graph,
+                                                      OperationKind::kLogicAnd,
+                                                      "decoded_priority_allowed_" + suffix + "_op",
+                                                      "decoded_priority_allowed_" + suffix,
+                                                      notReset,
+                                                      notHighGuard);
+            const ValueId active = addBinary(graph,
+                                             OperationKind::kLogicAnd,
+                                             "decoded_active_" + suffix + "_op",
+                                             "decoded_active_" + suffix,
+                                             priorityAllowed,
+                                             anyWriter);
+            const ValueId update = addBinary(graph,
+                                             OperationKind::kLogicOr,
+                                             "decoded_update_" + suffix + "_op",
+                                             "decoded_update_" + suffix,
+                                             reset,
+                                             active);
+            const ValueId next = addMux(graph,
+                                        "decoded_next_" + suffix + "_op",
+                                        "decoded_next_" + suffix,
+                                        active,
+                                        writeData,
+                                        resetData,
+                                        width);
+            addRegisterWrite(graph,
+                             "decoded_write_" + suffix,
+                             regs[row],
+                             update,
+                             next,
+                             mask,
+                             clk);
+        }
+        return design;
+    }
+
     Design buildTrueStorageOnlyDesign(bool completeWrites,
                                       std::size_t rows = 4,
                                       bool sharedPackedView = false,
@@ -2452,6 +2611,49 @@ namespace
         }
         return fail("compound-priority low-address memory write is missing");
     }
+
+    int testTrueMergeOrDecodedPriorityWrites()
+    {
+        Design design = buildTrueMergeOrDecodedPriorityDesign();
+        Graph &graph = *design.findGraph("top");
+        const ValueId highEnable = graph.inputPortValue("decoded_high_enable");
+        const ValueId highAddr = graph.inputPortValue("decoded_high_addr");
+        std::unordered_set<ValueId, ValueIdHash> expectedAddresses;
+        for (std::size_t writer = 0; writer < 3; ++writer)
+        {
+            expectedAddresses.insert(graph.inputPortValue("decoded_addr_" + std::to_string(writer)));
+        }
+
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 1 ||
+            countKind(graph, OperationKind::kMemoryWritePort) != 3 ||
+            countKind(graph, OperationKind::kMemoryFillPort) != 1 ||
+            countKind(graph, OperationKind::kRegister) != 0 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 0)
+        {
+            return fail("OR-decoded priority writes blocked true merge");
+        }
+        for (OperationId writeOpId : opsOfKind(graph, OperationKind::kMemoryWritePort))
+        {
+            const Operation write = graph.getOperation(writeOpId);
+            if (write.operands().size() < 4 || expectedAddresses.erase(write.operands()[1]) != 1)
+            {
+                return fail("OR-decoded memory write has the wrong address family");
+            }
+            if (!hasNegatedDependencies(graph, write.operands()[0], highEnable, highAddr))
+            {
+                return fail("OR-decoded memory guard lost the high-priority conflict");
+            }
+        }
+        if (!expectedAddresses.empty())
+        {
+            return fail("OR-decoded memory write family is incomplete");
+        }
+        return 0;
+    }
 } // namespace
 
 int main()
@@ -2567,6 +2769,10 @@ int main()
             return rc;
         }
         if (const int rc = testTrueMergeCombLanePackedCompoundPriorityWrites(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testTrueMergeOrDecodedPriorityWrites(); rc != 0)
         {
             return rc;
         }
