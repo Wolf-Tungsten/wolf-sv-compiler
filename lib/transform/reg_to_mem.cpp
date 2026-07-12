@@ -13,6 +13,7 @@
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -52,9 +53,9 @@ namespace wolvrix::lib::transform
             std::cerr.flush();
         }
 
-        bool profileAllGroupsEnabled()
+        bool profileFlagEnabled(const char *name)
         {
-            const char *rawValue = std::getenv("WOLVRIX_REG_TO_MEM_PROFILE_ALL_GROUPS");
+            const char *rawValue = std::getenv(name);
             if (!rawValue)
             {
                 return false;
@@ -64,6 +65,16 @@ namespace wolvrix::lib::transform
                 return static_cast<char>(std::tolower(ch));
             });
             return !value.empty() && value != "0" && value != "false" && value != "off";
+        }
+
+        bool profileAllGroupsEnabled()
+        {
+            return profileFlagEnabled("WOLVRIX_REG_TO_MEM_PROFILE_ALL_GROUPS");
+        }
+
+        bool profileBranchNotInUpdateEnabled()
+        {
+            return profileFlagEnabled("WOLVRIX_REG_TO_MEM_PROFILE_BRANCH_NOT_IN_UPDATE");
         }
 
         template <typename T>
@@ -302,6 +313,7 @@ namespace wolvrix::lib::transform
             std::size_t groupIndex = 0;
             std::size_t groupCount = 0;
             bool verbose = false;
+            bool branchNotInUpdate = false;
         };
 
         bool shouldProfileGroupRow(const GroupProfileContext *groupProfile, std::size_t row, std::size_t rowCount)
@@ -3061,6 +3073,277 @@ namespace wolvrix::lib::transform
             return chain;
         }
 
+        enum class RegisterDependency
+        {
+            kNo,
+            kYes,
+            kTruncated,
+        };
+
+        RegisterDependency dependsOnRegisterRead(const Graph &graph,
+                                                 ValueId root,
+                                                 std::string_view regSymbol)
+        {
+            constexpr std::size_t kNodeLimit = 2048;
+            std::vector<ValueId> pending{root};
+            std::unordered_set<ValueId, ValueIdHash> visited;
+            visited.reserve(64);
+            while (!pending.empty())
+            {
+                ValueId value = pending.back();
+                pending.pop_back();
+                const auto unwrapped = unwrapAssign(graph, value);
+                if (unwrapped)
+                {
+                    value = *unwrapped;
+                }
+                if (!visited.insert(value).second)
+                {
+                    continue;
+                }
+                if (visited.size() > kNodeLimit)
+                {
+                    return RegisterDependency::kTruncated;
+                }
+                const OperationId opId = graph.valueDef(value);
+                if (!opId.valid())
+                {
+                    continue;
+                }
+                const Operation op = graph.getOperation(opId);
+                if (op.kind() == OperationKind::kRegisterReadPort &&
+                    getStringAttr(op, "regSymbol").value_or(std::string()) == regSymbol)
+                {
+                    return RegisterDependency::kYes;
+                }
+                pending.insert(pending.end(), op.operands().begin(), op.operands().end());
+            }
+            return RegisterDependency::kNo;
+        }
+
+        std::string valueRootKind(const Graph &graph, ValueId value)
+        {
+            const auto unwrapped = unwrapAssign(graph, value);
+            if (!unwrapped)
+            {
+                return "assign_limit";
+            }
+            const OperationId opId = graph.valueDef(*unwrapped);
+            if (!opId.valid())
+            {
+                return "source";
+            }
+            return std::string(grh::toString(graph.getOperation(opId).kind()));
+        }
+
+        bool isConstantValue(const Graph &graph, ValueId value)
+        {
+            const auto unwrapped = unwrapAssign(graph, value);
+            if (!unwrapped)
+            {
+                return false;
+            }
+            const OperationId opId = graph.valueDef(*unwrapped);
+            return opId.valid() && graph.getOperation(opId).kind() == OperationKind::kConstant;
+        }
+
+        bool valueVectorsEqualAfterAssign(const Graph &graph,
+                                          std::span<const ValueId> lhs,
+                                          std::span<const ValueId> rhs)
+        {
+            return lhs.size() == rhs.size() &&
+                   std::equal(lhs.begin(), lhs.end(), rhs.begin(), [&](ValueId left, ValueId right) {
+                       return sameValueAfterAssign(graph, left, right);
+                   });
+        }
+
+        std::string formatKindCounts(const std::map<std::string, std::size_t> &counts)
+        {
+            std::string result;
+            for (const auto &[kind, count] : counts)
+            {
+                if (!result.empty())
+                {
+                    result += ',';
+                }
+                result += kind + ':' + std::to_string(count);
+            }
+            return result.empty() ? "none" : result;
+        }
+
+        struct EventGuardRelation
+        {
+            int polarity = 0;
+            int64_t eventIndex = -1;
+
+            bool operator==(const EventGuardRelation &) const = default;
+        };
+
+        EventGuardRelation matchEventGuard(const Graph &graph,
+                                           ValueId guard,
+                                           std::span<const ValueId> events)
+        {
+            EventGuardRelation relation;
+            for (std::size_t eventIndex = 0; eventIndex < events.size(); ++eventIndex)
+            {
+                int polarity = 0;
+                if (sameValueAfterAssign(graph, guard, events[eventIndex]))
+                {
+                    polarity = 1;
+                }
+                else if (isNegationOf(graph, guard, events[eventIndex]))
+                {
+                    polarity = -1;
+                }
+                if (polarity == 0)
+                {
+                    continue;
+                }
+                if (relation.polarity != 0)
+                {
+                    return EventGuardRelation{};
+                }
+                relation.polarity = polarity;
+                relation.eventIndex = static_cast<int64_t>(eventIndex);
+            }
+            return relation;
+        }
+
+        void profileBranchNotInUpdateShape(const Graph &graph,
+                                           const GroupCandidate &group,
+                                           std::span<const WritePortInfo *const> rowWrites,
+                                           const GroupProfileContext *groupProfile)
+        {
+            if (groupProfile == nullptr || !groupProfile->branchNotInUpdate)
+            {
+                return;
+            }
+
+            std::size_t outerMuxRows = 0;
+            std::size_t guardEventRows = 0;
+            std::size_t guardNegatedEventRows = 0;
+            std::size_t guardUnmatchedEventRows = 0;
+            std::size_t constantResetRows = 0;
+            std::size_t normalSelfRows = 0;
+            std::size_t normalNoSelfRows = 0;
+            std::size_t normalTruncatedRows = 0;
+            std::map<std::string, std::size_t> normalRootKinds;
+            std::map<std::string, std::size_t> resetRootKinds;
+            std::optional<ValueId> firstGuard;
+            std::optional<EventGuardRelation> firstRelation;
+            bool commonGuard = true;
+            bool commonRelation = true;
+            bool commonUpdate = true;
+            bool commonMask = true;
+            bool commonEvents = true;
+            bool commonEventEdges = true;
+
+            for (std::size_t row = 0; row < rowWrites.size(); ++row)
+            {
+                const WritePortInfo &write = *rowWrites[row];
+                if (row != 0)
+                {
+                    commonUpdate &= sameValueAfterAssign(graph, rowWrites.front()->updateCond, write.updateCond);
+                    commonMask &= sameValueAfterAssign(graph, rowWrites.front()->mask, write.mask);
+                    commonEvents &= valueVectorsEqualAfterAssign(graph, rowWrites.front()->events, write.events);
+                    commonEventEdges &= rowWrites.front()->eventEdges == write.eventEdges;
+                }
+
+                const auto nextValue = unwrapAssign(graph, write.nextValue);
+                if (!nextValue)
+                {
+                    ++guardUnmatchedEventRows;
+                    continue;
+                }
+                const OperationId muxId = graph.valueDef(*nextValue);
+                if (!muxId.valid())
+                {
+                    ++guardUnmatchedEventRows;
+                    continue;
+                }
+                const Operation mux = graph.getOperation(muxId);
+                if (mux.kind() != OperationKind::kMux || mux.operands().size() != 3)
+                {
+                    ++guardUnmatchedEventRows;
+                    continue;
+                }
+                ++outerMuxRows;
+                const ValueId guard = mux.operands()[0];
+                const EventGuardRelation relation = matchEventGuard(graph, guard, write.events);
+                if (!firstGuard)
+                {
+                    firstGuard = guard;
+                    firstRelation = relation;
+                }
+                else
+                {
+                    commonGuard &= sameValueAfterAssign(graph, *firstGuard, guard);
+                    commonRelation &= firstRelation && *firstRelation == relation;
+                }
+
+                ValueId normalArm;
+                ValueId resetArm;
+                if (relation.polarity > 0)
+                {
+                    ++guardEventRows;
+                    resetArm = mux.operands()[1];
+                    normalArm = mux.operands()[2];
+                }
+                else if (relation.polarity < 0)
+                {
+                    ++guardNegatedEventRows;
+                    normalArm = mux.operands()[1];
+                    resetArm = mux.operands()[2];
+                }
+                else
+                {
+                    ++guardUnmatchedEventRows;
+                    continue;
+                }
+
+                ++normalRootKinds[valueRootKind(graph, normalArm)];
+                ++resetRootKinds[valueRootKind(graph, resetArm)];
+                constantResetRows += isConstantValue(graph, resetArm) ? 1 : 0;
+                switch (dependsOnRegisterRead(graph, normalArm, group.regSymbols[row]))
+                {
+                case RegisterDependency::kYes:
+                    ++normalSelfRows;
+                    break;
+                case RegisterDependency::kNo:
+                    ++normalNoSelfRows;
+                    break;
+                case RegisterDependency::kTruncated:
+                    ++normalTruncatedRows;
+                    break;
+                }
+            }
+
+            const int relationPolarity = firstRelation && commonRelation ? firstRelation->polarity : 0;
+            const int64_t relationEventIndex = firstRelation && commonRelation ? firstRelation->eventIndex : -1;
+            profileLog("group_detail graph_index=" + std::to_string(groupProfile->graphIndex) +
+                       " group=" + std::to_string(groupProfile->groupIndex) +
+                       "/" + std::to_string(groupProfile->groupCount) +
+                       " stage=branch_not_in_update_shape rows=" + std::to_string(rowWrites.size()) +
+                       " outer_mux_rows=" + std::to_string(outerMuxRows) +
+                       " common_guard=" + std::to_string(commonGuard ? 1 : 0) +
+                       " common_relation=" + std::to_string(commonRelation ? 1 : 0) +
+                       " relation_polarity=" + std::to_string(relationPolarity) +
+                       " relation_event_index=" + std::to_string(relationEventIndex) +
+                       " guard_event_rows=" + std::to_string(guardEventRows) +
+                       " guard_negated_event_rows=" + std::to_string(guardNegatedEventRows) +
+                       " guard_unmatched_event_rows=" + std::to_string(guardUnmatchedEventRows) +
+                       " common_update=" + std::to_string(commonUpdate ? 1 : 0) +
+                       " common_mask=" + std::to_string(commonMask ? 1 : 0) +
+                       " common_events=" + std::to_string(commonEvents ? 1 : 0) +
+                       " common_event_edges=" + std::to_string(commonEventEdges ? 1 : 0) +
+                       " constant_reset_rows=" + std::to_string(constantResetRows) +
+                       " normal_self_rows=" + std::to_string(normalSelfRows) +
+                       " normal_no_self_rows=" + std::to_string(normalNoSelfRows) +
+                       " normal_truncated_rows=" + std::to_string(normalTruncatedRows) +
+                       " normal_roots=" + formatKindCounts(normalRootKinds) +
+                       " reset_roots=" + formatKindCounts(resetRootKinds));
+        }
+
         std::optional<ConsolidatedWriteMatch> matchConsolidatedWriteFamilies(
             const Graph &graph,
             const GroupCandidate &group,
@@ -3190,6 +3473,7 @@ namespace wolvrix::lib::transform
                     }
                     if (!found)
                     {
+                        profileBranchNotInUpdateShape(graph, group, rowWrites, groupProfile);
                         return reject("branch_not_in_update", row, kNoIndex);
                     }
                 }
@@ -4420,8 +4704,11 @@ namespace wolvrix::lib::transform
         RegToMemStats stats;
         RegToMemProfile profile;
         const bool profileAllGroups = profileAllGroupsEnabled();
+        const bool profileBranchNotInUpdate = profileBranchNotInUpdateEnabled();
         const auto passStart = ProfileClock::now();
-        profileLog("config profile_all_groups=" + std::to_string(profileAllGroups ? 1 : 0));
+        profileLog("config profile_all_groups=" + std::to_string(profileAllGroups ? 1 : 0) +
+                   " profile_branch_not_in_update=" +
+                   std::to_string(profileBranchNotInUpdate ? 1 : 0));
         std::size_t graphIndex = 0;
         for (const auto &entry : design().graphs())
         {
@@ -4581,6 +4868,7 @@ namespace wolvrix::lib::transform
                     .groupIndex = visitedGroups,
                     .groupCount = groups.size(),
                     .verbose = verboseGroup,
+                    .branchNotInUpdate = profileBranchNotInUpdate,
                 };
                 if (verboseGroup)
                 {

@@ -862,6 +862,74 @@ namespace
         return design;
     }
 
+    Design buildBranchNotInUpdateOuterResetDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        constexpr int32_t width = 1;
+        constexpr std::size_t rows = 4;
+        std::vector<std::string> regs;
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            regs.push_back("outer_reset_r" + std::to_string(row));
+            addRegister(graph, regs.back(), width);
+        }
+
+        const ValueId index = makeLogicValue(graph, "outer_reset_index", 2);
+        const ValueId lock = makeLogicValue(graph, "outer_reset_lock", 1);
+        const ValueId normalData = makeLogicValue(graph, "outer_reset_normal_data", width);
+        const ValueId reset = makeLogicValue(graph, "outer_reset", 1);
+        const ValueId clk = makeLogicValue(graph, "outer_reset_clk", 1);
+        graph.bindInputPort("outer_reset_index", index);
+        graph.bindInputPort("outer_reset_lock", lock);
+        graph.bindInputPort("outer_reset_normal_data", normalData);
+        graph.bindInputPort("outer_reset", reset);
+        graph.bindInputPort("outer_reset_clk", clk);
+
+        ValueId selected;
+        addSliceArrayAnchor(graph, "outer_reset_anchor", regs, index, width, selected);
+        graph.bindOutputPort("outer_reset_selected", selected);
+
+        const ValueId notReset = addUnary(graph,
+                                          OperationKind::kLogicNot,
+                                          "outer_reset_not_op",
+                                          "outer_reset_not",
+                                          reset);
+        const ValueId resetData = addConstant(graph,
+                                              "outer_reset_data_op",
+                                              "outer_reset_data",
+                                              width,
+                                              "1'b0");
+        const ValueId mask = addConstant(graph,
+                                         "outer_reset_mask_op",
+                                         "outer_reset_mask",
+                                         width,
+                                         "1'b1");
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            const ValueId next = addMux(graph,
+                                        "outer_reset_next" + std::to_string(row) + "_op",
+                                        "outer_reset_next" + std::to_string(row),
+                                        notReset,
+                                        normalData,
+                                        resetData,
+                                        width);
+            const OperationId write = graph.createOperation(
+                OperationKind::kRegisterWritePort,
+                graph.internSymbol("outer_reset_write" + std::to_string(row)));
+            graph.addOperand(write, lock);
+            graph.addOperand(write, next);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clk);
+            graph.addOperand(write, reset);
+            graph.setAttr(write, "regSymbol", regs[row]);
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge", "posedge"});
+        }
+        return design;
+    }
+
     Design buildTrueMergeCompoundPriorityDesign()
     {
         Design design;
@@ -2698,6 +2766,23 @@ namespace
         return 0;
     }
 
+    int testBranchNotInUpdateOuterResetRemainsScalar()
+    {
+        Design design = buildBranchNotInUpdateOuterResetDesign();
+        Graph &graph = *design.findGraph("top");
+        if (const int rc = runTruePass(design); rc != 0)
+        {
+            return rc;
+        }
+        if (countKind(graph, OperationKind::kMemory) != 0 ||
+            countKind(graph, OperationKind::kRegister) != 4 ||
+            countKind(graph, OperationKind::kRegisterWritePort) != 4)
+        {
+            return fail("outer reset-mux diagnostic changed rejected scalar storage");
+        }
+        return 0;
+    }
+
     int testTrueMergeCombLanePackedMuxWrites()
     {
         Design design = buildTrueMergeCompoundResetDesign(false, true);
@@ -3083,6 +3168,10 @@ int main()
             return rc;
         }
         if (const int rc = testTrueMergeCompoundResetWithTrailingNoOpMux(); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = testBranchNotInUpdateOuterResetRemainsScalar(); rc != 0)
         {
             return rc;
         }
