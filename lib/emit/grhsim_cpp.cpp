@@ -2410,6 +2410,26 @@ namespace wolvrix::lib::emit
             kCount,
         };
 
+        std::string_view valueSlotScalarKindName(ValueSlotScalarKind kind)
+        {
+            switch (kind)
+            {
+            case ValueSlotScalarKind::kBool:
+                return "bool";
+            case ValueSlotScalarKind::kU8:
+                return "u8";
+            case ValueSlotScalarKind::kU16:
+                return "u16";
+            case ValueSlotScalarKind::kU32:
+                return "u32";
+            case ValueSlotScalarKind::kU64:
+                return "u64";
+            case ValueSlotScalarKind::kCount:
+                break;
+            }
+            return "unknown";
+        }
+
         struct StateDecl
         {
             enum class Kind
@@ -9117,6 +9137,222 @@ namespace wolvrix::lib::emit
             return true;
         }
 
+        bool emitMaterializedScalarReadLocalityStatsFile(
+            const Graph &graph,
+            const EmitModel &model,
+            const ScheduleRefs &schedule,
+            const std::vector<ScheduleBatch> &scheduleBatches,
+            const std::filesystem::path &path,
+            std::string &error)
+        {
+            struct TouchInfo
+            {
+                std::size_t operandTouches = 0;
+                std::size_t resultWrites = 0;
+                std::size_t firstTouchOrder = kInvalidIndex;
+                std::unordered_set<ValueId, ValueIdHash> operandValues;
+                std::unordered_set<OperationId, OperationIdHash> useOps;
+            };
+            struct Row
+            {
+                uint32_t supernodeId = 0;
+                std::size_t batchIndex = kInvalidIndex;
+                ValueId value{};
+                ValueSlotScalarKind scalarKind = ValueSlotScalarKind::kBool;
+                std::size_t slotIndex = 0;
+                std::size_t operandTouches = 0;
+                std::size_t distinctOperandValues = 0;
+                std::size_t useOps = 0;
+                std::size_t resultWrites = 0;
+                std::size_t supernodeOps = 0;
+                std::size_t emittedComputeOps = 0;
+                std::size_t firstTouchOrder = kInvalidIndex;
+                bool candidate = false;
+            };
+
+            std::vector<Row> rows;
+            std::unordered_set<uint32_t> visitedSupernodes;
+            std::size_t scannedSupernodes = 0;
+            std::size_t scalarOperandTouches = 0;
+            std::size_t directStateReadOperandTouches = 0;
+            std::size_t candidateOperandTouches = 0;
+            std::size_t loadsSavedPerFire = 0;
+
+            for (const ScheduleBatch &batch : scheduleBatches)
+            {
+                if (batch.phase != ScheduleBatch::Phase::kCompute)
+                {
+                    continue;
+                }
+                for (uint32_t supernodeId : batch.supernodeIds)
+                {
+                    if (supernodeId >= schedule.supernodeToOps.size() ||
+                        !visitedSupernodes.insert(supernodeId).second)
+                    {
+                        continue;
+                    }
+                    ++scannedSupernodes;
+                    const auto &supernodeOps = schedule.supernodeToOps[supernodeId];
+                    std::unordered_map<ValueId, TouchInfo, ValueIdHash> touchesByValue;
+                    std::size_t emittedComputeOps = 0;
+                    std::size_t nextTouchOrder = 0;
+
+                    for (OperationId opId : supernodeOps)
+                    {
+                        const Operation op = graph.getOperation(opId);
+                        if (isCommitPhaseOp(op) || isRegToMemIntentBypassOp(model, opId))
+                        {
+                            continue;
+                        }
+                        ++emittedComputeOps;
+                        for (ValueId operand : op.operands())
+                        {
+                            if (model.directStateReadSymbolByValue.contains(operand))
+                            {
+                                ++directStateReadOperandTouches;
+                                continue;
+                            }
+                            const ValueId canonicalValue = canonicalMaterializedStorageValue(model, operand);
+                            const auto slotIt = model.valueScalarSlotByValue.find(canonicalValue);
+                            if (slotIt == model.valueScalarSlotByValue.end() ||
+                                !isMaterializedValue(model, canonicalValue))
+                            {
+                                continue;
+                            }
+                            TouchInfo &touch = touchesByValue[canonicalValue];
+                            if (touch.firstTouchOrder == kInvalidIndex)
+                            {
+                                touch.firstTouchOrder = nextTouchOrder++;
+                            }
+                            ++touch.operandTouches;
+                            touch.operandValues.insert(operand);
+                            touch.useOps.insert(opId);
+                            ++scalarOperandTouches;
+                        }
+                        for (ValueId result : op.results())
+                        {
+                            if (model.directStateReadSymbolByValue.contains(result))
+                            {
+                                continue;
+                            }
+                            const ValueId canonicalValue = canonicalMaterializedStorageValue(model, result);
+                            if (!model.valueScalarSlotByValue.contains(canonicalValue) ||
+                                !isMaterializedValue(model, canonicalValue))
+                            {
+                                continue;
+                            }
+                            ++touchesByValue[canonicalValue].resultWrites;
+                        }
+                    }
+
+                    for (const auto &[value, touch] : touchesByValue)
+                    {
+                        if (touch.operandTouches == 0)
+                        {
+                            continue;
+                        }
+                        const ValueScalarSlotRef &slot = model.valueScalarSlotByValue.at(value);
+                        const bool candidate = touch.operandTouches >= 2 && touch.resultWrites == 0;
+                        rows.push_back(Row{
+                            .supernodeId = supernodeId,
+                            .batchIndex = batch.index,
+                            .value = value,
+                            .scalarKind = slot.kind,
+                            .slotIndex = slot.slotIndex,
+                            .operandTouches = touch.operandTouches,
+                            .distinctOperandValues = touch.operandValues.size(),
+                            .useOps = touch.useOps.size(),
+                            .resultWrites = touch.resultWrites,
+                            .supernodeOps = supernodeOps.size(),
+                            .emittedComputeOps = emittedComputeOps,
+                            .firstTouchOrder = touch.firstTouchOrder,
+                            .candidate = candidate,
+                        });
+                        if (candidate)
+                        {
+                            candidateOperandTouches += touch.operandTouches;
+                            loadsSavedPerFire += touch.operandTouches - 1u;
+                        }
+                    }
+                }
+            }
+
+            std::sort(rows.begin(),
+                      rows.end(),
+                      [](const Row &lhs, const Row &rhs) {
+                          if (lhs.batchIndex != rhs.batchIndex)
+                          {
+                              return lhs.batchIndex < rhs.batchIndex;
+                          }
+                          if (lhs.supernodeId != rhs.supernodeId)
+                          {
+                              return lhs.supernodeId < rhs.supernodeId;
+                          }
+                          if (lhs.firstTouchOrder != rhs.firstTouchOrder)
+                          {
+                              return lhs.firstTouchOrder < rhs.firstTouchOrder;
+                          }
+                          if (lhs.value.index != rhs.value.index)
+                          {
+                              return lhs.value.index < rhs.value.index;
+                          }
+                          return lhs.value.generation < rhs.value.generation;
+                      });
+
+            if (auto dirError = ensureOutputDirectory(path))
+            {
+                error = *dirError;
+                return false;
+            }
+            std::ofstream stream(path, std::ios::out | std::ios::trunc);
+            if (!stream.is_open())
+            {
+                error = "failed to open output file";
+                return false;
+            }
+            stream << "supernode_id\tphase\tbatch_id\tcanonical_value_id\tcanonical_value_generation"
+                      "\tvalue_name\twidth\tscalar_kind\tslot_index\toperand_touches"
+                      "\tdistinct_operand_values\tuse_ops\tresult_writes\tsupernode_ops"
+                      "\temitted_compute_ops\tcandidate\tloads_saved_per_fire\n";
+            for (const Row &row : rows)
+            {
+                stream << row.supernodeId << "\tcompute\t"
+                       << row.batchIndex << '\t'
+                       << row.value.index << '\t'
+                       << row.value.generation << '\t'
+                       << sanitizeTsvField(valueSymbolOrUnnamed(graph, row.value)) << '\t'
+                       << graph.valueWidth(row.value) << '\t'
+                       << valueSlotScalarKindName(row.scalarKind) << '\t'
+                       << row.slotIndex << '\t'
+                       << row.operandTouches << '\t'
+                       << row.distinctOperandValues << '\t'
+                       << row.useOps << '\t'
+                       << row.resultWrites << '\t'
+                       << row.supernodeOps << '\t'
+                       << row.emittedComputeOps << '\t'
+                       << (row.candidate ? 1 : 0) << '\t'
+                       << (row.candidate ? row.operandTouches - 1u : 0u) << '\n';
+            }
+            if (!stream.good())
+            {
+                error = "failed while writing output file";
+                return false;
+            }
+            std::fprintf(stderr,
+                         "[GRHSIM_MATERIALIZED_SCALAR_READ_LOCALITY] path=%s supernodes=%zu read_rows=%zu scalar_operand_touches=%zu direct_state_read_operand_touches=%zu candidate_rows=%zu candidate_touches=%zu loads_saved_per_fire=%zu\n",
+                         path.string().c_str(),
+                         scannedSupernodes,
+                         rows.size(),
+                         scalarOperandTouches,
+                         directStateReadOperandTouches,
+                         static_cast<std::size_t>(std::count_if(rows.begin(), rows.end(), [](const Row &row) {
+                             return row.candidate;
+                         })),
+                         candidateOperandTouches,
+                         loadsSavedPerFire);
+            return true;
+        }
+
         bool collectDeclaredSymbolWaveformSignals(const Graph &graph,
                                                   const EmitModel &model,
                                                   std::vector<WaveformSignalDecl> &outSignals)
@@ -15721,6 +15957,10 @@ namespace wolvrix::lib::emit
             parseBooleanEmitOption(options,
                                    "state_read_locality_stats",
                                    "WOLVRIX_GRHSIM_STATE_READ_LOCALITY_STATS");
+        const bool emitMaterializedScalarReadLocalityStats =
+            parseBooleanEmitOption(options,
+                                   "materialized_scalar_read_locality_stats",
+                                   "WOLVRIX_GRHSIM_MATERIALIZED_SCALAR_READ_LOCALITY_STATS");
         const bool inputFullpassSpecialization =
             parseBooleanEmitOption(options,
                                    "input_fullpass_specialization",
@@ -15874,6 +16114,19 @@ namespace wolvrix::lib::emit
             const std::filesystem::path localityPath = outDir / "grhsim_state_read_locality.tsv";
             std::string localityError;
             if (!emitStateReadLocalityStatsFile(
+                    graph, model, schedule, scheduleBatches, localityPath, localityError))
+            {
+                reportError(localityError, localityPath.string());
+                result.success = false;
+                return result;
+            }
+        }
+        if (emitMaterializedScalarReadLocalityStats)
+        {
+            const std::filesystem::path localityPath =
+                outDir / "grhsim_materialized_scalar_read_locality.tsv";
+            std::string localityError;
+            if (!emitMaterializedScalarReadLocalityStatsFile(
                     graph, model, schedule, scheduleBatches, localityPath, localityError))
             {
                 reportError(localityError, localityPath.string());

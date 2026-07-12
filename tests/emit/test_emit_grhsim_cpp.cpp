@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -1016,7 +1017,8 @@ namespace
                                   bool posedgeFullpassSpecialization = false,
                                   bool perf = false,
                                   bool stateReadLocalityStats = false,
-                                  bool directSingleWriterStateReads = false)
+                                  bool directSingleWriterStateReads = false,
+                                  bool materializedScalarReadLocalityStats = false)
     {
         SessionStore session;
         if (scheduleOptions.path.empty())
@@ -1051,6 +1053,10 @@ namespace
         if (directSingleWriterStateReads)
         {
             options.attributes["direct_single_writer_state_reads"] = "1";
+        }
+        if (materializedScalarReadLocalityStats)
+        {
+            options.attributes["materialized_scalar_read_locality_stats"] = "1";
         }
 
         EmitGrhSimCpp emitter(&diag);
@@ -1812,6 +1818,70 @@ namespace
         graph.setAttr(display, "procKind", std::string("always_ff"));
         graph.setAttr(display, "hasTiming", false);
         graph.setAttr(display, "eventEdge", std::vector<std::string>{"posedge"});
+
+        return design;
+    }
+
+    Design buildMaterializedScalarReadLocalityDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        const ValueId a = makeLogicValue(graph, "locality_a", 8);
+        const ValueId b = makeLogicValue(graph, "locality_b", 8);
+        graph.bindInputPort("locality_a", a);
+        graph.bindInputPort("locality_b", b);
+
+        const ValueId repeatedSource = makeLogicValue(graph, "locality_repeated_source", 8);
+        const OperationId repeatedSourceOp =
+            graph.createOperation(OperationKind::kAdd, graph.internSymbol("locality_repeated_source_op"));
+        graph.addOperand(repeatedSourceOp, a);
+        graph.addOperand(repeatedSourceOp, b);
+        graph.addResult(repeatedSourceOp, repeatedSource);
+        graph.bindOutputPort("locality_repeated_source_out", repeatedSource);
+
+        const ValueId repeatedResult = makeLogicValue(graph, "locality_repeated_result", 16);
+        const OperationId repeatedResultOp =
+            graph.createOperation(OperationKind::kConcat, graph.internSymbol("locality_repeated_result_op"));
+        graph.addOperand(repeatedResultOp, repeatedSource);
+        graph.addOperand(repeatedResultOp, repeatedSource);
+        graph.addResult(repeatedResultOp, repeatedResult);
+        graph.bindOutputPort("locality_repeated_result_out", repeatedResult);
+
+        const ValueId singleSource = makeLogicValue(graph, "locality_single_source", 8);
+        const OperationId singleSourceOp =
+            graph.createOperation(OperationKind::kXor, graph.internSymbol("locality_single_source_op"));
+        graph.addOperand(singleSourceOp, a);
+        graph.addOperand(singleSourceOp, b);
+        graph.addResult(singleSourceOp, singleSource);
+        graph.bindOutputPort("locality_single_source_out", singleSource);
+
+        const ValueId singleResult = makeLogicValue(graph, "locality_single_result", 8);
+        const OperationId singleResultOp =
+            graph.createOperation(OperationKind::kAdd, graph.internSymbol("locality_single_result_op"));
+        graph.addOperand(singleResultOp, singleSource);
+        graph.addOperand(singleResultOp, b);
+        graph.addResult(singleResultOp, singleResult);
+        graph.bindOutputPort("locality_single_result_out", singleResult);
+
+        const ValueId wideSource = makeLogicValue(graph, "locality_wide_source", 72);
+        const OperationId wideSourceOp =
+            graph.createOperation(OperationKind::kConcat, graph.internSymbol("locality_wide_source_op"));
+        for (std::size_t index = 0; index < 9; ++index)
+        {
+            graph.addOperand(wideSourceOp, a);
+        }
+        graph.addResult(wideSourceOp, wideSource);
+        graph.bindOutputPort("locality_wide_source_out", wideSource);
+
+        const ValueId wideResult = makeLogicValue(graph, "locality_wide_result", 144);
+        const OperationId wideResultOp =
+            graph.createOperation(OperationKind::kConcat, graph.internSymbol("locality_wide_result_op"));
+        graph.addOperand(wideResultOp, wideSource);
+        graph.addOperand(wideResultOp, wideSource);
+        graph.addResult(wideResultOp, wideResult);
+        graph.bindOutputPort("locality_wide_result_out", wideResult);
 
         return design;
     }
@@ -5227,6 +5297,214 @@ int main()
             return fail("gated-clock harness failed to run");
         }
 
+        const std::filesystem::path scalarLocalityCoarsenedDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_scalar_locality_coarsened";
+        std::filesystem::remove_all(scalarLocalityCoarsenedDir);
+        Design scalarLocalityCoarsenedDesign = buildMaterializedScalarReadLocalityDesign();
+        EmitDiagnostics scalarLocalityCoarsenedDiag;
+        EmitResult scalarLocalityCoarsenedResult;
+        if (!emitWithActivitySchedule(scalarLocalityCoarsenedDesign,
+                                      scalarLocalityCoarsenedDir,
+                                      scalarLocalityCoarsenedDiag,
+                                      scalarLocalityCoarsenedResult,
+                                      {},
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true) ||
+            !scalarLocalityCoarsenedResult.success || scalarLocalityCoarsenedDiag.hasError())
+        {
+            return fail("coarsened scalar read-locality diagnostic emit failed");
+        }
+        std::istringstream scalarLocalityCoarsenedStream(readFile(
+            scalarLocalityCoarsenedDir / "grhsim_materialized_scalar_read_locality.tsv"));
+        std::string scalarLocalityCoarsenedLine;
+        if (!std::getline(scalarLocalityCoarsenedStream, scalarLocalityCoarsenedLine))
+        {
+            return fail("coarsened scalar read-locality TSV is missing");
+        }
+        const std::vector<std::string_view> scalarLocalityCoarsenedHeader = splitTabs(scalarLocalityCoarsenedLine);
+        const auto coarsenedColumnIndex = [&](std::string_view name) {
+            const auto it = std::find(scalarLocalityCoarsenedHeader.begin(), scalarLocalityCoarsenedHeader.end(), name);
+            return it == scalarLocalityCoarsenedHeader.end()
+                       ? std::numeric_limits<std::size_t>::max()
+                       : static_cast<std::size_t>(std::distance(scalarLocalityCoarsenedHeader.begin(), it));
+        };
+        const std::size_t coarsenedNameColumn = coarsenedColumnIndex("value_name");
+        const std::size_t coarsenedTouchesColumn = coarsenedColumnIndex("operand_touches");
+        const std::size_t coarsenedWritesColumn = coarsenedColumnIndex("result_writes");
+        const std::size_t coarsenedCandidateColumn = coarsenedColumnIndex("candidate");
+        const std::size_t coarsenedSavedColumn = coarsenedColumnIndex("loads_saved_per_fire");
+        if (coarsenedNameColumn == std::numeric_limits<std::size_t>::max() ||
+            coarsenedTouchesColumn == std::numeric_limits<std::size_t>::max() ||
+            coarsenedWritesColumn == std::numeric_limits<std::size_t>::max() ||
+            coarsenedCandidateColumn == std::numeric_limits<std::size_t>::max() ||
+            coarsenedSavedColumn == std::numeric_limits<std::size_t>::max())
+        {
+            return fail("coarsened scalar read-locality TSV schema is incomplete");
+        }
+        bool foundCoarsenedRepeatedSource = false;
+        while (std::getline(scalarLocalityCoarsenedStream, scalarLocalityCoarsenedLine))
+        {
+            const std::vector<std::string_view> fields = splitTabs(scalarLocalityCoarsenedLine);
+            if (fields.size() != scalarLocalityCoarsenedHeader.size())
+            {
+                return fail("coarsened scalar read-locality TSV row width mismatch");
+            }
+            if (fields[coarsenedNameColumn] != "locality_repeated_source")
+            {
+                continue;
+            }
+            foundCoarsenedRepeatedSource = true;
+            if (fields[coarsenedTouchesColumn] != "2" || fields[coarsenedWritesColumn] != "1" ||
+                fields[coarsenedCandidateColumn] != "0" || fields[coarsenedSavedColumn] != "0")
+            {
+                return fail("same-supernode scalar writes must be reported as ineligible");
+            }
+        }
+        if (!foundCoarsenedRepeatedSource)
+        {
+            return fail("coarsened scalar read-locality TSV should retain excluded read/write rows");
+        }
+
+        ActivityScheduleOptions scalarLocalitySplitSchedule;
+        scalarLocalitySplitSchedule.maxOpInComputeSupernode = 1;
+        scalarLocalitySplitSchedule.splitOversizeComputeNodes = true;
+        scalarLocalitySplitSchedule.splitOversizeComputeNodeMaxOps = 1;
+        const std::filesystem::path scalarLocalitySplitDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_scalar_locality_split";
+        std::filesystem::remove_all(scalarLocalitySplitDir);
+        Design scalarLocalitySplitDesign = buildMaterializedScalarReadLocalityDesign();
+        EmitDiagnostics scalarLocalitySplitDiag;
+        EmitResult scalarLocalitySplitResult;
+        if (!emitWithActivitySchedule(scalarLocalitySplitDesign,
+                                      scalarLocalitySplitDir,
+                                      scalarLocalitySplitDiag,
+                                      scalarLocalitySplitResult,
+                                      scalarLocalitySplitSchedule,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true) ||
+            !scalarLocalitySplitResult.success || scalarLocalitySplitDiag.hasError())
+        {
+            return fail("split scalar read-locality diagnostic emit failed");
+        }
+        std::istringstream scalarLocalitySplitStream(readFile(
+            scalarLocalitySplitDir / "grhsim_materialized_scalar_read_locality.tsv"));
+        std::string scalarLocalitySplitLine;
+        if (!std::getline(scalarLocalitySplitStream, scalarLocalitySplitLine))
+        {
+            return fail("split scalar read-locality TSV is missing");
+        }
+        const std::vector<std::string_view> scalarLocalitySplitHeader = splitTabs(scalarLocalitySplitLine);
+        const auto splitColumnIndex = [&](std::string_view name) {
+            const auto it = std::find(scalarLocalitySplitHeader.begin(), scalarLocalitySplitHeader.end(), name);
+            return it == scalarLocalitySplitHeader.end()
+                       ? std::numeric_limits<std::size_t>::max()
+                       : static_cast<std::size_t>(std::distance(scalarLocalitySplitHeader.begin(), it));
+        };
+        const std::size_t splitNameColumn = splitColumnIndex("value_name");
+        const std::size_t splitWidthColumn = splitColumnIndex("width");
+        const std::size_t splitTouchesColumn = splitColumnIndex("operand_touches");
+        const std::size_t splitWritesColumn = splitColumnIndex("result_writes");
+        const std::size_t splitCandidateColumn = splitColumnIndex("candidate");
+        const std::size_t splitSavedColumn = splitColumnIndex("loads_saved_per_fire");
+        if (splitNameColumn == std::numeric_limits<std::size_t>::max() ||
+            splitWidthColumn == std::numeric_limits<std::size_t>::max() ||
+            splitTouchesColumn == std::numeric_limits<std::size_t>::max() ||
+            splitWritesColumn == std::numeric_limits<std::size_t>::max() ||
+            splitCandidateColumn == std::numeric_limits<std::size_t>::max() ||
+            splitSavedColumn == std::numeric_limits<std::size_t>::max())
+        {
+            return fail("split scalar read-locality TSV schema is incomplete");
+        }
+        std::size_t scalarLocalitySplitRows = 0;
+        bool foundSplitRepeatedSource = false;
+        bool foundSplitSingleSource = false;
+        while (std::getline(scalarLocalitySplitStream, scalarLocalitySplitLine))
+        {
+            const std::vector<std::string_view> fields = splitTabs(scalarLocalitySplitLine);
+            if (fields.size() != scalarLocalitySplitHeader.size())
+            {
+                return fail("split scalar read-locality TSV row width mismatch");
+            }
+            ++scalarLocalitySplitRows;
+            if (fields[splitNameColumn] == "locality_wide_source")
+            {
+                return fail("wide values must not be scalar locality rows");
+            }
+            if (fields[splitNameColumn] == "locality_repeated_source")
+            {
+                foundSplitRepeatedSource = true;
+                if (fields[splitWidthColumn] != "8" || fields[splitTouchesColumn] != "2" ||
+                    fields[splitWritesColumn] != "0" || fields[splitCandidateColumn] != "1" ||
+                    fields[splitSavedColumn] != "1")
+                {
+                    return fail("split repeated scalar locality candidate has unexpected metrics");
+                }
+            }
+            if (fields[splitNameColumn] == "locality_single_source")
+            {
+                foundSplitSingleSource = true;
+                if (fields[splitTouchesColumn] != "1" || fields[splitWritesColumn] != "0" ||
+                    fields[splitCandidateColumn] != "0" || fields[splitSavedColumn] != "0")
+                {
+                    return fail("single scalar read should be reported as ineligible");
+                }
+            }
+        }
+        if (scalarLocalitySplitRows != 2 || !foundSplitRepeatedSource || !foundSplitSingleSource)
+        {
+            return fail("split scalar locality rows should distinguish repeated and single reads");
+        }
+
+        const std::filesystem::path scalarLocalityDisabledDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_scalar_locality_disabled";
+        std::filesystem::remove_all(scalarLocalityDisabledDir);
+        Design scalarLocalityDisabledDesign = buildMaterializedScalarReadLocalityDesign();
+        EmitDiagnostics scalarLocalityDisabledDiag;
+        EmitResult scalarLocalityDisabledResult;
+        if (!emitWithActivitySchedule(scalarLocalityDisabledDesign,
+                                      scalarLocalityDisabledDir,
+                                      scalarLocalityDisabledDiag,
+                                      scalarLocalityDisabledResult,
+                                      scalarLocalitySplitSchedule) ||
+            !scalarLocalityDisabledResult.success || scalarLocalityDisabledDiag.hasError())
+        {
+            return fail("disabled scalar read-locality diagnostic emit failed");
+        }
+        if (std::filesystem::exists(
+                scalarLocalityDisabledDir / "grhsim_materialized_scalar_read_locality.tsv"))
+        {
+            return fail("disabled scalar read-locality diagnostic must not emit a TSV");
+        }
+        const auto collectGeneratedModelFiles = [](const std::filesystem::path &dir) {
+            std::map<std::string, std::string> files;
+            for (const auto &entry : std::filesystem::directory_iterator(dir))
+            {
+                if (!entry.is_regular_file())
+                {
+                    continue;
+                }
+                const std::string name = entry.path().filename().string();
+                if (!name.starts_with("grhsim_top") ||
+                    (entry.path().extension() != ".cpp" && entry.path().extension() != ".hpp"))
+                {
+                    continue;
+                }
+                files.emplace(name, readFile(entry.path()));
+            }
+            return files;
+        };
+        if (collectGeneratedModelFiles(scalarLocalitySplitDir) !=
+            collectGeneratedModelFiles(scalarLocalityDisabledDir))
+        {
+            return fail("scalar read-locality diagnostic must not change generated model code");
+        }
+
         const std::filesystem::path repeatedReadDir =
             std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_repeated_state_read";
         std::filesystem::remove_all(repeatedReadDir);
@@ -5243,6 +5521,8 @@ int main()
                                       repeatedReadResult,
                                       repeatedReadScheduleOptions,
                                       false,
+                                      false,
+                                      true,
                                       false,
                                       true))
         {
@@ -5318,6 +5598,74 @@ int main()
         {
             return fail("repeated state-read locality TSV contents are incomplete");
         }
+        const std::filesystem::path repeatedReadScalarLocalityPath =
+            repeatedReadDir / "grhsim_materialized_scalar_read_locality.tsv";
+        std::istringstream scalarLocalityStream(readFile(repeatedReadScalarLocalityPath));
+        std::string scalarLocalityLine;
+        if (!std::getline(scalarLocalityStream, scalarLocalityLine))
+        {
+            return fail("materialized scalar read-locality TSV is missing");
+        }
+        const std::vector<std::string_view> scalarLocalityHeader = splitTabs(scalarLocalityLine);
+        const auto scalarColumnIndex = [&](std::string_view name) {
+            const auto it = std::find(scalarLocalityHeader.begin(), scalarLocalityHeader.end(), name);
+            return it == scalarLocalityHeader.end()
+                       ? std::numeric_limits<std::size_t>::max()
+                       : static_cast<std::size_t>(std::distance(scalarLocalityHeader.begin(), it));
+        };
+        const std::size_t scalarPhaseColumn = scalarColumnIndex("phase");
+        const std::size_t scalarValueNameColumn = scalarColumnIndex("value_name");
+        const std::size_t scalarKindColumn = scalarColumnIndex("scalar_kind");
+        const std::size_t scalarTouchesColumn = scalarColumnIndex("operand_touches");
+        const std::size_t scalarUseOpsColumn = scalarColumnIndex("use_ops");
+        const std::size_t scalarWritesColumn = scalarColumnIndex("result_writes");
+        const std::size_t scalarCandidateColumn = scalarColumnIndex("candidate");
+        const std::size_t scalarSavedColumn = scalarColumnIndex("loads_saved_per_fire");
+        if (scalarPhaseColumn == std::numeric_limits<std::size_t>::max() ||
+            scalarValueNameColumn == std::numeric_limits<std::size_t>::max() ||
+            scalarKindColumn == std::numeric_limits<std::size_t>::max() ||
+            scalarTouchesColumn == std::numeric_limits<std::size_t>::max() ||
+            scalarUseOpsColumn == std::numeric_limits<std::size_t>::max() ||
+            scalarWritesColumn == std::numeric_limits<std::size_t>::max() ||
+            scalarCandidateColumn == std::numeric_limits<std::size_t>::max() ||
+            scalarSavedColumn == std::numeric_limits<std::size_t>::max())
+        {
+            return fail("materialized scalar read-locality TSV schema is incomplete");
+        }
+        std::size_t repeatedScalarCandidateRows = 0;
+        std::size_t repeatedScalarCandidateTouches = 0;
+        std::size_t repeatedScalarCandidateSaved = 0;
+        while (std::getline(scalarLocalityStream, scalarLocalityLine))
+        {
+            const std::vector<std::string_view> fields = splitTabs(scalarLocalityLine);
+            if (fields.size() != scalarLocalityHeader.size())
+            {
+                return fail("materialized scalar read-locality TSV row width mismatch");
+            }
+            if (fields[scalarCandidateColumn] != "1")
+            {
+                continue;
+            }
+            if (fields[scalarPhaseColumn] != "compute" || fields[scalarKindColumn] != "u8" ||
+                fields[scalarUseOpsColumn] != "1" || fields[scalarWritesColumn] != "0")
+            {
+                return fail("repeated scalar read-locality candidate has unexpected classification");
+            }
+            const std::size_t touches = static_cast<std::size_t>(std::stoull(std::string(fields[scalarTouchesColumn])));
+            const std::size_t saved = static_cast<std::size_t>(std::stoull(std::string(fields[scalarSavedColumn])));
+            if (touches < 2 || saved != touches - 1u)
+            {
+                return fail("repeated scalar read-locality candidate has unexpected metrics");
+            }
+            ++repeatedScalarCandidateRows;
+            repeatedScalarCandidateTouches += touches;
+            repeatedScalarCandidateSaved += saved;
+        }
+        if (repeatedScalarCandidateRows != 4 || repeatedScalarCandidateTouches != 15 ||
+            repeatedScalarCandidateSaved != 11)
+        {
+            return fail("repeated materialized scalar reads should aggregate by canonical slot");
+        }
         const auto runRepeatedReadHarness = [&](const std::filesystem::path &dir,
                                                 const std::vector<std::filesystem::path> &stateFiles,
                                                 const std::vector<std::filesystem::path> &schedFiles) {
@@ -5387,6 +5735,7 @@ int main()
                                       false,
                                       false,
                                       false,
+                                      true,
                                       true))
         {
             return fail("repeated direct state-read activity-schedule pass failed");
@@ -5400,6 +5749,34 @@ int main()
         const std::vector<std::filesystem::path> repeatedDirectSchedFiles =
             collectSchedFiles(repeatedDirectDir, "grhsim_top_sched_");
         const std::string repeatedDirectSched = readFiles(repeatedDirectSchedFiles);
+        std::istringstream repeatedDirectScalarLocalityStream(
+            readFile(repeatedDirectDir / "grhsim_materialized_scalar_read_locality.tsv"));
+        std::string repeatedDirectScalarLocalityLine;
+        if (!std::getline(repeatedDirectScalarLocalityStream, repeatedDirectScalarLocalityLine))
+        {
+            return fail("direct state-read scalar locality TSV is missing");
+        }
+        const std::vector<std::string_view> repeatedDirectScalarHeader = splitTabs(repeatedDirectScalarLocalityLine);
+        const auto repeatedDirectCandidateIt =
+            std::find(repeatedDirectScalarHeader.begin(), repeatedDirectScalarHeader.end(), "candidate");
+        if (repeatedDirectCandidateIt == repeatedDirectScalarHeader.end())
+        {
+            return fail("direct state-read scalar locality TSV schema is incomplete");
+        }
+        const std::size_t repeatedDirectCandidateColumn = static_cast<std::size_t>(
+            std::distance(repeatedDirectScalarHeader.begin(), repeatedDirectCandidateIt));
+        while (std::getline(repeatedDirectScalarLocalityStream, repeatedDirectScalarLocalityLine))
+        {
+            const std::vector<std::string_view> fields = splitTabs(repeatedDirectScalarLocalityLine);
+            if (fields.size() != repeatedDirectScalarHeader.size())
+            {
+                return fail("direct state-read scalar locality TSV row width mismatch");
+            }
+            if (fields[repeatedDirectCandidateColumn] == "1")
+            {
+                return fail("direct state-read operands must not be scalar slot locality candidates");
+            }
+        }
         constexpr std::size_t expectedDirectRepeatedReads = 15;
         if (countSubstring(repeatedDirectSched,
                            "direct single-writer state read: consumer reads visible state") !=
@@ -5444,6 +5821,10 @@ int main()
         if (!directReadResult.success || directReadDiag.hasError())
         {
             return fail("direct state-read emit failed");
+        }
+        if (std::filesystem::exists(directReadDir / "grhsim_materialized_scalar_read_locality.tsv"))
+        {
+            return fail("materialized scalar read-locality diagnostic should be disabled by default");
         }
         const std::vector<std::filesystem::path> directReadStateFiles =
             collectSchedFiles(directReadDir, "grhsim_top_state");
