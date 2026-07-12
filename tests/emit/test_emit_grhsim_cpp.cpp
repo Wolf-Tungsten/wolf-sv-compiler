@@ -1573,6 +1573,94 @@ namespace
         return design;
     }
 
+    Design buildOneBitBitwiseDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        ValueId a = makeLogicValue(graph, "a", 1);
+        ValueId b = makeLogicValue(graph, "b", 1);
+        ValueId c = makeLogicValue(graph, "c", 1);
+        ValueId d = makeLogicValue(graph, "d", 1);
+        ValueId e = makeLogicValue(graph, "e", 1);
+        ValueId clk = makeLogicValue(graph, "clk", 1);
+        ValueId wideA = makeLogicValue(graph, "wide_a", 8);
+        ValueId wideB = makeLogicValue(graph, "wide_b", 8);
+        graph.bindInputPort("a", a);
+        graph.bindInputPort("b", b);
+        graph.bindInputPort("c", c);
+        graph.bindInputPort("d", d);
+        graph.bindInputPort("e", e);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("wide_a", wideA);
+        graph.bindInputPort("wide_b", wideB);
+
+        const auto addBinary = [&](OperationKind kind,
+                                   std::string_view opName,
+                                   std::string_view valueName,
+                                   ValueId lhs,
+                                   ValueId rhs,
+                                   int32_t width) {
+            ValueId result = makeLogicValue(graph, valueName, width);
+            OperationId op = graph.createOperation(kind, graph.internSymbol(opName));
+            graph.addOperand(op, lhs);
+            graph.addOperand(op, rhs);
+            graph.addResult(op, result);
+            return result;
+        };
+        const auto addUnary = [&](OperationKind kind,
+                                  std::string_view opName,
+                                  std::string_view valueName,
+                                  ValueId operand) {
+            ValueId result = makeLogicValue(graph, valueName, 1);
+            OperationId op = graph.createOperation(kind, graph.internSymbol(opName));
+            graph.addOperand(op, operand);
+            graph.addResult(op, result);
+            return result;
+        };
+
+        ValueId andY = addBinary(OperationKind::kAnd, "and_op", "and_y", a, b, 1);
+        ValueId orY = addBinary(OperationKind::kOr, "or_op", "or_y", c, d, 1);
+        ValueId xorY = addBinary(OperationKind::kXor, "xor_op", "xor_y", a, c, 1);
+        ValueId xnorY = addBinary(OperationKind::kXnor, "xnor_op", "xnor_y", b, d, 1);
+        ValueId notY = addUnary(OperationKind::kNot, "not_op", "not_y", e);
+        ValueId chainY = addBinary(OperationKind::kAnd, "chain_and_op", "chain_y", orY, e, 1);
+        ValueId logicAndY = addBinary(OperationKind::kLogicAnd, "logic_and_op", "logic_and_y", a, d, 1);
+        ValueId wideAndY = addBinary(OperationKind::kAnd, "wide_and_op", "wide_and_y", wideA, wideB, 8);
+
+        OperationId bitReg = graph.createOperation(OperationKind::kRegister, graph.internSymbol("bit_reg"));
+        graph.setAttr(bitReg, "width", static_cast<int64_t>(1));
+        graph.setAttr(bitReg, "isSigned", false);
+        graph.setAttr(bitReg, "initValue", std::string("1'b0"));
+        ValueId bitQ = makeLogicValue(graph, "bit_q", 1);
+        OperationId bitRead = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                    graph.internSymbol("bit_read"));
+        graph.addResult(bitRead, bitQ);
+        graph.setAttr(bitRead, "regSymbol", std::string("bit_reg"));
+        ValueId one = addConstant(graph, "one_op", "one", 1, "1'b1");
+        OperationId bitWrite = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                     graph.internSymbol("bit_write"));
+        graph.addOperand(bitWrite, one);
+        graph.addOperand(bitWrite, a);
+        graph.addOperand(bitWrite, one);
+        graph.addOperand(bitWrite, clk);
+        graph.setAttr(bitWrite, "regSymbol", std::string("bit_reg"));
+        graph.setAttr(bitWrite, "eventEdge", std::vector<std::string>{"posedge"});
+        ValueId stateAndY = addBinary(OperationKind::kAnd, "state_and_op", "state_and_y", bitQ, b, 1);
+
+        graph.bindOutputPort("and_y", andY);
+        graph.bindOutputPort("or_y", orY);
+        graph.bindOutputPort("xor_y", xorY);
+        graph.bindOutputPort("xnor_y", xnorY);
+        graph.bindOutputPort("not_y", notY);
+        graph.bindOutputPort("chain_y", chainY);
+        graph.bindOutputPort("logic_and_y", logicAndY);
+        graph.bindOutputPort("wide_and_y", wideAndY);
+        graph.bindOutputPort("state_and_y", stateAndY);
+        return design;
+    }
+
     Design buildGatedClockDesign()
     {
         Design design;
@@ -5299,6 +5387,161 @@ int main()
         if (std::system(commitBatchHarnessExe.string().c_str()) != 0)
         {
             return fail("commit-cond-batch harness failed to run");
+        }
+
+        const std::filesystem::path oneBitBaseDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_one_bit_bitwise";
+        const std::array<std::string, 3> oneBitVariantNames = {"default", "zero", "enabled"};
+        std::filesystem::remove_all(oneBitBaseDir);
+        Design oneBitDesign = buildOneBitBitwiseDesign();
+        SessionStore oneBitSession;
+        if (!runActivitySchedule(oneBitDesign, oneBitSession))
+        {
+            return fail("one-bit-bitwise activity-schedule pass failed");
+        }
+        std::array<std::filesystem::path, 3> oneBitDirs;
+        std::array<std::string, 3> oneBitCombinedSources;
+        std::array<std::string, 3> oneBitRuntimeSources;
+        std::array<std::string, 3> oneBitSchedSources;
+        for (std::size_t variant = 0; variant < oneBitVariantNames.size(); ++variant)
+        {
+            oneBitDirs[variant] = oneBitBaseDir / oneBitVariantNames[variant];
+            std::filesystem::create_directories(oneBitDirs[variant]);
+            EmitOptions oneBitOptions;
+            oneBitOptions.outputDir = oneBitDirs[variant].string();
+            oneBitOptions.session = &oneBitSession;
+            oneBitOptions.sessionPathPrefix = std::string("top");
+            oneBitOptions.attributes["emit_parallelism"] = "2";
+            oneBitOptions.attributes["direct_single_writer_state_reads"] = "1";
+            if (variant == 1)
+            {
+                oneBitOptions.attributes["one_bit_bitwise_bytes"] = "0";
+            }
+            else if (variant == 2)
+            {
+                oneBitOptions.attributes["one_bit_bitwise_bytes"] = "1";
+            }
+            EmitDiagnostics oneBitDiag;
+            EmitGrhSimCpp oneBitEmitter(&oneBitDiag);
+            const EmitResult oneBitResult = oneBitEmitter.emit(oneBitDesign, oneBitOptions);
+            if (!oneBitResult.success || oneBitDiag.hasError())
+            {
+                return fail("one-bit-bitwise emit failed for " + oneBitVariantNames[variant]);
+            }
+            const std::vector<std::filesystem::path> variantStateFiles =
+                collectSchedFiles(oneBitDirs[variant], "grhsim_top_state");
+            const std::vector<std::filesystem::path> variantSchedFiles =
+                collectSchedFiles(oneBitDirs[variant], "grhsim_top_sched_");
+            if (variantStateFiles.empty() || variantSchedFiles.empty())
+            {
+                return fail("one-bit-bitwise generated files missing");
+            }
+            oneBitRuntimeSources[variant] = readFile(oneBitDirs[variant] / "grhsim_top_runtime.hpp");
+            oneBitSchedSources[variant] = readFiles(variantSchedFiles);
+            oneBitCombinedSources[variant] = readFile(oneBitDirs[variant] / "grhsim_top.hpp") +
+                                             oneBitRuntimeSources[variant] +
+                                             readFiles(variantStateFiles) +
+                                             readFile(oneBitDirs[variant] / "grhsim_top_eval.cpp") +
+                                             oneBitSchedSources[variant];
+        }
+        if (oneBitCombinedSources[0] != oneBitCombinedSources[1])
+        {
+            return fail("one-bit-bitwise default and explicit zero output should match");
+        }
+        if (oneBitRuntimeSources[0].find("grhsim_assume_bit_u8") != std::string::npos ||
+            oneBitSchedSources[0].find("const std::uint8_t next_value = grhsim_assume_bit_u8") !=
+                std::string::npos)
+        {
+            return fail("one-bit-bitwise default output should stay disabled");
+        }
+        if (oneBitRuntimeSources[2].find("GRHSIM_ALWAYS_INLINE std::uint8_t grhsim_assume_bit_u8") ==
+                std::string::npos ||
+            oneBitSchedSources[2].find("const std::uint8_t next_value =") == std::string::npos ||
+            oneBitSchedSources[2].find("grhsim_assume_bit_u8") == std::string::npos)
+        {
+            return fail("one-bit-bitwise enabled output should use assumed byte expressions");
+        }
+        if (oneBitSchedSources[2].find("const bool next_value = a ^ c;") == std::string::npos ||
+            oneBitSchedSources[2].find("const bool next_value = (~(b ^ d)) & UINT64_C(1);") ==
+                std::string::npos ||
+            oneBitSchedSources[2].find("const bool next_value = (~(e)) & UINT64_C(1);") == std::string::npos)
+        {
+            return fail("one-bit-bitwise should not alter xor, xnor, or not");
+        }
+        if (oneBitSchedSources[2].find("const bool next_value = (a) && (d);") == std::string::npos)
+        {
+            return fail("one-bit-bitwise should not alter kLogicAnd");
+        }
+        const std::filesystem::path oneBitEnabledDir = oneBitDirs[2];
+        const std::filesystem::path oneBitHarnessPath = oneBitEnabledDir / "grhsim_top_harness.cpp";
+        {
+            std::ofstream harness(oneBitHarnessPath);
+            if (!harness.is_open())
+            {
+                return fail("failed to create one-bit-bitwise harness");
+            }
+            harness << "#include \"grhsim_top.hpp\"\n";
+            harness << "#include <cstdint>\n\n";
+            harness << "int main()\n{\n";
+            harness << "    GrhSIM_top sim;\n";
+            harness << "    sim.init();\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    for (unsigned bits = 0; bits < 32; ++bits) {\n";
+            harness << "        sim.a = (bits & 1u) != 0;\n";
+            harness << "        sim.b = (bits & 2u) != 0;\n";
+            harness << "        sim.c = (bits & 4u) != 0;\n";
+            harness << "        sim.d = (bits & 8u) != 0;\n";
+            harness << "        sim.e = (bits & 16u) != 0;\n";
+            harness << "        sim.wide_a = static_cast<std::uint8_t>(bits * 7u);\n";
+            harness << "        sim.wide_b = static_cast<std::uint8_t>(0xA5u ^ bits);\n";
+            harness << "        sim.eval();\n";
+            harness << "        if (sim.and_y != (sim.a & sim.b)) return 1;\n";
+            harness << "        if (sim.or_y != (sim.c | sim.d)) return 2;\n";
+            harness << "        if (sim.xor_y != (sim.a ^ sim.c)) return 3;\n";
+            harness << "        if (sim.xnor_y != !(sim.b ^ sim.d)) return 4;\n";
+            harness << "        if (sim.not_y != !sim.e) return 5;\n";
+            harness << "        if (sim.chain_y != ((sim.c | sim.d) & sim.e)) return 6;\n";
+            harness << "        if (sim.logic_and_y != (sim.a && sim.d)) return 7;\n";
+            harness << "        if (sim.wide_and_y != static_cast<std::uint8_t>(sim.wide_a & sim.wide_b)) return 8;\n";
+            harness << "    }\n";
+            harness << "    sim.a = true;\n";
+            harness << "    sim.b = true;\n";
+            harness << "    sim.clk = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (!sim.state_and_y) return 9;\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    sim.eval();\n";
+            harness << "    sim.a = false;\n";
+            harness << "    sim.clk = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.state_and_y) return 10;\n";
+            harness << "    return 0;\n";
+            harness << "}\n";
+        }
+        const std::vector<std::filesystem::path> oneBitStateFiles =
+            collectSchedFiles(oneBitEnabledDir, "grhsim_top_state");
+        const std::vector<std::filesystem::path> oneBitSchedFiles =
+            collectSchedFiles(oneBitEnabledDir, "grhsim_top_sched_");
+        const std::filesystem::path oneBitHarnessExe = oneBitEnabledDir / "grhsim_top_harness";
+        std::string oneBitCompileCmd =
+            "clang++ " + std::string(kHarnessCompileFlags) + " -I" + oneBitEnabledDir.string();
+        for (const auto &stateFile : oneBitStateFiles)
+        {
+            oneBitCompileCmd += " " + stateFile.string();
+        }
+        oneBitCompileCmd += " " + (oneBitEnabledDir / "grhsim_top_eval.cpp").string();
+        for (const auto &schedPath : oneBitSchedFiles)
+        {
+            oneBitCompileCmd += " " + schedPath.string();
+        }
+        oneBitCompileCmd += " " + oneBitHarnessPath.string() + " -o " + oneBitHarnessExe.string();
+        if (std::system(oneBitCompileCmd.c_str()) != 0)
+        {
+            return fail("one-bit-bitwise harness failed to compile");
+        }
+        if (std::system(oneBitHarnessExe.string().c_str()) != 0)
+        {
+            return fail("one-bit-bitwise harness failed to run");
         }
 
         const std::filesystem::path gatedDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_gated_clock";

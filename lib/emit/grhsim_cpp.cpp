@@ -997,6 +997,7 @@ namespace wolvrix::lib::emit
         {
             std::string expr;
             bool alreadyBoundedToResultWidth = false;
+            bool byteBitResult = false;
         };
 
         std::string scalarMaskExpr(std::size_t width)
@@ -2726,6 +2727,7 @@ namespace wolvrix::lib::emit
             bool commitStateChangeUnlikely = false;
             bool directSingleWriterStateReads = false;
             bool fullActiveWordConsume = false;
+            bool oneBitBitwiseBytes = false;
             std::size_t directStateReadCount = 0;
             std::size_t directStateReadCanonicalCount = 0;
             std::size_t directStateReadAliasCount = 0;
@@ -4950,6 +4952,10 @@ namespace wolvrix::lib::emit
 
         std::string renderScalarLogicExpr(const Graph &graph, ValueId resultValue, const ScalarLogicExpr &rhs)
         {
+            if (rhs.byteBitResult)
+            {
+                return "static_cast<std::uint8_t>(" + rhs.expr + ")";
+            }
             const std::string cppType = cppTypeForValue(graph, resultValue);
             const std::size_t width = static_cast<std::size_t>(graph.valueWidth(resultValue));
             if (cppType == "std::uint64_t" && (rhs.alreadyBoundedToResultWidth || width >= 64u))
@@ -4966,7 +4972,8 @@ namespace wolvrix::lib::emit
         std::string renderScalarAssignedExpr(const Graph &graph,
                                              ValueId resultValue,
                                              const std::string &expr,
-                                             bool alreadyBoundedToResultWidth)
+                                             bool alreadyBoundedToResultWidth,
+                                             bool byteBitResult = false)
         {
             return renderScalarLogicExpr(
                 graph,
@@ -4974,6 +4981,7 @@ namespace wolvrix::lib::emit
                 ScalarLogicExpr{
                     .expr = expr,
                     .alreadyBoundedToResultWidth = alreadyBoundedToResultWidth,
+                    .byteBitResult = byteBitResult,
                 });
         }
 
@@ -10831,12 +10839,13 @@ namespace wolvrix::lib::emit
                                            bool alreadyBoundedToResultWidth,
                                            SupernodeLocalExprContext *context = nullptr,
                                            const ActivationEmitContext *activationContext = nullptr,
-                                           DeferredActivationEmitContext *deferredContext = nullptr)
+                                           DeferredActivationEmitContext *deferredContext = nullptr,
+                                           bool byteBitResult = false)
         {
             const std::string lhs = resolvedStoredValueRefExpr(model, resultValue, context);
             const std::string assignedExpr =
-                renderScalarAssignedExpr(graph, resultValue, expr, alreadyBoundedToResultWidth);
-            const std::string cppType = cppTypeForValue(graph, resultValue);
+                renderScalarAssignedExpr(graph, resultValue, expr, alreadyBoundedToResultWidth, byteBitResult);
+            const std::string cppType = byteBitResult ? "std::uint8_t" : cppTypeForValue(graph, resultValue);
             const std::string initializerExpr = scalarTypedInitializerExpr(graph, resultValue, assignedExpr);
             const bool materialized = isMaterializedValue(model, resultValue);
             if (!materialized)
@@ -11491,7 +11500,8 @@ namespace wolvrix::lib::emit
                                              const Graph &graph,
                                              const std::unordered_map<ScalarConcatPrefixCacheKey,
                                                                       std::string,
-                                                                      ScalarConcatPrefixCacheKeyHash> *concatPrefixTemps = nullptr);
+                                                                      ScalarConcatPrefixCacheKeyHash> *concatPrefixTemps = nullptr,
+                                             bool oneBitBitwiseBytes = false);
         std::optional<std::string> eventWordLogicExprForOp(const Graph &graph,
                                                            const EmitModel &model,
                                                            const Operation &op,
@@ -12374,7 +12384,8 @@ namespace wolvrix::lib::emit
             {
                 return eventWordLogicExprForOp(graph, model, op, value, operandExprs);
             }
-            const ScalarLogicExpr rhs = scalarAssignmentExpr(op.kind(), operandExprs, op, graph);
+            const ScalarLogicExpr rhs =
+                scalarAssignmentExpr(op.kind(), operandExprs, op, graph, nullptr, model.oneBitBitwiseBytes);
             if (rhs.expr.empty())
             {
                 return std::nullopt;
@@ -12580,7 +12591,8 @@ namespace wolvrix::lib::emit
                         }
                         else
                         {
-                            const ScalarLogicExpr rhs = scalarAssignmentExpr(op.kind(), operandExprs, op, graph);
+                            const ScalarLogicExpr rhs =
+                                scalarAssignmentExpr(op.kind(), operandExprs, op, graph, nullptr, model.oneBitBitwiseBytes);
                             if (!rhs.expr.empty())
                             {
                                 expr = renderScalarLogicExpr(graph, value, rhs);
@@ -12610,10 +12622,38 @@ namespace wolvrix::lib::emit
                                              const Graph &graph,
                                              const std::unordered_map<ScalarConcatPrefixCacheKey,
                                                                       std::string,
-                                                                      ScalarConcatPrefixCacheKeyHash> *concatPrefixTemps)
+                                                                      ScalarConcatPrefixCacheKeyHash> *concatPrefixTemps,
+                                             bool oneBitBitwiseBytes)
         {
             const auto resultWidth =
                 op.results().empty() ? 64 : static_cast<std::size_t>(graph.valueWidth(op.results().front()));
+            const bool byteBitResult = oneBitBitwiseBytes &&
+                                       (op.kind() == OperationKind::kAnd || op.kind() == OperationKind::kOr) &&
+                                       resultWidth == 1u &&
+                                       std::ranges::all_of(op.operands(), [&](ValueId value) {
+                                           return graph.valueType(value) == ValueType::Logic &&
+                                                  graph.valueWidth(value) == 1;
+                                       });
+            auto byteBitOperandExpr = [&](std::size_t index) -> std::string
+            {
+                std::string expr = stripRedundantOuterParens(operands[index]);
+                while (true)
+                {
+                    const std::string previous = expr;
+                    expr = stripOuterCastToType(std::move(expr), "bool");
+                    expr = stripRedundantUint64Cast(expr);
+                    expr = stripRedundantOuterParens(std::move(expr));
+                    if (expr == previous)
+                    {
+                        break;
+                    }
+                }
+                if (expr.starts_with("grhsim_assume_bit_u8(") && expr.ends_with(")"))
+                {
+                    return expr;
+                }
+                return "grhsim_assume_bit_u8(static_cast<std::uint8_t>(" + expr + "))";
+            };
             auto operandExpr = [&](std::size_t index, std::size_t width) -> std::string
             {
                 const ValueId value = op.operands()[index];
@@ -12670,8 +12710,20 @@ namespace wolvrix::lib::emit
                     true};
             }
             case OperationKind::kAnd:
+                if (byteBitResult)
+                {
+                    return ScalarLogicExpr{"(" + byteBitOperandExpr(0) + " & " + byteBitOperandExpr(1) + ")",
+                                           true,
+                                           true};
+                }
                 return ScalarLogicExpr{"(" + operandExpr(0, resultWidth) + " & " + operandExpr(1, resultWidth) + ")", true};
             case OperationKind::kOr:
+                if (byteBitResult)
+                {
+                    return ScalarLogicExpr{"(" + byteBitOperandExpr(0) + " | " + byteBitOperandExpr(1) + ")",
+                                           true,
+                                           true};
+                }
                 return ScalarLogicExpr{"(" + operandExpr(0, resultWidth) + " | " + operandExpr(1, resultWidth) + ")", true};
             case OperationKind::kXor:
                 return ScalarLogicExpr{"(" + operandExpr(0, resultWidth) + " ^ " + operandExpr(1, resultWidth) + ")", true};
@@ -15397,8 +15449,12 @@ namespace wolvrix::lib::emit
                         {
                             operandExprs.push_back(resolvedScheduleValueExpr(model, operand, &localExprContext));
                         }
-                        const ScalarLogicExpr rhs =
-                            scalarAssignmentExpr(op.kind(), operandExprs, op, graph, &concatPrefixTemps);
+                        const ScalarLogicExpr rhs = scalarAssignmentExpr(op.kind(),
+                                                                         operandExprs,
+                                                                         op,
+                                                                         graph,
+                                                                         &concatPrefixTemps,
+                                                                         model.oneBitBitwiseBytes);
                         if (rhs.expr.empty())
                         {
                             return emitError("unsupported scalar expression emit", std::string(op.symbolText()));
@@ -15411,7 +15467,8 @@ namespace wolvrix::lib::emit
                                                       rhs.alreadyBoundedToResultWidth,
                                                       &localExprContext,
                                                       &activationContext,
-                                                      &deferredActivationContext);
+                                                      &deferredActivationContext,
+                                                      rhs.byteBitResult);
                         break;
                     }
                     case OperationKind::kSystemTask:
@@ -15990,6 +16047,10 @@ namespace wolvrix::lib::emit
             parseBooleanEmitOption(options,
                                    "full_active_word_consume",
                                    "WOLVRIX_GRHSIM_FULL_ACTIVE_WORD_CONSUME");
+        const bool oneBitBitwiseBytes =
+            parseBooleanEmitOption(options,
+                                   "one_bit_bitwise_bytes",
+                                   "WOLVRIX_GRHSIM_ONE_BIT_BITWISE_BYTES");
         const std::size_t schedBatchesPerCpp = parseScheduleBatchesPerCpp(options);
         const std::unordered_set<ValueId, ValueIdHash> waveformValueIds =
             waveformMode == WaveformMode::kDeclaredSymbols ? collectDeclaredSymbolWaveformValueIds(graph)
@@ -16020,6 +16081,7 @@ namespace wolvrix::lib::emit
         model.posedgeFullpassSpecialization = posedgeFullpassSpecialization;
         model.commitStateChangeUnlikely = commitStateChangeUnlikely;
         model.fullActiveWordConsume = fullActiveWordConsume;
+        model.oneBitBitwiseBytes = oneBitBitwiseBytes;
         if (model.emitRuntimeProfile)
         {
             buildRuntimeProfileWeights(graph, schedule, model);
@@ -16984,6 +17046,19 @@ namespace wolvrix::lib::emit
             *stream << "#define GRHSIM_ALWAYS_INLINE inline\n";
             *stream << "#endif\n";
             *stream << "#endif\n\n";
+            if (model.oneBitBitwiseBytes)
+            {
+                *stream << "GRHSIM_ALWAYS_INLINE std::uint8_t grhsim_assume_bit_u8(std::uint8_t value)\n{\n";
+                *stream << "#if defined(__clang__)\n";
+                *stream << "    __builtin_assume(value <= UINT8_C(1));\n";
+                *stream << "#elif defined(__GNUC__)\n";
+                *stream << "    if (value > UINT8_C(1)) {\n";
+                *stream << "        __builtin_unreachable();\n";
+                *stream << "    }\n";
+                *stream << "#endif\n";
+                *stream << "    return value;\n";
+                *stream << "}\n\n";
+            }
             *stream << "template <std::size_t N>\n";
             *stream << "GRHSIM_ALWAYS_INLINE bool grhsim_assign_words_full(std::array<std::uint64_t, N> &dst,\n";
             *stream << "                                                  const std::array<std::uint64_t, N> &src)\n{\n";
