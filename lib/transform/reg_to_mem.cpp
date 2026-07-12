@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <limits>
@@ -49,6 +50,20 @@ namespace wolvrix::lib::transform
         {
             std::cerr << "reg-to-mem profile: " << message << '\n';
             std::cerr.flush();
+        }
+
+        bool profileAllGroupsEnabled()
+        {
+            const char *rawValue = std::getenv("WOLVRIX_REG_TO_MEM_PROFILE_ALL_GROUPS");
+            if (!rawValue)
+            {
+                return false;
+            }
+            std::string value(rawValue);
+            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+                return static_cast<char>(std::tolower(ch));
+            });
+            return !value.empty() && value != "0" && value != "false" && value != "off";
         }
 
         template <typename T>
@@ -4404,7 +4419,9 @@ namespace wolvrix::lib::transform
 
         RegToMemStats stats;
         RegToMemProfile profile;
+        const bool profileAllGroups = profileAllGroupsEnabled();
         const auto passStart = ProfileClock::now();
+        profileLog("config profile_all_groups=" + std::to_string(profileAllGroups ? 1 : 0));
         std::size_t graphIndex = 0;
         for (const auto &entry : design().graphs())
         {
@@ -4557,7 +4574,7 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
-                const bool verboseGroup = visitedGroups <= 20 || visitedGroups % 100 == 0 ||
+                const bool verboseGroup = profileAllGroups || visitedGroups <= 20 || visitedGroups % 100 == 0 ||
                                           group.regSymbols.size() >= 500 || group.decodedWriteStorage;
                 GroupProfileContext groupProfile{
                     .graphIndex = graphIndex,
