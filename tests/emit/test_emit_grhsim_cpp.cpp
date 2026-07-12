@@ -1015,7 +1015,8 @@ namespace
                                   ActivityScheduleOptions scheduleOptions = {},
                                   bool posedgeFullpassSpecialization = false,
                                   bool perf = false,
-                                  bool stateReadLocalityStats = false)
+                                  bool stateReadLocalityStats = false,
+                                  bool directSingleWriterStateReads = false)
     {
         SessionStore session;
         if (scheduleOptions.path.empty())
@@ -1046,6 +1047,10 @@ namespace
         if (stateReadLocalityStats)
         {
             options.attributes["state_read_locality_stats"] = "1";
+        }
+        if (directSingleWriterStateReads)
+        {
+            options.attributes["direct_single_writer_state_reads"] = "1";
         }
 
         EmitGrhSimCpp emitter(&diag);
@@ -1807,6 +1812,89 @@ namespace
         graph.setAttr(display, "procKind", std::string("always_ff"));
         graph.setAttr(display, "hasTiming", false);
         graph.setAttr(display, "eventEdge", std::vector<std::string>{"posedge"});
+
+        return design;
+    }
+
+    Design buildDirectStateReadForwardDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        const ValueId clk = makeLogicValue(graph, "clk", 1);
+        const ValueId directData = makeLogicValue(graph, "direct_data", 8);
+        const ValueId protectedData = makeLogicValue(graph, "protected_data", 8);
+        const ValueId multiWriteA = makeLogicValue(graph, "multi_write_a", 1);
+        const ValueId multiWriteB = makeLogicValue(graph, "multi_write_b", 1);
+        const ValueId multiDataA = makeLogicValue(graph, "multi_data_a", 8);
+        const ValueId multiDataB = makeLogicValue(graph, "multi_data_b", 8);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("direct_data", directData);
+        graph.bindInputPort("protected_data", protectedData);
+        graph.bindInputPort("multi_write_a", multiWriteA);
+        graph.bindInputPort("multi_write_b", multiWriteB);
+        graph.bindInputPort("multi_data_a", multiDataA);
+        graph.bindInputPort("multi_data_b", multiDataB);
+
+        const ValueId one = addConstant(graph, "direct_const_one", "direct_one", 1, "1'b1");
+        const ValueId increment = addConstant(graph, "direct_const_increment", "direct_increment", 8, "8'h01");
+        const ValueId mask = addConstant(graph, "direct_const_mask", "direct_mask", 8, "8'hff");
+
+        auto addRegister = [&](std::string_view symbol, std::string_view initValue) {
+            const OperationId reg = graph.createOperation(OperationKind::kRegister,
+                                                          graph.internSymbol(std::string(symbol)));
+            graph.setAttr(reg, "width", int64_t{8});
+            graph.setAttr(reg, "isSigned", false);
+            graph.setAttr(reg, "initValue", std::string(initValue));
+        };
+        auto addRead = [&](std::string_view stateSymbol, std::string_view valueSymbol) {
+            const ValueId value = makeLogicValue(graph, std::string(valueSymbol), 8);
+            const OperationId read = graph.createOperation(
+                OperationKind::kRegisterReadPort,
+                graph.internSymbol(std::string(valueSymbol) + "_op"));
+            graph.addResult(read, value);
+            graph.setAttr(read, "regSymbol", std::string(stateSymbol));
+            return value;
+        };
+        auto addIncrement = [&](ValueId value, std::string_view symbol) {
+            const ValueId result = makeLogicValue(graph, std::string(symbol), 8);
+            const OperationId add = graph.createOperation(OperationKind::kAdd,
+                                                          graph.internSymbol(std::string(symbol) + "_op"));
+            graph.addOperand(add, value);
+            graph.addOperand(add, increment);
+            graph.addResult(add, result);
+            return result;
+        };
+        auto addWrite = [&](std::string_view opSymbol,
+                            std::string_view stateSymbol,
+                            ValueId cond,
+                            ValueId data) {
+            const OperationId write = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                            graph.internSymbol(std::string(opSymbol)));
+            graph.addOperand(write, cond);
+            graph.addOperand(write, data);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clk);
+            graph.setAttr(write, "regSymbol", std::string(stateSymbol));
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        };
+
+        addRegister("direct_q", "8'h03");
+        const ValueId directRead = addRead("direct_q", "direct_q_read");
+        graph.bindOutputPort("direct_plus_one", addIncrement(directRead, "direct_plus_one_value"));
+        addWrite("direct_q_write", "direct_q", one, directData);
+
+        addRegister("protected_q", "8'h07");
+        const ValueId protectedRead = addRead("protected_q", "protected_q_read");
+        graph.bindOutputPort("protected_q_out", protectedRead);
+        addWrite("protected_q_write", "protected_q", one, protectedData);
+
+        addRegister("multi_q", "8'h05");
+        const ValueId multiRead = addRead("multi_q", "multi_q_read");
+        graph.bindOutputPort("multi_plus_one", addIncrement(multiRead, "multi_plus_one_value"));
+        addWrite("multi_q_write_a", "multi_q", multiWriteA, multiDataA);
+        addWrite("multi_q_write_b", "multi_q", multiWriteB, multiDataB);
 
         return design;
     }
@@ -5230,12 +5318,14 @@ int main()
         {
             return fail("repeated state-read locality TSV contents are incomplete");
         }
-        const std::filesystem::path repeatedReadHarnessPath = repeatedReadDir / "grhsim_top_harness.cpp";
-        {
-            std::ofstream harness(repeatedReadHarnessPath);
+        const auto runRepeatedReadHarness = [&](const std::filesystem::path &dir,
+                                                const std::vector<std::filesystem::path> &stateFiles,
+                                                const std::vector<std::filesystem::path> &schedFiles) {
+            const std::filesystem::path harnessPath = dir / "grhsim_top_harness.cpp";
+            std::ofstream harness(harnessPath);
             if (!harness.is_open())
             {
-                return fail("failed to create repeated state-read harness");
+                return false;
             }
             harness << "#include \"grhsim_top.hpp\"\n";
             harness << "#include <cstdint>\n\n";
@@ -5255,30 +5345,220 @@ int main()
             harness << "    if (sim.q_out != static_cast<std::uint8_t>(9)) return 3;\n";
             harness << "    return 0;\n";
             harness << "}\n";
-        }
-        const std::filesystem::path repeatedReadHarnessExe = repeatedReadDir / "grhsim_top_harness";
-        std::string repeatedReadCompileCmd =
-            "clang++ " + std::string(kHarnessCompileFlags) + " -I" + repeatedReadDir.string();
-        for (const auto &stateFile : repeatedReadStateFiles)
+            harness.close();
+
+            const std::filesystem::path harnessExe = dir / "grhsim_top_harness";
+            std::string compileCmd =
+                "clang++ " + std::string(kHarnessCompileFlags) + " -I" + dir.string();
+            for (const auto &stateFile : stateFiles)
+            {
+                compileCmd += " " + stateFile.string();
+            }
+            compileCmd += " " + (dir / "grhsim_top_eval.cpp").string();
+            for (const auto &schedFile : schedFiles)
+            {
+                compileCmd += " " + schedFile.string();
+            }
+            compileCmd += " " + harnessPath.string() + " -o " + harnessExe.string();
+            if (std::system(compileCmd.c_str()) != 0)
+            {
+                return false;
+            }
+            const std::filesystem::path harnessLog = dir / "grhsim_top_harness.log";
+            const std::string runCmd = harnessExe.string() + " > " + harnessLog.string() + " 2>&1";
+            return std::system(runCmd.c_str()) == 0;
+        };
+        if (!runRepeatedReadHarness(repeatedReadDir, repeatedReadStateFiles, repeatedReadSchedFiles))
         {
-            repeatedReadCompileCmd += " " + stateFile.string();
+            return fail("repeated state-read harness failed");
         }
-        repeatedReadCompileCmd += " " + (repeatedReadDir / "grhsim_top_eval.cpp").string();
-        for (const auto &schedFile : repeatedReadSchedFiles)
+
+        const std::filesystem::path repeatedDirectDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_repeated_direct_state_read";
+        std::filesystem::remove_all(repeatedDirectDir);
+        Design repeatedDirectDesign = buildRepeatedScalarStateReadDesign();
+        EmitDiagnostics repeatedDirectDiag;
+        EmitResult repeatedDirectResult;
+        if (!emitWithActivitySchedule(repeatedDirectDesign,
+                                      repeatedDirectDir,
+                                      repeatedDirectDiag,
+                                      repeatedDirectResult,
+                                      repeatedReadScheduleOptions,
+                                      false,
+                                      false,
+                                      false,
+                                      true))
         {
-            repeatedReadCompileCmd += " " + schedFile.string();
+            return fail("repeated direct state-read activity-schedule pass failed");
         }
-        repeatedReadCompileCmd += " " + repeatedReadHarnessPath.string() + " -o " + repeatedReadHarnessExe.string();
-        if (std::system(repeatedReadCompileCmd.c_str()) != 0)
+        if (!repeatedDirectResult.success || repeatedDirectDiag.hasError())
         {
-            return fail("repeated state-read harness failed to compile");
+            return fail("repeated direct state-read emit failed");
         }
-        const std::filesystem::path repeatedReadHarnessLog = repeatedReadDir / "grhsim_top_harness.log";
-        const std::string runRepeatedReadHarnessCmd =
-            repeatedReadHarnessExe.string() + " > " + repeatedReadHarnessLog.string() + " 2>&1";
-        if (std::system(runRepeatedReadHarnessCmd.c_str()) != 0)
+        const std::vector<std::filesystem::path> repeatedDirectStateFiles =
+            collectSchedFiles(repeatedDirectDir, "grhsim_top_state");
+        const std::vector<std::filesystem::path> repeatedDirectSchedFiles =
+            collectSchedFiles(repeatedDirectDir, "grhsim_top_sched_");
+        const std::string repeatedDirectSched = readFiles(repeatedDirectSchedFiles);
+        constexpr std::size_t expectedDirectRepeatedReads = 15;
+        if (countSubstring(repeatedDirectSched,
+                           "direct single-writer state read: consumer reads visible state") !=
+                expectedDirectRepeatedReads ||
+            countSubstring(repeatedDirectSched,
+                           "same-state scalar read: reuse synchronized change predicate") != 0 ||
+            countSubstring(repeatedDirectSched, "grhsim_any_changed_") != 0 ||
+            countSubstring(repeatedDirectSched, "[kRegisterReadPort] reg=repeated_q") !=
+                expectedDirectRepeatedReads + 2)
         {
-            return fail("repeated state-read harness failed to run");
+            return fail("repeated direct state reads should forward canonical and alias groups atomically");
+        }
+        if (!runRepeatedReadHarness(repeatedDirectDir,
+                                    repeatedDirectStateFiles,
+                                    repeatedDirectSchedFiles))
+        {
+            return fail("repeated direct state-read harness failed");
+        }
+
+        const std::filesystem::path directReadDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_direct_state_read";
+        std::filesystem::remove_all(directReadDir);
+        Design directReadDesign = buildDirectStateReadForwardDesign();
+        ActivityScheduleOptions directReadScheduleOptions;
+        directReadScheduleOptions.maxOpInComputeSupernode = 1;
+        directReadScheduleOptions.splitOversizeComputeNodes = true;
+        directReadScheduleOptions.splitOversizeComputeNodeMaxOps = 1;
+        EmitDiagnostics directReadDiag;
+        EmitResult directReadResult;
+        if (!emitWithActivitySchedule(directReadDesign,
+                                      directReadDir,
+                                      directReadDiag,
+                                      directReadResult,
+                                      directReadScheduleOptions,
+                                      false,
+                                      false,
+                                      false,
+                                      true))
+        {
+            return fail("direct state-read activity-schedule pass failed");
+        }
+        if (!directReadResult.success || directReadDiag.hasError())
+        {
+            return fail("direct state-read emit failed");
+        }
+        const std::vector<std::filesystem::path> directReadStateFiles =
+            collectSchedFiles(directReadDir, "grhsim_top_state");
+        const std::vector<std::filesystem::path> directReadSchedFiles =
+            collectSchedFiles(directReadDir, "grhsim_top_sched_");
+        const std::string directReadSched = readFiles(directReadSchedFiles);
+        const auto directReadSnippet = [&](std::string_view opComment) {
+            const std::size_t begin = directReadSched.find(opComment);
+            if (begin == std::string::npos)
+            {
+                return std::string_view{};
+            }
+            const std::size_t end = directReadSched.find("// op ", begin + opComment.size());
+            return std::string_view(directReadSched).substr(
+                begin,
+                end == std::string::npos ? end : end - begin);
+        };
+        const std::string_view directReadSource =
+            directReadSnippet("[kRegisterReadPort] reg=direct_q");
+        const std::string_view directReadConsumer =
+            directReadSnippet("// op direct_plus_one_value_op [kAdd]");
+        const std::string_view protectedReadSource =
+            directReadSnippet("// op protected_q_read_op [kRegisterReadPort] reg=protected_q");
+        const std::string_view multiReadSource =
+            directReadSnippet("[kRegisterReadPort] reg=multi_q");
+        if (directReadSource.empty() ||
+            directReadSource.find("direct single-writer state read: consumer reads visible state") ==
+                std::string_view::npos ||
+            directReadSource.find("grhsim_changed_") != std::string_view::npos)
+        {
+            return fail("eligible single-writer register read should bypass its materialized slot");
+        }
+        if (directReadConsumer.empty() ||
+            directReadConsumer.find("state_logic_storage_") == std::string_view::npos)
+        {
+            return fail("direct state-read consumer should reference visible state storage");
+        }
+        if (protectedReadSource.empty() || multiReadSource.empty() ||
+            protectedReadSource.find("direct single-writer state read") != std::string_view::npos ||
+            multiReadSource.find("direct single-writer state read") != std::string_view::npos)
+        {
+            return fail("protected and multi-writer register reads must retain the materialized path");
+        }
+
+        const std::filesystem::path directReadHarnessPath = directReadDir / "grhsim_top_harness.cpp";
+        {
+            std::ofstream harness(directReadHarnessPath);
+            if (!harness.is_open())
+            {
+                return fail("failed to create direct state-read harness");
+            }
+            harness << "#include \"grhsim_top.hpp\"\n";
+            harness << "#include <cstdint>\n\n";
+            harness << "int main()\n";
+            harness << "{\n";
+            harness << "    GrhSIM_top sim;\n";
+            harness << "    sim.init();\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    sim.direct_data = static_cast<std::uint8_t>(9);\n";
+            harness << "    sim.protected_data = static_cast<std::uint8_t>(11);\n";
+            harness << "    sim.multi_write_a = false;\n";
+            harness << "    sim.multi_write_b = false;\n";
+            harness << "    sim.multi_data_a = static_cast<std::uint8_t>(13);\n";
+            harness << "    sim.multi_data_b = static_cast<std::uint8_t>(17);\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.direct_plus_one != static_cast<std::uint8_t>(4)) return 1;\n";
+            harness << "    if (sim.protected_q_out != static_cast<std::uint8_t>(7)) return 2;\n";
+            harness << "    if (sim.multi_plus_one != static_cast<std::uint8_t>(6)) return 3;\n";
+            harness << "    sim.multi_write_a = true;\n";
+            harness << "    sim.clk = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.direct_plus_one != static_cast<std::uint8_t>(10)) return 4;\n";
+            harness << "    if (sim.protected_q_out != static_cast<std::uint8_t>(11)) return 5;\n";
+            harness << "    if (sim.multi_plus_one != static_cast<std::uint8_t>(14)) return 6;\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    sim.multi_write_a = false;\n";
+            harness << "    sim.eval();\n";
+            harness << "    sim.clk = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.direct_plus_one != static_cast<std::uint8_t>(10)) return 7;\n";
+            harness << "    if (sim.protected_q_out != static_cast<std::uint8_t>(11)) return 8;\n";
+            harness << "    if (sim.multi_plus_one != static_cast<std::uint8_t>(14)) return 9;\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    sim.eval();\n";
+            harness << "    sim.direct_data = static_cast<std::uint8_t>(2);\n";
+            harness << "    sim.protected_data = static_cast<std::uint8_t>(19);\n";
+            harness << "    sim.multi_write_b = true;\n";
+            harness << "    sim.clk = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.direct_plus_one != static_cast<std::uint8_t>(3)) return 10;\n";
+            harness << "    if (sim.protected_q_out != static_cast<std::uint8_t>(19)) return 11;\n";
+            harness << "    if (sim.multi_plus_one != static_cast<std::uint8_t>(18)) return 12;\n";
+            harness << "    return 0;\n";
+            harness << "}\n";
+        }
+        const std::filesystem::path directReadHarnessExe = directReadDir / "grhsim_top_harness";
+        std::string directReadCompileCmd =
+            "clang++ " + std::string(kHarnessCompileFlags) + " -I" + directReadDir.string();
+        for (const auto &stateFile : directReadStateFiles)
+        {
+            directReadCompileCmd += " " + stateFile.string();
+        }
+        directReadCompileCmd += " " + (directReadDir / "grhsim_top_eval.cpp").string();
+        for (const auto &schedFile : directReadSchedFiles)
+        {
+            directReadCompileCmd += " " + schedFile.string();
+        }
+        directReadCompileCmd += " " + directReadHarnessPath.string() + " -o " + directReadHarnessExe.string();
+        if (std::system(directReadCompileCmd.c_str()) != 0)
+        {
+            return fail("direct state-read harness failed to compile");
+        }
+        if (std::system(directReadHarnessExe.string().c_str()) != 0)
+        {
+            return fail("direct state-read harness failed to run");
         }
 
         const std::filesystem::path systemTaskDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_systemtask";

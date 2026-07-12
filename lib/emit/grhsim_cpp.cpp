@@ -2615,6 +2615,7 @@ namespace wolvrix::lib::emit
             std::unordered_map<ValueId, std::size_t, ValueIdHash> valueStringSlotByValue;
             std::unordered_set<ValueId, ValueIdHash> materializedValues;
             std::unordered_map<ValueId, ValueId, ValueIdHash> materializedValueAliasByValue;
+            std::unordered_map<ValueId, std::string, ValueIdHash> directStateReadSymbolByValue;
             std::unordered_map<ValueId, std::vector<uint32_t>, ValueIdHash> inputHeadSupernodesByValue;
             std::unordered_map<ValueId, std::vector<uint32_t>, ValueIdHash> boundaryFanoutByValue;
             std::vector<ValueId> commitInputValues;
@@ -2703,6 +2704,14 @@ namespace wolvrix::lib::emit
             bool inputFullpassSpecialization = false;
             bool posedgeFullpassSpecialization = false;
             bool commitStateChangeUnlikely = false;
+            bool directSingleWriterStateReads = false;
+            std::size_t directStateReadCount = 0;
+            std::size_t directStateReadCanonicalCount = 0;
+            std::size_t directStateReadAliasCount = 0;
+            std::size_t directStateReadGroupCount = 0;
+            std::size_t directStateReadSourceGroupCount = 0;
+            std::size_t directStateReadRemovedSourceHeadCount = 0;
+            std::size_t directStateReadConsumerHeadCount = 0;
         };
 
         ValueId canonicalMaterializedStorageValue(const EmitModel &model, ValueId value) noexcept
@@ -2938,29 +2947,38 @@ namespace wolvrix::lib::emit
                 {
                     const Operation op = graph.getOperation(opId);
                     const OperationKind kind = op.kind();
-                    switch (classifyRuntimeProfileOp(kind))
+                    const bool directStateRead =
+                        kind == OperationKind::kRegisterReadPort && op.results().size() == 1 &&
+                        model.directStateReadSymbolByValue.contains(op.results().front());
+                    if (!directStateRead)
                     {
-                    case RuntimeProfileOpClass::Source:
-                        ++model.runtimeProfileSourceOpsBySupernode[supernodeId];
-                        break;
-                    case RuntimeProfileOpClass::Const:
-                        ++model.runtimeProfileConstOpsBySupernode[supernodeId];
-                        break;
-                    case RuntimeProfileOpClass::Compute:
-                        ++model.runtimeProfileComputeOpsBySupernode[supernodeId];
-                        break;
-                    case RuntimeProfileOpClass::Sink:
-                        ++model.runtimeProfileSinkOpsBySupernode[supernodeId];
-                        break;
-                    case RuntimeProfileOpClass::Ignored:
-                        break;
-                    }
-                    for (ValueId result : op.results())
-                    {
-                        const auto fanoutIt = model.boundaryFanoutByValue.find(result);
-                        if (fanoutIt != model.boundaryFanoutByValue.end() && !fanoutIt->second.empty())
+                        switch (classifyRuntimeProfileOp(kind))
                         {
-                            ++model.runtimeProfileASuccBySupernode[supernodeId];
+                        case RuntimeProfileOpClass::Source:
+                            ++model.runtimeProfileSourceOpsBySupernode[supernodeId];
+                            break;
+                        case RuntimeProfileOpClass::Const:
+                            ++model.runtimeProfileConstOpsBySupernode[supernodeId];
+                            break;
+                        case RuntimeProfileOpClass::Compute:
+                            ++model.runtimeProfileComputeOpsBySupernode[supernodeId];
+                            break;
+                        case RuntimeProfileOpClass::Sink:
+                            ++model.runtimeProfileSinkOpsBySupernode[supernodeId];
+                            break;
+                        case RuntimeProfileOpClass::Ignored:
+                            break;
+                        }
+                    }
+                    if (!directStateRead)
+                    {
+                        for (ValueId result : op.results())
+                        {
+                            const auto fanoutIt = model.boundaryFanoutByValue.find(result);
+                            if (fanoutIt != model.boundaryFanoutByValue.end() && !fanoutIt->second.empty())
+                            {
+                                ++model.runtimeProfileASuccBySupernode[supernodeId];
+                            }
                         }
                     }
                     if (isWritePortKind(kind))
@@ -4639,6 +4657,10 @@ namespace wolvrix::lib::emit
             std::size_t nextTouchOrder = 0;
 
             const auto noteValue = [&](ValueId value, std::size_t weight = 1) {
+                if (model.directStateReadSymbolByValue.contains(value))
+                {
+                    return;
+                }
                 value = canonicalMaterializedStorageValue(model, value);
                 if (!model.valueScalarSlotByValue.contains(value) && !model.valueWideSlotByValue.contains(value))
                 {
@@ -4674,6 +4696,11 @@ namespace wolvrix::lib::emit
                     continue;
                 }
                 if (isRegToMemIntentBypassOp(model, opId))
+                {
+                    continue;
+                }
+                if (op.kind() == OperationKind::kRegisterReadPort && op.results().size() == 1 &&
+                    model.directStateReadSymbolByValue.contains(op.results().front()))
                 {
                     continue;
                 }
@@ -5211,7 +5238,8 @@ namespace wolvrix::lib::emit
                 }
                 for (ValueId resultValue : op.results())
                 {
-                    if (isEventValue(model, resultValue))
+                    if (isEventValue(model, resultValue) ||
+                        model.directStateReadSymbolByValue.contains(resultValue))
                     {
                         continue;
                     }
@@ -6692,6 +6720,255 @@ namespace wolvrix::lib::emit
             model.sameSupernodeStateReadSlotAliasGroupCount = aliasedCanonicalValues.size();
         }
 
+        void buildDirectSingleWriterStateReads(
+            const Graph &graph,
+            const ScheduleRefs &schedule,
+            const std::unordered_set<ValueId, ValueIdHash> &waveformValueIds,
+            EmitModel &model)
+        {
+            model.directStateReadSymbolByValue.clear();
+            model.directStateReadCount = 0;
+            model.directStateReadCanonicalCount = 0;
+            model.directStateReadAliasCount = 0;
+            model.directStateReadGroupCount = 0;
+            model.directStateReadSourceGroupCount = 0;
+            model.directStateReadRemovedSourceHeadCount = 0;
+            model.directStateReadConsumerHeadCount = 0;
+            if (!model.directSingleWriterStateReads)
+            {
+                return;
+            }
+
+            constexpr uint32_t kNoSupernode = std::numeric_limits<uint32_t>::max();
+            std::vector<uint32_t> supernodeByOp;
+            if (!graph.operations().empty())
+            {
+                supernodeByOp.assign(graph.operations().back().index + 1u, kNoSupernode);
+            }
+            for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps.size(); ++supernodeId)
+            {
+                for (OperationId opId : schedule.supernodeToOps[supernodeId])
+                {
+                    if (opId.index >= supernodeByOp.size())
+                    {
+                        supernodeByOp.resize(opId.index + 1u, kNoSupernode);
+                    }
+                    supernodeByOp[opId.index] = supernodeId;
+                }
+            }
+
+            std::unordered_map<std::string, std::size_t> registerWriteCountBySymbol;
+            for (const WriteDecl &write : model.writes)
+            {
+                if (write.kind == StateDecl::Kind::Register)
+                {
+                    ++registerWriteCountBySymbol[write.symbol];
+                }
+            }
+
+            std::unordered_set<ValueId, ValueIdHash> protectedValues = waveformValueIds;
+            for (const auto &port : graph.outputPorts())
+            {
+                protectedValues.insert(port.value);
+            }
+            for (const auto &port : graph.inoutPorts())
+            {
+                protectedValues.insert(port.out);
+                protectedValues.insert(port.oe);
+            }
+            for (const auto &[value, _] : model.eventEdgeFieldByValue)
+            {
+                (void)_;
+                protectedValues.insert(value);
+            }
+
+            struct CandidateRead
+            {
+                ValueId value;
+                const StateDecl *state = nullptr;
+                uint32_t sourceSupernode = kNoSupernode;
+                ValueId canonicalValue;
+                bool rawEligible = false;
+            };
+            struct SourceReadGroup
+            {
+                std::size_t readCount = 0;
+                std::size_t directCount = 0;
+            };
+
+            std::vector<CandidateRead> reads;
+            reads.reserve(model.materializedValues.size());
+            std::unordered_map<std::string, std::unordered_map<uint32_t, SourceReadGroup>> sourceGroupsByState;
+            std::unordered_map<ValueId, bool, ValueIdHash> aliasGroupEligible;
+
+            for (uint32_t supernodeId : model.computeSupernodeIds)
+            {
+                if (supernodeId >= schedule.supernodeToOps.size())
+                {
+                    continue;
+                }
+                for (OperationId opId : schedule.supernodeToOps[supernodeId])
+                {
+                    const Operation op = graph.getOperation(opId);
+                    if (op.kind() != OperationKind::kRegisterReadPort)
+                    {
+                        continue;
+                    }
+                    const auto targetSymbol = getAttribute<std::string>(op, "regSymbol");
+                    if (!targetSymbol)
+                    {
+                        continue;
+                    }
+                    const auto stateIt = model.stateBySymbol.find(*targetSymbol);
+                    if (stateIt == model.stateBySymbol.end())
+                    {
+                        continue;
+                    }
+                    ++sourceGroupsByState[*targetSymbol][supernodeId].readCount;
+                    if (op.results().size() != 1)
+                    {
+                        continue;
+                    }
+
+                    const ValueId resultValue = op.results().front();
+                    const StateDecl &state = stateIt->second;
+                    bool rawEligible =
+                        state.kind == StateDecl::Kind::Register &&
+                        !state.regToMemIntentStorage &&
+                        !isWideLogicWidth(state.width) &&
+                        registerWriteCountBySymbol[*targetSymbol] == 1u &&
+                        model.materializedValues.contains(resultValue) &&
+                        graph.valueType(resultValue) == ValueType::Logic &&
+                        !isWideLogicValue(graph, resultValue) &&
+                        graph.valueWidth(resultValue) == state.width &&
+                        graph.valueSigned(resultValue) == state.isSigned &&
+                        valueNeedsTrackedChange(model, resultValue) &&
+                        !protectedValues.contains(resultValue) &&
+                        !model.packedArrayLaneViewByValue.contains(resultValue) &&
+                        !isRegToMemIntentBypassOp(model, opId);
+
+                    const auto boundaryIt = model.boundaryFanoutByValue.find(resultValue);
+                    rawEligible = rawEligible &&
+                                  boundaryIt != model.boundaryFanoutByValue.end() &&
+                                  !boundaryIt->second.empty();
+                    if (rawEligible)
+                    {
+                        std::vector<uint32_t> userActiveIds;
+                        for (const auto &user : graph.getValue(resultValue).users())
+                        {
+                            const OperationId userOpId = user.operation;
+                            const uint32_t userSupernode =
+                                userOpId.valid() && userOpId.index < supernodeByOp.size()
+                                    ? supernodeByOp[userOpId.index]
+                                    : kNoSupernode;
+                            if (userSupernode == kNoSupernode || userSupernode == supernodeId ||
+                                !isComputeSupernode(model, userSupernode) ||
+                                userSupernode >= model.activeIdBySupernode.size() ||
+                                model.activeIdBySupernode[userSupernode] == kInvalidIndex)
+                            {
+                                rawEligible = false;
+                                break;
+                            }
+                            userActiveIds.push_back(
+                                static_cast<uint32_t>(model.activeIdBySupernode[userSupernode]));
+                        }
+                        if (rawEligible)
+                        {
+                            sortUniqueVector(userActiveIds);
+                            rawEligible = userActiveIds == boundaryIt->second;
+                        }
+                    }
+
+                    const ValueId canonicalValue = canonicalMaterializedStorageValue(model, resultValue);
+                    auto [eligibleIt, inserted] = aliasGroupEligible.emplace(canonicalValue, rawEligible);
+                    if (!inserted)
+                    {
+                        eligibleIt->second = eligibleIt->second && rawEligible;
+                    }
+                    reads.push_back(CandidateRead{
+                        .value = resultValue,
+                        .state = &state,
+                        .sourceSupernode = supernodeId,
+                        .canonicalValue = canonicalValue,
+                        .rawEligible = rawEligible,
+                    });
+                }
+            }
+
+            std::unordered_map<std::string, std::vector<uint32_t>> directConsumerActiveIdsByState;
+            std::unordered_set<ValueId, ValueIdHash> directCanonicalGroups;
+            for (const CandidateRead &read : reads)
+            {
+                const auto groupIt = aliasGroupEligible.find(read.canonicalValue);
+                if (!read.rawEligible || groupIt == aliasGroupEligible.end() || !groupIt->second)
+                {
+                    continue;
+                }
+                model.directStateReadSymbolByValue.emplace(read.value, read.state->symbol);
+                ++sourceGroupsByState[read.state->symbol][read.sourceSupernode].directCount;
+                const auto boundaryIt = model.boundaryFanoutByValue.find(read.value);
+                if (boundaryIt != model.boundaryFanoutByValue.end())
+                {
+                    auto &consumers = directConsumerActiveIdsByState[read.state->symbol];
+                    consumers.insert(consumers.end(), boundaryIt->second.begin(), boundaryIt->second.end());
+                }
+                directCanonicalGroups.insert(read.canonicalValue);
+                ++model.directStateReadCount;
+                if (model.materializedValueAliasByValue.contains(read.value))
+                {
+                    ++model.directStateReadAliasCount;
+                }
+                else
+                {
+                    ++model.directStateReadCanonicalCount;
+                }
+            }
+            model.directStateReadGroupCount = directCanonicalGroups.size();
+
+            for (auto &[stateSymbol, sourceGroups] : sourceGroupsByState)
+            {
+                auto &frontier = model.stateHeadSupernodesBySymbol[stateSymbol];
+                for (const auto &[sourceSupernode, group] : sourceGroups)
+                {
+                    if (group.directCount == 0)
+                    {
+                        continue;
+                    }
+                    ++model.directStateReadSourceGroupCount;
+                    if (group.directCount != group.readCount ||
+                        sourceSupernode >= model.activeIdBySupernode.size() ||
+                        model.activeIdBySupernode[sourceSupernode] == kInvalidIndex)
+                    {
+                        continue;
+                    }
+                    const uint32_t sourceActiveId =
+                        static_cast<uint32_t>(model.activeIdBySupernode[sourceSupernode]);
+                    const std::size_t oldSize = frontier.size();
+                    frontier.erase(std::remove(frontier.begin(), frontier.end(), sourceActiveId), frontier.end());
+                    model.directStateReadRemovedSourceHeadCount += oldSize - frontier.size();
+                }
+            }
+
+            for (auto &[stateSymbol, consumers] : directConsumerActiveIdsByState)
+            {
+                sortUniqueVector(consumers);
+                model.directStateReadConsumerHeadCount += consumers.size();
+                auto &frontier = model.stateHeadSupernodesBySymbol[stateSymbol];
+                frontier.insert(frontier.end(), consumers.begin(), consumers.end());
+                sortUniqueVector(frontier);
+            }
+
+            std::fprintf(stderr,
+                         "[GRHSIM_DIRECT_STATE_READ] enabled=1 reads=%zu canonical=%zu aliases=%zu groups=%zu source_groups=%zu removed_source_heads=%zu consumer_heads=%zu\n",
+                         model.directStateReadCount,
+                         model.directStateReadCanonicalCount,
+                         model.directStateReadAliasCount,
+                         model.directStateReadGroupCount,
+                         model.directStateReadSourceGroupCount,
+                         model.directStateReadRemovedSourceHeadCount,
+                         model.directStateReadConsumerHeadCount);
+        }
+
         bool buildModel(const Graph &graph,
                         const ScheduleRefs &schedule,
                         const std::vector<ScheduleBatch> &scheduleBatches,
@@ -6723,6 +7000,7 @@ namespace wolvrix::lib::emit
             model.localValueNameByValue.clear();
             model.materializedValues.clear();
             model.materializedValueAliasByValue.clear();
+            model.directStateReadSymbolByValue.clear();
             model.sameSupernodeStateReadSlotAliasCount = 0;
             model.sameSupernodeStateReadSlotAliasGroupCount = 0;
             model.eventEdgeFieldByValue.clear();
@@ -7818,6 +8096,7 @@ namespace wolvrix::lib::emit
                 (void)symbol;
                 sortUniqueVector(supernodes);
             }
+            buildDirectSingleWriterStateReads(graph, schedule, waveformValueIds, model);
 
             struct MemoryReaderActivationCandidate
             {
@@ -8042,6 +8321,15 @@ namespace wolvrix::lib::emit
                                               ValueId value,
                                               const SupernodeLocalExprContext *context = nullptr)
         {
+            if (const auto directIt = model.directStateReadSymbolByValue.find(value);
+                directIt != model.directStateReadSymbolByValue.end())
+            {
+                if (const auto stateIt = model.stateBySymbol.find(directIt->second);
+                    stateIt != model.stateBySymbol.end())
+                {
+                    return resolvedStateRefExpr(stateIt->second, context);
+                }
+            }
             if (context != nullptr)
             {
                 const auto storedIt = context->storedValueRefByValue.find(value);
@@ -9615,6 +9903,11 @@ namespace wolvrix::lib::emit
                                                OperationId opId,
                                                const Operation &op)
         {
+            if (op.kind() == OperationKind::kRegisterReadPort && op.results().size() == 1 &&
+                model.directStateReadSymbolByValue.contains(op.results().front()))
+            {
+                return 1;
+            }
             if (isCommitPhaseOp(op) &&
                 (op.kind() == OperationKind::kRegisterWritePort ||
                  op.kind() == OperationKind::kLatchWritePort ||
@@ -14321,6 +14614,12 @@ namespace wolvrix::lib::emit
                         {
                             break;
                         }
+                        const ValueId resultValue = op.results().front();
+                        if (model.directStateReadSymbolByValue.contains(resultValue))
+                        {
+                            stream << "            // direct single-writer state read: consumer reads visible state\n";
+                            break;
+                        }
                         auto targetSymbol = getAttribute<std::string>(op, op.kind() == OperationKind::kRegisterReadPort ? "regSymbol" : "latchSymbol");
                         if (!targetSymbol)
                         {
@@ -14334,7 +14633,6 @@ namespace wolvrix::lib::emit
                         const std::string stateExpr = resolvedStateRefExpr(stateIt->second, &localExprContext);
                         const std::string lhs =
                             resolvedStoredValueRefExpr(model, op.results().front(), &localExprContext);
-                        const ValueId resultValue = op.results().front();
                         const bool materialized = isMaterializedValue(model, resultValue);
                         const bool needChangeDetect = valueNeedsTrackedChange(model, resultValue);
                         if (!materialized)
@@ -15436,6 +15734,10 @@ namespace wolvrix::lib::emit
                                    "commit_state_change_unlikely",
                                    "WOLVRIX_GRHSIM_COMMIT_STATE_CHANGE_UNLIKELY",
                                    true);
+        const bool directSingleWriterStateReads =
+            parseBooleanEmitOption(options,
+                                   "direct_single_writer_state_reads",
+                                   "WOLVRIX_GRHSIM_DIRECT_SINGLE_WRITER_STATE_READS");
         const std::size_t schedBatchesPerCpp = parseScheduleBatchesPerCpp(options);
         const std::unordered_set<ValueId, ValueIdHash> waveformValueIds =
             waveformMode == WaveformMode::kDeclaredSymbols ? collectDeclaredSymbolWaveformValueIds(graph)
@@ -15451,6 +15753,7 @@ namespace wolvrix::lib::emit
 #endif
 
         EmitModel model;
+        model.directSingleWriterStateReads = directSingleWriterStateReads;
         std::string buildError;
         if (!buildModel(graph, schedule, {}, waveformValueIds, model, buildError))
         {
