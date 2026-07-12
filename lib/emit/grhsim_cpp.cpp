@@ -2725,6 +2725,7 @@ namespace wolvrix::lib::emit
             bool posedgeFullpassSpecialization = false;
             bool commitStateChangeUnlikely = false;
             bool directSingleWriterStateReads = false;
+            bool fullActiveWordConsume = false;
             std::size_t directStateReadCount = 0;
             std::size_t directStateReadCanonicalCount = 0;
             std::size_t directStateReadAliasCount = 0;
@@ -14307,6 +14308,10 @@ namespace wolvrix::lib::emit
             {
                 const std::uint8_t dispatchMask = scheduleBatchWordDispatchMask(model, word);
                 const std::uint8_t clearMask = scheduleBatchWordClearMask(model, batch, word);
+                const bool consumeFullActiveWord =
+                    model.fullActiveWordConsume &&
+                    batch.phase == ScheduleBatch::Phase::kCompute &&
+                    dispatchMask == UINT8_C(0xff);
                 struct CommitEventWordCluster
                 {
                     std::string eventExpr;
@@ -14421,9 +14426,12 @@ namespace wolvrix::lib::emit
                     stream << "    \n";
                     stream << "        // Supernode " << supernodeId << ": run when its activity flag is set.\n";
                     stream << "        if (unlikely(activeWordFlags & UINT8_C(" << static_cast<unsigned>(supernodeMask) << "))) {\n";
-                    stream << "        activeWordFlags = static_cast<std::uint8_t>(\n";
-                    stream << "            activeWordFlags & static_cast<std::uint8_t>(~UINT8_C("
-                           << static_cast<unsigned>(supernodeMask) << ")));\n";
+                    if (!consumeFullActiveWord)
+                    {
+                        stream << "        activeWordFlags = static_cast<std::uint8_t>(\n";
+                        stream << "            activeWordFlags & static_cast<std::uint8_t>(~UINT8_C("
+                               << static_cast<unsigned>(supernodeMask) << ")));\n";
+                    }
                     if (model.emitRuntimeProfile)
                     {
                         stream << "        if (runtime_profile_enabled_) {\n";
@@ -15678,7 +15686,7 @@ namespace wolvrix::lib::emit
                         stream << "        }\n";
                         stream << "        }\n";
                 }
-                if (!fullpassVariant)
+                if (!fullpassVariant && !consumeFullActiveWord)
                 {
                     stream << "                supernode_active_curr_[" << word.activeFlagWordIndex
                            << "u] = static_cast<std::uint8_t>(supernode_active_curr_["
@@ -15978,6 +15986,10 @@ namespace wolvrix::lib::emit
             parseBooleanEmitOption(options,
                                    "direct_single_writer_state_reads",
                                    "WOLVRIX_GRHSIM_DIRECT_SINGLE_WRITER_STATE_READS");
+        const bool fullActiveWordConsume =
+            parseBooleanEmitOption(options,
+                                   "full_active_word_consume",
+                                   "WOLVRIX_GRHSIM_FULL_ACTIVE_WORD_CONSUME");
         const std::size_t schedBatchesPerCpp = parseScheduleBatchesPerCpp(options);
         const std::unordered_set<ValueId, ValueIdHash> waveformValueIds =
             waveformMode == WaveformMode::kDeclaredSymbols ? collectDeclaredSymbolWaveformValueIds(graph)
@@ -16007,6 +16019,7 @@ namespace wolvrix::lib::emit
         model.inputFullpassSpecialization = inputFullpassSpecialization;
         model.posedgeFullpassSpecialization = posedgeFullpassSpecialization;
         model.commitStateChangeUnlikely = commitStateChangeUnlikely;
+        model.fullActiveWordConsume = fullActiveWordConsume;
         if (model.emitRuntimeProfile)
         {
             buildRuntimeProfileWeights(graph, schedule, model);

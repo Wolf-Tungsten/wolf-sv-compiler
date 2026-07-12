@@ -1018,7 +1018,8 @@ namespace
                                   bool perf = false,
                                   bool stateReadLocalityStats = false,
                                   bool directSingleWriterStateReads = false,
-                                  bool materializedScalarReadLocalityStats = false)
+                                  bool materializedScalarReadLocalityStats = false,
+                                  bool fullActiveWordConsume = false)
     {
         SessionStore session;
         if (scheduleOptions.path.empty())
@@ -1057,6 +1058,10 @@ namespace
         if (materializedScalarReadLocalityStats)
         {
             options.attributes["materialized_scalar_read_locality_stats"] = "1";
+        }
+        if (fullActiveWordConsume)
+        {
+            options.attributes["full_active_word_consume"] = "1";
         }
 
         EmitGrhSimCpp emitter(&diag);
@@ -1210,6 +1215,30 @@ namespace
             graph.bindOutputPort("packed_activation_out_" + index, out);
         }
 
+        return design;
+    }
+
+    Design buildFullActiveWordConsumeDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        ValueId current = makeLogicValue(graph, "chain_in", 8);
+        graph.bindInputPort("chain_in", current);
+        ValueId one = addConstant(graph, "chain_one", "chain_one_value", 8, "8'h1");
+        for (std::size_t i = 0; i < 9u; ++i)
+        {
+            const std::string index = std::to_string(i);
+            ValueId next = makeLogicValue(graph, "chain_value_" + index, 8);
+            OperationId add = graph.createOperation(OperationKind::kAdd,
+                                                    graph.internSymbol("chain_add_" + index));
+            graph.addOperand(add, current);
+            graph.addOperand(add, one);
+            graph.addResult(add, next);
+            current = next;
+        }
+        graph.bindOutputPort("chain_out", current);
         return design;
     }
 
@@ -3311,6 +3340,12 @@ int main()
     {
         return fail("Compute batch emit should keep same-word activations in local activeWordFlags");
     }
+    if (sched.find("activeWordFlags & static_cast<std::uint8_t>(~UINT8_C(") == std::string::npos ||
+        sched.find("supernode_active_curr_[") == std::string::npos ||
+        sched.find(" | activeWordFlags);") == std::string::npos)
+    {
+        return fail("default compute word dispatch should retain mutable clear/restore protocol");
+    }
     if (sched.find("display_task") == std::string::npos || sched.find("trace_dpi_call") == std::string::npos)
     {
         return fail("Missing side-effect op anchors in schedule file");
@@ -4802,6 +4837,142 @@ int main()
         if (packedActivationEval.find("grhsim_or_active_u16(supernode_active_curr_.data()") == std::string::npos)
         {
             return fail("packed-activation fanout should emit packed active flag ORs");
+        }
+
+        const std::filesystem::path fullWordConsumeDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_full_active_word_consume";
+        std::filesystem::remove_all(fullWordConsumeDir);
+        Design fullWordConsumeDesign = buildFullActiveWordConsumeDesign();
+        EmitDiagnostics fullWordConsumeDiag;
+        EmitResult fullWordConsumeResult;
+        ActivityScheduleOptions fullWordConsumeSchedule;
+        fullWordConsumeSchedule.maxOpInComputeSupernode = 1;
+        fullWordConsumeSchedule.enableCoarsen = false;
+        fullWordConsumeSchedule.splitOversizeComputeNodes = true;
+        fullWordConsumeSchedule.splitOversizeComputeNodeMaxOps = 1;
+        if (!emitWithActivitySchedule(fullWordConsumeDesign,
+                                      fullWordConsumeDir,
+                                      fullWordConsumeDiag,
+                                      fullWordConsumeResult,
+                                      fullWordConsumeSchedule,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true))
+        {
+            return fail("full-active-word-consume activity-schedule pass failed");
+        }
+        if (!fullWordConsumeResult.success || fullWordConsumeDiag.hasError())
+        {
+            return fail("full-active-word-consume emit failed");
+        }
+        const std::vector<std::filesystem::path> fullWordConsumeStateFiles =
+            collectSchedFiles(fullWordConsumeDir, "grhsim_top_state");
+        const std::vector<std::filesystem::path> fullWordConsumeSchedFiles =
+            collectSchedFiles(fullWordConsumeDir, "grhsim_top_sched_");
+        if (fullWordConsumeStateFiles.empty() || fullWordConsumeSchedFiles.empty())
+        {
+            return fail("full-active-word-consume generated files missing");
+        }
+        const std::string fullWordConsumeSched = readFiles(fullWordConsumeSchedFiles);
+        const std::string dispatchMarker =
+            "constexpr std::uint8_t dispatchMask = UINT8_C(";
+        std::string_view fullMaskBlock;
+        std::string_view partialMaskBlock;
+        std::size_t dispatchSearch = 0;
+        while ((dispatchSearch = fullWordConsumeSched.find(dispatchMarker, dispatchSearch)) != std::string::npos)
+        {
+            const std::size_t maskBegin = dispatchSearch + dispatchMarker.size();
+            const std::size_t maskEnd = fullWordConsumeSched.find(");", maskBegin);
+            if (maskEnd == std::string::npos)
+            {
+                return fail("full-active-word-consume emitted a malformed dispatch mask");
+            }
+            const unsigned mask = static_cast<unsigned>(
+                std::stoul(fullWordConsumeSched.substr(maskBegin, maskEnd - maskBegin)));
+            const std::size_t blockEnd = fullWordConsumeSched.find(dispatchMarker, maskEnd);
+            const std::string_view block = std::string_view(fullWordConsumeSched).substr(
+                dispatchSearch,
+                blockEnd == std::string::npos ? blockEnd : blockEnd - dispatchSearch);
+            if (mask == 255u && block.find("activeWordFlags |=") != std::string_view::npos)
+            {
+                fullMaskBlock = block;
+            }
+            else if (mask != 255u && partialMaskBlock.empty())
+            {
+                partialMaskBlock = block;
+            }
+            dispatchSearch = maskEnd;
+        }
+        if (fullMaskBlock.empty())
+        {
+            return fail("full-active-word-consume should emit a complete word with forward activation");
+        }
+        if (fullMaskBlock.find("activeWordFlags |=") == std::string_view::npos ||
+            fullMaskBlock.find("activeWordFlags & static_cast<std::uint8_t>(~UINT8_C(") !=
+                std::string_view::npos ||
+            fullMaskBlock.find(" | activeWordFlags);") != std::string_view::npos)
+        {
+            return fail("complete compute words should consume forward local activations without clear/restore");
+        }
+        if (partialMaskBlock.empty())
+        {
+            return fail("full-active-word-consume should retain a partial boundary word");
+        }
+        if (partialMaskBlock.find("activeWordFlags & static_cast<std::uint8_t>(~UINT8_C(") ==
+                std::string_view::npos ||
+            partialMaskBlock.find(" | activeWordFlags);") == std::string_view::npos)
+        {
+            return fail("partial compute words should retain mutable clear/restore protocol");
+        }
+
+        const std::filesystem::path fullWordConsumeHarnessPath =
+            fullWordConsumeDir / "grhsim_top_harness.cpp";
+        {
+            std::ofstream harness(fullWordConsumeHarnessPath);
+            if (!harness.is_open())
+            {
+                return fail("failed to create full-active-word-consume harness");
+            }
+            harness << "#include \"grhsim_top.hpp\"\n";
+            harness << "#include <cstdint>\n\n";
+            harness << "int main()\n";
+            harness << "{\n";
+            harness << "    GrhSIM_top sim;\n";
+            harness << "    sim.init();\n";
+            harness << "    sim.chain_in = static_cast<std::uint8_t>(1);\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.chain_out != static_cast<std::uint8_t>(10)) return 1;\n";
+            harness << "    sim.chain_in = static_cast<std::uint8_t>(7);\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.chain_out != static_cast<std::uint8_t>(16)) return 2;\n";
+            harness << "    return 0;\n";
+            harness << "}\n";
+        }
+        const std::filesystem::path fullWordConsumeHarnessExe =
+            fullWordConsumeDir / "grhsim_top_harness";
+        std::string fullWordConsumeCompileCmd =
+            "clang++ " + std::string(kHarnessCompileFlags) + " -I" + fullWordConsumeDir.string();
+        for (const auto &stateFile : fullWordConsumeStateFiles)
+        {
+            fullWordConsumeCompileCmd += " " + stateFile.string();
+        }
+        fullWordConsumeCompileCmd += " " + (fullWordConsumeDir / "grhsim_top_eval.cpp").string();
+        for (const auto &schedPath : fullWordConsumeSchedFiles)
+        {
+            fullWordConsumeCompileCmd += " " + schedPath.string();
+        }
+        fullWordConsumeCompileCmd +=
+            " " + fullWordConsumeHarnessPath.string() + " -o " + fullWordConsumeHarnessExe.string();
+        if (std::system(fullWordConsumeCompileCmd.c_str()) != 0)
+        {
+            return fail("full-active-word-consume harness failed to compile");
+        }
+        if (std::system(fullWordConsumeHarnessExe.string().c_str()) != 0)
+        {
+            return fail("full-active-word-consume harness failed to run");
         }
 
         const std::filesystem::path overlappingActivationDir =
