@@ -2728,6 +2728,7 @@ namespace wolvrix::lib::emit
             bool directSingleWriterStateReads = false;
             bool fullActiveWordConsume = false;
             bool oneBitBitwiseBytes = false;
+            bool pureEventComputeWordBypass = false;
             std::size_t directStateReadCount = 0;
             std::size_t directStateReadCanonicalCount = 0;
             std::size_t directStateReadAliasCount = 0;
@@ -13478,6 +13479,163 @@ namespace wolvrix::lib::emit
             return info;
         }
 
+        bool isPureEventComputeProducerKind(OperationKind kind) noexcept
+        {
+            switch (kind)
+            {
+            case OperationKind::kConstant:
+            case OperationKind::kAdd:
+            case OperationKind::kSub:
+            case OperationKind::kMul:
+            case OperationKind::kDiv:
+            case OperationKind::kMod:
+            case OperationKind::kEq:
+            case OperationKind::kNe:
+            case OperationKind::kCaseEq:
+            case OperationKind::kCaseNe:
+            case OperationKind::kWildcardEq:
+            case OperationKind::kWildcardNe:
+            case OperationKind::kLt:
+            case OperationKind::kLe:
+            case OperationKind::kGt:
+            case OperationKind::kGe:
+            case OperationKind::kAnd:
+            case OperationKind::kOr:
+            case OperationKind::kXor:
+            case OperationKind::kXnor:
+            case OperationKind::kNot:
+            case OperationKind::kLogicAnd:
+            case OperationKind::kLogicOr:
+            case OperationKind::kLogicNot:
+            case OperationKind::kReduceAnd:
+            case OperationKind::kReduceOr:
+            case OperationKind::kReduceXor:
+            case OperationKind::kReduceNor:
+            case OperationKind::kReduceNand:
+            case OperationKind::kReduceXnor:
+            case OperationKind::kShl:
+            case OperationKind::kLShr:
+            case OperationKind::kAShr:
+            case OperationKind::kMux:
+            case OperationKind::kAssign:
+            case OperationKind::kConcat:
+            case OperationKind::kReplicate:
+            case OperationKind::kSliceStatic:
+            case OperationKind::kSliceDynamic:
+            case OperationKind::kSliceArray:
+            case OperationKind::kLatchReadPort:
+            case OperationKind::kRegisterReadPort:
+            case OperationKind::kMemoryReadPort:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        std::optional<std::string> analyzePureEventComputeSupernode(
+            const Graph &graph,
+            const EmitModel &model,
+            const ActivityScheduleSupernodeToOps &supernodeToOps,
+            uint32_t supernodeId)
+        {
+            if (supernodeId >= supernodeToOps.size())
+            {
+                return std::nullopt;
+            }
+
+            bool sawSideEffect = false;
+            std::optional<std::string> commonEventExpr;
+            for (OperationId opId : supernodeToOps[supernodeId])
+            {
+                const Operation op = graph.getOperation(opId);
+                if (isCommitPhaseOp(op) || isRegToMemIntentBypassOp(model, opId))
+                {
+                    return std::nullopt;
+                }
+                if (op.kind() == OperationKind::kSystemTask || op.kind() == OperationKind::kDpicCall)
+                {
+                    if (op.operands().empty() || !op.results().empty() ||
+                        (op.kind() == OperationKind::kSystemTask && systemTaskIsFinal(op)))
+                    {
+                        return std::nullopt;
+                    }
+                    const auto sampleIt = model.eventSamplesByOp.find(opId);
+                    if (sampleIt == model.eventSamplesByOp.end() || sampleIt->second.values.size() != 1u ||
+                        sampleIt->second.edges.size() != 1u || !sampleIt->second.completedFieldName.empty())
+                    {
+                        return std::nullopt;
+                    }
+                    const std::string &edge = sampleIt->second.edges.front();
+                    if (edge != "posedge" && edge != "negedge")
+                    {
+                        return std::nullopt;
+                    }
+                    const auto eventExpr = exactEventExpr(graph, model, opId, op);
+                    if (!eventExpr || *eventExpr == "true")
+                    {
+                        return std::nullopt;
+                    }
+                    if (commonEventExpr && *commonEventExpr != *eventExpr)
+                    {
+                        return std::nullopt;
+                    }
+                    commonEventExpr = *eventExpr;
+                    sawSideEffect = true;
+                    continue;
+                }
+
+                if (!isPureEventComputeProducerKind(op.kind()) ||
+                    getAttribute<bool>(op, "hasSideEffects").value_or(false))
+                {
+                    return std::nullopt;
+                }
+                if (op.kind() == OperationKind::kConstant)
+                {
+                    continue;
+                }
+                if (op.results().empty())
+                {
+                    return std::nullopt;
+                }
+                for (ValueId result : op.results())
+                {
+                    if (isMaterializedValue(model, result) || valueNeedsTrackedChange(model, result))
+                    {
+                        return std::nullopt;
+                    }
+                }
+            }
+            if (!sawSideEffect || !commonEventExpr)
+            {
+                return std::nullopt;
+            }
+            return commonEventExpr;
+        }
+
+        std::optional<std::string> analyzePureEventComputeWord(
+            const Graph &graph,
+            const EmitModel &model,
+            const ActivityScheduleSupernodeToOps &supernodeToOps,
+            const ScheduleBatch::Word &word)
+        {
+            std::optional<std::string> commonEventExpr;
+            for (uint32_t supernodeId : word.supernodeIds)
+            {
+                const auto eventExpr =
+                    analyzePureEventComputeSupernode(graph, model, supernodeToOps, supernodeId);
+                if (!eventExpr)
+                {
+                    return std::nullopt;
+                }
+                if (commonEventExpr && *commonEventExpr != *eventExpr)
+                {
+                    return std::nullopt;
+                }
+                commonEventExpr = *eventExpr;
+            }
+            return commonEventExpr;
+        }
+
         bool isCompressibleScalarStateWrite(const EmitModel &model, OperationId opId)
         {
             (void)model;
@@ -14356,7 +14514,8 @@ namespace wolvrix::lib::emit
             for (const ScheduleBatch &batch : batches)
             {
             const auto emitWordBody = [&](const ScheduleBatch::Word &word,
-                                          bool fullpassVariant) -> std::optional<std::string>
+                                          bool fullpassVariant,
+                                          bool allowPureEventBypass) -> std::optional<std::string>
             {
                 const std::uint8_t dispatchMask = scheduleBatchWordDispatchMask(model, word);
                 const std::uint8_t clearMask = scheduleBatchWordClearMask(model, batch, word);
@@ -14364,6 +14523,18 @@ namespace wolvrix::lib::emit
                     model.fullActiveWordConsume &&
                     batch.phase == ScheduleBatch::Phase::kCompute &&
                     dispatchMask == UINT8_C(0xff);
+                std::optional<std::string> pureEventBypassExpr;
+                if (model.pureEventComputeWordBypass &&
+                    allowPureEventBypass &&
+                    !fullpassVariant &&
+                    !consumeFullActiveWord &&
+                    batch.phase == ScheduleBatch::Phase::kCompute &&
+                    dispatchMask != UINT8_C(0) &&
+                    dispatchMask == clearMask)
+                {
+                    pureEventBypassExpr =
+                        analyzePureEventComputeWord(graph, model, schedule.supernodeToOps, word);
+                }
                 struct CommitEventWordCluster
                 {
                     std::string eventExpr;
@@ -14461,8 +14632,13 @@ namespace wolvrix::lib::emit
                 if (!fullpassVariant)
                 {
                     stream << "                supernode_active_curr_[" << word.activeFlagWordIndex
-                            << "u] = static_cast<std::uint8_t>(supernode_active_curr_["
+                           << "u] = static_cast<std::uint8_t>(supernode_active_curr_["
                            << word.activeFlagWordIndex << "u] & static_cast<std::uint8_t>(~clearMask));\n";
+                }
+                if (pureEventBypassExpr)
+                {
+                    stream << "                // Pure-event compute word: an event miss consumes the cleared word.\n";
+                    stream << "                if (" << *pureEventBypassExpr << ") {\n";
                 }
                 for (uint32_t supernodeId : word.supernodeIds)
                 {
@@ -15749,6 +15925,10 @@ namespace wolvrix::lib::emit
                            << "u] = static_cast<std::uint8_t>(supernode_active_curr_["
                            << word.activeFlagWordIndex << "u] | activeWordFlags);\n";
                 }
+                if (pureEventBypassExpr)
+                {
+                    stream << "                }\n";
+                }
                 stream << "            }\n";
                 stream << "        }\n";
                 return std::nullopt;
@@ -15759,7 +15939,7 @@ namespace wolvrix::lib::emit
             {
                 if (batch.phase == ScheduleBatch::Phase::kCommit)
                 {
-                    return emitWordBody(word, false);
+                    return emitWordBody(word, false, false);
                 }
                 std::uint8_t dispatchMask = UINT8_C(0);
                 std::uint8_t clearMask = UINT8_C(0);
@@ -15861,7 +16041,7 @@ namespace wolvrix::lib::emit
                           stream << "void " << className << "::"
                               << scheduleBatchWordChunkHelperName(batch, wordChunkIndex, chunkIndex)
                               << "()\n{\n";
-                    if (auto error = emitWordBody(chunkWord, false))
+                    if (auto error = emitWordBody(chunkWord, false, false))
                     {
                         return error;
                     }
@@ -15870,7 +16050,7 @@ namespace wolvrix::lib::emit
                   stream << "void " << className << "::"
                       << scheduleBatchWordHelperName(batch, wordChunkIndex)
                       << "()\n{\n";
-                if (auto error = word.helperChunks.empty() ? emitWordBody(word, false)
+                if (auto error = word.helperChunks.empty() ? emitWordBody(word, false, true)
                                                            : emitSplitWordBody(word, wordChunkIndex))
                 {
                     return error;
@@ -15897,7 +16077,7 @@ namespace wolvrix::lib::emit
                     stream << "        " << scheduleBatchWordHelperName(batch, wordChunkIndex) << "();\n";
                     continue;
                 }
-                if (auto error = emitWordBody(word, false))
+                if (auto error = emitWordBody(word, false, true))
                 {
                     return error;
                 }
@@ -15911,7 +16091,7 @@ namespace wolvrix::lib::emit
                        << " full-pass specialization: evaluate all supernodes and suppress compute propagation.\n";
                 for (const auto &word : batch.words)
                 {
-                    if (auto error = emitWordBody(word, true))
+                    if (auto error = emitWordBody(word, true, false))
                     {
                         return error;
                     }
@@ -16051,6 +16231,10 @@ namespace wolvrix::lib::emit
             parseBooleanEmitOption(options,
                                    "one_bit_bitwise_bytes",
                                    "WOLVRIX_GRHSIM_ONE_BIT_BITWISE_BYTES");
+        const bool pureEventComputeWordBypass =
+            parseBooleanEmitOption(options,
+                                   "pure_event_compute_word_bypass",
+                                   "WOLVRIX_GRHSIM_PURE_EVENT_COMPUTE_WORD_BYPASS");
         const std::size_t schedBatchesPerCpp = parseScheduleBatchesPerCpp(options);
         const std::unordered_set<ValueId, ValueIdHash> waveformValueIds =
             waveformMode == WaveformMode::kDeclaredSymbols ? collectDeclaredSymbolWaveformValueIds(graph)
@@ -16082,6 +16266,7 @@ namespace wolvrix::lib::emit
         model.commitStateChangeUnlikely = commitStateChangeUnlikely;
         model.fullActiveWordConsume = fullActiveWordConsume;
         model.oneBitBitwiseBytes = oneBitBitwiseBytes;
+        model.pureEventComputeWordBypass = pureEventComputeWordBypass;
         if (model.emitRuntimeProfile)
         {
             buildRuntimeProfileWeights(graph, schedule, model);

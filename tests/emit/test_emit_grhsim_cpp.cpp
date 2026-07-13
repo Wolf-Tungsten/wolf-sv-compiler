@@ -12,6 +12,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -1019,7 +1020,8 @@ namespace
                                   bool stateReadLocalityStats = false,
                                   bool directSingleWriterStateReads = false,
                                   bool materializedScalarReadLocalityStats = false,
-                                  bool fullActiveWordConsume = false)
+                                  bool fullActiveWordConsume = false,
+                                  std::optional<bool> pureEventComputeWordBypass = std::nullopt)
     {
         SessionStore session;
         if (scheduleOptions.path.empty())
@@ -1062,6 +1064,10 @@ namespace
         if (fullActiveWordConsume)
         {
             options.attributes["full_active_word_consume"] = "1";
+        }
+        if (pureEventComputeWordBypass)
+        {
+            options.attributes["pure_event_compute_word_bypass"] = *pureEventComputeWordBypass ? "1" : "0";
         }
 
         EmitGrhSimCpp emitter(&diag);
@@ -1866,6 +1872,60 @@ namespace
         addTask("task_final", "display", {fmtFinal, data}, "final", false);
         addTask("task_final_fdisplay", "fdisplay", {handle, fmtFdisplay, data}, "final", false);
 
+        return design;
+    }
+
+    enum class PureEventWordFixtureMode
+    {
+        kHomogeneous,
+        kOnceOnly,
+        kMultiEvent,
+    };
+
+    Design buildPureEventWordBypassDesign(PureEventWordFixtureMode mode)
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        ValueId clk = makeLogicValue(graph, "clk", 1);
+        ValueId auxClk = makeLogicValue(graph, "aux_clk", 1);
+        ValueId data = makeLogicValue(graph, "data", 8);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("aux_clk", auxClk);
+        graph.bindInputPort("data", data);
+        graph.bindOutputPort("data_out", data);
+
+        ValueId one = addConstant(graph, "pure_event_one_op", "pure_event_one", 1, "1'b1");
+        ValueId format = addConstant(graph,
+                                     "pure_event_format_op",
+                                     "pure_event_format",
+                                     0,
+                                     "\"pure-event=%0d\"",
+                                     ValueType::String);
+        for (std::size_t index = 0; index < 16u; ++index)
+        {
+            OperationId task = graph.createOperation(
+                OperationKind::kSystemTask,
+                graph.internSymbol("pure_event_task_" + std::to_string(index)));
+            graph.addOperand(task, one);
+            graph.addOperand(task, format);
+            graph.addOperand(task, data);
+            graph.addOperand(task, clk);
+            std::vector<std::string> edges{"posedge"};
+            if (mode == PureEventWordFixtureMode::kMultiEvent)
+            {
+                graph.addOperand(task, auxClk);
+                edges.push_back("negedge");
+            }
+            graph.setAttr(task, "name", std::string("display"));
+            graph.setAttr(task,
+                          "procKind",
+                          std::string(mode == PureEventWordFixtureMode::kOnceOnly ? "initial" : "always_ff"));
+            graph.setAttr(task, "hasTiming", mode == PureEventWordFixtureMode::kOnceOnly);
+            graph.setAttr(task, "hasSideEffects", true);
+            graph.setAttr(task, "eventEdge", std::move(edges));
+        }
         return design;
     }
 
@@ -5223,6 +5283,11 @@ int main()
                                       commitBatchResult,
                                       {},
                                       true,
+                                      true,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
                                       true))
         {
             return fail("commit-cond-batch activity-schedule pass failed");
@@ -5246,6 +5311,11 @@ int main()
         if (countSubstring(commitBatchSched, "apply_commit_scalar_state_write_table(") != 0)
         {
             return fail("commit-cond-batch should not fall back to legacy commit tables");
+        }
+        if (commitBatchSched.find("// Pure-event compute word: an event miss consumes the cleared word.") !=
+            std::string::npos)
+        {
+            return fail("commit words must not use the pure-event compute-word bypass");
         }
         const std::size_t eventFastPathBegin = commitBatchEval.find("    if (event_fullpass_candidate) {");
         const std::size_t normalPathBegin = commitBatchEval.find("    while (pending_eval_round) {", eventFastPathBegin);
@@ -6354,6 +6424,249 @@ int main()
         if (std::system(directReadHarnessExe.string().c_str()) != 0)
         {
             return fail("direct state-read harness failed to run");
+        }
+
+        const std::filesystem::path pureEventRoot =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_pure_event_word";
+        ActivityScheduleOptions pureEventSchedule;
+        pureEventSchedule.maxOpInComputeSupernode = 1;
+        pureEventSchedule.enableCoarsen = false;
+        pureEventSchedule.splitOversizeComputeNodes = true;
+        pureEventSchedule.splitOversizeComputeNodeMaxOps = 1;
+        const auto emitPureEventFixture = [&](std::string_view suffix,
+                                              PureEventWordFixtureMode mode,
+                                              std::optional<bool> bypass,
+                                              bool posedgeFullpass,
+                                              bool fullWordConsume) -> std::optional<std::filesystem::path>
+        {
+            const std::filesystem::path dir = pureEventRoot.string() + "_" + std::string(suffix);
+            std::filesystem::remove_all(dir);
+            Design fixture = buildPureEventWordBypassDesign(mode);
+            EmitDiagnostics fixtureDiag;
+            EmitResult fixtureResult;
+            if (!emitWithActivitySchedule(fixture,
+                                          dir,
+                                          fixtureDiag,
+                                          fixtureResult,
+                                          pureEventSchedule,
+                                          posedgeFullpass,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          fullWordConsume,
+                                          bypass) ||
+                !fixtureResult.success || fixtureDiag.hasError())
+            {
+                return std::nullopt;
+            }
+            return dir;
+        };
+
+        const auto pureEventDefaultDir = emitPureEventFixture("default",
+                                                              PureEventWordFixtureMode::kHomogeneous,
+                                                              std::nullopt,
+                                                              false,
+                                                              false);
+        const auto pureEventDisabledDir = emitPureEventFixture("disabled",
+                                                               PureEventWordFixtureMode::kHomogeneous,
+                                                               false,
+                                                               false,
+                                                               false);
+        const auto pureEventEnabledDir = emitPureEventFixture("enabled",
+                                                              PureEventWordFixtureMode::kHomogeneous,
+                                                              true,
+                                                              false,
+                                                              false);
+        const auto pureEventOnceDir = emitPureEventFixture("once",
+                                                           PureEventWordFixtureMode::kOnceOnly,
+                                                           true,
+                                                           false,
+                                                           false);
+        const auto pureEventMultiDir = emitPureEventFixture("multi",
+                                                            PureEventWordFixtureMode::kMultiEvent,
+                                                            true,
+                                                            false,
+                                                            false);
+        const auto pureEventFullpassDir = emitPureEventFixture("fullpass",
+                                                               PureEventWordFixtureMode::kHomogeneous,
+                                                               true,
+                                                               true,
+                                                               false);
+        const auto pureEventFullWordConsumeDir = emitPureEventFixture("full_word_consume",
+                                                                      PureEventWordFixtureMode::kHomogeneous,
+                                                                      true,
+                                                                      false,
+                                                                      true);
+        if (!pureEventDefaultDir || !pureEventDisabledDir || !pureEventEnabledDir || !pureEventOnceDir ||
+            !pureEventMultiDir || !pureEventFullpassDir || !pureEventFullWordConsumeDir)
+        {
+            return fail("pure-event compute-word fixture emit failed");
+        }
+
+        const auto readPureEventGenerated = [](const std::filesystem::path &dir) {
+            return readFile(dir / "grhsim_top.hpp") +
+                   readFiles(collectSchedFiles(dir, "grhsim_top_state")) +
+                   readFile(dir / "grhsim_top_eval.cpp") +
+                   readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+        };
+        const std::string pureEventDefaultSource = readPureEventGenerated(*pureEventDefaultDir);
+        const std::string pureEventDisabledSource = readPureEventGenerated(*pureEventDisabledDir);
+        const std::string pureEventEnabledSched =
+            readFiles(collectSchedFiles(*pureEventEnabledDir, "grhsim_top_sched_"));
+        constexpr std::string_view pureEventMarker =
+            "// Pure-event compute word: an event miss consumes the cleared word.";
+        if (pureEventDefaultSource != pureEventDisabledSource ||
+            pureEventDefaultSource.find(pureEventMarker) != std::string::npos)
+        {
+            return fail("pure-event compute-word default and explicit zero sources should be byte-identical");
+        }
+        const std::size_t pureEventMarkerCount = countSubstring(pureEventEnabledSched, pureEventMarker);
+        if (pureEventMarkerCount == 0)
+        {
+            return fail("pure-event compute-word enabled fixture should emit at least one wrapper");
+        }
+        const std::size_t pureEventMarkerPos = pureEventEnabledSched.find(pureEventMarker);
+        const std::size_t pureEventClearPos = pureEventEnabledSched.rfind("~clearMask", pureEventMarkerPos);
+        const std::size_t pureEventWrapperIfPos = pureEventEnabledSched.find("if (event_edge_slots_[", pureEventMarkerPos);
+        const std::size_t pureEventWrapperOpen =
+            pureEventEnabledSched.find('{', pureEventWrapperIfPos);
+        const std::size_t pureEventWrapperClose = findMatchingBrace(pureEventEnabledSched, pureEventWrapperOpen);
+        const std::size_t pureEventFirstEntry = pureEventEnabledSched.find("// Supernode ", pureEventWrapperOpen);
+        const std::size_t pureEventRestore = pureEventEnabledSched.find(" | activeWordFlags);", pureEventFirstEntry);
+        if (pureEventClearPos == std::string::npos || pureEventWrapperIfPos == std::string::npos ||
+            pureEventWrapperClose == std::string::npos || pureEventFirstEntry == std::string::npos ||
+            pureEventRestore == std::string::npos || pureEventClearPos >= pureEventMarkerPos ||
+            pureEventMarkerPos >= pureEventWrapperIfPos || pureEventWrapperIfPos >= pureEventFirstEntry ||
+            pureEventFirstEntry >= pureEventRestore || pureEventRestore >= pureEventWrapperClose)
+        {
+            return fail("pure-event compute-word wrapper should follow clear and contain entries plus restore");
+        }
+        const std::string_view pureEventFirstWrapper =
+            std::string_view(pureEventEnabledSched).substr(pureEventWrapperIfPos,
+                                                           pureEventWrapperClose - pureEventWrapperIfPos + 1u);
+        if (countSubstring(pureEventFirstWrapper, "event_edge_slots_[") < 2u)
+        {
+            return fail("pure-event compute-word wrapper should retain inner exact-event guards");
+        }
+
+        const std::string pureEventOnceSched =
+            readFiles(collectSchedFiles(*pureEventOnceDir, "grhsim_top_sched_"));
+        const std::string pureEventMultiSched =
+            readFiles(collectSchedFiles(*pureEventMultiDir, "grhsim_top_sched_"));
+        if (pureEventOnceSched.find(pureEventMarker) != std::string::npos ||
+            pureEventMultiSched.find(pureEventMarker) != std::string::npos)
+        {
+            return fail("once-only and multi-event compute words must not use the pure-event bypass");
+        }
+        const std::string pureEventFullpassSched =
+            readFiles(collectSchedFiles(*pureEventFullpassDir, "grhsim_top_sched_"));
+        if (countSubstring(pureEventFullpassSched, pureEventMarker) != pureEventMarkerCount)
+        {
+            return fail("fullpass methods must not add pure-event compute-word wrappers");
+        }
+
+        const std::string pureEventFullWordConsumeSched =
+            readFiles(collectSchedFiles(*pureEventFullWordConsumeDir, "grhsim_top_sched_"));
+        constexpr std::string_view pureEventDispatchMarker =
+            "constexpr std::uint8_t dispatchMask = UINT8_C(";
+        bool sawPureEventFullWord = false;
+        std::size_t pureEventDispatchPos = 0;
+        while ((pureEventDispatchPos = pureEventFullWordConsumeSched.find(pureEventDispatchMarker,
+                                                                          pureEventDispatchPos)) !=
+               std::string::npos)
+        {
+            const std::size_t maskBegin = pureEventDispatchPos + pureEventDispatchMarker.size();
+            const std::size_t maskEnd = pureEventFullWordConsumeSched.find(");", maskBegin);
+            if (maskEnd == std::string::npos)
+            {
+                return fail("pure-event full-word consume emitted a malformed dispatch mask");
+            }
+            const unsigned mask = static_cast<unsigned>(
+                std::stoul(pureEventFullWordConsumeSched.substr(maskBegin, maskEnd - maskBegin)));
+            const std::size_t nextDispatch =
+                pureEventFullWordConsumeSched.find(pureEventDispatchMarker, maskEnd);
+            const std::string_view block = std::string_view(pureEventFullWordConsumeSched).substr(
+                pureEventDispatchPos,
+                nextDispatch == std::string::npos ? nextDispatch : nextDispatch - pureEventDispatchPos);
+            if (mask == 255u)
+            {
+                sawPureEventFullWord = true;
+                if (block.find(pureEventMarker) != std::string_view::npos)
+                {
+                    return fail("full-active-word consume words must not use the pure-event bypass");
+                }
+            }
+            pureEventDispatchPos = maskEnd;
+        }
+        if (!sawPureEventFullWord)
+        {
+            return fail("pure-event fixture should contain a complete active word");
+        }
+
+        const auto runPureEventHarness = [&](const std::filesystem::path &dir) -> std::optional<std::string>
+        {
+            const std::filesystem::path harnessPath = dir / "grhsim_top_harness.cpp";
+            {
+                std::ofstream harness(harnessPath);
+                if (!harness.is_open())
+                {
+                    return std::nullopt;
+                }
+                harness << "#include \"grhsim_top.hpp\"\n";
+                harness << "#include <cstdint>\n\n";
+                harness << "int main()\n{\n";
+                harness << "    GrhSIM_top sim;\n";
+                harness << "    sim.init();\n";
+                harness << "    sim.clk = false;\n";
+                harness << "    sim.aux_clk = true;\n";
+                harness << "    sim.data = static_cast<std::uint8_t>(1);\n";
+                harness << "    sim.eval();\n";
+                harness << "    sim.data = static_cast<std::uint8_t>(2);\n";
+                harness << "    sim.eval();\n";
+                harness << "    sim.clk = true;\n";
+                harness << "    sim.eval();\n";
+                harness << "    sim.data = static_cast<std::uint8_t>(3);\n";
+                harness << "    sim.eval();\n";
+                harness << "    sim.clk = false;\n";
+                harness << "    sim.eval();\n";
+                harness << "    sim.clk = true;\n";
+                harness << "    sim.eval();\n";
+                harness << "    return sim.data_out == static_cast<std::uint8_t>(3) ? 0 : 1;\n";
+                harness << "}\n";
+            }
+            const std::vector<std::filesystem::path> stateFiles = collectSchedFiles(dir, "grhsim_top_state");
+            const std::vector<std::filesystem::path> schedFiles = collectSchedFiles(dir, "grhsim_top_sched_");
+            const std::filesystem::path exe = dir / "grhsim_top_harness";
+            std::string command = "clang++ " + std::string(kHarnessCompileFlags) + " -I" + dir.string();
+            for (const auto &stateFile : stateFiles)
+            {
+                command += " " + stateFile.string();
+            }
+            command += " " + (dir / "grhsim_top_eval.cpp").string();
+            for (const auto &schedFile : schedFiles)
+            {
+                command += " " + schedFile.string();
+            }
+            command += " " + harnessPath.string() + " -o " + exe.string();
+            if (std::system(command.c_str()) != 0)
+            {
+                return std::nullopt;
+            }
+            const std::filesystem::path log = dir / "grhsim_top_harness.log";
+            command = exe.string() + " > " + log.string() + " 2>&1";
+            if (std::system(command.c_str()) != 0)
+            {
+                return std::nullopt;
+            }
+            return readFile(log);
+        };
+        const auto pureEventDefaultLog = runPureEventHarness(*pureEventDefaultDir);
+        const auto pureEventEnabledLog = runPureEventHarness(*pureEventEnabledDir);
+        if (!pureEventDefaultLog || !pureEventEnabledLog || *pureEventDefaultLog != *pureEventEnabledLog ||
+            countSubstring(*pureEventEnabledLog, "pure-event=") != 32u)
+        {
+            return fail("pure-event compute-word hit/miss harness output mismatch");
         }
 
         const std::filesystem::path systemTaskDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_systemtask";
