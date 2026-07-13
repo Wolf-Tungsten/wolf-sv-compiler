@@ -749,10 +749,16 @@ namespace wolvrix::lib::emit
             std::vector<SeqEvent> events;
         };
 
+        struct SeqStmt
+        {
+            std::string text;
+            wolvrix::lib::grh::OperationId op = wolvrix::lib::grh::OperationId::invalid();
+        };
+
         struct SeqBlock
         {
             SeqKey key{};
-            std::vector<std::string> stmts;
+            std::vector<SeqStmt> stmts;
             wolvrix::lib::grh::OperationId op = wolvrix::lib::grh::OperationId::invalid();
         };
 
@@ -1830,11 +1836,69 @@ namespace wolvrix::lib::emit
                 {
                     if (sameSeqKey(block.key, key))
                     {
-                        block.stmts.push_back(std::move(stmt));
+                        block.stmts.push_back(SeqStmt{.text = std::move(stmt), .op = sourceOp});
                         return;
                     }
                 }
-                seqBlocks.push_back(SeqBlock{key, std::vector<std::string>{std::move(stmt)}, sourceOp});
+                seqBlocks.push_back(SeqBlock{
+                    key,
+                    std::vector<SeqStmt>{SeqStmt{.text = std::move(stmt), .op = sourceOp}},
+                    sourceOp,
+                });
+            };
+
+            auto orderSequentialStmts = [&](const std::vector<SeqStmt> &source) {
+                struct Entry
+                {
+                    std::size_t slot = 0;
+                    SeqStmt stmt;
+                    int64_t priority = 0;
+                };
+                std::vector<SeqStmt> ordered = source;
+                std::unordered_map<std::string, std::vector<Entry>> entriesByGroup;
+                for (std::size_t slot = 0; slot < source.size(); ++slot)
+                {
+                    if (!source[slot].op.valid())
+                    {
+                        continue;
+                    }
+                    const auto op = graph->getOperation(source[slot].op);
+                    const auto group = getAttribute<std::string>(
+                        *graph, op, wolvrix::lib::grh::kMemoryWritePriorityGroupAttr);
+                    const auto priority = getAttribute<int64_t>(
+                        *graph, op, wolvrix::lib::grh::kMemoryWritePriorityAttr);
+                    if (!group || !priority)
+                    {
+                        continue;
+                    }
+                    entriesByGroup[*group].push_back(Entry{
+                        .slot = slot,
+                        .stmt = source[slot],
+                        .priority = *priority,
+                    });
+                }
+                for (auto &[group, entries] : entriesByGroup)
+                {
+                    (void)group;
+                    std::vector<std::size_t> slots;
+                    slots.reserve(entries.size());
+                    for (const Entry &entry : entries)
+                    {
+                        slots.push_back(entry.slot);
+                    }
+                    std::sort(entries.begin(), entries.end(), [](const Entry &lhs, const Entry &rhs) {
+                        if (lhs.priority != rhs.priority)
+                        {
+                            return lhs.priority > rhs.priority;
+                        }
+                        return lhs.stmt.op.index < rhs.stmt.op.index;
+                    });
+                    for (std::size_t index = 0; index < entries.size(); ++index)
+                    {
+                        ordered[slots[index]] = std::move(entries[index].stmt);
+                    }
+                }
+                return ordered;
             };
 
             auto addLatchBlock = [&](std::string stmt, wolvrix::lib::grh::OperationId sourceOp)
@@ -5913,10 +5977,10 @@ namespace wolvrix::lib::emit
                         out << "  " << attr << "\n";
                     }
                     out << "  always " << sens << " begin\n";
-                    for (const auto &stmt : seq.stmts)
+                    for (const auto &stmt : orderSequentialStmts(seq.stmts))
                     {
-                        out << stmt;
-                        if (!stmt.empty() && stmt.back() != '\n')
+                        out << stmt.text;
+                        if (!stmt.text.empty() && stmt.text.back() != '\n')
                         {
                             out << '\n';
                         }

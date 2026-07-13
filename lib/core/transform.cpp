@@ -1172,6 +1172,18 @@ namespace wolvrix::lib::transform
                         return nullptr;
                     }
                 }
+                else if (arg == "-final-topo-policy")
+                {
+                    if (!parseStringArg("-final-topo-policy", options.finalTopoPolicy))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-final-topo-policy="))
+                {
+                    options.finalTopoPolicy =
+                        std::string(arg.substr(std::string_view("-final-topo-policy=").size()));
+                }
                 else if (arg == "-split-oversize-compute-node-max-ops")
                 {
                     if (!parseSizeArg("-split-oversize-compute-node-max-ops",
@@ -1613,6 +1625,22 @@ namespace wolvrix::lib::transform
                 else if (arg == "-no-true-merge")
                 {
                     options.enableTrueMerge = false;
+                }
+                else if (arg == "-ordered-writes")
+                {
+                    options.enableOrderedWrites = true;
+                }
+                else if (arg == "-no-ordered-writes")
+                {
+                    options.enableOrderedWrites = false;
+                }
+                else if (arg == "-decoded-write-storage")
+                {
+                    options.enableDecodedWriteStorage = true;
+                }
+                else if (arg == "-no-decoded-write-storage")
+                {
+                    options.enableDecodedWriteStorage = false;
                 }
                 else if (arg == "-min-element-count")
                 {

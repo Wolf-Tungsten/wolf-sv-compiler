@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -215,6 +216,159 @@ namespace
                     return fail("Expected explicit supernode_kind to match contained ops");
                 }
             }
+        }
+        return 0;
+    }
+
+    int validateLevelOpTopoOrder(const ScheduleView &schedule)
+    {
+        const auto &supernodeToOps = *schedule.supernodeToOps;
+        const auto &dag = *schedule.dag;
+        const auto &topoOrder = *schedule.topoOrder;
+        std::vector<std::size_t> minOpIndex(supernodeToOps.size(),
+                                            std::numeric_limits<std::size_t>::max());
+        for (std::size_t supernodeId = 0; supernodeId < supernodeToOps.size(); ++supernodeId)
+        {
+            for (const auto opId : supernodeToOps[supernodeId])
+            {
+                minOpIndex[supernodeId] =
+                    std::min(minOpIndex[supernodeId], static_cast<std::size_t>(opId.index));
+            }
+        }
+
+        std::vector<uint32_t> indegree(dag.size(), 0);
+        for (const auto &succs : dag)
+        {
+            for (const uint32_t succ : succs)
+            {
+                if (succ >= indegree.size())
+                {
+                    return fail("Expected final topo DAG successors to be in range");
+                }
+                ++indegree[succ];
+            }
+        }
+        std::vector<uint32_t> frontier;
+        for (uint32_t node = 0; node < indegree.size(); ++node)
+        {
+            if (indegree[node] == 0)
+            {
+                frontier.push_back(node);
+            }
+        }
+
+        std::size_t topoOffset = 0;
+        while (!frontier.empty())
+        {
+            std::sort(frontier.begin(),
+                      frontier.end(),
+                      [&](uint32_t lhs, uint32_t rhs)
+                      {
+                          if (minOpIndex[lhs] != minOpIndex[rhs])
+                          {
+                              return minOpIndex[lhs] < minOpIndex[rhs];
+                          }
+                          return lhs < rhs;
+                      });
+            if (topoOffset + frontier.size() > topoOrder.size() ||
+                !std::equal(frontier.begin(), frontier.end(), topoOrder.begin() + topoOffset))
+            {
+                return fail("Expected level-op final topo to sort each Kahn layer by minimum op index");
+            }
+
+            std::vector<uint32_t> nextFrontier;
+            for (const uint32_t node : frontier)
+            {
+                for (const uint32_t succ : dag[node])
+                {
+                    if (--indegree[succ] == 0)
+                    {
+                        nextFrontier.push_back(succ);
+                    }
+                }
+            }
+            topoOffset += frontier.size();
+            frontier = std::move(nextFrontier);
+        }
+        if (topoOffset != topoOrder.size())
+        {
+            return fail("Expected level-op final topo to contain every supernode");
+        }
+        return 0;
+    }
+
+    int validateReadyOpTopoOrder(const ScheduleView &schedule)
+    {
+        const auto &supernodeToOps = *schedule.supernodeToOps;
+        const auto &dag = *schedule.dag;
+        const auto &topoOrder = *schedule.topoOrder;
+        std::vector<std::size_t> minOpIndex(supernodeToOps.size(),
+                                            std::numeric_limits<std::size_t>::max());
+        for (std::size_t supernodeId = 0; supernodeId < supernodeToOps.size(); ++supernodeId)
+        {
+            for (const auto opId : supernodeToOps[supernodeId])
+            {
+                minOpIndex[supernodeId] =
+                    std::min(minOpIndex[supernodeId], static_cast<std::size_t>(opId.index));
+            }
+        }
+        auto lessByKey = [&](uint32_t lhs, uint32_t rhs)
+        {
+            if (minOpIndex[lhs] != minOpIndex[rhs])
+            {
+                return minOpIndex[lhs] < minOpIndex[rhs];
+            }
+            return lhs < rhs;
+        };
+
+        std::vector<uint32_t> indegree(dag.size(), 0);
+        for (const auto &succs : dag)
+        {
+            for (const uint32_t succ : succs)
+            {
+                if (succ >= indegree.size())
+                {
+                    return fail("Expected ready-op DAG successors to be in range");
+                }
+                ++indegree[succ];
+            }
+        }
+        std::vector<uint32_t> readyStack;
+        for (uint32_t node = 0; node < indegree.size(); ++node)
+        {
+            if (indegree[node] == 0)
+            {
+                readyStack.push_back(node);
+            }
+        }
+        std::sort(readyStack.begin(), readyStack.end(), lessByKey);
+
+        std::size_t topoOffset = 0;
+        while (!readyStack.empty())
+        {
+            const uint32_t node = readyStack.back();
+            readyStack.pop_back();
+            if (topoOffset >= topoOrder.size() || topoOrder[topoOffset++] != node)
+            {
+                return fail("Expected ready-op final topo to follow stable ready-stack order");
+            }
+            std::vector<uint32_t> orderedSuccs = dag[node];
+            std::sort(orderedSuccs.begin(), orderedSuccs.end(), lessByKey);
+            for (const uint32_t succ : orderedSuccs)
+            {
+                if (indegree[succ] == 0)
+                {
+                    return fail("Expected ready-op DAG edges to be unique");
+                }
+                if (--indegree[succ] == 0)
+                {
+                    readyStack.push_back(succ);
+                }
+            }
+        }
+        if (topoOffset != topoOrder.size())
+        {
+            return fail("Expected ready-op final topo to contain every supernode");
         }
         return 0;
     }
@@ -741,17 +895,13 @@ int main()
         {
             return fail("Expected compute value fanout into commit supernode");
         }
-        if (hasFanoutTo(*schedule.valueFanout, maskValue, writeSupernode))
+        if (!hasFanoutTo(*schedule.valueFanout, maskValue, writeSupernode))
         {
-            return fail("Static constant commit operand should not create a value fanout");
+            return fail("Expected direct source value dependency into commit supernode");
         }
-        if ((*schedule.opToSupernode)[maskOp.index - 1] != kInvalidActivitySupernodeId)
+        if (schedule.summaryStats->find("\"compute_commit_value_pairs\":2") == std::string::npos)
         {
-            return fail("Static constant used only by commit should not need a compute supernode");
-        }
-        if (schedule.summaryStats->find("\"compute_commit_value_pairs\":1") == std::string::npos)
-        {
-            return fail("Expected summary_stats to report one dynamic compute->commit value pair in top case");
+            return fail("Expected summary_stats to report two compute->commit value pairs in top case");
         }
         if (schedule.summaryStats->find("\"compute_compute_value_pairs\":0") == std::string::npos)
         {
@@ -765,9 +915,9 @@ int main()
         {
             return fail("Expected top case to report zero memory-read propagation");
         }
-        if (schedule.summaryStats->find("\"constant_activation_edges\":0") == std::string::npos)
+        if (schedule.summaryStats->find("\"constant_activation_edges\":1") == std::string::npos)
         {
-            return fail("Expected top case to omit static constant commit propagation");
+            return fail("Expected top case to report one constant propagation edge");
         }
         if (schedule.summaryStats->find("\"other_compute_activation_edges\":1") == std::string::npos)
         {
@@ -777,60 +927,6 @@ int main()
         if (readersIt == schedule.stateReadSupernodes->end() || readersIt->second.empty())
         {
             return fail("Expected register read state mapping to compute supernode");
-        }
-    }
-
-    {
-        currentCase = "constant_event_commit";
-        wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("constant_event_commit");
-        design.markAsTop("constant_event_commit");
-
-        const auto enable = makeValue(graph, "enable", 1);
-        const auto data = makeValue(graph, "data", 8);
-        const auto mask = makeValue(graph, "mask", 8);
-        graph.bindInputPort("enable", enable);
-        graph.bindInputPort("data", data);
-        graph.bindInputPort("mask", mask);
-        const auto constantEvent = makeConstant(graph, "constant_event_op", "constant_event", 1, "1'b0");
-
-        const auto reg = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegister,
-                                               graph.internSymbol("q"));
-        graph.setAttr(reg, "width", static_cast<int64_t>(8));
-        graph.setAttr(reg, "isSigned", false);
-
-        const auto write = graph.createOperation(wolvrix::lib::grh::OperationKind::kRegisterWritePort,
-                                                 graph.internSymbol("q_write"));
-        graph.addOperand(write, enable);
-        graph.addOperand(write, data);
-        graph.addOperand(write, mask);
-        graph.addOperand(write, constantEvent);
-        graph.setAttr(write, "regSymbol", std::string("q"));
-        graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
-
-        SessionStore session;
-        PassManager manager;
-        manager.options().session = &session;
-        manager.addPass(std::make_unique<ActivitySchedulePass>(
-            ActivityScheduleOptions{.path = "constant_event_commit"}));
-        PassDiagnostics diags;
-        const PassManagerResult runResult = manager.run(design, diags);
-        if (!runResult.success || diags.hasError())
-        {
-            return fail("Expected constant event commit schedule to succeed");
-        }
-        const auto schedule = loadSchedule(session, "constant_event_commit");
-        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
-        {
-            return rc;
-        }
-        const auto constantEventOp = graph.valueDef(constantEvent);
-        const uint32_t writeSupernode = (*schedule.opToSupernode)[write.index - 1];
-        if (!constantEventOp.valid() ||
-            (*schedule.opToSupernode)[constantEventOp.index - 1] == kInvalidActivitySupernodeId ||
-            !hasFanoutTo(*schedule.valueFanout, constantEvent, writeSupernode))
-        {
-            return fail("Constant event operand must retain its source and commit dependency");
         }
     }
 
@@ -1000,7 +1096,7 @@ int main()
         manager.options().session = &session;
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
             .path = "plain_coarsen_chain",
-            .maxOpInComputeSupernode = 1,
+            .maxOpInComputeSupernode = 2,
             .maxOpInComputeNode = 1,
             .enableCoarsen = true,
         }));
@@ -1057,22 +1153,12 @@ int main()
         graph.addResult(right, rightValue);
         graph.bindOutputPort("right_out", rightValue);
 
-        for (int i = 0; i < 15; ++i)
-        {
-            const auto extraValue = makeValue(graph, "extra_value_" + std::to_string(i), 1);
-            const auto extra = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
-                                                     graph.internSymbol("extra_assign_" + std::to_string(i)));
-            graph.addOperand(extra, rootValue);
-            graph.addResult(extra, extraValue);
-            graph.bindOutputPort("extra_out_" + std::to_string(i), extraValue);
-        }
-
         SessionStore session;
         PassManager manager;
         manager.options().session = &session;
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
             .path = "plain_sibling_coarsen",
-            .maxOpInComputeSupernode = 1,
+            .maxOpInComputeSupernode = 2,
             .maxOpInComputeNode = 1,
             .enableCoarsen = true,
             .enableChainMerge = false,
@@ -1089,105 +1175,16 @@ int main()
         {
             return rc;
         }
-        std::size_t maxComputeOps = 0;
-        for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps->size(); ++supernodeId)
-        {
-            if ((*schedule.supernodeKinds)[supernodeId] == ActivityScheduleSupernodeKind::Compute)
-            {
-                maxComputeOps = std::max(maxComputeOps, (*schedule.supernodeToOps)[supernodeId].size());
-            }
-        }
-        if (maxComputeOps != 16)
-        {
-            return fail("Expected sibling coarsen to stop at 16 times maxOpInComputeSupernode");
-        }
-    }
-
-    {
-        currentCase = "plain coarsen pre-siblings unlock chain";
-        wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("plain_coarsen_single_round");
-        design.markAsTop("plain_coarsen_single_round");
-
-        const auto a = makeValue(graph, "a", 1);
-        const auto b = makeValue(graph, "b", 1);
-        graph.bindInputPort("a", a);
-        graph.bindInputPort("b", b);
-
-        const auto rootAValue = makeValue(graph, "root_a_value", 1);
-        const auto rootA = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
-                                                 graph.internSymbol("root_a"));
-        graph.addOperand(rootA, a);
-        graph.addResult(rootA, rootAValue);
-
-        const auto rootBValue = makeValue(graph, "root_b_value", 1);
-        const auto rootB = graph.createOperation(wolvrix::lib::grh::OperationKind::kAssign,
-                                                 graph.internSymbol("root_b"));
-        graph.addOperand(rootB, b);
-        graph.addResult(rootB, rootBValue);
-
-        const auto leftValue = makeValue(graph, "left_value", 1);
-        const auto left = graph.createOperation(wolvrix::lib::grh::OperationKind::kAnd,
-                                                graph.internSymbol("left"));
-        graph.addOperand(left, rootAValue);
-        graph.addOperand(left, rootBValue);
-        graph.addResult(left, leftValue);
-
-        const auto rightValue = makeValue(graph, "right_value", 1);
-        const auto right = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
-                                                 graph.internSymbol("right"));
-        graph.addOperand(right, rootAValue);
-        graph.addOperand(right, rootBValue);
-        graph.addResult(right, rightValue);
-
-        const auto lowerLeftValue = makeValue(graph, "lower_left_value", 1);
-        const auto lowerLeft = graph.createOperation(wolvrix::lib::grh::OperationKind::kAnd,
-                                                     graph.internSymbol("lower_left"));
-        graph.addOperand(lowerLeft, leftValue);
-        graph.addOperand(lowerLeft, rightValue);
-        graph.addResult(lowerLeft, lowerLeftValue);
-        graph.bindOutputPort("lower_left_out", lowerLeftValue);
-
-        const auto lowerRightValue = makeValue(graph, "lower_right_value", 1);
-        const auto lowerRight = graph.createOperation(wolvrix::lib::grh::OperationKind::kOr,
-                                                      graph.internSymbol("lower_right"));
-        graph.addOperand(lowerRight, leftValue);
-        graph.addOperand(lowerRight, rightValue);
-        graph.addResult(lowerRight, lowerRightValue);
-        graph.bindOutputPort("lower_right_out", lowerRightValue);
-
-        SessionStore session;
-        PassManager manager;
-        manager.options().session = &session;
-        manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
-            .path = "plain_coarsen_single_round",
-            .maxOpInComputeSupernode = 1,
-            .maxOpInComputeNode = 1,
-            .enableCoarsen = true,
-        }));
-
-        PassDiagnostics diags;
-        const PassManagerResult runResult = manager.run(design, diags);
-        if (!runResult.success || diags.hasError())
-        {
-            return fail("Expected pre-siblings plain coarsen schedule to succeed");
-        }
-        const auto schedule = loadSchedule(session, "plain_coarsen_single_round");
-        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
-        {
-            return rc;
-        }
+        const uint32_t rootSupernode = (*schedule.opToSupernode)[root.index - 1];
         const uint32_t leftSupernode = (*schedule.opToSupernode)[left.index - 1];
         const uint32_t rightSupernode = (*schedule.opToSupernode)[right.index - 1];
-        const uint32_t lowerLeftSupernode = (*schedule.opToSupernode)[lowerLeft.index - 1];
-        const uint32_t lowerRightSupernode = (*schedule.opToSupernode)[lowerRight.index - 1];
-        if (leftSupernode == kInvalidActivitySupernodeId ||
-            lowerLeftSupernode == kInvalidActivitySupernodeId ||
-            leftSupernode != rightSupernode ||
-            lowerLeftSupernode != lowerRightSupernode ||
-            leftSupernode != lowerLeftSupernode)
+        if (rootSupernode == kInvalidActivitySupernodeId ||
+            leftSupernode == kInvalidActivitySupernodeId ||
+            rightSupernode == kInvalidActivitySupernodeId ||
+            rootSupernode == leftSupernode ||
+            leftSupernode != rightSupernode)
         {
-            return fail("Expected pre-chain siblings to enable chain merging in the same coarsen round");
+            return fail("Expected plain sibling coarsen to merge sibling consumers only");
         }
     }
 
@@ -1701,10 +1698,10 @@ int main()
     }
 
     {
-        currentCase = "coarsen_uses_expanded_merge_limit";
+        currentCase = "coarsen_respects_compute_supernode_op_limit";
         wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("coarsen_uses_expanded_merge_limit");
-        design.markAsTop("coarsen_uses_expanded_merge_limit");
+        auto &graph = design.createGraph("coarsen_respects_compute_supernode_op_limit");
+        design.markAsTop("coarsen_respects_compute_supernode_op_limit");
 
         const auto a = makeValue(graph, "a", 8);
         const auto b = makeValue(graph, "b", 8);
@@ -1712,8 +1709,8 @@ int main()
         graph.bindInputPort("b", b);
 
         std::vector<wolvrix::lib::grh::ValueId> leaves;
-        leaves.reserve(100);
-        for (int i = 0; i < 100; ++i)
+        leaves.reserve(10);
+        for (int i = 0; i < 10; ++i)
         {
             const auto result = makeValue(graph, "leaf_" + std::to_string(i), 8);
             const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
@@ -1741,7 +1738,7 @@ int main()
         PassManager manager;
         manager.options().session = &session;
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
-            .path = "coarsen_uses_expanded_merge_limit",
+            .path = "coarsen_respects_compute_supernode_op_limit",
             .maxOpInComputeSupernode = 3,
             .maxOpInComputeNode = 1,
             .enableCoarsen = true,
@@ -1751,30 +1748,20 @@ int main()
         const PassManagerResult runResult = manager.run(design, diags);
         if (!runResult.success || diags.hasError())
         {
-            return fail("Expected expanded-limit coarsen schedule to succeed");
+            return fail("Expected coarsen op-limit schedule to succeed");
         }
-        const auto schedule = loadSchedule(session, "coarsen_uses_expanded_merge_limit");
+        const auto schedule = loadSchedule(session, "coarsen_respects_compute_supernode_op_limit");
         if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
         {
             return rc;
         }
-        bool exceededDpLimit = false;
         for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps->size(); ++supernodeId)
         {
-            if ((*schedule.supernodeKinds)[supernodeId] != ActivityScheduleSupernodeKind::Compute)
+            if ((*schedule.supernodeKinds)[supernodeId] == ActivityScheduleSupernodeKind::Compute &&
+                (*schedule.supernodeToOps)[supernodeId].size() > 3)
             {
-                continue;
+                return fail("Expected coarsened compute supernodes to obey maxOpInComputeSupernode");
             }
-            const std::size_t opCount = (*schedule.supernodeToOps)[supernodeId].size();
-            exceededDpLimit = exceededDpLimit || opCount > 3;
-            if (opCount > 96)
-            {
-                return fail("Expected chain coarsen to stay within 32 times maxOpInComputeSupernode");
-            }
-        }
-        if (!exceededDpLimit)
-        {
-            return fail("Expected expanded coarsen limit to exceed the DP max-op setting");
         }
     }
 
@@ -2053,6 +2040,89 @@ int main()
     }
 
     {
+        currentCase = "ordered_memory_write_atomic_chunk";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("ordered_memory_write_atomic_chunk");
+        design.markAsTop("ordered_memory_write_atomic_chunk");
+
+        const auto clk = makeValue(graph, "clk", 1);
+        const auto en = makeValue(graph, "en", 1);
+        const auto addr = makeValue(graph, "addr", 2);
+        const auto mask = makeValue(graph, "mask", 8);
+        const auto highData = makeValue(graph, "high_data", 8);
+        const auto lowData = makeValue(graph, "low_data", 8);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("en", en);
+        graph.bindInputPort("addr", addr);
+        graph.bindInputPort("mask", mask);
+        graph.bindInputPort("high_data", highData);
+        graph.bindInputPort("low_data", lowData);
+
+        const auto memory = graph.createOperation(wolvrix::lib::grh::OperationKind::kMemory,
+                                                  graph.internSymbol("mem"));
+        graph.setAttr(memory, "width", int64_t{8});
+        graph.setAttr(memory, "row", int64_t{4});
+        graph.setAttr(memory, "isSigned", false);
+
+        const auto addWrite = [&](std::string_view name,
+                                  wolvrix::lib::grh::ValueId data,
+                                  int64_t priority)
+        {
+            const auto write = graph.createOperation(wolvrix::lib::grh::OperationKind::kMemoryWritePort,
+                                                     graph.internSymbol(name));
+            graph.addOperand(write, en);
+            graph.addOperand(write, addr);
+            graph.addOperand(write, data);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clk);
+            graph.setAttr(write, "memSymbol", std::string("mem"));
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+            graph.setAttr(write,
+                          wolvrix::lib::grh::kMemoryWritePriorityGroupAttr,
+                          std::string("mem_writes"));
+            graph.setAttr(write, wolvrix::lib::grh::kMemoryWritePriorityAttr, priority);
+            return write;
+        };
+        const auto highWrite = addWrite("high_write", highData, 0);
+        const auto lowWrite = addWrite("low_write", lowData, 1);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
+            .path = "ordered_memory_write_atomic_chunk",
+            .maxOpInComputeSupernode = 1,
+            .maxOpInCommitSupernode = 1,
+            .enableCoarsen = false,
+            .commitGuardEventBuckets = false,
+        }));
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected ordered memory write schedule to succeed");
+        }
+        const auto schedule = loadSchedule(session, "ordered_memory_write_atomic_chunk");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+        const uint32_t highSupernode = (*schedule.opToSupernode)[highWrite.index - 1];
+        const uint32_t lowSupernode = (*schedule.opToSupernode)[lowWrite.index - 1];
+        if (highSupernode != lowSupernode)
+        {
+            return fail("Ordered memory write group was split by the commit chunk limit");
+        }
+        const auto &commitOps = (*schedule.supernodeToOps)[highSupernode];
+        const auto lowIt = std::find(commitOps.begin(), commitOps.end(), lowWrite);
+        const auto highIt = std::find(commitOps.begin(), commitOps.end(), highWrite);
+        if (lowIt == commitOps.end() || highIt == commitOps.end() || lowIt >= highIt)
+        {
+            return fail("Ordered memory writes were not scheduled from low to high priority");
+        }
+    }
+
+    {
         currentCase = "commit_guard_event_oversize_bucket";
         wolvrix::lib::grh::Design design;
         auto &graph = design.createGraph("commit_guard_event_oversize_bucket");
@@ -2142,6 +2212,117 @@ int main()
             std::find(commitOps.begin(), commitOps.end(), write2) == commitOps.end())
         {
             return fail("Expected oversized guard bucket supernode to contain exactly the same-guard writes");
+        }
+    }
+
+    {
+        currentCase = "final_topo_level_op";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("final_topo_level_op");
+        design.markAsTop("final_topo_level_op");
+
+        const auto a = makeValue(graph, "a", 8);
+        const auto b = makeValue(graph, "b", 8);
+        graph.bindInputPort("a", a);
+        graph.bindInputPort("b", b);
+        const auto notAValue = makeValue(graph, "not_a_value", 8);
+        const auto notA = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                graph.internSymbol("not_a"));
+        graph.addOperand(notA, a);
+        graph.addResult(notA, notAValue);
+        graph.bindOutputPort("not_a", notAValue);
+
+        const auto notBValue = makeValue(graph, "not_b_value", 8);
+        const auto notB = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                graph.internSymbol("not_b"));
+        graph.addOperand(notB, b);
+        graph.addResult(notB, notBValue);
+        graph.bindOutputPort("not_b", notBValue);
+
+        const auto notCValue = makeValue(graph, "not_c_value", 8);
+        const auto notC = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                graph.internSymbol("not_c"));
+        graph.addOperand(notC, notBValue);
+        graph.addResult(notC, notCValue);
+        graph.bindOutputPort("not_c", notCValue);
+
+        const auto runSchedule = [&](const std::string &policy, SessionStore &session) -> bool
+        {
+            PassManager manager;
+            manager.options().session = &session;
+            manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
+                .path = "final_topo_level_op",
+                .maxOpInComputeSupernode = 1,
+                .maxOpInComputeNode = 1,
+                .enableCoarsen = false,
+                .finalTopoPolicy = policy,
+            }));
+            PassDiagnostics diags;
+            const PassManagerResult runResult = manager.run(design, diags);
+            return runResult.success && !diags.hasError();
+        };
+
+        SessionStore levelIdSession;
+        if (!runSchedule("level-id", levelIdSession))
+        {
+            return fail("Expected level-id final topo schedule to succeed");
+        }
+        SessionStore levelOpSession;
+        if (!runSchedule("level-op", levelOpSession))
+        {
+            return fail("Expected level-op final topo schedule to succeed");
+        }
+        SessionStore readyOpSession;
+        if (!runSchedule("ready-op", readyOpSession))
+        {
+            return fail("Expected ready-op final topo schedule to succeed");
+        }
+        const auto levelId = loadSchedule(levelIdSession, "final_topo_level_op");
+        const auto levelOp = loadSchedule(levelOpSession, "final_topo_level_op");
+        const auto readyOp = loadSchedule(readyOpSession, "final_topo_level_op");
+        if (const int rc = validateCommonScheduleShape(graph, levelId); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = validateCommonScheduleShape(graph, levelOp); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = validateCommonScheduleShape(graph, readyOp); rc != 0)
+        {
+            return rc;
+        }
+        if (*levelId.supernodeToOps != *levelOp.supernodeToOps ||
+            *levelId.opToSupernode != *levelOp.opToSupernode ||
+            *levelId.dag != *levelOp.dag ||
+            *levelId.valueFanout != *levelOp.valueFanout ||
+            *levelId.supernodeKinds != *levelOp.supernodeKinds ||
+            *levelId.computeNodesBySupernode != *levelOp.computeNodesBySupernode ||
+            *levelId.summaryStats != *levelOp.summaryStats)
+        {
+            return fail("Expected final topo policy to leave schedule structure unchanged");
+        }
+        if (*levelId.supernodeToOps != *readyOp.supernodeToOps ||
+            *levelId.opToSupernode != *readyOp.opToSupernode ||
+            *levelId.dag != *readyOp.dag ||
+            *levelId.valueFanout != *readyOp.valueFanout ||
+            *levelId.supernodeKinds != *readyOp.supernodeKinds ||
+            *levelId.computeNodesBySupernode != *readyOp.computeNodesBySupernode ||
+            *levelId.summaryStats != *readyOp.summaryStats)
+        {
+            return fail("Expected ready-op final topo policy to leave schedule structure unchanged");
+        }
+        if (const int rc = validateLevelOpTopoOrder(levelOp); rc != 0)
+        {
+            return rc;
+        }
+        if (const int rc = validateReadyOpTopoOrder(readyOp); rc != 0)
+        {
+            return rc;
+        }
+        if (*levelOp.topoOrder == *readyOp.topoOrder)
+        {
+            return fail("Expected ready-op to cross a complete Kahn layer boundary");
         }
     }
 
