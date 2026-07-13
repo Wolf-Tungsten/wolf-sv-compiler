@@ -43,6 +43,7 @@ namespace wolvrix::lib::transform
         bool commitGuardEventBuckets = true;
         bool splitOversizeComputeNodes = false;
         bool declaredValueComputeNodeBoundary = false;
+        std::string finalTopoPolicy = "level-id";
         std::string exportComputeDagPath;
     };
 

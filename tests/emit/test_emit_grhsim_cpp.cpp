@@ -10,6 +10,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <map>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1012,7 +1016,15 @@ namespace
                                   EmitResult &result,
                                   ActivityScheduleOptions scheduleOptions = {},
                                   bool posedgeFullpassSpecialization = false,
-                                  bool perf = false)
+                                  bool perf = false,
+                                  bool stateReadLocalityStats = false,
+                                  bool directSingleWriterStateReads = false,
+                                  bool materializedScalarReadLocalityStats = false,
+                                  bool fullActiveWordConsume = false,
+                                  std::optional<bool> pureEventComputeWordBypass = std::nullopt,
+                                  std::optional<bool> pureEventComputeWordProfile = std::nullopt,
+                                  std::size_t schedBatchMaxOps = 8u,
+                                  std::size_t schedBatchMaxEstimatedLines = 96u)
     {
         SessionStore session;
         if (scheduleOptions.path.empty())
@@ -1029,8 +1041,8 @@ namespace
         options.outputDir = outDir.string();
         options.session = &session;
         options.sessionPathPrefix = std::string("top");
-        options.attributes["sched_batch_max_ops"] = "8";
-        options.attributes["sched_batch_max_estimated_lines"] = "96";
+        options.attributes["sched_batch_max_ops"] = std::to_string(schedBatchMaxOps);
+        options.attributes["sched_batch_max_estimated_lines"] = std::to_string(schedBatchMaxEstimatedLines);
         options.attributes["emit_parallelism"] = "2";
         if (posedgeFullpassSpecialization)
         {
@@ -1039,6 +1051,30 @@ namespace
         if (perf)
         {
             options.attributes["perf"] = "eval";
+        }
+        if (stateReadLocalityStats)
+        {
+            options.attributes["state_read_locality_stats"] = "1";
+        }
+        if (directSingleWriterStateReads)
+        {
+            options.attributes["direct_single_writer_state_reads"] = "1";
+        }
+        if (materializedScalarReadLocalityStats)
+        {
+            options.attributes["materialized_scalar_read_locality_stats"] = "1";
+        }
+        if (fullActiveWordConsume)
+        {
+            options.attributes["full_active_word_consume"] = "1";
+        }
+        if (pureEventComputeWordBypass)
+        {
+            options.attributes["pure_event_compute_word_bypass"] = *pureEventComputeWordBypass ? "1" : "0";
+        }
+        if (pureEventComputeWordProfile)
+        {
+            options.attributes["pure_event_compute_word_profile"] = *pureEventComputeWordProfile ? "1" : "0";
         }
 
         EmitGrhSimCpp emitter(&diag);
@@ -1097,11 +1133,13 @@ namespace
         ValueId b64 = makeLogicValue(graph, "b64", 64);
         ValueId wide96 = makeLogicValue(graph, "wide96", 96);
         ValueId tag8 = makeLogicValue(graph, "tag8", 8);
+        ValueId broadcastBit = makeLogicValue(graph, "broadcast_bit", 1);
         graph.bindInputPort("clk", clk);
         graph.bindInputPort("a64", a64);
         graph.bindInputPort("b64", b64);
         graph.bindInputPort("wide96", wide96);
         graph.bindInputPort("tag8", tag8);
+        graph.bindInputPort("broadcast_bit", broadcastBit);
 
         ValueId concat128 = makeLogicValue(graph, "concat128", 128);
         OperationId concat11 =
@@ -1125,6 +1163,22 @@ namespace
         graph.addResult(rep, rep96);
         graph.setAttr(rep, "rep", static_cast<int64_t>(12));
         graph.bindOutputPort("rep96", rep96);
+
+        ValueId rep65 = makeLogicValue(graph, "rep65", 65);
+        OperationId rep65Op =
+            graph.createOperation(OperationKind::kReplicate, graph.internSymbol("replicate_bit_65"));
+        graph.addOperand(rep65Op, broadcastBit);
+        graph.addResult(rep65Op, rep65);
+        graph.setAttr(rep65Op, "rep", static_cast<int64_t>(65));
+        graph.bindOutputPort("rep65", rep65);
+
+        ValueId rep256 = makeLogicValue(graph, "rep256", 256);
+        OperationId rep256Op =
+            graph.createOperation(OperationKind::kReplicate, graph.internSymbol("replicate_bit_256"));
+        graph.addOperand(rep256Op, broadcastBit);
+        graph.addResult(rep256Op, rep256);
+        graph.setAttr(rep256Op, "rep", static_cast<int64_t>(256));
+        graph.bindOutputPort("rep256", rep256);
 
         OperationId reg = graph.createOperation(OperationKind::kRegister, graph.internSymbol("two_word_reg"));
         graph.setAttr(reg, "width", static_cast<int64_t>(96));
@@ -1174,6 +1228,30 @@ namespace
             graph.bindOutputPort("packed_activation_out_" + index, out);
         }
 
+        return design;
+    }
+
+    Design buildFullActiveWordConsumeDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        ValueId current = makeLogicValue(graph, "chain_in", 8);
+        graph.bindInputPort("chain_in", current);
+        ValueId one = addConstant(graph, "chain_one", "chain_one_value", 8, "8'h1");
+        for (std::size_t i = 0; i < 9u; ++i)
+        {
+            const std::string index = std::to_string(i);
+            ValueId next = makeLogicValue(graph, "chain_value_" + index, 8);
+            OperationId add = graph.createOperation(OperationKind::kAdd,
+                                                    graph.internSymbol("chain_add_" + index));
+            graph.addOperand(add, current);
+            graph.addOperand(add, one);
+            graph.addResult(add, next);
+            current = next;
+        }
+        graph.bindOutputPort("chain_out", current);
         return design;
     }
 
@@ -1364,7 +1442,7 @@ namespace
         graph.bindInputPort("d2", d2);
         graph.bindInputPort("d3", d3);
 
-        ValueId mask = addConstant(graph, "const_mask_commit_batch", "mask_commit_batch", 8, "8'h0F");
+        ValueId mask = addConstant(graph, "const_mask_commit_batch", "mask_commit_batch", 8, "8'hFF");
         ValueId one = addConstant(graph, "const_one_commit_batch", "one_commit_batch", 8, "8'h01");
         ValueId zero = addConstant(graph, "const_zero_commit_batch", "zero_commit_batch", 8, "8'h00");
 
@@ -1505,6 +1583,94 @@ namespace
         graph.setAttr(write, "regSymbol", std::string("bad_reg"));
         graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
 
+        return design;
+    }
+
+    Design buildOneBitBitwiseDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        ValueId a = makeLogicValue(graph, "a", 1);
+        ValueId b = makeLogicValue(graph, "b", 1);
+        ValueId c = makeLogicValue(graph, "c", 1);
+        ValueId d = makeLogicValue(graph, "d", 1);
+        ValueId e = makeLogicValue(graph, "e", 1);
+        ValueId clk = makeLogicValue(graph, "clk", 1);
+        ValueId wideA = makeLogicValue(graph, "wide_a", 8);
+        ValueId wideB = makeLogicValue(graph, "wide_b", 8);
+        graph.bindInputPort("a", a);
+        graph.bindInputPort("b", b);
+        graph.bindInputPort("c", c);
+        graph.bindInputPort("d", d);
+        graph.bindInputPort("e", e);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("wide_a", wideA);
+        graph.bindInputPort("wide_b", wideB);
+
+        const auto addBinary = [&](OperationKind kind,
+                                   std::string_view opName,
+                                   std::string_view valueName,
+                                   ValueId lhs,
+                                   ValueId rhs,
+                                   int32_t width) {
+            ValueId result = makeLogicValue(graph, valueName, width);
+            OperationId op = graph.createOperation(kind, graph.internSymbol(opName));
+            graph.addOperand(op, lhs);
+            graph.addOperand(op, rhs);
+            graph.addResult(op, result);
+            return result;
+        };
+        const auto addUnary = [&](OperationKind kind,
+                                  std::string_view opName,
+                                  std::string_view valueName,
+                                  ValueId operand) {
+            ValueId result = makeLogicValue(graph, valueName, 1);
+            OperationId op = graph.createOperation(kind, graph.internSymbol(opName));
+            graph.addOperand(op, operand);
+            graph.addResult(op, result);
+            return result;
+        };
+
+        ValueId andY = addBinary(OperationKind::kAnd, "and_op", "and_y", a, b, 1);
+        ValueId orY = addBinary(OperationKind::kOr, "or_op", "or_y", c, d, 1);
+        ValueId xorY = addBinary(OperationKind::kXor, "xor_op", "xor_y", a, c, 1);
+        ValueId xnorY = addBinary(OperationKind::kXnor, "xnor_op", "xnor_y", b, d, 1);
+        ValueId notY = addUnary(OperationKind::kNot, "not_op", "not_y", e);
+        ValueId chainY = addBinary(OperationKind::kAnd, "chain_and_op", "chain_y", orY, e, 1);
+        ValueId logicAndY = addBinary(OperationKind::kLogicAnd, "logic_and_op", "logic_and_y", a, d, 1);
+        ValueId wideAndY = addBinary(OperationKind::kAnd, "wide_and_op", "wide_and_y", wideA, wideB, 8);
+
+        OperationId bitReg = graph.createOperation(OperationKind::kRegister, graph.internSymbol("bit_reg"));
+        graph.setAttr(bitReg, "width", static_cast<int64_t>(1));
+        graph.setAttr(bitReg, "isSigned", false);
+        graph.setAttr(bitReg, "initValue", std::string("1'b0"));
+        ValueId bitQ = makeLogicValue(graph, "bit_q", 1);
+        OperationId bitRead = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                    graph.internSymbol("bit_read"));
+        graph.addResult(bitRead, bitQ);
+        graph.setAttr(bitRead, "regSymbol", std::string("bit_reg"));
+        ValueId one = addConstant(graph, "one_op", "one", 1, "1'b1");
+        OperationId bitWrite = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                     graph.internSymbol("bit_write"));
+        graph.addOperand(bitWrite, one);
+        graph.addOperand(bitWrite, a);
+        graph.addOperand(bitWrite, one);
+        graph.addOperand(bitWrite, clk);
+        graph.setAttr(bitWrite, "regSymbol", std::string("bit_reg"));
+        graph.setAttr(bitWrite, "eventEdge", std::vector<std::string>{"posedge"});
+        ValueId stateAndY = addBinary(OperationKind::kAnd, "state_and_op", "state_and_y", bitQ, b, 1);
+
+        graph.bindOutputPort("and_y", andY);
+        graph.bindOutputPort("or_y", orY);
+        graph.bindOutputPort("xor_y", xorY);
+        graph.bindOutputPort("xnor_y", xnorY);
+        graph.bindOutputPort("not_y", notY);
+        graph.bindOutputPort("chain_y", chainY);
+        graph.bindOutputPort("logic_and_y", logicAndY);
+        graph.bindOutputPort("wide_and_y", wideAndY);
+        graph.bindOutputPort("state_and_y", stateAndY);
         return design;
     }
 
@@ -1712,6 +1878,278 @@ namespace
         addTask("task_conditional_display", "display", {fmtCond, data}, "always_ff", false, {clk}, {"posedge"}, cond8);
         addTask("task_final", "display", {fmtFinal, data}, "final", false);
         addTask("task_final_fdisplay", "fdisplay", {handle, fmtFdisplay, data}, "final", false);
+
+        return design;
+    }
+
+    enum class PureEventWordFixtureMode
+    {
+        kHomogeneous,
+        kOnceOnly,
+        kMultiEvent,
+    };
+
+    Design buildPureEventWordBypassDesign(PureEventWordFixtureMode mode,
+                                          std::size_t taskCount = 16u)
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        ValueId clk = makeLogicValue(graph, "clk", 1);
+        ValueId auxClk = makeLogicValue(graph, "aux_clk", 1);
+        ValueId data = makeLogicValue(graph, "data", 8);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("aux_clk", auxClk);
+        graph.bindInputPort("data", data);
+        graph.bindOutputPort("data_out", data);
+
+        ValueId one = addConstant(graph, "pure_event_one_op", "pure_event_one", 1, "1'b1");
+        ValueId format = addConstant(graph,
+                                     "pure_event_format_op",
+                                     "pure_event_format",
+                                     0,
+                                     "\"pure-event=%0d\"",
+                                     ValueType::String);
+        for (std::size_t index = 0; index < taskCount; ++index)
+        {
+            OperationId task = graph.createOperation(
+                OperationKind::kSystemTask,
+                graph.internSymbol("pure_event_task_" + std::to_string(index)));
+            graph.addOperand(task, one);
+            graph.addOperand(task, format);
+            graph.addOperand(task, data);
+            graph.addOperand(task, clk);
+            std::vector<std::string> edges{"posedge"};
+            if (mode == PureEventWordFixtureMode::kMultiEvent)
+            {
+                graph.addOperand(task, auxClk);
+                edges.push_back("negedge");
+            }
+            graph.setAttr(task, "name", std::string("display"));
+            graph.setAttr(task,
+                          "procKind",
+                          std::string(mode == PureEventWordFixtureMode::kOnceOnly ? "initial" : "always_ff"));
+            graph.setAttr(task, "hasTiming", mode == PureEventWordFixtureMode::kOnceOnly);
+            graph.setAttr(task, "hasSideEffects", true);
+            graph.setAttr(task, "eventEdge", std::move(edges));
+        }
+        return design;
+    }
+
+    Design buildRepeatedScalarStateReadDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        ValueId clk = makeLogicValue(graph, "clk", 1);
+        ValueId data = makeLogicValue(graph, "data", 8);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("data", data);
+
+        ValueId one = addConstant(graph, "repeated_const_one", "repeated_one", 1, "1'b1");
+        ValueId mask = addConstant(graph, "repeated_const_mask", "repeated_mask", 8, "8'hff");
+        std::string format = "\"";
+        constexpr std::size_t repeatCount = 16;
+        for (std::size_t index = 0; index < repeatCount; ++index)
+        {
+            if (index != 0)
+            {
+                format += ' ';
+            }
+            format += "%0d";
+        }
+        format += "\"";
+        ValueId fmt = addConstant(graph,
+                                  "repeated_const_fmt",
+                                  "repeated_fmt",
+                                  0,
+                                  std::move(format),
+                                  ValueType::String);
+
+        OperationId reg = graph.createOperation(OperationKind::kRegister,
+                                                graph.internSymbol("repeated_q"));
+        graph.setAttr(reg, "width", static_cast<int64_t>(8));
+        graph.setAttr(reg, "isSigned", false);
+        graph.setAttr(reg, "initValue", std::string("8'h03"));
+
+        ValueId q = makeLogicValue(graph, "repeated_q_read", 8);
+        OperationId read = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                 graph.internSymbol("repeated_q_read_op"));
+        graph.addResult(read, q);
+        graph.setAttr(read, "regSymbol", std::string("repeated_q"));
+        graph.bindOutputPort("q_out", q);
+
+        OperationId write = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                  graph.internSymbol("repeated_q_write"));
+        graph.addOperand(write, one);
+        graph.addOperand(write, data);
+        graph.addOperand(write, mask);
+        graph.addOperand(write, clk);
+        graph.setAttr(write, "regSymbol", std::string("repeated_q"));
+        graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+
+        OperationId display = graph.createOperation(OperationKind::kSystemTask,
+                                                    graph.internSymbol("repeated_q_display"));
+        graph.addOperand(display, one);
+        graph.addOperand(display, fmt);
+        for (std::size_t index = 0; index < repeatCount; ++index)
+        {
+            graph.addOperand(display, q);
+        }
+        graph.addOperand(display, clk);
+        graph.setAttr(display, "name", std::string("display"));
+        graph.setAttr(display, "procKind", std::string("always_ff"));
+        graph.setAttr(display, "hasTiming", false);
+        graph.setAttr(display, "eventEdge", std::vector<std::string>{"posedge"});
+
+        return design;
+    }
+
+    Design buildMaterializedScalarReadLocalityDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        const ValueId a = makeLogicValue(graph, "locality_a", 8);
+        const ValueId b = makeLogicValue(graph, "locality_b", 8);
+        graph.bindInputPort("locality_a", a);
+        graph.bindInputPort("locality_b", b);
+
+        const ValueId repeatedSource = makeLogicValue(graph, "locality_repeated_source", 8);
+        const OperationId repeatedSourceOp =
+            graph.createOperation(OperationKind::kAdd, graph.internSymbol("locality_repeated_source_op"));
+        graph.addOperand(repeatedSourceOp, a);
+        graph.addOperand(repeatedSourceOp, b);
+        graph.addResult(repeatedSourceOp, repeatedSource);
+        graph.bindOutputPort("locality_repeated_source_out", repeatedSource);
+
+        const ValueId repeatedResult = makeLogicValue(graph, "locality_repeated_result", 16);
+        const OperationId repeatedResultOp =
+            graph.createOperation(OperationKind::kConcat, graph.internSymbol("locality_repeated_result_op"));
+        graph.addOperand(repeatedResultOp, repeatedSource);
+        graph.addOperand(repeatedResultOp, repeatedSource);
+        graph.addResult(repeatedResultOp, repeatedResult);
+        graph.bindOutputPort("locality_repeated_result_out", repeatedResult);
+
+        const ValueId singleSource = makeLogicValue(graph, "locality_single_source", 8);
+        const OperationId singleSourceOp =
+            graph.createOperation(OperationKind::kXor, graph.internSymbol("locality_single_source_op"));
+        graph.addOperand(singleSourceOp, a);
+        graph.addOperand(singleSourceOp, b);
+        graph.addResult(singleSourceOp, singleSource);
+        graph.bindOutputPort("locality_single_source_out", singleSource);
+
+        const ValueId singleResult = makeLogicValue(graph, "locality_single_result", 8);
+        const OperationId singleResultOp =
+            graph.createOperation(OperationKind::kAdd, graph.internSymbol("locality_single_result_op"));
+        graph.addOperand(singleResultOp, singleSource);
+        graph.addOperand(singleResultOp, b);
+        graph.addResult(singleResultOp, singleResult);
+        graph.bindOutputPort("locality_single_result_out", singleResult);
+
+        const ValueId wideSource = makeLogicValue(graph, "locality_wide_source", 72);
+        const OperationId wideSourceOp =
+            graph.createOperation(OperationKind::kConcat, graph.internSymbol("locality_wide_source_op"));
+        for (std::size_t index = 0; index < 9; ++index)
+        {
+            graph.addOperand(wideSourceOp, a);
+        }
+        graph.addResult(wideSourceOp, wideSource);
+        graph.bindOutputPort("locality_wide_source_out", wideSource);
+
+        const ValueId wideResult = makeLogicValue(graph, "locality_wide_result", 144);
+        const OperationId wideResultOp =
+            graph.createOperation(OperationKind::kConcat, graph.internSymbol("locality_wide_result_op"));
+        graph.addOperand(wideResultOp, wideSource);
+        graph.addOperand(wideResultOp, wideSource);
+        graph.addResult(wideResultOp, wideResult);
+        graph.bindOutputPort("locality_wide_result_out", wideResult);
+
+        return design;
+    }
+
+    Design buildDirectStateReadForwardDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        const ValueId clk = makeLogicValue(graph, "clk", 1);
+        const ValueId directData = makeLogicValue(graph, "direct_data", 8);
+        const ValueId protectedData = makeLogicValue(graph, "protected_data", 8);
+        const ValueId multiWriteA = makeLogicValue(graph, "multi_write_a", 1);
+        const ValueId multiWriteB = makeLogicValue(graph, "multi_write_b", 1);
+        const ValueId multiDataA = makeLogicValue(graph, "multi_data_a", 8);
+        const ValueId multiDataB = makeLogicValue(graph, "multi_data_b", 8);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("direct_data", directData);
+        graph.bindInputPort("protected_data", protectedData);
+        graph.bindInputPort("multi_write_a", multiWriteA);
+        graph.bindInputPort("multi_write_b", multiWriteB);
+        graph.bindInputPort("multi_data_a", multiDataA);
+        graph.bindInputPort("multi_data_b", multiDataB);
+
+        const ValueId one = addConstant(graph, "direct_const_one", "direct_one", 1, "1'b1");
+        const ValueId increment = addConstant(graph, "direct_const_increment", "direct_increment", 8, "8'h01");
+        const ValueId mask = addConstant(graph, "direct_const_mask", "direct_mask", 8, "8'hff");
+
+        auto addRegister = [&](std::string_view symbol, std::string_view initValue) {
+            const OperationId reg = graph.createOperation(OperationKind::kRegister,
+                                                          graph.internSymbol(std::string(symbol)));
+            graph.setAttr(reg, "width", int64_t{8});
+            graph.setAttr(reg, "isSigned", false);
+            graph.setAttr(reg, "initValue", std::string(initValue));
+        };
+        auto addRead = [&](std::string_view stateSymbol, std::string_view valueSymbol) {
+            const ValueId value = makeLogicValue(graph, std::string(valueSymbol), 8);
+            const OperationId read = graph.createOperation(
+                OperationKind::kRegisterReadPort,
+                graph.internSymbol(std::string(valueSymbol) + "_op"));
+            graph.addResult(read, value);
+            graph.setAttr(read, "regSymbol", std::string(stateSymbol));
+            return value;
+        };
+        auto addIncrement = [&](ValueId value, std::string_view symbol) {
+            const ValueId result = makeLogicValue(graph, std::string(symbol), 8);
+            const OperationId add = graph.createOperation(OperationKind::kAdd,
+                                                          graph.internSymbol(std::string(symbol) + "_op"));
+            graph.addOperand(add, value);
+            graph.addOperand(add, increment);
+            graph.addResult(add, result);
+            return result;
+        };
+        auto addWrite = [&](std::string_view opSymbol,
+                            std::string_view stateSymbol,
+                            ValueId cond,
+                            ValueId data) {
+            const OperationId write = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                            graph.internSymbol(std::string(opSymbol)));
+            graph.addOperand(write, cond);
+            graph.addOperand(write, data);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clk);
+            graph.setAttr(write, "regSymbol", std::string(stateSymbol));
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        };
+
+        addRegister("direct_q", "8'h03");
+        const ValueId directRead = addRead("direct_q", "direct_q_read");
+        graph.bindOutputPort("direct_plus_one", addIncrement(directRead, "direct_plus_one_value"));
+        addWrite("direct_q_write", "direct_q", one, directData);
+
+        addRegister("protected_q", "8'h07");
+        const ValueId protectedRead = addRead("protected_q", "protected_q_read");
+        graph.bindOutputPort("protected_q_out", protectedRead);
+        addWrite("protected_q_write", "protected_q", one, protectedData);
+
+        addRegister("multi_q", "8'h05");
+        const ValueId multiRead = addRead("multi_q", "multi_q_read");
+        graph.bindOutputPort("multi_plus_one", addIncrement(multiRead, "multi_plus_one_value"));
+        addWrite("multi_q_write_a", "multi_q", multiWriteA, multiDataA);
+        addWrite("multi_q_write_b", "multi_q", multiWriteB, multiDataB);
 
         return design;
     }
@@ -1995,6 +2433,321 @@ namespace
         return design;
     }
 
+    Design buildRegToMemTrueMultiWriteEmitDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        constexpr int32_t width = 8;
+        constexpr std::size_t rows = 4;
+        const ValueId clk = makeLogicValue(graph, "clk", 1);
+        const ValueId index = makeLogicValue(graph, "index", 2);
+        const ValueId addr = makeLogicValue(graph, "addr", 2);
+        const ValueId wen = makeLogicValue(graph, "wen", 1);
+        const ValueId data = makeLogicValue(graph, "data", width);
+        const ValueId addr2 = makeLogicValue(graph, "addr2", 2);
+        const ValueId wen2 = makeLogicValue(graph, "wen2", 1);
+        const ValueId data2 = makeLogicValue(graph, "data2", width);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("index", index);
+        graph.bindInputPort("addr", addr);
+        graph.bindInputPort("wen", wen);
+        graph.bindInputPort("data", data);
+        graph.bindInputPort("addr2", addr2);
+        graph.bindInputPort("wen2", wen2);
+        graph.bindInputPort("data2", data2);
+
+        std::vector<std::string> regSymbols;
+        std::vector<ValueId> readValues;
+        regSymbols.reserve(rows);
+        readValues.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            const std::string regSymbol = "multi_r" + std::to_string(row);
+            regSymbols.push_back(regSymbol);
+            const OperationId reg = graph.createOperation(OperationKind::kRegister,
+                                                          graph.internSymbol(regSymbol));
+            graph.setAttr(reg, "width", int64_t{width});
+            graph.setAttr(reg, "isSigned", false);
+            graph.setAttr(reg, "initValue", std::string("8'h00"));
+
+            const ValueId readValue = makeLogicValue(graph, regSymbol + "_read", width);
+            const OperationId read = graph.createOperation(OperationKind::kRegisterReadPort,
+                                                           graph.internSymbol(regSymbol + "_read_op"));
+            graph.addResult(read, readValue);
+            graph.setAttr(read, "regSymbol", regSymbol);
+            readValues.push_back(readValue);
+        }
+
+        const ValueId packed = makeLogicValue(graph, "multi_packed", width * static_cast<int32_t>(rows) * 2);
+        const OperationId concat = graph.createOperation(OperationKind::kConcat,
+                                                         graph.internSymbol("multi_concat"));
+        for (int repeat = 0; repeat < 2; ++repeat)
+        {
+            for (std::size_t row = rows; row-- > 0;)
+            {
+                graph.addOperand(concat, readValues[row]);
+            }
+        }
+        graph.addResult(concat, packed);
+
+        const ValueId selected = makeLogicValue(graph, "selected", width);
+        const OperationId slice = graph.createOperation(OperationKind::kSliceArray,
+                                                        graph.internSymbol("multi_slice"));
+        graph.addOperand(slice, packed);
+        graph.addOperand(slice, index);
+        graph.addResult(slice, selected);
+        graph.setAttr(slice, "sliceWidth", int64_t{width});
+        graph.bindOutputPort("selected", selected);
+
+        const ValueId extra = makeLogicValue(graph, "extra", width);
+        const OperationId extraAssign = graph.createOperation(OperationKind::kAssign,
+                                                              graph.internSymbol("multi_extra_assign"));
+        graph.addOperand(extraAssign, readValues.front());
+        graph.addResult(extraAssign, extra);
+        graph.bindOutputPort("extra", extra);
+
+        const ValueId mask = addConstant(graph, "multi_mask_op", "multi_mask", width, "8'hff");
+        auto addBinaryValue = [&](OperationKind kind,
+                                  const std::string &base,
+                                  ValueId lhs,
+                                  ValueId rhs,
+                                  int32_t valueWidth) {
+            const ValueId out = makeLogicValue(graph, base + "_value", valueWidth);
+            const OperationId op = graph.createOperation(kind, graph.internSymbol(base + "_op"));
+            graph.addOperand(op, lhs);
+            graph.addOperand(op, rhs);
+            graph.addResult(op, out);
+            return out;
+        };
+        auto addUnaryValue = [&](OperationKind kind, const std::string &base, ValueId operand) {
+            const ValueId out = makeLogicValue(graph, base + "_value", 1);
+            const OperationId op = graph.createOperation(kind, graph.internSymbol(base + "_op"));
+            graph.addOperand(op, operand);
+            graph.addResult(op, out);
+            return out;
+        };
+        auto addMuxValue = [&](const std::string &base, ValueId cond, ValueId onTrue, ValueId onFalse) {
+            const ValueId out = makeLogicValue(graph, base + "_value", width);
+            const OperationId op = graph.createOperation(OperationKind::kMux, graph.internSymbol(base + "_op"));
+            graph.addOperand(op, cond);
+            graph.addOperand(op, onTrue);
+            graph.addOperand(op, onFalse);
+            graph.addResult(op, out);
+            return out;
+        };
+        const ValueId sharedEnable = addBinaryValue(OperationKind::kLogicAnd, "multi_shared_enable", wen, wen2, 1);
+        const ValueId fallback = addConstant(graph, "multi_fallback_op", "multi_fallback", width, "8'h00");
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            const std::string rowText = std::to_string(row);
+            const ValueId rowConst = addConstant(graph,
+                                                 "multi_first_const_" + rowText + "_op",
+                                                 "multi_first_const_" + rowText,
+                                                 2,
+                                                 "2'd" + rowText);
+            const ValueId rowConst2 = addConstant(graph,
+                                                  "multi_second_const_" + rowText + "_op",
+                                                  "multi_second_const_" + rowText,
+                                                  2,
+                                                  "2'd" + rowText);
+            const ValueId firstHit = addBinaryValue(
+                OperationKind::kEq, "multi_first_hit_" + rowText, addr, rowConst, 1);
+            const ValueId secondHit = addBinaryValue(
+                OperationKind::kEq, "multi_second_hit_" + rowText, addr2, rowConst2, 1);
+            const ValueId secondGuard = addBinaryValue(
+                OperationKind::kLogicAnd, "multi_second_guard_" + rowText, sharedEnable, secondHit, 1);
+            const ValueId notSecondHit = addUnaryValue(
+                OperationKind::kLogicNot, "multi_not_second_hit_" + rowText, secondHit);
+            const ValueId firstEligible = addBinaryValue(
+                OperationKind::kLogicAnd, "multi_first_eligible_" + rowText, sharedEnable, notSecondHit, 1);
+            const ValueId firstGuard = addBinaryValue(
+                OperationKind::kLogicAnd, "multi_first_guard_" + rowText, firstEligible, firstHit, 1);
+            const ValueId updateCond = addBinaryValue(
+                OperationKind::kLogicOr, "multi_update_" + rowText, firstGuard, secondGuard, 1);
+            const ValueId firstNext = addMuxValue(
+                "multi_first_mux_" + rowText, firstGuard, data, fallback);
+            const ValueId next = addMuxValue(
+                "multi_second_mux_" + rowText, secondGuard, data2, firstNext);
+            const OperationId write = graph.createOperation(OperationKind::kRegisterWritePort,
+                                                            graph.internSymbol("multi_write_" + rowText));
+            graph.addOperand(write, updateCond);
+            graph.addOperand(write, next);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clk);
+            graph.setAttr(write, "regSymbol", regSymbols[row]);
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        }
+        return design;
+    }
+
+    Design buildOrderedMemoryWriteAffineEmitDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        constexpr int32_t width = 8;
+        constexpr std::size_t rows = 4;
+        constexpr std::size_t writerCount = 16;
+        const ValueId clk = makeLogicValue(graph, "clk", 1);
+        const ValueId readAddr = makeLogicValue(graph, "read_addr", 2);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("read_addr", readAddr);
+
+        const OperationId memory = graph.createOperation(OperationKind::kMemory,
+                                                         graph.internSymbol("ordered_mem"));
+        graph.setAttr(memory, "width", int64_t{width});
+        graph.setAttr(memory, "row", static_cast<int64_t>(rows));
+        graph.setAttr(memory, "isSigned", false);
+        graph.setAttr(memory, "initKind", std::vector<std::string>{});
+        graph.setAttr(memory, "initFile", std::vector<std::string>{});
+        graph.setAttr(memory, "initValue", std::vector<std::string>{});
+        graph.setAttr(memory, "initStart", std::vector<int64_t>{});
+        graph.setAttr(memory, "initLen", std::vector<int64_t>{});
+
+        const ValueId readValue = makeLogicValue(graph, "ordered_read_value", width);
+        const OperationId read = graph.createOperation(OperationKind::kMemoryReadPort,
+                                                       graph.internSymbol("ordered_read"));
+        graph.addOperand(read, readAddr);
+        graph.addResult(read, readValue);
+        graph.setAttr(read, "memSymbol", std::string("ordered_mem"));
+        graph.bindOutputPort("selected", readValue);
+
+        const ValueId mask = addConstant(graph,
+                                         "ordered_mask_op",
+                                         "ordered_mask",
+                                         width,
+                                         "8'hff");
+        for (std::size_t writer = 0; writer < writerCount; ++writer)
+        {
+            const std::string writerText = std::to_string(writer);
+            const ValueId enable = makeLogicValue(graph, "ordered_wen_" + writerText, 1);
+            const ValueId addr = makeLogicValue(graph, "ordered_addr_" + writerText, 2);
+            const ValueId data = makeLogicValue(graph, "ordered_data_" + writerText, width);
+            graph.bindInputPort("ordered_wen_" + writerText, enable);
+            graph.bindInputPort("ordered_addr_" + writerText, addr);
+            graph.bindInputPort("ordered_data_" + writerText, data);
+
+            const ValueId materializedEnable =
+                makeLogicValue(graph, "ordered_wen_materialized_" + writerText, 1);
+            const OperationId enableAssign = graph.createOperation(
+                OperationKind::kAssign, graph.internSymbol("ordered_wen_assign_" + writerText));
+            graph.addOperand(enableAssign, enable);
+            graph.addResult(enableAssign, materializedEnable);
+            const ValueId materializedAddr =
+                makeLogicValue(graph, "ordered_addr_materialized_" + writerText, 2);
+            const OperationId addrAssign = graph.createOperation(
+                OperationKind::kAssign, graph.internSymbol("ordered_addr_assign_" + writerText));
+            graph.addOperand(addrAssign, addr);
+            graph.addResult(addrAssign, materializedAddr);
+            const ValueId materializedData =
+                makeLogicValue(graph, "ordered_data_materialized_" + writerText, width);
+            const OperationId dataAssign = graph.createOperation(
+                OperationKind::kAssign, graph.internSymbol("ordered_data_assign_" + writerText));
+            graph.addOperand(dataAssign, data);
+            graph.addResult(dataAssign, materializedData);
+
+            const OperationId write = graph.createOperation(OperationKind::kMemoryWritePort,
+                                                            graph.internSymbol("ordered_write_" + writerText));
+            graph.addOperand(write, materializedEnable);
+            graph.addOperand(write, materializedAddr);
+            graph.addOperand(write, materializedData);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clk);
+            graph.setAttr(write, "memSymbol", std::string("ordered_mem"));
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+            graph.setAttr(write,
+                          wolvrix::lib::grh::kMemoryWritePriorityGroupAttr,
+                          std::string("ordered_mem_writes"));
+            graph.setAttr(write,
+                          wolvrix::lib::grh::kMemoryWritePriorityAttr,
+                          static_cast<int64_t>(writer));
+        }
+        return design;
+    }
+
+    Design buildMemoryRowReaderActivationDesign()
+    {
+        Design design;
+        Graph &graph = design.createGraph("top");
+        design.markAsTop(graph.symbol());
+
+        constexpr int32_t width = 8;
+        constexpr std::size_t rows = 64;
+        const ValueId clk = makeLogicValue(graph, "clk", 1);
+        const ValueId wen = makeLogicValue(graph, "wen", 1);
+        const ValueId writeAddr = makeLogicValue(graph, "write_addr", 6);
+        const ValueId writeData = makeLogicValue(graph, "write_data", width);
+        const ValueId readAddr = makeLogicValue(graph, "read_addr", 6);
+        graph.bindInputPort("clk", clk);
+        graph.bindInputPort("wen", wen);
+        graph.bindInputPort("write_addr", writeAddr);
+        graph.bindInputPort("write_data", writeData);
+        graph.bindInputPort("read_addr", readAddr);
+
+        const OperationId memory = graph.createOperation(OperationKind::kMemory,
+                                                         graph.internSymbol("row_activation_mem"));
+        graph.setAttr(memory, "width", int64_t{width});
+        graph.setAttr(memory, "row", static_cast<int64_t>(rows));
+        graph.setAttr(memory, "isSigned", false);
+        graph.setAttr(memory, "initKind", std::vector<std::string>{});
+        graph.setAttr(memory, "initFile", std::vector<std::string>{});
+        graph.setAttr(memory, "initValue", std::vector<std::string>{});
+        graph.setAttr(memory, "initStart", std::vector<int64_t>{});
+        graph.setAttr(memory, "initLen", std::vector<int64_t>{});
+
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            const std::string rowText = std::to_string(row);
+            const ValueId addr = addConstant(graph,
+                                             "row_activation_addr_" + rowText + "_op",
+                                             "row_activation_addr_" + rowText,
+                                             6,
+                                             "6'd" + rowText);
+            for (std::size_t copy = 0; copy < 2; ++copy)
+            {
+                const std::string copyText = std::to_string(copy);
+                const ValueId value = makeLogicValue(
+                    graph, "row_activation_value_" + rowText + "_" + copyText, width);
+                const OperationId read = graph.createOperation(
+                    OperationKind::kMemoryReadPort,
+                    graph.internSymbol("row_activation_read_" + rowText + "_" + copyText));
+                graph.addOperand(read, addr);
+                graph.addResult(read, value);
+                graph.setAttr(read, "memSymbol", std::string("row_activation_mem"));
+                graph.bindOutputPort(
+                    (copy == 0 ? "row_" : "row_mirror_") + rowText, value);
+            }
+        }
+
+        const ValueId dynamicValue = makeLogicValue(graph, "row_activation_dynamic_value", width);
+        const OperationId dynamicRead = graph.createOperation(OperationKind::kMemoryReadPort,
+                                                              graph.internSymbol("row_activation_dynamic_read"));
+        graph.addOperand(dynamicRead, readAddr);
+        graph.addResult(dynamicRead, dynamicValue);
+        graph.setAttr(dynamicRead, "memSymbol", std::string("row_activation_mem"));
+        graph.bindOutputPort("dynamic_value", dynamicValue);
+
+        const ValueId mask = addConstant(graph,
+                                         "row_activation_mask_op",
+                                         "row_activation_mask",
+                                         width,
+                                         "8'hff");
+        const OperationId write = graph.createOperation(OperationKind::kMemoryWritePort,
+                                                        graph.internSymbol("row_activation_write"));
+        graph.addOperand(write, wen);
+        graph.addOperand(write, writeAddr);
+        graph.addOperand(write, writeData);
+        graph.addOperand(write, mask);
+        graph.addOperand(write, clk);
+        graph.setAttr(write, "memSymbol", std::string("row_activation_mem"));
+        graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+
+        return design;
+    }
+
     Design buildRegToMemDynamicInputIntentEmitDesign()
     {
         Design design;
@@ -2247,6 +3000,27 @@ namespace
         return result.success && !diags.hasError();
     }
 
+    bool runRegToMemTruePass(Design &design)
+    {
+        PassManager manager;
+        RegToMemOptions options;
+        options.enableTrueMerge = true;
+        options.enableOrderedWrites = true;
+        options.minElementCount = 4;
+        manager.addPass(std::make_unique<RegToMemPass>(options));
+        PassDiagnostics diags;
+        const PassManagerResult result = manager.run(design, diags);
+        if (!result.success || diags.hasError())
+        {
+            for (const auto &diag : diags.messages())
+            {
+                std::cerr << "[emit_grhsim_cpp] true reg-to-mem diagnostic: "
+                          << diag.message << '\n';
+            }
+        }
+        return result.success && !diags.hasError();
+    }
+
 } // namespace
 
 #ifndef WOLF_SV_EMIT_ARTIFACT_DIR
@@ -2424,6 +3198,45 @@ int main()
     {
         return fail("wide dynamic register masks should retain words masked merge emission");
     }
+    if (scalarFullMaskWrite.find("if (unlikely(") == std::string_view::npos ||
+        wideFullMaskWrite.find("if (unlikely(") == std::string_view::npos ||
+        dynamicMaskWrite.find("if (unlikely(") == std::string_view::npos ||
+        wideDynamicMaskWrite.find("if (unlikely(") == std::string_view::npos)
+    {
+        return fail("commit state-change hint should cover scalar and wide register writes");
+    }
+    {
+        EmitOptions unhintedOptions = options;
+        const std::filesystem::path unhintedOutDir =
+            std::filesystem::path(std::string(WOLF_SV_EMIT_ARTIFACT_DIR)) / "grhsim_cpp_unhinted_commit";
+        unhintedOptions.outputDir = unhintedOutDir.string();
+        unhintedOptions.attributes["commit_state_change_unlikely"] = "0";
+        EmitDiagnostics unhintedDiag;
+        EmitGrhSimCpp unhintedEmitter(&unhintedDiag);
+        const EmitResult unhintedResult = unhintedEmitter.emit(design, unhintedOptions);
+        if (!unhintedResult.success || unhintedDiag.hasError())
+        {
+            return fail("unhinted commit EmitGrhSimCpp failed");
+        }
+        const std::string unhintedSched = readFiles(collectSchedFiles(unhintedOutDir, "grhsim_top_sched_"));
+        const std::size_t unhintedWriteBegin =
+            unhintedSched.find("// op reg_q_write [kRegisterWritePort] reg=reg_q");
+        if (unhintedWriteBegin == std::string::npos)
+        {
+            return fail("unhinted commit emit should contain the scalar register write");
+        }
+        const std::size_t unhintedWriteEnd =
+            unhintedSched.find("// op ", unhintedWriteBegin + 1);
+        const std::string_view unhintedWrite =
+            std::string_view(unhintedSched).substr(
+                unhintedWriteBegin,
+                unhintedWriteEnd == std::string::npos ? unhintedWriteEnd : unhintedWriteEnd - unhintedWriteBegin);
+        if (unhintedWrite.find("if (unlikely(") != std::string_view::npos ||
+            unhintedWrite.find(" != next_value") == std::string_view::npos)
+        {
+            return fail("commit state-change hint disable switch should preserve the unhinted condition");
+        }
+    }
     if (header.find("static const char value_") != std::string::npos ||
         state.find("const char GrhSIM_top::value_") != std::string::npos ||
         sched.find("\"q=%0d\"") == std::string::npos)
@@ -2458,6 +3271,7 @@ int main()
         runtime.find("grhsim_add_words_2") == std::string::npos ||
         runtime.find("grhsim_concat_words_2_1_1") == std::string::npos ||
         runtime.find("grhsim_replicate_words_2_1") == std::string::npos ||
+        runtime.find("grhsim_replicate_bit_words") == std::string::npos ||
         runtime.find("grhsim_assign_words_2") == std::string::npos ||
         runtime.find("grhsim_clog2_words") == std::string::npos)
     {
@@ -2650,6 +3464,13 @@ int main()
     {
         return fail("Missing supernode activity runtime helpers");
     }
+    if (runtime.find("for (; index + 32u <= byteCount; index += 32u)") == std::string::npos ||
+        runtime.find("(word0 | word1 | word2 | word3) != UINT64_C(0)") == std::string::npos ||
+        runtime.find("for (; index + 8u <= byteCount; index += 8u)") == std::string::npos ||
+        runtime.find("\"+r\"(word0), \"+r\"(word1), \"+r\"(word2), \"+r\"(word3)") == std::string::npos)
+    {
+        return fail("Activity pending checks should scan packed words instead of individual bytes");
+    }
     if (eval.find("kBatchEvalFns") != std::string::npos ||
         eval.find("kComputeActiveWordBatchOffsets") != std::string::npos ||
         eval.find("kCommitActiveWordBatchOffsets") != std::string::npos ||
@@ -2674,6 +3495,12 @@ int main()
     if (sched.find("newlyActivatedWordFlags") != std::string::npos)
     {
         return fail("Compute batch emit should keep same-word activations in local activeWordFlags");
+    }
+    if (sched.find("activeWordFlags & static_cast<std::uint8_t>(~UINT8_C(") == std::string::npos ||
+        sched.find("supernode_active_curr_[") == std::string::npos ||
+        sched.find(" | activeWordFlags);") == std::string::npos)
+    {
+        return fail("default compute word dispatch should retain mutable clear/restore protocol");
     }
     if (sched.find("display_task") == std::string::npos || sched.find("trace_dpi_call") == std::string::npos)
     {
@@ -2719,6 +3546,291 @@ int main()
         makefile.find("-include-pch $(PCH_FILE)") == std::string::npos)
     {
         return fail("Missing split state/schedule Makefile skeleton or PCH support");
+    }
+
+    const std::filesystem::path trueMultiWriteDir =
+        std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_reg_to_mem_true_multi_write";
+    std::filesystem::remove_all(trueMultiWriteDir);
+    Design trueMultiWriteDesign = buildRegToMemTrueMultiWriteEmitDesign();
+    if (!runRegToMemTruePass(trueMultiWriteDesign))
+    {
+        return fail("true reg-to-mem multi-write pass failed");
+    }
+    EmitDiagnostics trueMultiWriteDiag;
+    EmitResult trueMultiWriteResult;
+    if (!emitWithActivitySchedule(trueMultiWriteDesign,
+                                  trueMultiWriteDir,
+                                  trueMultiWriteDiag,
+                                  trueMultiWriteResult,
+                                  ActivityScheduleOptions{.path = "top",
+                                                          .maxOpInComputeSupernode = 8,
+                                                          .maxOpInComputeNode = 2,
+                                                          .enableCoarsen = false}))
+    {
+        return fail("true reg-to-mem multi-write activity-schedule pass failed");
+    }
+    if (!trueMultiWriteResult.success || trueMultiWriteDiag.hasError())
+    {
+        return fail("true reg-to-mem multi-write emit failed");
+    }
+    const std::string trueMultiWriteBuildCmd =
+        "make -C " + trueMultiWriteDir.string() + " CXX=clang++ CXXFLAGS='" +
+        std::string(kHarnessCompileFlags) + "'";
+    if (std::system(trueMultiWriteBuildCmd.c_str()) != 0)
+    {
+        return fail("true reg-to-mem multi-write archive failed to build");
+    }
+    const std::filesystem::path trueMultiWriteHarnessPath = trueMultiWriteDir / "grhsim_top_harness.cpp";
+    {
+        std::ofstream harness(trueMultiWriteHarnessPath);
+        if (!harness.is_open())
+        {
+            return fail("Failed to create true reg-to-mem multi-write harness");
+        }
+        harness << "#include \"grhsim_top.hpp\"\n";
+        harness << "#include <cstdint>\n\n";
+        harness << "int main()\n";
+        harness << "{\n";
+        harness << "    GrhSIM_top sim;\n";
+        harness << "    sim.init();\n";
+        harness << "    sim.clk = false;\n";
+        harness << "    sim.index = static_cast<std::uint8_t>(1);\n";
+        harness << "    sim.addr = static_cast<std::uint8_t>(1);\n";
+        harness << "    sim.addr2 = static_cast<std::uint8_t>(1);\n";
+        harness << "    sim.wen = true;\n";
+        harness << "    sim.wen2 = true;\n";
+        harness << "    sim.data = static_cast<std::uint8_t>(0x11);\n";
+        harness << "    sim.data2 = static_cast<std::uint8_t>(0x22);\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.clk = true;\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.selected != static_cast<std::uint8_t>(0x22)) return 1;\n";
+        harness << "    sim.index = static_cast<std::uint8_t>(0);\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.extra != static_cast<std::uint8_t>(0x00)) return 4;\n";
+        harness << "    sim.clk = false;\n";
+        harness << "    sim.addr = static_cast<std::uint8_t>(0);\n";
+        harness << "    sim.addr2 = static_cast<std::uint8_t>(2);\n";
+        harness << "    sim.data = static_cast<std::uint8_t>(0x33);\n";
+        harness << "    sim.data2 = static_cast<std::uint8_t>(0x44);\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.clk = true;\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.index = static_cast<std::uint8_t>(0);\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.selected != static_cast<std::uint8_t>(0x33)) return 2;\n";
+        harness << "    if (sim.extra != static_cast<std::uint8_t>(0x33)) return 5;\n";
+        harness << "    sim.index = static_cast<std::uint8_t>(2);\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.selected != static_cast<std::uint8_t>(0x44)) return 3;\n";
+        harness << "    return 0;\n";
+        harness << "}\n";
+    }
+    const std::filesystem::path trueMultiWriteHarnessExe = trueMultiWriteDir / "grhsim_top_harness";
+    const std::string trueMultiWriteCompileCmd =
+        "clang++ " + std::string(kHarnessCompileFlags) + " -I" + trueMultiWriteDir.string() +
+        " -include-pch " + (trueMultiWriteDir / "grhsim_top.hpp.pch").string() + " " +
+        trueMultiWriteHarnessPath.string() + " " + (trueMultiWriteDir / "libgrhsim_top.a").string() +
+        " -o " + trueMultiWriteHarnessExe.string();
+    if (std::system(trueMultiWriteCompileCmd.c_str()) != 0)
+    {
+        return fail("true reg-to-mem multi-write harness failed to compile");
+    }
+    if (std::system(trueMultiWriteHarnessExe.string().c_str()) != 0)
+    {
+        return fail("true reg-to-mem multi-write collision priority is wrong");
+    }
+
+    const std::filesystem::path orderedAffineDir =
+        std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_ordered_memory_write_affine";
+    std::filesystem::remove_all(orderedAffineDir);
+    Design orderedAffineDesign = buildOrderedMemoryWriteAffineEmitDesign();
+    EmitDiagnostics orderedAffineDiag;
+    EmitResult orderedAffineResult;
+    if (!emitWithActivitySchedule(orderedAffineDesign,
+                                  orderedAffineDir,
+                                  orderedAffineDiag,
+                                  orderedAffineResult,
+                                  ActivityScheduleOptions{.path = "top",
+                                                          .maxOpInCommitSupernode = 1,
+                                                          .enableCoarsen = false,
+                                                          .commitGuardEventBuckets = false}))
+    {
+        return fail("ordered memory write affine activity-schedule pass failed");
+    }
+    if (!orderedAffineResult.success || orderedAffineDiag.hasError())
+    {
+        return fail("ordered memory write affine emit failed");
+    }
+    const std::string orderedAffineSched =
+        readFiles(collectSchedFiles(orderedAffineDir, "grhsim_top_sched_"));
+    if (orderedAffineSched.find("Ordered memory write affine group: 16 writers in ") ==
+            std::string::npos ||
+        orderedAffineSched.find("for (std::size_t ordered_write_index_") == std::string::npos)
+    {
+        return fail("ordered memory write group was not emitted as affine loops");
+    }
+    if (orderedAffineSched.find("[kMemoryWritePort] mem=ordered_mem") != std::string::npos)
+    {
+        return fail("ordered memory write affine group retained per-writer commit bodies");
+    }
+    const std::string orderedAffineBuildCmd =
+        "make -C " + orderedAffineDir.string() + " CXX=clang++ CXXFLAGS='" +
+        std::string(kHarnessCompileFlags) + "'";
+    if (std::system(orderedAffineBuildCmd.c_str()) != 0)
+    {
+        return fail("ordered memory write affine archive failed to build");
+    }
+    const std::filesystem::path orderedAffineHarnessPath = orderedAffineDir / "grhsim_top_harness.cpp";
+    {
+        std::ofstream harness(orderedAffineHarnessPath);
+        if (!harness.is_open())
+        {
+            return fail("Failed to create ordered memory write affine harness");
+        }
+        harness << "#include \"grhsim_top.hpp\"\n";
+        harness << "#include <cstdint>\n\n";
+        harness << "int main()\n";
+        harness << "{\n";
+        harness << "    GrhSIM_top sim;\n";
+        harness << "    sim.init();\n";
+        harness << "    sim.clk = false;\n";
+        harness << "    sim.read_addr = static_cast<std::uint8_t>(1);\n";
+        harness << "    sim.ordered_wen_15 = true;\n";
+        harness << "    sim.ordered_addr_15 = static_cast<std::uint8_t>(1);\n";
+        harness << "    sim.ordered_data_15 = static_cast<std::uint8_t>(0x11);\n";
+        harness << "    sim.ordered_wen_0 = true;\n";
+        harness << "    sim.ordered_addr_0 = static_cast<std::uint8_t>(1);\n";
+        harness << "    sim.ordered_data_0 = static_cast<std::uint8_t>(0x22);\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.clk = true;\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.selected != static_cast<std::uint8_t>(0x22)) return 1;\n";
+        harness << "    sim.clk = false;\n";
+        harness << "    sim.ordered_addr_15 = static_cast<std::uint8_t>(0);\n";
+        harness << "    sim.ordered_data_15 = static_cast<std::uint8_t>(0x33);\n";
+        harness << "    sim.ordered_addr_0 = static_cast<std::uint8_t>(2);\n";
+        harness << "    sim.ordered_data_0 = static_cast<std::uint8_t>(0x44);\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.clk = true;\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.read_addr = static_cast<std::uint8_t>(0);\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.selected != static_cast<std::uint8_t>(0x33)) return 2;\n";
+        harness << "    sim.read_addr = static_cast<std::uint8_t>(2);\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.selected != static_cast<std::uint8_t>(0x44)) return 3;\n";
+        harness << "    return 0;\n";
+        harness << "}\n";
+    }
+    const std::filesystem::path orderedAffineHarnessExe = orderedAffineDir / "grhsim_top_harness";
+    const std::string orderedAffineCompileCmd =
+        "clang++ " + std::string(kHarnessCompileFlags) + " -I" + orderedAffineDir.string() +
+        " -include-pch " + (orderedAffineDir / "grhsim_top.hpp.pch").string() + " " +
+        orderedAffineHarnessPath.string() + " " + (orderedAffineDir / "libgrhsim_top.a").string() +
+        " -o " + orderedAffineHarnessExe.string();
+    if (std::system(orderedAffineCompileCmd.c_str()) != 0)
+    {
+        return fail("ordered memory write affine harness failed to compile");
+    }
+    if (std::system(orderedAffineHarnessExe.string().c_str()) != 0)
+    {
+        return fail("ordered memory write affine priority or row update is wrong");
+    }
+
+    const std::filesystem::path rowActivationDir =
+        std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_memory_row_reader_activation";
+    std::filesystem::remove_all(rowActivationDir);
+    Design rowActivationDesign = buildMemoryRowReaderActivationDesign();
+    EmitDiagnostics rowActivationDiag;
+    EmitResult rowActivationResult;
+    if (!emitWithActivitySchedule(rowActivationDesign,
+                                  rowActivationDir,
+                                  rowActivationDiag,
+                                  rowActivationResult,
+                                  ActivityScheduleOptions{.path = "top",
+                                                          .maxOpInComputeSupernode = 8,
+                                                          .maxOpInComputeNode = 8,
+                                                          .enableCoarsen = false}))
+    {
+        return fail("memory row reader activation activity-schedule pass failed");
+    }
+    if (!rowActivationResult.success || rowActivationDiag.hasError())
+    {
+        return fail("memory row reader activation emit failed");
+    }
+    const std::string rowActivationHeader = readFile(rowActivationDir / "grhsim_top.hpp");
+    const std::string rowActivationState = readFile(rowActivationDir / "grhsim_top_state.cpp");
+    const std::string rowActivationSched =
+        readFiles(collectSchedFiles(rowActivationDir, "grhsim_top_sched_"));
+    if (rowActivationHeader.find("void activate_memory_row_readers_0(std::size_t row") == std::string::npos ||
+        rowActivationState.find("std::array<std::size_t, 65> kRowOffsets") == std::string::npos ||
+        rowActivationState.find("std::array<grhsim_active_mask_entry, 128> kRowReaders") == std::string::npos ||
+        rowActivationState.find("entryIndex < kRowOffsets[row + 1u]") == std::string::npos ||
+        rowActivationState.find("entry.word_index == localWordIndex") == std::string::npos ||
+        rowActivationSched.find("activate_memory_row_readers_0(") == std::string::npos)
+    {
+        return fail("large constant-address memory should emit row-specialized reader activation");
+    }
+    const std::string rowActivationBuildCmd =
+        "make -C " + rowActivationDir.string() + " CXX=clang++ CXXFLAGS='" +
+        std::string(kHarnessCompileFlags) + "'";
+    if (std::system(rowActivationBuildCmd.c_str()) != 0)
+    {
+        return fail("memory row reader activation archive failed to build");
+    }
+    const std::filesystem::path rowActivationHarnessPath = rowActivationDir / "grhsim_top_harness.cpp";
+    {
+        std::ofstream harness(rowActivationHarnessPath);
+        if (!harness.is_open())
+        {
+            return fail("Failed to create memory row reader activation harness");
+        }
+        harness << "#include \"grhsim_top.hpp\"\n";
+        harness << "#include <cstdint>\n\n";
+        harness << "int main()\n";
+        harness << "{\n";
+        harness << "    GrhSIM_top sim;\n";
+        harness << "    sim.init();\n";
+        harness << "    sim.clk = false;\n";
+        harness << "    sim.wen = true;\n";
+        harness << "    sim.write_addr = static_cast<std::uint8_t>(0);\n";
+        harness << "    sim.write_data = static_cast<std::uint8_t>(0x11);\n";
+        harness << "    sim.read_addr = static_cast<std::uint8_t>(0);\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.clk = true;\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.row_0 != static_cast<std::uint8_t>(0x11)) return 1;\n";
+        harness << "    if (sim.row_mirror_0 != static_cast<std::uint8_t>(0x11)) return 2;\n";
+        harness << "    if (sim.dynamic_value != static_cast<std::uint8_t>(0x11)) return 3;\n";
+        harness << "    sim.clk = false;\n";
+        harness << "    sim.write_addr = static_cast<std::uint8_t>(33);\n";
+        harness << "    sim.write_data = static_cast<std::uint8_t>(0x22);\n";
+        harness << "    sim.read_addr = static_cast<std::uint8_t>(33);\n";
+        harness << "    sim.eval();\n";
+        harness << "    sim.clk = true;\n";
+        harness << "    sim.eval();\n";
+        harness << "    if (sim.row_0 != static_cast<std::uint8_t>(0x11)) return 4;\n";
+        harness << "    if (sim.row_mirror_0 != static_cast<std::uint8_t>(0x11)) return 5;\n";
+        harness << "    if (sim.row_33 != static_cast<std::uint8_t>(0x22)) return 6;\n";
+        harness << "    if (sim.row_mirror_33 != static_cast<std::uint8_t>(0x22)) return 7;\n";
+        harness << "    if (sim.dynamic_value != static_cast<std::uint8_t>(0x22)) return 8;\n";
+        harness << "    return 0;\n";
+        harness << "}\n";
+    }
+    const std::filesystem::path rowActivationHarnessExe = rowActivationDir / "grhsim_top_harness";
+    const std::string rowActivationCompileCmd =
+        "clang++ " + std::string(kHarnessCompileFlags) + " -I" + rowActivationDir.string() +
+        " -include-pch " + (rowActivationDir / "grhsim_top.hpp.pch").string() + " " +
+        rowActivationHarnessPath.string() + " " + (rowActivationDir / "libgrhsim_top.a").string() +
+        " -o " + rowActivationHarnessExe.string();
+    if (std::system(rowActivationCompileCmd.c_str()) != 0)
+    {
+        return fail("memory row reader activation harness failed to compile");
+    }
+    if (std::system(rowActivationHarnessExe.string().c_str()) != 0)
+    {
+        return fail("memory row reader activation behavior is wrong");
     }
 
     const std::filesystem::path intentDir =
@@ -3883,6 +4995,143 @@ int main()
             return fail("packed-activation fanout should emit packed active flag ORs");
         }
 
+        const std::filesystem::path fullWordConsumeDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_full_active_word_consume";
+        std::filesystem::remove_all(fullWordConsumeDir);
+        Design fullWordConsumeDesign = buildFullActiveWordConsumeDesign();
+        EmitDiagnostics fullWordConsumeDiag;
+        EmitResult fullWordConsumeResult;
+        ActivityScheduleOptions fullWordConsumeSchedule;
+        fullWordConsumeSchedule.maxOpInComputeSupernode = 1;
+        fullWordConsumeSchedule.enableCoarsen = false;
+        fullWordConsumeSchedule.splitOversizeComputeNodes = true;
+        fullWordConsumeSchedule.splitOversizeComputeNodeMaxOps = 1;
+        if (!emitWithActivitySchedule(fullWordConsumeDesign,
+                                      fullWordConsumeDir,
+                                      fullWordConsumeDiag,
+                                      fullWordConsumeResult,
+                                      fullWordConsumeSchedule,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true,
+                                      true))
+        {
+            return fail("full-active-word-consume activity-schedule pass failed");
+        }
+        if (!fullWordConsumeResult.success || fullWordConsumeDiag.hasError())
+        {
+            return fail("full-active-word-consume emit failed");
+        }
+        const std::vector<std::filesystem::path> fullWordConsumeStateFiles =
+            collectSchedFiles(fullWordConsumeDir, "grhsim_top_state");
+        const std::vector<std::filesystem::path> fullWordConsumeSchedFiles =
+            collectSchedFiles(fullWordConsumeDir, "grhsim_top_sched_");
+        if (fullWordConsumeStateFiles.empty() || fullWordConsumeSchedFiles.empty())
+        {
+            return fail("full-active-word-consume generated files missing");
+        }
+        const std::string fullWordConsumeSched = readFiles(fullWordConsumeSchedFiles);
+        const std::string dispatchMarker =
+            "constexpr std::uint8_t dispatchMask = UINT8_C(";
+        std::string_view fullMaskBlock;
+        std::string_view partialMaskBlock;
+        std::size_t dispatchSearch = 0;
+        while ((dispatchSearch = fullWordConsumeSched.find(dispatchMarker, dispatchSearch)) != std::string::npos)
+        {
+            const std::size_t maskBegin = dispatchSearch + dispatchMarker.size();
+            const std::size_t maskEnd = fullWordConsumeSched.find(");", maskBegin);
+            if (maskEnd == std::string::npos)
+            {
+                return fail("full-active-word-consume emitted a malformed dispatch mask");
+            }
+            const unsigned mask = static_cast<unsigned>(
+                std::stoul(fullWordConsumeSched.substr(maskBegin, maskEnd - maskBegin)));
+            const std::size_t blockEnd = fullWordConsumeSched.find(dispatchMarker, maskEnd);
+            const std::string_view block = std::string_view(fullWordConsumeSched).substr(
+                dispatchSearch,
+                blockEnd == std::string::npos ? blockEnd : blockEnd - dispatchSearch);
+            if (mask == 255u && block.find("activeWordFlags |=") != std::string_view::npos)
+            {
+                fullMaskBlock = block;
+            }
+            else if (mask != 255u && partialMaskBlock.empty())
+            {
+                partialMaskBlock = block;
+            }
+            dispatchSearch = maskEnd;
+        }
+        if (fullMaskBlock.empty())
+        {
+            return fail("full-active-word-consume should emit a complete word with forward activation");
+        }
+        if (fullMaskBlock.find("activeWordFlags |=") == std::string_view::npos ||
+            fullMaskBlock.find("activeWordFlags & static_cast<std::uint8_t>(~UINT8_C(") !=
+                std::string_view::npos ||
+            fullMaskBlock.find(" | activeWordFlags);") != std::string_view::npos)
+        {
+            return fail("complete compute words should consume forward local activations without clear/restore");
+        }
+        if (partialMaskBlock.empty())
+        {
+            return fail("full-active-word-consume should retain a partial boundary word");
+        }
+        if (partialMaskBlock.find("activeWordFlags & static_cast<std::uint8_t>(~UINT8_C(") ==
+                std::string_view::npos ||
+            partialMaskBlock.find(" | activeWordFlags);") == std::string_view::npos)
+        {
+            return fail("partial compute words should retain mutable clear/restore protocol");
+        }
+
+        const std::filesystem::path fullWordConsumeHarnessPath =
+            fullWordConsumeDir / "grhsim_top_harness.cpp";
+        {
+            std::ofstream harness(fullWordConsumeHarnessPath);
+            if (!harness.is_open())
+            {
+                return fail("failed to create full-active-word-consume harness");
+            }
+            harness << "#include \"grhsim_top.hpp\"\n";
+            harness << "#include <cstdint>\n\n";
+            harness << "int main()\n";
+            harness << "{\n";
+            harness << "    GrhSIM_top sim;\n";
+            harness << "    sim.init();\n";
+            harness << "    sim.chain_in = static_cast<std::uint8_t>(1);\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.chain_out != static_cast<std::uint8_t>(10)) return 1;\n";
+            harness << "    sim.chain_in = static_cast<std::uint8_t>(7);\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.chain_out != static_cast<std::uint8_t>(16)) return 2;\n";
+            harness << "    return 0;\n";
+            harness << "}\n";
+        }
+        const std::filesystem::path fullWordConsumeHarnessExe =
+            fullWordConsumeDir / "grhsim_top_harness";
+        std::string fullWordConsumeCompileCmd =
+            "clang++ " + std::string(kHarnessCompileFlags) + " -I" + fullWordConsumeDir.string();
+        for (const auto &stateFile : fullWordConsumeStateFiles)
+        {
+            fullWordConsumeCompileCmd += " " + stateFile.string();
+        }
+        fullWordConsumeCompileCmd += " " + (fullWordConsumeDir / "grhsim_top_eval.cpp").string();
+        for (const auto &schedPath : fullWordConsumeSchedFiles)
+        {
+            fullWordConsumeCompileCmd += " " + schedPath.string();
+        }
+        fullWordConsumeCompileCmd +=
+            " " + fullWordConsumeHarnessPath.string() + " -o " + fullWordConsumeHarnessExe.string();
+        if (std::system(fullWordConsumeCompileCmd.c_str()) != 0)
+        {
+            return fail("full-active-word-consume harness failed to compile");
+        }
+        if (std::system(fullWordConsumeHarnessExe.string().c_str()) != 0)
+        {
+            return fail("full-active-word-consume harness failed to run");
+        }
+
         const std::filesystem::path overlappingActivationDir =
             std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_overlapping_activation";
         std::filesystem::remove_all(overlappingActivationDir);
@@ -3950,6 +5199,9 @@ int main()
         if (twoWordSched.find("grhsim_concat_words_2_1_1<") == std::string::npos ||
             twoWordSched.find("grhsim_concat_words_2_1_2<") == std::string::npos ||
             twoWordSched.find("grhsim_replicate_words_2_1<") == std::string::npos ||
+            twoWordSched.find("grhsim_replicate_bit_words<2, 65>") == std::string::npos ||
+            twoWordSched.find("grhsim_replicate_bit_words<4, 256>") == std::string::npos ||
+            twoWordSched.find("grhsim_replicate_words<4>") != std::string::npos ||
             twoWordSched.find("grhsim_assign_words_2<") == std::string::npos)
         {
             return fail("two-word-helper should instantiate fixed two-word helpers");
@@ -3981,21 +5233,28 @@ int main()
             harness << "    sim.b64 = UINT64_C(0x99AABBCCDDEEFF00);\n";
             harness << "    sim.wide96 = std::array<std::uint64_t, 2>{UINT64_C(0x0123456789ABCDEF), UINT64_C(0x0000000012345678)};\n";
             harness << "    sim.tag8 = static_cast<std::uint8_t>(0x5A);\n";
+            harness << "    sim.broadcast_bit = true;\n";
             harness << "    sim.eval();\n";
             harness << "    if (!same_words(sim.concat128, std::array<std::uint64_t, 2>{UINT64_C(0x99AABBCCDDEEFF00), UINT64_C(0x1122334455667788)})) return 1;\n";
             harness << "    if (!same_words(sim.concat104, std::array<std::uint64_t, 2>{UINT64_C(0x0123456789ABCDEF), UINT64_C(0x0000005A12345678)})) return 2;\n";
             harness << "    if (!same_words(sim.rep96, std::array<std::uint64_t, 2>{UINT64_C(0x5A5A5A5A5A5A5A5A), UINT64_C(0x000000005A5A5A5A)})) return 3;\n";
-            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0), UINT64_C(0)})) return 4;\n";
+            harness << "    if (!same_words(sim.rep65, std::array<std::uint64_t, 2>{UINT64_MAX, UINT64_C(1)})) return 4;\n";
+            harness << "    if (!same_words(sim.rep256, std::array<std::uint64_t, 4>{UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX})) return 5;\n";
+            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0), UINT64_C(0)})) return 6;\n";
+            harness << "    sim.broadcast_bit = false;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (!same_words(sim.rep65, std::array<std::uint64_t, 2>{UINT64_C(0), UINT64_C(0)})) return 7;\n";
+            harness << "    if (!same_words(sim.rep256, std::array<std::uint64_t, 4>{UINT64_C(0), UINT64_C(0), UINT64_C(0), UINT64_C(0)})) return 8;\n";
             harness << "    sim.clk = true;\n";
             harness << "    sim.eval();\n";
-            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0x0123456789ABCDEF), UINT64_C(0x0000000012345678)})) return 5;\n";
+            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0x0123456789ABCDEF), UINT64_C(0x0000000012345678)})) return 9;\n";
             harness << "    sim.clk = false;\n";
             harness << "    sim.wide96 = std::array<std::uint64_t, 2>{UINT64_C(0xFEEDFACECAFEBEEF), UINT64_C(0x00000000ABCDEF01)};\n";
             harness << "    sim.eval();\n";
-            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0x0123456789ABCDEF), UINT64_C(0x0000000012345678)})) return 6;\n";
+            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0x0123456789ABCDEF), UINT64_C(0x0000000012345678)})) return 10;\n";
             harness << "    sim.clk = true;\n";
             harness << "    sim.eval();\n";
-            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0xFEEDFACECAFEBEEF), UINT64_C(0x00000000ABCDEF01)})) return 7;\n";
+            harness << "    if (!same_words(sim.reg_q, std::array<std::uint64_t, 2>{UINT64_C(0xFEEDFACECAFEBEEF), UINT64_C(0x00000000ABCDEF01)})) return 11;\n";
             harness << "    return 0;\n";
             harness << "}\n";
         }
@@ -4033,6 +5292,12 @@ int main()
                                       commitBatchResult,
                                       {},
                                       true,
+                                      true,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true,
                                       true))
         {
             return fail("commit-cond-batch activity-schedule pass failed");
@@ -4046,8 +5311,6 @@ int main()
         const std::string commitBatchEval = readFile(commitBatchDir / "grhsim_top_eval.cpp");
         const std::string commitBatchSched =
             readFiles(collectSchedFiles(commitBatchDir, "grhsim_top_sched_"));
-        const std::string commitBatchState =
-            readFiles(collectSchedFiles(commitBatchDir, "grhsim_top_state"));
         if (commitBatchHeader.find("std::uint32_t condIndex = 0;") != std::string::npos ||
             commitBatchHeader.find("std::uint32_t condBase = 0;") != std::string::npos ||
             commitBatchRuntime.find("struct grhsim_active_mask_entry") == std::string::npos ||
@@ -4059,11 +5322,11 @@ int main()
         {
             return fail("commit-cond-batch should not fall back to legacy commit tables");
         }
-        if (commitBatchSched.find("grhsim_value_10_0_slot") != std::string::npos ||
-            commitBatchSched.find("UINT64_C(15)") == std::string::npos ||
-            commitBatchState.find("UINT64_C(15)") != std::string::npos)
+        if (commitBatchSched.find("// Pure-event compute word: an event miss consumes the cleared word.") !=
+                std::string::npos ||
+            commitBatchHeader.find("kPureEventComputeWordEligibleCount = 0u") == std::string::npos)
         {
-            return fail("commit-cond-batch should inline static mask constants without materializing them");
+            return fail("commit words must not use the pure-event compute-word bypass");
         }
         const std::size_t eventFastPathBegin = commitBatchEval.find("    if (event_fullpass_candidate) {");
         const std::size_t normalPathBegin = commitBatchEval.find("    while (pending_eval_round) {", eventFastPathBegin);
@@ -4161,11 +5424,11 @@ int main()
             harness << "    sim.fire1 = static_cast<std::uint8_t>(1);\n";
             harness << "    sim.fire2 = static_cast<std::uint8_t>(0);\n";
             harness << "    sim.fire3 = static_cast<std::uint8_t>(0);\n";
-            harness << "    sim.d1 = static_cast<std::uint8_t>(17);\n";
+            harness << "    sim.d1 = static_cast<std::uint8_t>(16);\n";
             harness << "    sim.eval();\n";
             harness << "    sim.clk = true;\n";
             harness << "    sim.eval();\n";
-            harness << "    if (sim.y != static_cast<std::uint8_t>(14)) {\n";
+            harness << "    if (sim.y != static_cast<std::uint8_t>(29)) {\n";
             harness << "        return 2;\n";
             harness << "    }\n";
             harness << "    const auto counters = sim.perf_counters();\n";
@@ -4205,6 +5468,161 @@ int main()
         if (std::system(commitBatchHarnessExe.string().c_str()) != 0)
         {
             return fail("commit-cond-batch harness failed to run");
+        }
+
+        const std::filesystem::path oneBitBaseDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_one_bit_bitwise";
+        const std::array<std::string, 3> oneBitVariantNames = {"default", "zero", "enabled"};
+        std::filesystem::remove_all(oneBitBaseDir);
+        Design oneBitDesign = buildOneBitBitwiseDesign();
+        SessionStore oneBitSession;
+        if (!runActivitySchedule(oneBitDesign, oneBitSession))
+        {
+            return fail("one-bit-bitwise activity-schedule pass failed");
+        }
+        std::array<std::filesystem::path, 3> oneBitDirs;
+        std::array<std::string, 3> oneBitCombinedSources;
+        std::array<std::string, 3> oneBitRuntimeSources;
+        std::array<std::string, 3> oneBitSchedSources;
+        for (std::size_t variant = 0; variant < oneBitVariantNames.size(); ++variant)
+        {
+            oneBitDirs[variant] = oneBitBaseDir / oneBitVariantNames[variant];
+            std::filesystem::create_directories(oneBitDirs[variant]);
+            EmitOptions oneBitOptions;
+            oneBitOptions.outputDir = oneBitDirs[variant].string();
+            oneBitOptions.session = &oneBitSession;
+            oneBitOptions.sessionPathPrefix = std::string("top");
+            oneBitOptions.attributes["emit_parallelism"] = "2";
+            oneBitOptions.attributes["direct_single_writer_state_reads"] = "1";
+            if (variant == 1)
+            {
+                oneBitOptions.attributes["one_bit_bitwise_bytes"] = "0";
+            }
+            else if (variant == 2)
+            {
+                oneBitOptions.attributes["one_bit_bitwise_bytes"] = "1";
+            }
+            EmitDiagnostics oneBitDiag;
+            EmitGrhSimCpp oneBitEmitter(&oneBitDiag);
+            const EmitResult oneBitResult = oneBitEmitter.emit(oneBitDesign, oneBitOptions);
+            if (!oneBitResult.success || oneBitDiag.hasError())
+            {
+                return fail("one-bit-bitwise emit failed for " + oneBitVariantNames[variant]);
+            }
+            const std::vector<std::filesystem::path> variantStateFiles =
+                collectSchedFiles(oneBitDirs[variant], "grhsim_top_state");
+            const std::vector<std::filesystem::path> variantSchedFiles =
+                collectSchedFiles(oneBitDirs[variant], "grhsim_top_sched_");
+            if (variantStateFiles.empty() || variantSchedFiles.empty())
+            {
+                return fail("one-bit-bitwise generated files missing");
+            }
+            oneBitRuntimeSources[variant] = readFile(oneBitDirs[variant] / "grhsim_top_runtime.hpp");
+            oneBitSchedSources[variant] = readFiles(variantSchedFiles);
+            oneBitCombinedSources[variant] = readFile(oneBitDirs[variant] / "grhsim_top.hpp") +
+                                             oneBitRuntimeSources[variant] +
+                                             readFiles(variantStateFiles) +
+                                             readFile(oneBitDirs[variant] / "grhsim_top_eval.cpp") +
+                                             oneBitSchedSources[variant];
+        }
+        if (oneBitCombinedSources[0] != oneBitCombinedSources[1])
+        {
+            return fail("one-bit-bitwise default and explicit zero output should match");
+        }
+        if (oneBitRuntimeSources[0].find("grhsim_assume_bit_u8") != std::string::npos ||
+            oneBitSchedSources[0].find("const std::uint8_t next_value = grhsim_assume_bit_u8") !=
+                std::string::npos)
+        {
+            return fail("one-bit-bitwise default output should stay disabled");
+        }
+        if (oneBitRuntimeSources[2].find("GRHSIM_ALWAYS_INLINE std::uint8_t grhsim_assume_bit_u8") ==
+                std::string::npos ||
+            oneBitSchedSources[2].find("const std::uint8_t next_value =") == std::string::npos ||
+            oneBitSchedSources[2].find("grhsim_assume_bit_u8") == std::string::npos)
+        {
+            return fail("one-bit-bitwise enabled output should use assumed byte expressions");
+        }
+        if (oneBitSchedSources[2].find("const bool next_value = a ^ c;") == std::string::npos ||
+            oneBitSchedSources[2].find("const bool next_value = (~(b ^ d)) & UINT64_C(1);") ==
+                std::string::npos ||
+            oneBitSchedSources[2].find("const bool next_value = (~(e)) & UINT64_C(1);") == std::string::npos)
+        {
+            return fail("one-bit-bitwise should not alter xor, xnor, or not");
+        }
+        if (oneBitSchedSources[2].find("const bool next_value = (a) && (d);") == std::string::npos)
+        {
+            return fail("one-bit-bitwise should not alter kLogicAnd");
+        }
+        const std::filesystem::path oneBitEnabledDir = oneBitDirs[2];
+        const std::filesystem::path oneBitHarnessPath = oneBitEnabledDir / "grhsim_top_harness.cpp";
+        {
+            std::ofstream harness(oneBitHarnessPath);
+            if (!harness.is_open())
+            {
+                return fail("failed to create one-bit-bitwise harness");
+            }
+            harness << "#include \"grhsim_top.hpp\"\n";
+            harness << "#include <cstdint>\n\n";
+            harness << "int main()\n{\n";
+            harness << "    GrhSIM_top sim;\n";
+            harness << "    sim.init();\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    for (unsigned bits = 0; bits < 32; ++bits) {\n";
+            harness << "        sim.a = (bits & 1u) != 0;\n";
+            harness << "        sim.b = (bits & 2u) != 0;\n";
+            harness << "        sim.c = (bits & 4u) != 0;\n";
+            harness << "        sim.d = (bits & 8u) != 0;\n";
+            harness << "        sim.e = (bits & 16u) != 0;\n";
+            harness << "        sim.wide_a = static_cast<std::uint8_t>(bits * 7u);\n";
+            harness << "        sim.wide_b = static_cast<std::uint8_t>(0xA5u ^ bits);\n";
+            harness << "        sim.eval();\n";
+            harness << "        if (sim.and_y != (sim.a & sim.b)) return 1;\n";
+            harness << "        if (sim.or_y != (sim.c | sim.d)) return 2;\n";
+            harness << "        if (sim.xor_y != (sim.a ^ sim.c)) return 3;\n";
+            harness << "        if (sim.xnor_y != !(sim.b ^ sim.d)) return 4;\n";
+            harness << "        if (sim.not_y != !sim.e) return 5;\n";
+            harness << "        if (sim.chain_y != ((sim.c | sim.d) & sim.e)) return 6;\n";
+            harness << "        if (sim.logic_and_y != (sim.a && sim.d)) return 7;\n";
+            harness << "        if (sim.wide_and_y != static_cast<std::uint8_t>(sim.wide_a & sim.wide_b)) return 8;\n";
+            harness << "    }\n";
+            harness << "    sim.a = true;\n";
+            harness << "    sim.b = true;\n";
+            harness << "    sim.clk = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (!sim.state_and_y) return 9;\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    sim.eval();\n";
+            harness << "    sim.a = false;\n";
+            harness << "    sim.clk = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.state_and_y) return 10;\n";
+            harness << "    return 0;\n";
+            harness << "}\n";
+        }
+        const std::vector<std::filesystem::path> oneBitStateFiles =
+            collectSchedFiles(oneBitEnabledDir, "grhsim_top_state");
+        const std::vector<std::filesystem::path> oneBitSchedFiles =
+            collectSchedFiles(oneBitEnabledDir, "grhsim_top_sched_");
+        const std::filesystem::path oneBitHarnessExe = oneBitEnabledDir / "grhsim_top_harness";
+        std::string oneBitCompileCmd =
+            "clang++ " + std::string(kHarnessCompileFlags) + " -I" + oneBitEnabledDir.string();
+        for (const auto &stateFile : oneBitStateFiles)
+        {
+            oneBitCompileCmd += " " + stateFile.string();
+        }
+        oneBitCompileCmd += " " + (oneBitEnabledDir / "grhsim_top_eval.cpp").string();
+        for (const auto &schedPath : oneBitSchedFiles)
+        {
+            oneBitCompileCmd += " " + schedPath.string();
+        }
+        oneBitCompileCmd += " " + oneBitHarnessPath.string() + " -o " + oneBitHarnessExe.string();
+        if (std::system(oneBitCompileCmd.c_str()) != 0)
+        {
+            return fail("one-bit-bitwise harness failed to compile");
+        }
+        if (std::system(oneBitHarnessExe.string().c_str()) != 0)
+        {
+            return fail("one-bit-bitwise harness failed to run");
         }
 
         const std::filesystem::path gatedDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_gated_clock";
@@ -4372,6 +5790,1052 @@ int main()
         if (std::system(gatedHarnessExe.string().c_str()) != 0)
         {
             return fail("gated-clock harness failed to run");
+        }
+
+        const std::filesystem::path scalarLocalityCoarsenedDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_scalar_locality_coarsened";
+        std::filesystem::remove_all(scalarLocalityCoarsenedDir);
+        Design scalarLocalityCoarsenedDesign = buildMaterializedScalarReadLocalityDesign();
+        EmitDiagnostics scalarLocalityCoarsenedDiag;
+        EmitResult scalarLocalityCoarsenedResult;
+        if (!emitWithActivitySchedule(scalarLocalityCoarsenedDesign,
+                                      scalarLocalityCoarsenedDir,
+                                      scalarLocalityCoarsenedDiag,
+                                      scalarLocalityCoarsenedResult,
+                                      {},
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true) ||
+            !scalarLocalityCoarsenedResult.success || scalarLocalityCoarsenedDiag.hasError())
+        {
+            return fail("coarsened scalar read-locality diagnostic emit failed");
+        }
+        std::istringstream scalarLocalityCoarsenedStream(readFile(
+            scalarLocalityCoarsenedDir / "grhsim_materialized_scalar_read_locality.tsv"));
+        std::string scalarLocalityCoarsenedLine;
+        if (!std::getline(scalarLocalityCoarsenedStream, scalarLocalityCoarsenedLine))
+        {
+            return fail("coarsened scalar read-locality TSV is missing");
+        }
+        const std::vector<std::string_view> scalarLocalityCoarsenedHeader = splitTabs(scalarLocalityCoarsenedLine);
+        const auto coarsenedColumnIndex = [&](std::string_view name) {
+            const auto it = std::find(scalarLocalityCoarsenedHeader.begin(), scalarLocalityCoarsenedHeader.end(), name);
+            return it == scalarLocalityCoarsenedHeader.end()
+                       ? std::numeric_limits<std::size_t>::max()
+                       : static_cast<std::size_t>(std::distance(scalarLocalityCoarsenedHeader.begin(), it));
+        };
+        const std::size_t coarsenedNameColumn = coarsenedColumnIndex("value_name");
+        const std::size_t coarsenedTouchesColumn = coarsenedColumnIndex("operand_touches");
+        const std::size_t coarsenedWritesColumn = coarsenedColumnIndex("result_writes");
+        const std::size_t coarsenedCandidateColumn = coarsenedColumnIndex("candidate");
+        const std::size_t coarsenedSavedColumn = coarsenedColumnIndex("loads_saved_per_fire");
+        if (coarsenedNameColumn == std::numeric_limits<std::size_t>::max() ||
+            coarsenedTouchesColumn == std::numeric_limits<std::size_t>::max() ||
+            coarsenedWritesColumn == std::numeric_limits<std::size_t>::max() ||
+            coarsenedCandidateColumn == std::numeric_limits<std::size_t>::max() ||
+            coarsenedSavedColumn == std::numeric_limits<std::size_t>::max())
+        {
+            return fail("coarsened scalar read-locality TSV schema is incomplete");
+        }
+        bool foundCoarsenedRepeatedSource = false;
+        while (std::getline(scalarLocalityCoarsenedStream, scalarLocalityCoarsenedLine))
+        {
+            const std::vector<std::string_view> fields = splitTabs(scalarLocalityCoarsenedLine);
+            if (fields.size() != scalarLocalityCoarsenedHeader.size())
+            {
+                return fail("coarsened scalar read-locality TSV row width mismatch");
+            }
+            if (fields[coarsenedNameColumn] != "locality_repeated_source")
+            {
+                continue;
+            }
+            foundCoarsenedRepeatedSource = true;
+            if (fields[coarsenedTouchesColumn] != "2" || fields[coarsenedWritesColumn] != "1" ||
+                fields[coarsenedCandidateColumn] != "0" || fields[coarsenedSavedColumn] != "0")
+            {
+                return fail("same-supernode scalar writes must be reported as ineligible");
+            }
+        }
+        if (!foundCoarsenedRepeatedSource)
+        {
+            return fail("coarsened scalar read-locality TSV should retain excluded read/write rows");
+        }
+
+        ActivityScheduleOptions scalarLocalitySplitSchedule;
+        scalarLocalitySplitSchedule.maxOpInComputeSupernode = 1;
+        scalarLocalitySplitSchedule.splitOversizeComputeNodes = true;
+        scalarLocalitySplitSchedule.splitOversizeComputeNodeMaxOps = 1;
+        const std::filesystem::path scalarLocalitySplitDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_scalar_locality_split";
+        std::filesystem::remove_all(scalarLocalitySplitDir);
+        Design scalarLocalitySplitDesign = buildMaterializedScalarReadLocalityDesign();
+        EmitDiagnostics scalarLocalitySplitDiag;
+        EmitResult scalarLocalitySplitResult;
+        if (!emitWithActivitySchedule(scalarLocalitySplitDesign,
+                                      scalarLocalitySplitDir,
+                                      scalarLocalitySplitDiag,
+                                      scalarLocalitySplitResult,
+                                      scalarLocalitySplitSchedule,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true) ||
+            !scalarLocalitySplitResult.success || scalarLocalitySplitDiag.hasError())
+        {
+            return fail("split scalar read-locality diagnostic emit failed");
+        }
+        std::istringstream scalarLocalitySplitStream(readFile(
+            scalarLocalitySplitDir / "grhsim_materialized_scalar_read_locality.tsv"));
+        std::string scalarLocalitySplitLine;
+        if (!std::getline(scalarLocalitySplitStream, scalarLocalitySplitLine))
+        {
+            return fail("split scalar read-locality TSV is missing");
+        }
+        const std::vector<std::string_view> scalarLocalitySplitHeader = splitTabs(scalarLocalitySplitLine);
+        const auto splitColumnIndex = [&](std::string_view name) {
+            const auto it = std::find(scalarLocalitySplitHeader.begin(), scalarLocalitySplitHeader.end(), name);
+            return it == scalarLocalitySplitHeader.end()
+                       ? std::numeric_limits<std::size_t>::max()
+                       : static_cast<std::size_t>(std::distance(scalarLocalitySplitHeader.begin(), it));
+        };
+        const std::size_t splitNameColumn = splitColumnIndex("value_name");
+        const std::size_t splitWidthColumn = splitColumnIndex("width");
+        const std::size_t splitTouchesColumn = splitColumnIndex("operand_touches");
+        const std::size_t splitWritesColumn = splitColumnIndex("result_writes");
+        const std::size_t splitCandidateColumn = splitColumnIndex("candidate");
+        const std::size_t splitSavedColumn = splitColumnIndex("loads_saved_per_fire");
+        if (splitNameColumn == std::numeric_limits<std::size_t>::max() ||
+            splitWidthColumn == std::numeric_limits<std::size_t>::max() ||
+            splitTouchesColumn == std::numeric_limits<std::size_t>::max() ||
+            splitWritesColumn == std::numeric_limits<std::size_t>::max() ||
+            splitCandidateColumn == std::numeric_limits<std::size_t>::max() ||
+            splitSavedColumn == std::numeric_limits<std::size_t>::max())
+        {
+            return fail("split scalar read-locality TSV schema is incomplete");
+        }
+        std::size_t scalarLocalitySplitRows = 0;
+        bool foundSplitRepeatedSource = false;
+        bool foundSplitSingleSource = false;
+        while (std::getline(scalarLocalitySplitStream, scalarLocalitySplitLine))
+        {
+            const std::vector<std::string_view> fields = splitTabs(scalarLocalitySplitLine);
+            if (fields.size() != scalarLocalitySplitHeader.size())
+            {
+                return fail("split scalar read-locality TSV row width mismatch");
+            }
+            ++scalarLocalitySplitRows;
+            if (fields[splitNameColumn] == "locality_wide_source")
+            {
+                return fail("wide values must not be scalar locality rows");
+            }
+            if (fields[splitNameColumn] == "locality_repeated_source")
+            {
+                foundSplitRepeatedSource = true;
+                if (fields[splitWidthColumn] != "8" || fields[splitTouchesColumn] != "2" ||
+                    fields[splitWritesColumn] != "0" || fields[splitCandidateColumn] != "1" ||
+                    fields[splitSavedColumn] != "1")
+                {
+                    return fail("split repeated scalar locality candidate has unexpected metrics");
+                }
+            }
+            if (fields[splitNameColumn] == "locality_single_source")
+            {
+                foundSplitSingleSource = true;
+                if (fields[splitTouchesColumn] != "1" || fields[splitWritesColumn] != "0" ||
+                    fields[splitCandidateColumn] != "0" || fields[splitSavedColumn] != "0")
+                {
+                    return fail("single scalar read should be reported as ineligible");
+                }
+            }
+        }
+        if (scalarLocalitySplitRows != 2 || !foundSplitRepeatedSource || !foundSplitSingleSource)
+        {
+            return fail("split scalar locality rows should distinguish repeated and single reads");
+        }
+
+        const std::filesystem::path scalarLocalityDisabledDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_scalar_locality_disabled";
+        std::filesystem::remove_all(scalarLocalityDisabledDir);
+        Design scalarLocalityDisabledDesign = buildMaterializedScalarReadLocalityDesign();
+        EmitDiagnostics scalarLocalityDisabledDiag;
+        EmitResult scalarLocalityDisabledResult;
+        if (!emitWithActivitySchedule(scalarLocalityDisabledDesign,
+                                      scalarLocalityDisabledDir,
+                                      scalarLocalityDisabledDiag,
+                                      scalarLocalityDisabledResult,
+                                      scalarLocalitySplitSchedule) ||
+            !scalarLocalityDisabledResult.success || scalarLocalityDisabledDiag.hasError())
+        {
+            return fail("disabled scalar read-locality diagnostic emit failed");
+        }
+        if (std::filesystem::exists(
+                scalarLocalityDisabledDir / "grhsim_materialized_scalar_read_locality.tsv"))
+        {
+            return fail("disabled scalar read-locality diagnostic must not emit a TSV");
+        }
+        const auto collectGeneratedModelFiles = [](const std::filesystem::path &dir) {
+            std::map<std::string, std::string> files;
+            for (const auto &entry : std::filesystem::directory_iterator(dir))
+            {
+                if (!entry.is_regular_file())
+                {
+                    continue;
+                }
+                const std::string name = entry.path().filename().string();
+                if (!name.starts_with("grhsim_top") ||
+                    (entry.path().extension() != ".cpp" && entry.path().extension() != ".hpp"))
+                {
+                    continue;
+                }
+                files.emplace(name, readFile(entry.path()));
+            }
+            return files;
+        };
+        if (collectGeneratedModelFiles(scalarLocalitySplitDir) !=
+            collectGeneratedModelFiles(scalarLocalityDisabledDir))
+        {
+            return fail("scalar read-locality diagnostic must not change generated model code");
+        }
+
+        const std::filesystem::path repeatedReadDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_repeated_state_read";
+        std::filesystem::remove_all(repeatedReadDir);
+        Design repeatedReadDesign = buildRepeatedScalarStateReadDesign();
+        ActivityScheduleOptions repeatedReadScheduleOptions;
+        repeatedReadScheduleOptions.maxOpInComputeSupernode = 4;
+        repeatedReadScheduleOptions.splitOversizeComputeNodes = true;
+        repeatedReadScheduleOptions.splitOversizeComputeNodeMaxOps = 4;
+        EmitDiagnostics repeatedReadDiag;
+        EmitResult repeatedReadResult;
+        if (!emitWithActivitySchedule(repeatedReadDesign,
+                                      repeatedReadDir,
+                                      repeatedReadDiag,
+                                      repeatedReadResult,
+                                      repeatedReadScheduleOptions,
+                                      false,
+                                      false,
+                                      true,
+                                      false,
+                                      true))
+        {
+            return fail("repeated state-read activity-schedule pass failed");
+        }
+        if (!repeatedReadResult.success || repeatedReadDiag.hasError())
+        {
+            return fail("repeated state-read emit failed");
+        }
+        const std::vector<std::filesystem::path> repeatedReadStateFiles =
+            collectSchedFiles(repeatedReadDir, "grhsim_top_state");
+        const std::vector<std::filesystem::path> repeatedReadSchedFiles =
+            collectSchedFiles(repeatedReadDir, "grhsim_top_sched_");
+        const std::string repeatedReadSched = readFiles(repeatedReadSchedFiles);
+        if (countSubstring(repeatedReadSched,
+                           "same-state scalar read: reuse synchronized change predicate") == 0)
+        {
+            return fail("repeated scalar state reads should share one changed predicate per supernode");
+        }
+        if (countSubstring(repeatedReadSched,
+                           "same-state scalar read: reuse consolidated storage slot") == 0)
+        {
+            return fail("repeated scalar state reads should share one materialized slot per supernode");
+        }
+        const std::filesystem::path repeatedReadLocalityPath =
+            repeatedReadDir / "grhsim_state_read_locality.tsv";
+        const std::string repeatedReadLocality = readFile(repeatedReadLocalityPath);
+        std::istringstream localityStream(repeatedReadLocality);
+        std::string localityLine;
+        if (!std::getline(localityStream, localityLine))
+        {
+            return fail("repeated state-read locality TSV is missing");
+        }
+        const std::vector<std::string_view> localityHeader = splitTabs(localityLine);
+        const auto columnIndex = [&](std::string_view name) {
+            const auto it = std::find(localityHeader.begin(), localityHeader.end(), name);
+            return it == localityHeader.end()
+                       ? std::numeric_limits<std::size_t>::max()
+                       : static_cast<std::size_t>(std::distance(localityHeader.begin(), it));
+        };
+        const std::size_t stateSymbolColumn = columnIndex("state_symbol");
+        const std::size_t materializedColumn = columnIndex("materialized");
+        const std::size_t aliasColumn = columnIndex("alias");
+        const std::size_t onlyReadsColumn = columnIndex("supernode_only_state_reads");
+        if (stateSymbolColumn == std::numeric_limits<std::size_t>::max() ||
+            materializedColumn == std::numeric_limits<std::size_t>::max() ||
+            aliasColumn == std::numeric_limits<std::size_t>::max() ||
+            onlyReadsColumn == std::numeric_limits<std::size_t>::max())
+        {
+            return fail("repeated state-read locality TSV schema is incomplete");
+        }
+        std::size_t repeatedReadRows = 0;
+        bool foundRepeatedState = false;
+        bool foundMaterialized = false;
+        bool foundAlias = false;
+        bool foundPureOrMixedClassification = false;
+        while (std::getline(localityStream, localityLine))
+        {
+            const std::vector<std::string_view> fields = splitTabs(localityLine);
+            if (fields.size() != localityHeader.size())
+            {
+                return fail("repeated state-read locality TSV row width mismatch");
+            }
+            ++repeatedReadRows;
+            foundRepeatedState = foundRepeatedState || fields[stateSymbolColumn] == "repeated_q";
+            foundMaterialized = foundMaterialized || fields[materializedColumn] == "1";
+            foundAlias = foundAlias || fields[aliasColumn] == "1";
+            foundPureOrMixedClassification =
+                foundPureOrMixedClassification || fields[onlyReadsColumn] == "0" || fields[onlyReadsColumn] == "1";
+        }
+        if (repeatedReadRows == 0 || !foundRepeatedState || !foundMaterialized || !foundAlias ||
+            !foundPureOrMixedClassification)
+        {
+            return fail("repeated state-read locality TSV contents are incomplete");
+        }
+        const std::filesystem::path repeatedReadScalarLocalityPath =
+            repeatedReadDir / "grhsim_materialized_scalar_read_locality.tsv";
+        std::istringstream scalarLocalityStream(readFile(repeatedReadScalarLocalityPath));
+        std::string scalarLocalityLine;
+        if (!std::getline(scalarLocalityStream, scalarLocalityLine))
+        {
+            return fail("materialized scalar read-locality TSV is missing");
+        }
+        const std::vector<std::string_view> scalarLocalityHeader = splitTabs(scalarLocalityLine);
+        const auto scalarColumnIndex = [&](std::string_view name) {
+            const auto it = std::find(scalarLocalityHeader.begin(), scalarLocalityHeader.end(), name);
+            return it == scalarLocalityHeader.end()
+                       ? std::numeric_limits<std::size_t>::max()
+                       : static_cast<std::size_t>(std::distance(scalarLocalityHeader.begin(), it));
+        };
+        const std::size_t scalarPhaseColumn = scalarColumnIndex("phase");
+        const std::size_t scalarValueNameColumn = scalarColumnIndex("value_name");
+        const std::size_t scalarKindColumn = scalarColumnIndex("scalar_kind");
+        const std::size_t scalarTouchesColumn = scalarColumnIndex("operand_touches");
+        const std::size_t scalarUseOpsColumn = scalarColumnIndex("use_ops");
+        const std::size_t scalarWritesColumn = scalarColumnIndex("result_writes");
+        const std::size_t scalarCandidateColumn = scalarColumnIndex("candidate");
+        const std::size_t scalarSavedColumn = scalarColumnIndex("loads_saved_per_fire");
+        if (scalarPhaseColumn == std::numeric_limits<std::size_t>::max() ||
+            scalarValueNameColumn == std::numeric_limits<std::size_t>::max() ||
+            scalarKindColumn == std::numeric_limits<std::size_t>::max() ||
+            scalarTouchesColumn == std::numeric_limits<std::size_t>::max() ||
+            scalarUseOpsColumn == std::numeric_limits<std::size_t>::max() ||
+            scalarWritesColumn == std::numeric_limits<std::size_t>::max() ||
+            scalarCandidateColumn == std::numeric_limits<std::size_t>::max() ||
+            scalarSavedColumn == std::numeric_limits<std::size_t>::max())
+        {
+            return fail("materialized scalar read-locality TSV schema is incomplete");
+        }
+        std::size_t repeatedScalarCandidateRows = 0;
+        std::size_t repeatedScalarCandidateTouches = 0;
+        std::size_t repeatedScalarCandidateSaved = 0;
+        while (std::getline(scalarLocalityStream, scalarLocalityLine))
+        {
+            const std::vector<std::string_view> fields = splitTabs(scalarLocalityLine);
+            if (fields.size() != scalarLocalityHeader.size())
+            {
+                return fail("materialized scalar read-locality TSV row width mismatch");
+            }
+            if (fields[scalarCandidateColumn] != "1")
+            {
+                continue;
+            }
+            if (fields[scalarPhaseColumn] != "compute" || fields[scalarKindColumn] != "u8" ||
+                fields[scalarUseOpsColumn] != "1" || fields[scalarWritesColumn] != "0")
+            {
+                return fail("repeated scalar read-locality candidate has unexpected classification");
+            }
+            const std::size_t touches = static_cast<std::size_t>(std::stoull(std::string(fields[scalarTouchesColumn])));
+            const std::size_t saved = static_cast<std::size_t>(std::stoull(std::string(fields[scalarSavedColumn])));
+            if (touches < 2 || saved != touches - 1u)
+            {
+                return fail("repeated scalar read-locality candidate has unexpected metrics");
+            }
+            ++repeatedScalarCandidateRows;
+            repeatedScalarCandidateTouches += touches;
+            repeatedScalarCandidateSaved += saved;
+        }
+        if (repeatedScalarCandidateRows != 4 || repeatedScalarCandidateTouches != 15 ||
+            repeatedScalarCandidateSaved != 11)
+        {
+            return fail("repeated materialized scalar reads should aggregate by canonical slot");
+        }
+        const auto runRepeatedReadHarness = [&](const std::filesystem::path &dir,
+                                                const std::vector<std::filesystem::path> &stateFiles,
+                                                const std::vector<std::filesystem::path> &schedFiles) {
+            const std::filesystem::path harnessPath = dir / "grhsim_top_harness.cpp";
+            std::ofstream harness(harnessPath);
+            if (!harness.is_open())
+            {
+                return false;
+            }
+            harness << "#include \"grhsim_top.hpp\"\n";
+            harness << "#include <cstdint>\n\n";
+            harness << "int main()\n";
+            harness << "{\n";
+            harness << "    GrhSIM_top sim;\n";
+            harness << "    sim.init();\n";
+            harness << "    sim.data = static_cast<std::uint8_t>(9);\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.q_out != static_cast<std::uint8_t>(3)) return 1;\n";
+            harness << "    sim.clk = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.q_out != static_cast<std::uint8_t>(9)) return 2;\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.q_out != static_cast<std::uint8_t>(9)) return 3;\n";
+            harness << "    return 0;\n";
+            harness << "}\n";
+            harness.close();
+
+            const std::filesystem::path harnessExe = dir / "grhsim_top_harness";
+            std::string compileCmd =
+                "clang++ " + std::string(kHarnessCompileFlags) + " -I" + dir.string();
+            for (const auto &stateFile : stateFiles)
+            {
+                compileCmd += " " + stateFile.string();
+            }
+            compileCmd += " " + (dir / "grhsim_top_eval.cpp").string();
+            for (const auto &schedFile : schedFiles)
+            {
+                compileCmd += " " + schedFile.string();
+            }
+            compileCmd += " " + harnessPath.string() + " -o " + harnessExe.string();
+            if (std::system(compileCmd.c_str()) != 0)
+            {
+                return false;
+            }
+            const std::filesystem::path harnessLog = dir / "grhsim_top_harness.log";
+            const std::string runCmd = harnessExe.string() + " > " + harnessLog.string() + " 2>&1";
+            return std::system(runCmd.c_str()) == 0;
+        };
+        if (!runRepeatedReadHarness(repeatedReadDir, repeatedReadStateFiles, repeatedReadSchedFiles))
+        {
+            return fail("repeated state-read harness failed");
+        }
+
+        const std::filesystem::path repeatedDirectDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_repeated_direct_state_read";
+        std::filesystem::remove_all(repeatedDirectDir);
+        Design repeatedDirectDesign = buildRepeatedScalarStateReadDesign();
+        EmitDiagnostics repeatedDirectDiag;
+        EmitResult repeatedDirectResult;
+        if (!emitWithActivitySchedule(repeatedDirectDesign,
+                                      repeatedDirectDir,
+                                      repeatedDirectDiag,
+                                      repeatedDirectResult,
+                                      repeatedReadScheduleOptions,
+                                      false,
+                                      false,
+                                      false,
+                                      true,
+                                      true))
+        {
+            return fail("repeated direct state-read activity-schedule pass failed");
+        }
+        if (!repeatedDirectResult.success || repeatedDirectDiag.hasError())
+        {
+            return fail("repeated direct state-read emit failed");
+        }
+        const std::vector<std::filesystem::path> repeatedDirectStateFiles =
+            collectSchedFiles(repeatedDirectDir, "grhsim_top_state");
+        const std::vector<std::filesystem::path> repeatedDirectSchedFiles =
+            collectSchedFiles(repeatedDirectDir, "grhsim_top_sched_");
+        const std::string repeatedDirectSched = readFiles(repeatedDirectSchedFiles);
+        std::istringstream repeatedDirectScalarLocalityStream(
+            readFile(repeatedDirectDir / "grhsim_materialized_scalar_read_locality.tsv"));
+        std::string repeatedDirectScalarLocalityLine;
+        if (!std::getline(repeatedDirectScalarLocalityStream, repeatedDirectScalarLocalityLine))
+        {
+            return fail("direct state-read scalar locality TSV is missing");
+        }
+        const std::vector<std::string_view> repeatedDirectScalarHeader = splitTabs(repeatedDirectScalarLocalityLine);
+        const auto repeatedDirectCandidateIt =
+            std::find(repeatedDirectScalarHeader.begin(), repeatedDirectScalarHeader.end(), "candidate");
+        if (repeatedDirectCandidateIt == repeatedDirectScalarHeader.end())
+        {
+            return fail("direct state-read scalar locality TSV schema is incomplete");
+        }
+        const std::size_t repeatedDirectCandidateColumn = static_cast<std::size_t>(
+            std::distance(repeatedDirectScalarHeader.begin(), repeatedDirectCandidateIt));
+        while (std::getline(repeatedDirectScalarLocalityStream, repeatedDirectScalarLocalityLine))
+        {
+            const std::vector<std::string_view> fields = splitTabs(repeatedDirectScalarLocalityLine);
+            if (fields.size() != repeatedDirectScalarHeader.size())
+            {
+                return fail("direct state-read scalar locality TSV row width mismatch");
+            }
+            if (fields[repeatedDirectCandidateColumn] == "1")
+            {
+                return fail("direct state-read operands must not be scalar slot locality candidates");
+            }
+        }
+        constexpr std::size_t expectedDirectRepeatedReads = 15;
+        if (countSubstring(repeatedDirectSched,
+                           "direct single-writer state read: consumer reads visible state") !=
+                expectedDirectRepeatedReads ||
+            countSubstring(repeatedDirectSched,
+                           "same-state scalar read: reuse synchronized change predicate") != 0 ||
+            countSubstring(repeatedDirectSched, "grhsim_any_changed_") != 0 ||
+            countSubstring(repeatedDirectSched, "[kRegisterReadPort] reg=repeated_q") !=
+                expectedDirectRepeatedReads + 2)
+        {
+            return fail("repeated direct state reads should forward canonical and alias groups atomically");
+        }
+        if (!runRepeatedReadHarness(repeatedDirectDir,
+                                    repeatedDirectStateFiles,
+                                    repeatedDirectSchedFiles))
+        {
+            return fail("repeated direct state-read harness failed");
+        }
+
+        const std::filesystem::path directReadDir =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_direct_state_read";
+        std::filesystem::remove_all(directReadDir);
+        Design directReadDesign = buildDirectStateReadForwardDesign();
+        ActivityScheduleOptions directReadScheduleOptions;
+        directReadScheduleOptions.maxOpInComputeSupernode = 1;
+        directReadScheduleOptions.splitOversizeComputeNodes = true;
+        directReadScheduleOptions.splitOversizeComputeNodeMaxOps = 1;
+        EmitDiagnostics directReadDiag;
+        EmitResult directReadResult;
+        if (!emitWithActivitySchedule(directReadDesign,
+                                      directReadDir,
+                                      directReadDiag,
+                                      directReadResult,
+                                      directReadScheduleOptions,
+                                      false,
+                                      false,
+                                      false,
+                                      true))
+        {
+            return fail("direct state-read activity-schedule pass failed");
+        }
+        if (!directReadResult.success || directReadDiag.hasError())
+        {
+            return fail("direct state-read emit failed");
+        }
+        if (std::filesystem::exists(directReadDir / "grhsim_materialized_scalar_read_locality.tsv"))
+        {
+            return fail("materialized scalar read-locality diagnostic should be disabled by default");
+        }
+        const std::vector<std::filesystem::path> directReadStateFiles =
+            collectSchedFiles(directReadDir, "grhsim_top_state");
+        const std::vector<std::filesystem::path> directReadSchedFiles =
+            collectSchedFiles(directReadDir, "grhsim_top_sched_");
+        const std::string directReadSched = readFiles(directReadSchedFiles);
+        const auto directReadSnippet = [&](std::string_view opComment) {
+            const std::size_t begin = directReadSched.find(opComment);
+            if (begin == std::string::npos)
+            {
+                return std::string_view{};
+            }
+            const std::size_t end = directReadSched.find("// op ", begin + opComment.size());
+            return std::string_view(directReadSched).substr(
+                begin,
+                end == std::string::npos ? end : end - begin);
+        };
+        const std::string_view directReadSource =
+            directReadSnippet("[kRegisterReadPort] reg=direct_q");
+        const std::string_view directReadConsumer =
+            directReadSnippet("// op direct_plus_one_value_op [kAdd]");
+        const std::string_view protectedReadSource =
+            directReadSnippet("// op protected_q_read_op [kRegisterReadPort] reg=protected_q");
+        const std::string_view multiReadSource =
+            directReadSnippet("[kRegisterReadPort] reg=multi_q");
+        if (directReadSource.empty() ||
+            directReadSource.find("direct single-writer state read: consumer reads visible state") ==
+                std::string_view::npos ||
+            directReadSource.find("grhsim_changed_") != std::string_view::npos)
+        {
+            return fail("eligible single-writer register read should bypass its materialized slot");
+        }
+        if (directReadConsumer.empty() ||
+            directReadConsumer.find("state_logic_storage_") == std::string_view::npos)
+        {
+            return fail("direct state-read consumer should reference visible state storage");
+        }
+        if (protectedReadSource.empty() || multiReadSource.empty() ||
+            protectedReadSource.find("direct single-writer state read") != std::string_view::npos ||
+            multiReadSource.find("direct single-writer state read") != std::string_view::npos)
+        {
+            return fail("protected and multi-writer register reads must retain the materialized path");
+        }
+
+        const std::filesystem::path directReadHarnessPath = directReadDir / "grhsim_top_harness.cpp";
+        {
+            std::ofstream harness(directReadHarnessPath);
+            if (!harness.is_open())
+            {
+                return fail("failed to create direct state-read harness");
+            }
+            harness << "#include \"grhsim_top.hpp\"\n";
+            harness << "#include <cstdint>\n\n";
+            harness << "int main()\n";
+            harness << "{\n";
+            harness << "    GrhSIM_top sim;\n";
+            harness << "    sim.init();\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    sim.direct_data = static_cast<std::uint8_t>(9);\n";
+            harness << "    sim.protected_data = static_cast<std::uint8_t>(11);\n";
+            harness << "    sim.multi_write_a = false;\n";
+            harness << "    sim.multi_write_b = false;\n";
+            harness << "    sim.multi_data_a = static_cast<std::uint8_t>(13);\n";
+            harness << "    sim.multi_data_b = static_cast<std::uint8_t>(17);\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.direct_plus_one != static_cast<std::uint8_t>(4)) return 1;\n";
+            harness << "    if (sim.protected_q_out != static_cast<std::uint8_t>(7)) return 2;\n";
+            harness << "    if (sim.multi_plus_one != static_cast<std::uint8_t>(6)) return 3;\n";
+            harness << "    sim.multi_write_a = true;\n";
+            harness << "    sim.clk = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.direct_plus_one != static_cast<std::uint8_t>(10)) return 4;\n";
+            harness << "    if (sim.protected_q_out != static_cast<std::uint8_t>(11)) return 5;\n";
+            harness << "    if (sim.multi_plus_one != static_cast<std::uint8_t>(14)) return 6;\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    sim.multi_write_a = false;\n";
+            harness << "    sim.eval();\n";
+            harness << "    sim.clk = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.direct_plus_one != static_cast<std::uint8_t>(10)) return 7;\n";
+            harness << "    if (sim.protected_q_out != static_cast<std::uint8_t>(11)) return 8;\n";
+            harness << "    if (sim.multi_plus_one != static_cast<std::uint8_t>(14)) return 9;\n";
+            harness << "    sim.clk = false;\n";
+            harness << "    sim.eval();\n";
+            harness << "    sim.direct_data = static_cast<std::uint8_t>(2);\n";
+            harness << "    sim.protected_data = static_cast<std::uint8_t>(19);\n";
+            harness << "    sim.multi_write_b = true;\n";
+            harness << "    sim.clk = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.direct_plus_one != static_cast<std::uint8_t>(3)) return 10;\n";
+            harness << "    if (sim.protected_q_out != static_cast<std::uint8_t>(19)) return 11;\n";
+            harness << "    if (sim.multi_plus_one != static_cast<std::uint8_t>(18)) return 12;\n";
+            harness << "    return 0;\n";
+            harness << "}\n";
+        }
+        const std::filesystem::path directReadHarnessExe = directReadDir / "grhsim_top_harness";
+        std::string directReadCompileCmd =
+            "clang++ " + std::string(kHarnessCompileFlags) + " -I" + directReadDir.string();
+        for (const auto &stateFile : directReadStateFiles)
+        {
+            directReadCompileCmd += " " + stateFile.string();
+        }
+        directReadCompileCmd += " " + (directReadDir / "grhsim_top_eval.cpp").string();
+        for (const auto &schedFile : directReadSchedFiles)
+        {
+            directReadCompileCmd += " " + schedFile.string();
+        }
+        directReadCompileCmd += " " + directReadHarnessPath.string() + " -o " + directReadHarnessExe.string();
+        if (std::system(directReadCompileCmd.c_str()) != 0)
+        {
+            return fail("direct state-read harness failed to compile");
+        }
+        if (std::system(directReadHarnessExe.string().c_str()) != 0)
+        {
+            return fail("direct state-read harness failed to run");
+        }
+
+        const std::filesystem::path pureEventRoot =
+            std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_pure_event_word";
+        ActivityScheduleOptions pureEventSchedule;
+        pureEventSchedule.maxOpInComputeSupernode = 1;
+        pureEventSchedule.enableCoarsen = false;
+        pureEventSchedule.splitOversizeComputeNodes = true;
+        pureEventSchedule.splitOversizeComputeNodeMaxOps = 1;
+        const auto emitPureEventFixture = [&](std::string_view suffix,
+                                              PureEventWordFixtureMode mode,
+                                              std::optional<bool> bypass,
+                                              bool posedgeFullpass,
+                                              bool fullWordConsume,
+                                              std::optional<bool> profile = std::nullopt,
+                                              std::size_t taskCount = 16u,
+                                              std::size_t schedBatchMaxOps = 8u,
+                                              std::size_t schedBatchMaxEstimatedLines = 96u)
+            -> std::optional<std::filesystem::path>
+        {
+            const std::filesystem::path dir = pureEventRoot.string() + "_" + std::string(suffix);
+            std::filesystem::remove_all(dir);
+            Design fixture = buildPureEventWordBypassDesign(mode, taskCount);
+            EmitDiagnostics fixtureDiag;
+            EmitResult fixtureResult;
+            if (!emitWithActivitySchedule(fixture,
+                                          dir,
+                                          fixtureDiag,
+                                          fixtureResult,
+                                          pureEventSchedule,
+                                          posedgeFullpass,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          fullWordConsume,
+                                          bypass,
+                                          profile,
+                                          schedBatchMaxOps,
+                                          schedBatchMaxEstimatedLines) ||
+                !fixtureResult.success || fixtureDiag.hasError())
+            {
+                return std::nullopt;
+            }
+            return dir;
+        };
+
+        const auto pureEventDefaultDir = emitPureEventFixture("default",
+                                                              PureEventWordFixtureMode::kHomogeneous,
+                                                              std::nullopt,
+                                                              false,
+                                                              false);
+        const auto pureEventDisabledDir = emitPureEventFixture("disabled",
+                                                               PureEventWordFixtureMode::kHomogeneous,
+                                                               false,
+                                                               false,
+                                                               false);
+        const auto pureEventEnabledDir = emitPureEventFixture("enabled",
+                                                              PureEventWordFixtureMode::kHomogeneous,
+                                                              true,
+                                                              false,
+                                                              false);
+        const auto pureEventProfileDisabledDir = emitPureEventFixture("profile_disabled",
+                                                                      PureEventWordFixtureMode::kHomogeneous,
+                                                                      std::nullopt,
+                                                                      false,
+                                                                      false,
+                                                                      false);
+        const auto pureEventProfileOnlyDir = emitPureEventFixture("profile_only",
+                                                                  PureEventWordFixtureMode::kHomogeneous,
+                                                                  false,
+                                                                  false,
+                                                                  false,
+                                                                  true);
+        const auto pureEventProfileBypassDir = emitPureEventFixture("profile_bypass",
+                                                                    PureEventWordFixtureMode::kHomogeneous,
+                                                                    true,
+                                                                    false,
+                                                                    false,
+                                                                    true);
+        const auto pureEventOnceDir = emitPureEventFixture("once",
+                                                           PureEventWordFixtureMode::kOnceOnly,
+                                                           true,
+                                                           false,
+                                                           false,
+                                                           true);
+        const auto pureEventMultiDir = emitPureEventFixture("multi",
+                                                            PureEventWordFixtureMode::kMultiEvent,
+                                                            true,
+                                                            false,
+                                                            false,
+                                                            true);
+        const auto pureEventFullpassDir = emitPureEventFixture("fullpass",
+                                                               PureEventWordFixtureMode::kHomogeneous,
+                                                               true,
+                                                               true,
+                                                               false,
+                                                               true);
+        const auto pureEventFullWordConsumeDir = emitPureEventFixture("full_word_consume",
+                                                                      PureEventWordFixtureMode::kHomogeneous,
+                                                                      true,
+                                                                      false,
+                                                                      true,
+                                                                      true);
+        const auto pureEventSparseOneDir = emitPureEventFixture("sparse_one",
+                                                                PureEventWordFixtureMode::kHomogeneous,
+                                                                true,
+                                                                false,
+                                                                false,
+                                                                false,
+                                                                8u,
+                                                                100000u,
+                                                                100000u);
+        const auto pureEventSparseTwoDir = emitPureEventFixture("sparse_two",
+                                                                PureEventWordFixtureMode::kHomogeneous,
+                                                                true,
+                                                                false,
+                                                                false,
+                                                                false,
+                                                                16u,
+                                                                100000u,
+                                                                100000u);
+        const auto pureEventDenseThreeDir = emitPureEventFixture("dense_three",
+                                                                 PureEventWordFixtureMode::kHomogeneous,
+                                                                 true,
+                                                                 false,
+                                                                 false,
+                                                                 false,
+                                                                 24u,
+                                                                 100000u,
+                                                                 100000u);
+        if (!pureEventDefaultDir || !pureEventDisabledDir || !pureEventEnabledDir || !pureEventOnceDir ||
+            !pureEventProfileDisabledDir || !pureEventProfileOnlyDir || !pureEventProfileBypassDir ||
+            !pureEventMultiDir || !pureEventFullpassDir || !pureEventFullWordConsumeDir ||
+            !pureEventSparseOneDir || !pureEventSparseTwoDir || !pureEventDenseThreeDir)
+        {
+            return fail("pure-event compute-word fixture emit failed");
+        }
+
+        const auto readPureEventGenerated = [](const std::filesystem::path &dir) {
+            return readFile(dir / "grhsim_top.hpp") +
+                   readFiles(collectSchedFiles(dir, "grhsim_top_state")) +
+                   readFile(dir / "grhsim_top_eval.cpp") +
+                   readFiles(collectSchedFiles(dir, "grhsim_top_sched_"));
+        };
+        const std::string pureEventDefaultSource = readPureEventGenerated(*pureEventDefaultDir);
+        const std::string pureEventDisabledSource = readPureEventGenerated(*pureEventDisabledDir);
+        const std::string pureEventProfileDisabledSource =
+            readPureEventGenerated(*pureEventProfileDisabledDir);
+        const std::string pureEventEnabledSched =
+            readFiles(collectSchedFiles(*pureEventEnabledDir, "grhsim_top_sched_"));
+        constexpr std::string_view pureEventMarker =
+            "// Pure-event compute word: an event miss consumes the cleared word.";
+        if (pureEventDefaultSource != pureEventDisabledSource ||
+            pureEventDefaultSource != pureEventProfileDisabledSource ||
+            pureEventDefaultSource.find(pureEventMarker) != std::string::npos)
+        {
+            return fail("pure-event compute-word default and explicit zero option sources should be byte-identical");
+        }
+        const std::size_t pureEventMarkerCount = countSubstring(pureEventEnabledSched, pureEventMarker);
+        if (pureEventMarkerCount == 0)
+        {
+            return fail("pure-event compute-word enabled fixture should emit at least one wrapper");
+        }
+        const std::size_t pureEventMarkerPos = pureEventEnabledSched.find(pureEventMarker);
+        const std::size_t pureEventClearPos = pureEventEnabledSched.rfind("~clearMask", pureEventMarkerPos);
+        const std::size_t pureEventWrapperIfPos =
+            pureEventEnabledSched.find("if (grhsim_pure_event_word_hit_", pureEventMarkerPos);
+        const std::size_t pureEventWrapperOpen =
+            pureEventEnabledSched.find('{', pureEventWrapperIfPos);
+        const std::size_t pureEventWrapperClose = findMatchingBrace(pureEventEnabledSched, pureEventWrapperOpen);
+        const std::size_t pureEventFirstEntry = pureEventEnabledSched.find("// Supernode ", pureEventWrapperOpen);
+        const std::size_t pureEventRestore = pureEventEnabledSched.find(" | activeWordFlags);", pureEventFirstEntry);
+        if (pureEventClearPos == std::string::npos || pureEventWrapperIfPos == std::string::npos ||
+            pureEventWrapperClose == std::string::npos || pureEventFirstEntry == std::string::npos ||
+            pureEventRestore == std::string::npos || pureEventClearPos >= pureEventMarkerPos ||
+            pureEventMarkerPos >= pureEventWrapperIfPos || pureEventWrapperIfPos >= pureEventFirstEntry ||
+            pureEventFirstEntry >= pureEventRestore || pureEventRestore >= pureEventWrapperClose)
+        {
+            return fail("pure-event compute-word wrapper should follow clear and contain entries plus restore");
+        }
+        const std::string_view pureEventFirstWrapper =
+            std::string_view(pureEventEnabledSched).substr(pureEventWrapperIfPos,
+                                                           pureEventWrapperClose - pureEventWrapperIfPos + 1u);
+        if (countSubstring(pureEventFirstWrapper, "event_edge_slots_[") < 1u)
+        {
+            return fail("pure-event compute-word wrapper should retain inner exact-event guards");
+        }
+        if (countSubstring(pureEventEnabledSched,
+                           "const volatile bool grhsim_pure_event_word_hit_") != pureEventMarkerCount)
+        {
+            return fail("sparse pure-event batches should use one volatile hit per wrapper");
+        }
+
+        const std::string pureEventSparseOneSched =
+            readFiles(collectSchedFiles(*pureEventSparseOneDir, "grhsim_top_sched_"));
+        const std::string pureEventSparseTwoSched =
+            readFiles(collectSchedFiles(*pureEventSparseTwoDir, "grhsim_top_sched_"));
+        const std::string pureEventDenseThreeSched =
+            readFiles(collectSchedFiles(*pureEventDenseThreeDir, "grhsim_top_sched_"));
+        constexpr std::string_view pureEventVolatileHit =
+            "const volatile bool grhsim_pure_event_word_hit_";
+        constexpr std::string_view pureEventDirectOuter =
+            "if (event_edge_slots_[0] == grhsim_event_edge_kind::posedge) {";
+        if (countSubstring(pureEventSparseOneSched, pureEventMarker) != 1u ||
+            countSubstring(pureEventSparseOneSched, pureEventVolatileHit) != 1u ||
+            countSubstring(pureEventSparseTwoSched, pureEventMarker) != 2u ||
+            countSubstring(pureEventSparseTwoSched, pureEventVolatileHit) != 2u ||
+            countSubstring(pureEventDenseThreeSched, pureEventMarker) != 3u ||
+            countSubstring(pureEventDenseThreeSched, pureEventVolatileHit) != 0u ||
+            countSubstring(pureEventDenseThreeSched, pureEventDirectOuter) != 3u)
+        {
+            return fail("pure-event sparse predicate should switch at the two-word batch boundary");
+        }
+
+        const std::string pureEventProfileOnlySource = readPureEventGenerated(*pureEventProfileOnlyDir);
+        const std::string pureEventProfileOnlySched =
+            readFiles(collectSchedFiles(*pureEventProfileOnlyDir, "grhsim_top_sched_"));
+        const std::string pureEventProfileBypassSource = readPureEventGenerated(*pureEventProfileBypassDir);
+        const std::string pureEventProfileBypassSched =
+            readFiles(collectSchedFiles(*pureEventProfileBypassDir, "grhsim_top_sched_"));
+        if (pureEventProfileOnlySource.find("kPureEventComputeWordEligibleCount = 2u") == std::string::npos ||
+            pureEventProfileOnlySource.find("pure_event_word_active_hit_by_batch_") == std::string::npos ||
+            pureEventProfileOnlySource.find("pure_event_word_active_miss_by_batch_") == std::string::npos ||
+            pureEventProfileOnlySched.find(pureEventMarker) != std::string::npos ||
+            countSubstring(pureEventProfileOnlySched, "++pure_event_word_active_hit_by_batch_[") != 2u ||
+            countSubstring(pureEventProfileOnlySched, "++pure_event_word_active_miss_by_batch_[") != 2u)
+        {
+            return fail("pure-event profile-only source should count two eligible words without bypass wrappers");
+        }
+        if (countSubstring(pureEventProfileBypassSched, pureEventMarker) != 2u ||
+            countSubstring(pureEventProfileBypassSched,
+                           "const volatile bool grhsim_pure_event_word_hit_") != 2u ||
+            countSubstring(pureEventProfileBypassSched, "++pure_event_word_active_hit_by_batch_[") != 2u ||
+            pureEventProfileBypassSource.find("PureEventComputeWordProfile") == std::string::npos)
+        {
+            return fail("combined pure-event profile and bypass should share one hit temporary per eligible word");
+        }
+
+        const std::string pureEventOnceSched =
+            readFiles(collectSchedFiles(*pureEventOnceDir, "grhsim_top_sched_"));
+        const std::string pureEventMultiSched =
+            readFiles(collectSchedFiles(*pureEventMultiDir, "grhsim_top_sched_"));
+        if (pureEventOnceSched.find(pureEventMarker) != std::string::npos ||
+            pureEventMultiSched.find(pureEventMarker) != std::string::npos ||
+            readPureEventGenerated(*pureEventOnceDir).find("kPureEventComputeWordEligibleCount = 0u") ==
+                std::string::npos ||
+            readPureEventGenerated(*pureEventMultiDir).find("kPureEventComputeWordEligibleCount = 0u") ==
+                std::string::npos)
+        {
+            return fail("once-only and multi-event compute words must not use the pure-event bypass");
+        }
+        const std::string pureEventFullpassSched =
+            readFiles(collectSchedFiles(*pureEventFullpassDir, "grhsim_top_sched_"));
+        if (countSubstring(pureEventFullpassSched, pureEventMarker) != pureEventMarkerCount)
+        {
+            return fail("fullpass methods must not add pure-event compute-word wrappers");
+        }
+
+        const std::string pureEventFullWordConsumeSched =
+            readFiles(collectSchedFiles(*pureEventFullWordConsumeDir, "grhsim_top_sched_"));
+        if (readPureEventGenerated(*pureEventFullWordConsumeDir)
+                .find("kPureEventComputeWordEligibleCount = 0u") == std::string::npos)
+        {
+            return fail("full-active-word consume fixture should have zero profile-eligible words");
+        }
+        constexpr std::string_view pureEventDispatchMarker =
+            "constexpr std::uint8_t dispatchMask = UINT8_C(";
+        bool sawPureEventFullWord = false;
+        std::size_t pureEventDispatchPos = 0;
+        while ((pureEventDispatchPos = pureEventFullWordConsumeSched.find(pureEventDispatchMarker,
+                                                                          pureEventDispatchPos)) !=
+               std::string::npos)
+        {
+            const std::size_t maskBegin = pureEventDispatchPos + pureEventDispatchMarker.size();
+            const std::size_t maskEnd = pureEventFullWordConsumeSched.find(");", maskBegin);
+            if (maskEnd == std::string::npos)
+            {
+                return fail("pure-event full-word consume emitted a malformed dispatch mask");
+            }
+            const unsigned mask = static_cast<unsigned>(
+                std::stoul(pureEventFullWordConsumeSched.substr(maskBegin, maskEnd - maskBegin)));
+            const std::size_t nextDispatch =
+                pureEventFullWordConsumeSched.find(pureEventDispatchMarker, maskEnd);
+            const std::string_view block = std::string_view(pureEventFullWordConsumeSched).substr(
+                pureEventDispatchPos,
+                nextDispatch == std::string::npos ? nextDispatch : nextDispatch - pureEventDispatchPos);
+            if (mask == 255u)
+            {
+                sawPureEventFullWord = true;
+                if (block.find(pureEventMarker) != std::string_view::npos)
+                {
+                    return fail("full-active-word consume words must not use the pure-event bypass");
+                }
+            }
+            pureEventDispatchPos = maskEnd;
+        }
+        if (!sawPureEventFullWord)
+        {
+            return fail("pure-event fixture should contain a complete active word");
+        }
+
+        const auto runPureEventHarness = [&](const std::filesystem::path &dir,
+                                             bool expectProfile = false) -> std::optional<std::string>
+        {
+            const std::filesystem::path harnessPath = dir / "grhsim_top_harness.cpp";
+            {
+                std::ofstream harness(harnessPath);
+                if (!harness.is_open())
+                {
+                    return std::nullopt;
+                }
+                harness << "#include \"grhsim_top.hpp\"\n";
+                harness << "#include <cstdint>\n\n";
+                harness << "int main()\n{\n";
+                harness << "    GrhSIM_top sim;\n";
+                harness << "    sim.init();\n";
+                harness << "    sim.clk = false;\n";
+                harness << "    sim.aux_clk = true;\n";
+                harness << "    sim.data = static_cast<std::uint8_t>(1);\n";
+                harness << "    sim.eval();\n";
+                if (expectProfile)
+                {
+                    harness << "    sim.set_runtime_profile_enabled(true);\n";
+                }
+                harness << "    sim.data = static_cast<std::uint8_t>(2);\n";
+                harness << "    sim.eval();\n";
+                harness << "    sim.clk = true;\n";
+                harness << "    sim.eval();\n";
+                harness << "    sim.data = static_cast<std::uint8_t>(3);\n";
+                harness << "    sim.eval();\n";
+                harness << "    sim.clk = false;\n";
+                harness << "    sim.eval();\n";
+                harness << "    sim.clk = true;\n";
+                harness << "    sim.eval();\n";
+                if (expectProfile)
+                {
+                    harness << "    const auto profile = sim.pure_event_compute_word_profile();\n";
+                    harness << "    if (profile.eligibleWordCount != UINT64_C(2)) return 2;\n";
+                    harness << "    if (profile.activeHitCount != UINT64_C(4)) return 3;\n";
+                    harness << "    if (profile.activeMissCount != UINT64_C(6)) return 4;\n";
+                    harness << "    sim.dump_runtime_profile();\n";
+                }
+                harness << "    return sim.data_out == static_cast<std::uint8_t>(3) ? 0 : 1;\n";
+                harness << "}\n";
+            }
+            const std::vector<std::filesystem::path> stateFiles = collectSchedFiles(dir, "grhsim_top_state");
+            const std::vector<std::filesystem::path> schedFiles = collectSchedFiles(dir, "grhsim_top_sched_");
+            const std::filesystem::path exe = dir / "grhsim_top_harness";
+            std::string command = "clang++ " + std::string(kHarnessCompileFlags) + " -I" + dir.string();
+            for (const auto &stateFile : stateFiles)
+            {
+                command += " " + stateFile.string();
+            }
+            command += " " + (dir / "grhsim_top_eval.cpp").string();
+            for (const auto &schedFile : schedFiles)
+            {
+                command += " " + schedFile.string();
+            }
+            command += " " + harnessPath.string() + " -o " + exe.string();
+            if (std::system(command.c_str()) != 0)
+            {
+                return std::nullopt;
+            }
+            const std::filesystem::path log = dir / "grhsim_top_harness.log";
+            const std::filesystem::path profileTsv = dir / "pure_event_word_profile.tsv";
+            std::filesystem::remove(profileTsv);
+            command = (expectProfile
+                           ? "WOLVRIX_GRHSIM_PURE_EVENT_WORD_TSV=" + profileTsv.string() + " "
+                           : std::string()) +
+                      exe.string() + " > " + log.string() + " 2>&1";
+            if (std::system(command.c_str()) != 0)
+            {
+                return std::nullopt;
+            }
+            return readFile(log);
+        };
+        const auto pureEventDefaultLog = runPureEventHarness(*pureEventDefaultDir);
+        const auto pureEventEnabledLog = runPureEventHarness(*pureEventEnabledDir);
+        if (!pureEventDefaultLog || !pureEventEnabledLog || *pureEventDefaultLog != *pureEventEnabledLog ||
+            countSubstring(*pureEventEnabledLog, "pure-event=") != 32u)
+        {
+            return fail("pure-event compute-word hit/miss harness output mismatch");
+        }
+        const auto pureEventProfileOnlyLog = runPureEventHarness(*pureEventProfileOnlyDir, true);
+        const auto pureEventProfileBypassLog = runPureEventHarness(*pureEventProfileBypassDir, true);
+        const auto validatePureEventProfile = [&](const std::filesystem::path &dir,
+                                                  const std::optional<std::string> &log) {
+            if (!log || countSubstring(*log, "pure-event=") != 32u ||
+                log->find("eligible=2 hit=4 miss=6 total=10 miss_ratio=0.600000") == std::string::npos)
+            {
+                return false;
+            }
+            const std::string tsv = readFile(dir / "pure_event_word_profile.tsv");
+            return tsv.starts_with("batch_id\teligible_words\tactive_hit\tactive_miss\tactive_total\n") &&
+                   countSubstring(tsv, "\t1\t2\t3\t5\n") == 2u;
+        };
+        if (!validatePureEventProfile(*pureEventProfileOnlyDir, pureEventProfileOnlyLog) ||
+            !validatePureEventProfile(*pureEventProfileBypassDir, pureEventProfileBypassLog))
+        {
+            return fail("pure-event compute-word dynamic profile counts or TSV mismatch");
         }
 
         const std::filesystem::path systemTaskDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_systemtask";

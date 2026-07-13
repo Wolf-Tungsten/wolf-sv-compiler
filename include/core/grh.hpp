@@ -86,6 +86,9 @@ enum class OperationKind {
 std::string_view toString(OperationKind kind) noexcept;
 std::optional<OperationKind> parseOperationKind(std::string_view text) noexcept;
 
+inline constexpr std::string_view kMemoryWritePriorityGroupAttr = "memoryWrite.priorityGroup";
+inline constexpr std::string_view kMemoryWritePriorityAttr = "memoryWrite.priority";
+
 enum class ValueType : uint8_t {
     Logic,
     Real,

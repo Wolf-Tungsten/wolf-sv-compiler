@@ -151,6 +151,7 @@ namespace wolvrix::app::pybind
         const char *perfMode = nullptr;
         PyObject *inputFullpassSpecializationObj = Py_None;
         PyObject *posedgeFullpassSpecializationObj = Py_None;
+        PyObject *fullActiveWordConsumeObj = Py_None;
         static const char *kwlist[] = {"session",
                                        "design",
                                        "output",
@@ -165,8 +166,9 @@ namespace wolvrix::app::pybind
                                        "perf",
                                        "input_fullpass_specialization",
                                        "posedge_fullpass_specialization",
+                                       "full_active_word_consume",
                                        nullptr};
-                        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|OOOOOOOssOO", const_cast<char **>(kwlist),
+                        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Oss|OOOOOOOssOOO", const_cast<char **>(kwlist),
                                          &sessionObj,
                                          &designKey,
                                          &output,
@@ -180,7 +182,8 @@ namespace wolvrix::app::pybind
                                          &waveformMode,
                                          &perfMode,
                                          &inputFullpassSpecializationObj,
-                                         &posedgeFullpassSpecializationObj))
+                                         &posedgeFullpassSpecializationObj,
+                                         &fullActiveWordConsumeObj))
         {
             return nullptr;
         }
@@ -309,6 +312,15 @@ namespace wolvrix::app::pybind
                 return nullptr;
             }
             options.attributes["posedge_fullpass_specialization"] = enabled != 0 ? "1" : "0";
+        }
+        if (fullActiveWordConsumeObj != Py_None)
+        {
+            const int enabled = PyObject_IsTrue(fullActiveWordConsumeObj);
+            if (enabled < 0)
+            {
+                return nullptr;
+            }
+            options.attributes["full_active_word_consume"] = enabled != 0 ? "1" : "0";
         }
 
         const auto result = emitter.emit(*design, options);
