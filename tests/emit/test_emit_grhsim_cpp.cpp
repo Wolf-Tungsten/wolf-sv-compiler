@@ -1022,7 +1022,9 @@ namespace
                                   bool materializedScalarReadLocalityStats = false,
                                   bool fullActiveWordConsume = false,
                                   std::optional<bool> pureEventComputeWordBypass = std::nullopt,
-                                  std::optional<bool> pureEventComputeWordProfile = std::nullopt)
+                                  std::optional<bool> pureEventComputeWordProfile = std::nullopt,
+                                  std::size_t schedBatchMaxOps = 8u,
+                                  std::size_t schedBatchMaxEstimatedLines = 96u)
     {
         SessionStore session;
         if (scheduleOptions.path.empty())
@@ -1039,8 +1041,8 @@ namespace
         options.outputDir = outDir.string();
         options.session = &session;
         options.sessionPathPrefix = std::string("top");
-        options.attributes["sched_batch_max_ops"] = "8";
-        options.attributes["sched_batch_max_estimated_lines"] = "96";
+        options.attributes["sched_batch_max_ops"] = std::to_string(schedBatchMaxOps);
+        options.attributes["sched_batch_max_estimated_lines"] = std::to_string(schedBatchMaxEstimatedLines);
         options.attributes["emit_parallelism"] = "2";
         if (posedgeFullpassSpecialization)
         {
@@ -1887,7 +1889,8 @@ namespace
         kMultiEvent,
     };
 
-    Design buildPureEventWordBypassDesign(PureEventWordFixtureMode mode)
+    Design buildPureEventWordBypassDesign(PureEventWordFixtureMode mode,
+                                          std::size_t taskCount = 16u)
     {
         Design design;
         Graph &graph = design.createGraph("top");
@@ -1908,7 +1911,7 @@ namespace
                                      0,
                                      "\"pure-event=%0d\"",
                                      ValueType::String);
-        for (std::size_t index = 0; index < 16u; ++index)
+        for (std::size_t index = 0; index < taskCount; ++index)
         {
             OperationId task = graph.createOperation(
                 OperationKind::kSystemTask,
@@ -6446,12 +6449,15 @@ int main()
                                               std::optional<bool> bypass,
                                               bool posedgeFullpass,
                                               bool fullWordConsume,
-                                              std::optional<bool> profile = std::nullopt)
+                                              std::optional<bool> profile = std::nullopt,
+                                              std::size_t taskCount = 16u,
+                                              std::size_t schedBatchMaxOps = 8u,
+                                              std::size_t schedBatchMaxEstimatedLines = 96u)
             -> std::optional<std::filesystem::path>
         {
             const std::filesystem::path dir = pureEventRoot.string() + "_" + std::string(suffix);
             std::filesystem::remove_all(dir);
-            Design fixture = buildPureEventWordBypassDesign(mode);
+            Design fixture = buildPureEventWordBypassDesign(mode, taskCount);
             EmitDiagnostics fixtureDiag;
             EmitResult fixtureResult;
             if (!emitWithActivitySchedule(fixture,
@@ -6466,7 +6472,9 @@ int main()
                                           false,
                                           fullWordConsume,
                                           bypass,
-                                          profile) ||
+                                          profile,
+                                          schedBatchMaxOps,
+                                          schedBatchMaxEstimatedLines) ||
                 !fixtureResult.success || fixtureDiag.hasError())
             {
                 return std::nullopt;
@@ -6531,9 +6539,37 @@ int main()
                                                                       false,
                                                                       true,
                                                                       true);
+        const auto pureEventSparseOneDir = emitPureEventFixture("sparse_one",
+                                                                PureEventWordFixtureMode::kHomogeneous,
+                                                                true,
+                                                                false,
+                                                                false,
+                                                                false,
+                                                                8u,
+                                                                100000u,
+                                                                100000u);
+        const auto pureEventSparseTwoDir = emitPureEventFixture("sparse_two",
+                                                                PureEventWordFixtureMode::kHomogeneous,
+                                                                true,
+                                                                false,
+                                                                false,
+                                                                false,
+                                                                16u,
+                                                                100000u,
+                                                                100000u);
+        const auto pureEventDenseThreeDir = emitPureEventFixture("dense_three",
+                                                                 PureEventWordFixtureMode::kHomogeneous,
+                                                                 true,
+                                                                 false,
+                                                                 false,
+                                                                 false,
+                                                                 24u,
+                                                                 100000u,
+                                                                 100000u);
         if (!pureEventDefaultDir || !pureEventDisabledDir || !pureEventEnabledDir || !pureEventOnceDir ||
             !pureEventProfileDisabledDir || !pureEventProfileOnlyDir || !pureEventProfileBypassDir ||
-            !pureEventMultiDir || !pureEventFullpassDir || !pureEventFullWordConsumeDir)
+            !pureEventMultiDir || !pureEventFullpassDir || !pureEventFullWordConsumeDir ||
+            !pureEventSparseOneDir || !pureEventSparseTwoDir || !pureEventDenseThreeDir)
         {
             return fail("pure-event compute-word fixture emit failed");
         }
@@ -6565,7 +6601,8 @@ int main()
         }
         const std::size_t pureEventMarkerPos = pureEventEnabledSched.find(pureEventMarker);
         const std::size_t pureEventClearPos = pureEventEnabledSched.rfind("~clearMask", pureEventMarkerPos);
-        const std::size_t pureEventWrapperIfPos = pureEventEnabledSched.find("if (event_edge_slots_[", pureEventMarkerPos);
+        const std::size_t pureEventWrapperIfPos =
+            pureEventEnabledSched.find("if (grhsim_pure_event_word_hit_", pureEventMarkerPos);
         const std::size_t pureEventWrapperOpen =
             pureEventEnabledSched.find('{', pureEventWrapperIfPos);
         const std::size_t pureEventWrapperClose = findMatchingBrace(pureEventEnabledSched, pureEventWrapperOpen);
@@ -6582,9 +6619,35 @@ int main()
         const std::string_view pureEventFirstWrapper =
             std::string_view(pureEventEnabledSched).substr(pureEventWrapperIfPos,
                                                            pureEventWrapperClose - pureEventWrapperIfPos + 1u);
-        if (countSubstring(pureEventFirstWrapper, "event_edge_slots_[") < 2u)
+        if (countSubstring(pureEventFirstWrapper, "event_edge_slots_[") < 1u)
         {
             return fail("pure-event compute-word wrapper should retain inner exact-event guards");
+        }
+        if (countSubstring(pureEventEnabledSched,
+                           "const volatile bool grhsim_pure_event_word_hit_") != pureEventMarkerCount)
+        {
+            return fail("sparse pure-event batches should use one volatile hit per wrapper");
+        }
+
+        const std::string pureEventSparseOneSched =
+            readFiles(collectSchedFiles(*pureEventSparseOneDir, "grhsim_top_sched_"));
+        const std::string pureEventSparseTwoSched =
+            readFiles(collectSchedFiles(*pureEventSparseTwoDir, "grhsim_top_sched_"));
+        const std::string pureEventDenseThreeSched =
+            readFiles(collectSchedFiles(*pureEventDenseThreeDir, "grhsim_top_sched_"));
+        constexpr std::string_view pureEventVolatileHit =
+            "const volatile bool grhsim_pure_event_word_hit_";
+        constexpr std::string_view pureEventDirectOuter =
+            "if (event_edge_slots_[0] == grhsim_event_edge_kind::posedge) {";
+        if (countSubstring(pureEventSparseOneSched, pureEventMarker) != 1u ||
+            countSubstring(pureEventSparseOneSched, pureEventVolatileHit) != 1u ||
+            countSubstring(pureEventSparseTwoSched, pureEventMarker) != 2u ||
+            countSubstring(pureEventSparseTwoSched, pureEventVolatileHit) != 2u ||
+            countSubstring(pureEventDenseThreeSched, pureEventMarker) != 3u ||
+            countSubstring(pureEventDenseThreeSched, pureEventVolatileHit) != 0u ||
+            countSubstring(pureEventDenseThreeSched, pureEventDirectOuter) != 3u)
+        {
+            return fail("pure-event sparse predicate should switch at the two-word batch boundary");
         }
 
         const std::string pureEventProfileOnlySource = readPureEventGenerated(*pureEventProfileOnlyDir);
@@ -6603,7 +6666,8 @@ int main()
             return fail("pure-event profile-only source should count two eligible words without bypass wrappers");
         }
         if (countSubstring(pureEventProfileBypassSched, pureEventMarker) != 2u ||
-            countSubstring(pureEventProfileBypassSched, "const bool grhsim_pure_event_word_hit_") != 2u ||
+            countSubstring(pureEventProfileBypassSched,
+                           "const volatile bool grhsim_pure_event_word_hit_") != 2u ||
             countSubstring(pureEventProfileBypassSched, "++pure_event_word_active_hit_by_batch_[") != 2u ||
             pureEventProfileBypassSource.find("PureEventComputeWordProfile") == std::string::npos)
         {

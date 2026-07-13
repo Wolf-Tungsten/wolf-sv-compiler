@@ -53,6 +53,7 @@ namespace wolvrix::lib::emit
         constexpr std::size_t kInlineSystemTaskArgLimit = 16;
         constexpr std::size_t kRegToMemIntentIndexInlineOpLimit = 32;
         constexpr std::size_t kOrderedMemoryWriteAffineMinWrites = 16;
+        constexpr std::size_t kPureEventVolatileBatchMaxEligibleWords = 2;
 
         template <typename T>
         std::optional<T> getAttribute(const Operation &op, std::string_view key)
@@ -14537,6 +14538,21 @@ namespace wolvrix::lib::emit
 
             for (const ScheduleBatch &batch : batches)
             {
+            std::size_t pureEventEligibleWordCount = 0;
+            if (model.pureEventComputeWordBypass)
+            {
+                for (const ScheduleBatch::Word &word : batch.words)
+                {
+                    if (eligiblePureEventComputeWordExpr(
+                            graph, model, schedule, batch, word, word.helperChunks.empty()))
+                    {
+                        ++pureEventEligibleWordCount;
+                    }
+                }
+            }
+            const bool useVolatilePureEventHit =
+                pureEventEligibleWordCount != 0u &&
+                pureEventEligibleWordCount <= kPureEventVolatileBatchMaxEligibleWords;
             const auto emitWordBody = [&](const ScheduleBatch::Word &word,
                                           bool fullpassVariant,
                                           bool allowPureEventBypass) -> std::optional<std::string>
@@ -14655,11 +14671,20 @@ namespace wolvrix::lib::emit
                            << word.activeFlagWordIndex << "u] & static_cast<std::uint8_t>(~clearMask));\n";
                 }
                 std::string pureEventHitExpr;
-                if (pureEventWordExpr && model.pureEventComputeWordProfile && model.pureEventComputeWordBypass)
+                const bool emitVolatilePureEventHit =
+                    pureEventWordExpr && model.pureEventComputeWordBypass && useVolatilePureEventHit;
+                if (pureEventWordExpr && model.pureEventComputeWordBypass &&
+                    (model.pureEventComputeWordProfile || emitVolatilePureEventHit))
                 {
                     pureEventHitExpr = "grhsim_pure_event_word_hit_" +
                                        std::to_string(word.activeFlagWordIndex);
-                    stream << "                const bool " << pureEventHitExpr << " = "
+                    if (emitVolatilePureEventHit)
+                    {
+                        stream << "                // Keep sparse-batch event equality opaque to avoid whole-function codegen cliffs.\n";
+                    }
+                    stream << "                const "
+                           << (emitVolatilePureEventHit ? "volatile " : "")
+                           << "bool " << pureEventHitExpr << " = "
                            << *pureEventWordExpr << ";\n";
                 }
                 if (pureEventWordExpr && model.pureEventComputeWordProfile)
