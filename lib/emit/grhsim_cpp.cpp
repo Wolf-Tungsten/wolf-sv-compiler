@@ -2729,6 +2729,7 @@ namespace wolvrix::lib::emit
             bool fullActiveWordConsume = false;
             bool oneBitBitwiseBytes = false;
             bool pureEventComputeWordBypass = false;
+            bool pureEventComputeWordProfile = false;
             std::size_t directStateReadCount = 0;
             std::size_t directStateReadCanonicalCount = 0;
             std::size_t directStateReadAliasCount = 0;
@@ -13636,6 +13637,29 @@ namespace wolvrix::lib::emit
             return commonEventExpr;
         }
 
+        std::optional<std::string> eligiblePureEventComputeWordExpr(
+            const Graph &graph,
+            const EmitModel &model,
+            const ScheduleRefs &schedule,
+            const ScheduleBatch &batch,
+            const ScheduleBatch::Word &word,
+            bool allowed)
+        {
+            if (!allowed || batch.phase != ScheduleBatch::Phase::kCompute)
+            {
+                return std::nullopt;
+            }
+            const std::uint8_t dispatchMask = scheduleBatchWordDispatchMask(model, word);
+            const std::uint8_t clearMask = scheduleBatchWordClearMask(model, batch, word);
+            const bool consumeFullActiveWord =
+                model.fullActiveWordConsume && dispatchMask == UINT8_C(0xff);
+            if (consumeFullActiveWord || dispatchMask == UINT8_C(0) || dispatchMask != clearMask)
+            {
+                return std::nullopt;
+            }
+            return analyzePureEventComputeWord(graph, model, schedule.supernodeToOps, word);
+        }
+
         bool isCompressibleScalarStateWrite(const EmitModel &model, OperationId opId)
         {
             (void)model;
@@ -14523,17 +14547,12 @@ namespace wolvrix::lib::emit
                     model.fullActiveWordConsume &&
                     batch.phase == ScheduleBatch::Phase::kCompute &&
                     dispatchMask == UINT8_C(0xff);
-                std::optional<std::string> pureEventBypassExpr;
-                if (model.pureEventComputeWordBypass &&
-                    allowPureEventBypass &&
-                    !fullpassVariant &&
-                    !consumeFullActiveWord &&
-                    batch.phase == ScheduleBatch::Phase::kCompute &&
-                    dispatchMask != UINT8_C(0) &&
-                    dispatchMask == clearMask)
+                std::optional<std::string> pureEventWordExpr;
+                if ((model.pureEventComputeWordBypass || model.pureEventComputeWordProfile) &&
+                    !fullpassVariant)
                 {
-                    pureEventBypassExpr =
-                        analyzePureEventComputeWord(graph, model, schedule.supernodeToOps, word);
+                    pureEventWordExpr = eligiblePureEventComputeWordExpr(
+                        graph, model, schedule, batch, word, allowPureEventBypass);
                 }
                 struct CommitEventWordCluster
                 {
@@ -14635,10 +14654,35 @@ namespace wolvrix::lib::emit
                            << "u] = static_cast<std::uint8_t>(supernode_active_curr_["
                            << word.activeFlagWordIndex << "u] & static_cast<std::uint8_t>(~clearMask));\n";
                 }
-                if (pureEventBypassExpr)
+                std::string pureEventHitExpr;
+                if (pureEventWordExpr && model.pureEventComputeWordProfile && model.pureEventComputeWordBypass)
+                {
+                    pureEventHitExpr = "grhsim_pure_event_word_hit_" +
+                                       std::to_string(word.activeFlagWordIndex);
+                    stream << "                const bool " << pureEventHitExpr << " = "
+                           << *pureEventWordExpr << ";\n";
+                }
+                if (pureEventWordExpr && model.pureEventComputeWordProfile)
+                {
+                    stream << "                if (runtime_profile_enabled_) {\n";
+                    const std::string profileEventExpr = pureEventHitExpr.empty()
+                                                             ? *pureEventWordExpr
+                                                             : pureEventHitExpr;
+                    stream << "                    if (" << profileEventExpr << ") {\n";
+                    stream << "                        ++pure_event_word_active_hit_by_batch_["
+                           << batch.index << "u];\n";
+                    stream << "                    } else {\n";
+                    stream << "                        ++pure_event_word_active_miss_by_batch_["
+                           << batch.index << "u];\n";
+                    stream << "                    }\n";
+                    stream << "                }\n";
+                }
+                if (pureEventWordExpr && model.pureEventComputeWordBypass)
                 {
                     stream << "                // Pure-event compute word: an event miss consumes the cleared word.\n";
-                    stream << "                if (" << *pureEventBypassExpr << ") {\n";
+                    stream << "                if ("
+                           << (pureEventHitExpr.empty() ? *pureEventWordExpr : pureEventHitExpr)
+                           << ") {\n";
                 }
                 for (uint32_t supernodeId : word.supernodeIds)
                 {
@@ -15925,7 +15969,7 @@ namespace wolvrix::lib::emit
                            << "u] = static_cast<std::uint8_t>(supernode_active_curr_["
                            << word.activeFlagWordIndex << "u] | activeWordFlags);\n";
                 }
-                if (pureEventBypassExpr)
+                if (pureEventWordExpr && model.pureEventComputeWordBypass)
                 {
                     stream << "                }\n";
                 }
@@ -16235,6 +16279,10 @@ namespace wolvrix::lib::emit
             parseBooleanEmitOption(options,
                                    "pure_event_compute_word_bypass",
                                    "WOLVRIX_GRHSIM_PURE_EVENT_COMPUTE_WORD_BYPASS");
+        const bool pureEventComputeWordProfile =
+            parseBooleanEmitOption(options,
+                                   "pure_event_compute_word_profile",
+                                   "WOLVRIX_GRHSIM_PURE_EVENT_COMPUTE_WORD_PROFILE");
         const std::size_t schedBatchesPerCpp = parseScheduleBatchesPerCpp(options);
         const std::unordered_set<ValueId, ValueIdHash> waveformValueIds =
             waveformMode == WaveformMode::kDeclaredSymbols ? collectDeclaredSymbolWaveformValueIds(graph)
@@ -16267,6 +16315,7 @@ namespace wolvrix::lib::emit
         model.fullActiveWordConsume = fullActiveWordConsume;
         model.oneBitBitwiseBytes = oneBitBitwiseBytes;
         model.pureEventComputeWordBypass = pureEventComputeWordBypass;
+        model.pureEventComputeWordProfile = pureEventComputeWordProfile;
         if (model.emitRuntimeProfile)
         {
             buildRuntimeProfileWeights(graph, schedule, model);
@@ -16310,6 +16359,26 @@ namespace wolvrix::lib::emit
         std::vector<ValueId> batchReadLocalityValueOrder =
             buildStateAnchoredValueOrder(graph, model, scheduleBatches, schedule.supernodeToOps);
         rebuildMaterializedValueStorage(graph, batchReadLocalityValueOrder, model);
+        const bool runtimeProfileCompiled =
+            model.emitRuntimeProfile || model.pureEventComputeWordProfile;
+        std::vector<std::size_t> pureEventEligibleWordsByBatch(scheduleBatches.size(), 0u);
+        std::size_t pureEventEligibleWordCount = 0;
+        if (model.pureEventComputeWordProfile)
+        {
+            for (const ScheduleBatch &batch : scheduleBatches)
+            {
+                for (const ScheduleBatch::Word &word : batch.words)
+                {
+                    const bool allowed = word.helperChunks.empty();
+                    if (!eligiblePureEventComputeWordExpr(graph, model, schedule, batch, word, allowed))
+                    {
+                        continue;
+                    }
+                    ++pureEventEligibleWordsByBatch[batch.index];
+                    ++pureEventEligibleWordCount;
+                }
+            }
+        }
         if (waveformMode == WaveformMode::kDeclaredSymbols)
         {
             collectDeclaredSymbolWaveformSignals(graph, model, model.waveformSignals);
@@ -19923,7 +19992,18 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             *stream << "    [[nodiscard]] bool runtime_profile_enabled() const;\n";
             *stream << "    void dump_runtime_profile() const;\n";
             *stream << "    static constexpr bool kRuntimeProfileCompiled = "
-                    << (model.emitRuntimeProfile ? "true" : "false") << ";\n";
+                    << (runtimeProfileCompiled ? "true" : "false") << ";\n";
+            if (model.pureEventComputeWordProfile)
+            {
+                *stream << "    static constexpr std::size_t kPureEventComputeWordEligibleCount = "
+                        << pureEventEligibleWordCount << "u;\n";
+                *stream << "    struct PureEventComputeWordProfile {\n";
+                *stream << "        std::uint64_t eligibleWordCount = UINT64_C(0);\n";
+                *stream << "        std::uint64_t activeHitCount = UINT64_C(0);\n";
+                *stream << "        std::uint64_t activeMissCount = UINT64_C(0);\n";
+                *stream << "    };\n";
+                *stream << "    [[nodiscard]] PureEventComputeWordProfile pure_event_compute_word_profile() const;\n";
+            }
             if (model.emitWaveform)
             {
                 *stream << "    void configure_waveform(bool enabled, std::string path = {});\n";
@@ -20253,11 +20333,19 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             {
                 *stream << "    PerfCounters perf_counters_{};\n";
             }
-            if (model.emitRuntimeProfile)
+            if (runtimeProfileCompiled)
             {
                 *stream << "    bool runtime_profile_enabled_ = false;\n";
+            }
+            if (model.emitRuntimeProfile)
+            {
                 *stream << "    std::array<std::uint64_t, kSupernodeCount> runtime_profile_fire_compute_{};\n";
                 *stream << "    std::array<std::uint64_t, kSupernodeCount> runtime_profile_fire_commit_{};\n";
+            }
+            if (model.pureEventComputeWordProfile)
+            {
+                *stream << "    std::array<std::uint64_t, kBatchCount> pure_event_word_active_hit_by_batch_{};\n";
+                *stream << "    std::array<std::uint64_t, kBatchCount> pure_event_word_active_miss_by_batch_{};\n";
             }
             *stream << "    bool register_write_conflict_ = false;\n";
             *stream << "    std::uint64_t random_seed_ = UINT64_C(0);\n";
@@ -20672,7 +20760,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             *stream << "#include \"" << headerPath.filename().string() << "\"\n";
             *stream << "#include <cstdlib>\n";
             *stream << "#include <cstdio>\n\n";
-            if (model.emitRuntimeProfile)
+            if (runtimeProfileCompiled)
             {
                 *stream << "#include <filesystem>\n";
                 *stream << "#include <system_error>\n\n";
@@ -20881,7 +20969,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "}\n\n";
             }
             *stream << "void " << className << "::set_runtime_profile_enabled(bool enabled)\n{\n";
-            if (model.emitRuntimeProfile)
+            if (runtimeProfileCompiled)
             {
                 *stream << "    runtime_profile_enabled_ = enabled;\n";
             }
@@ -20891,7 +20979,7 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
             }
             *stream << "}\n\n";
             *stream << "bool " << className << "::runtime_profile_enabled() const\n{\n";
-            if (model.emitRuntimeProfile)
+            if (runtimeProfileCompiled)
             {
                 *stream << "    return runtime_profile_enabled_;\n";
             }
@@ -20900,12 +20988,28 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "    return false;\n";
             }
             *stream << "}\n\n";
+            if (model.pureEventComputeWordProfile)
+            {
+                *stream << className << "::PureEventComputeWordProfile " << className
+                        << "::pure_event_compute_word_profile() const\n{\n";
+                *stream << "    PureEventComputeWordProfile profile{};\n";
+                *stream << "    profile.eligibleWordCount = kPureEventComputeWordEligibleCount;\n";
+                *stream << "    for (std::size_t batchIndex = 0; batchIndex < kBatchCount; ++batchIndex) {\n";
+                *stream << "        profile.activeHitCount += pure_event_word_active_hit_by_batch_[batchIndex];\n";
+                *stream << "        profile.activeMissCount += pure_event_word_active_miss_by_batch_[batchIndex];\n";
+                *stream << "    }\n";
+                *stream << "    return profile;\n";
+                *stream << "}\n\n";
+            }
             *stream << "void " << className << "::dump_runtime_profile() const\n{\n";
-            if (model.emitRuntimeProfile)
+            if (runtimeProfileCompiled)
             {
                 *stream << "    if (!runtime_profile_enabled_) {\n";
                 *stream << "        return;\n";
                 *stream << "    }\n";
+            }
+            if (model.emitRuntimeProfile)
+            {
                 // NO0190 §10.1: RUNTIME output = per-(supernode,phase) fire counts only. Static
                 // columns are an EMIT-time artifact (grhsim_supernode_static.tsv); join on
                 // (supernode_id, phase). Only a minimal (id, phase) row table is baked here so the
@@ -20972,6 +21076,77 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "    std::printf(\"[GRHSIM_RUNTIME_PROFILE] supernode_fire_tsv=%s rows=%zu\\n\",\n";
                 *stream << "                path,\n";
                 *stream << "                kRows.size());\n";
+            }
+            if (model.pureEventComputeWordProfile)
+            {
+                const std::size_t profileBatchRowCount = static_cast<std::size_t>(std::count_if(
+                    pureEventEligibleWordsByBatch.begin(),
+                    pureEventEligibleWordsByBatch.end(),
+                    [](std::size_t count) { return count != 0; }));
+                *stream << "    const char *pureEventEnvPath = std::getenv(\"WOLVRIX_GRHSIM_PURE_EVENT_WORD_TSV\");\n";
+                *stream << "    const char *pureEventPath =\n";
+                *stream << "        (pureEventEnvPath != nullptr && pureEventEnvPath[0] != '\\0')\n";
+                *stream << "            ? pureEventEnvPath\n";
+                *stream << "            : \""
+                        << escapeCppString((outDir / "grhsim_pure_event_word_profile.tsv").string())
+                        << "\";\n";
+                *stream << "    const std::filesystem::path pureEventOutputPath(pureEventPath);\n";
+                *stream << "    if (pureEventOutputPath.has_parent_path()) {\n";
+                *stream << "        std::error_code ec;\n";
+                *stream << "        std::filesystem::create_directories(pureEventOutputPath.parent_path(), ec);\n";
+                *stream << "        if (ec) {\n";
+                *stream << "            std::fprintf(stderr,\n";
+                *stream << "                         \"[GRHSIM_PURE_EVENT_WORD_PROFILE] failed to create TSV directory %s: %s\\n\",\n";
+                *stream << "                         pureEventOutputPath.parent_path().string().c_str(),\n";
+                *stream << "                         ec.message().c_str());\n";
+                *stream << "            return;\n";
+                *stream << "        }\n";
+                *stream << "    }\n";
+                *stream << "    std::FILE *pureEventFp = std::fopen(pureEventPath, \"w\");\n";
+                *stream << "    if (pureEventFp == nullptr) {\n";
+                *stream << "        std::fprintf(stderr,\n";
+                *stream << "                     \"[GRHSIM_PURE_EVENT_WORD_PROFILE] failed to open TSV %s\\n\",\n";
+                *stream << "                     pureEventPath);\n";
+                *stream << "        return;\n";
+                *stream << "    }\n";
+                *stream << "    std::fprintf(pureEventFp,\n";
+                *stream << "                 \"batch_id\\teligible_words\\tactive_hit\\tactive_miss\\tactive_total\\n\");\n";
+                for (std::size_t batchIndex = 0; batchIndex < pureEventEligibleWordsByBatch.size(); ++batchIndex)
+                {
+                    const std::size_t eligibleCount = pureEventEligibleWordsByBatch[batchIndex];
+                    if (eligibleCount == 0)
+                    {
+                        continue;
+                    }
+                    *stream << "    std::fprintf(pureEventFp,\n";
+                    *stream << "                 \"" << batchIndex << "\\t" << eligibleCount
+                            << "\\t%llu\\t%llu\\t%llu\\n\",\n";
+                    *stream << "                 static_cast<unsigned long long>(pure_event_word_active_hit_by_batch_["
+                            << batchIndex << "u]),\n";
+                    *stream << "                 static_cast<unsigned long long>(pure_event_word_active_miss_by_batch_["
+                            << batchIndex << "u]),\n";
+                    *stream << "                 static_cast<unsigned long long>(pure_event_word_active_hit_by_batch_["
+                            << batchIndex << "u] + pure_event_word_active_miss_by_batch_[" << batchIndex
+                            << "u]));\n";
+                }
+                *stream << "    std::fclose(pureEventFp);\n";
+                *stream << "    const PureEventComputeWordProfile pureEventProfile =\n";
+                *stream << "        pure_event_compute_word_profile();\n";
+                *stream << "    const std::uint64_t pureEventActiveTotal =\n";
+                *stream << "        pureEventProfile.activeHitCount + pureEventProfile.activeMissCount;\n";
+                *stream << "    const double pureEventMissRatio = pureEventActiveTotal == UINT64_C(0)\n";
+                *stream << "        ? 0.0\n";
+                *stream << "        : static_cast<double>(pureEventProfile.activeMissCount) /\n";
+                *stream << "              static_cast<double>(pureEventActiveTotal);\n";
+                *stream << "    std::printf(\n";
+                *stream << "        \"[GRHSIM_PURE_EVENT_WORD_PROFILE] tsv=%s rows=%zu eligible=%llu hit=%llu miss=%llu total=%llu miss_ratio=%.6f\\n\",\n";
+                *stream << "        pureEventPath,\n";
+                *stream << "        static_cast<std::size_t>(" << profileBatchRowCount << "u),\n";
+                *stream << "        static_cast<unsigned long long>(pureEventProfile.eligibleWordCount),\n";
+                *stream << "        static_cast<unsigned long long>(pureEventProfile.activeHitCount),\n";
+                *stream << "        static_cast<unsigned long long>(pureEventProfile.activeMissCount),\n";
+                *stream << "        static_cast<unsigned long long>(pureEventActiveTotal),\n";
+                *stream << "        pureEventMissRatio);\n";
             }
             *stream << "}\n\n";
             const bool useCommitBoolRange = modelUsesCommitScalarStateWriteKind(model, ValueSlotScalarKind::kBool);
@@ -22567,6 +22742,11 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 {
                     *stream << "    runtime_profile_fire_compute_.fill(UINT64_C(0));\n";
                     *stream << "    runtime_profile_fire_commit_.fill(UINT64_C(0));\n";
+                }
+                if (model.pureEventComputeWordProfile)
+                {
+                    *stream << "    pure_event_word_active_hit_by_batch_.fill(UINT64_C(0));\n";
+                    *stream << "    pure_event_word_active_miss_by_batch_.fill(UINT64_C(0));\n";
                 }
                 *stream << "    first_eval_ = true;\n";
                 *stream << "    event_baseline_initialized_ = false;\n";

@@ -1021,7 +1021,8 @@ namespace
                                   bool directSingleWriterStateReads = false,
                                   bool materializedScalarReadLocalityStats = false,
                                   bool fullActiveWordConsume = false,
-                                  std::optional<bool> pureEventComputeWordBypass = std::nullopt)
+                                  std::optional<bool> pureEventComputeWordBypass = std::nullopt,
+                                  std::optional<bool> pureEventComputeWordProfile = std::nullopt)
     {
         SessionStore session;
         if (scheduleOptions.path.empty())
@@ -1068,6 +1069,10 @@ namespace
         if (pureEventComputeWordBypass)
         {
             options.attributes["pure_event_compute_word_bypass"] = *pureEventComputeWordBypass ? "1" : "0";
+        }
+        if (pureEventComputeWordProfile)
+        {
+            options.attributes["pure_event_compute_word_profile"] = *pureEventComputeWordProfile ? "1" : "0";
         }
 
         EmitGrhSimCpp emitter(&diag);
@@ -5008,6 +5013,7 @@ int main()
                                       false,
                                       false,
                                       false,
+                                      true,
                                       true))
         {
             return fail("full-active-word-consume activity-schedule pass failed");
@@ -5288,6 +5294,7 @@ int main()
                                       false,
                                       false,
                                       false,
+                                      true,
                                       true))
         {
             return fail("commit-cond-batch activity-schedule pass failed");
@@ -5313,7 +5320,8 @@ int main()
             return fail("commit-cond-batch should not fall back to legacy commit tables");
         }
         if (commitBatchSched.find("// Pure-event compute word: an event miss consumes the cleared word.") !=
-            std::string::npos)
+                std::string::npos ||
+            commitBatchHeader.find("kPureEventComputeWordEligibleCount = 0u") == std::string::npos)
         {
             return fail("commit words must not use the pure-event compute-word bypass");
         }
@@ -6437,7 +6445,9 @@ int main()
                                               PureEventWordFixtureMode mode,
                                               std::optional<bool> bypass,
                                               bool posedgeFullpass,
-                                              bool fullWordConsume) -> std::optional<std::filesystem::path>
+                                              bool fullWordConsume,
+                                              std::optional<bool> profile = std::nullopt)
+            -> std::optional<std::filesystem::path>
         {
             const std::filesystem::path dir = pureEventRoot.string() + "_" + std::string(suffix);
             std::filesystem::remove_all(dir);
@@ -6455,7 +6465,8 @@ int main()
                                           false,
                                           false,
                                           fullWordConsume,
-                                          bypass) ||
+                                          bypass,
+                                          profile) ||
                 !fixtureResult.success || fixtureDiag.hasError())
             {
                 return std::nullopt;
@@ -6478,27 +6489,50 @@ int main()
                                                               true,
                                                               false,
                                                               false);
+        const auto pureEventProfileDisabledDir = emitPureEventFixture("profile_disabled",
+                                                                      PureEventWordFixtureMode::kHomogeneous,
+                                                                      std::nullopt,
+                                                                      false,
+                                                                      false,
+                                                                      false);
+        const auto pureEventProfileOnlyDir = emitPureEventFixture("profile_only",
+                                                                  PureEventWordFixtureMode::kHomogeneous,
+                                                                  false,
+                                                                  false,
+                                                                  false,
+                                                                  true);
+        const auto pureEventProfileBypassDir = emitPureEventFixture("profile_bypass",
+                                                                    PureEventWordFixtureMode::kHomogeneous,
+                                                                    true,
+                                                                    false,
+                                                                    false,
+                                                                    true);
         const auto pureEventOnceDir = emitPureEventFixture("once",
                                                            PureEventWordFixtureMode::kOnceOnly,
                                                            true,
                                                            false,
-                                                           false);
+                                                           false,
+                                                           true);
         const auto pureEventMultiDir = emitPureEventFixture("multi",
                                                             PureEventWordFixtureMode::kMultiEvent,
                                                             true,
                                                             false,
-                                                            false);
+                                                            false,
+                                                            true);
         const auto pureEventFullpassDir = emitPureEventFixture("fullpass",
                                                                PureEventWordFixtureMode::kHomogeneous,
                                                                true,
                                                                true,
-                                                               false);
+                                                               false,
+                                                               true);
         const auto pureEventFullWordConsumeDir = emitPureEventFixture("full_word_consume",
                                                                       PureEventWordFixtureMode::kHomogeneous,
                                                                       true,
                                                                       false,
+                                                                      true,
                                                                       true);
         if (!pureEventDefaultDir || !pureEventDisabledDir || !pureEventEnabledDir || !pureEventOnceDir ||
+            !pureEventProfileDisabledDir || !pureEventProfileOnlyDir || !pureEventProfileBypassDir ||
             !pureEventMultiDir || !pureEventFullpassDir || !pureEventFullWordConsumeDir)
         {
             return fail("pure-event compute-word fixture emit failed");
@@ -6512,14 +6546,17 @@ int main()
         };
         const std::string pureEventDefaultSource = readPureEventGenerated(*pureEventDefaultDir);
         const std::string pureEventDisabledSource = readPureEventGenerated(*pureEventDisabledDir);
+        const std::string pureEventProfileDisabledSource =
+            readPureEventGenerated(*pureEventProfileDisabledDir);
         const std::string pureEventEnabledSched =
             readFiles(collectSchedFiles(*pureEventEnabledDir, "grhsim_top_sched_"));
         constexpr std::string_view pureEventMarker =
             "// Pure-event compute word: an event miss consumes the cleared word.";
         if (pureEventDefaultSource != pureEventDisabledSource ||
+            pureEventDefaultSource != pureEventProfileDisabledSource ||
             pureEventDefaultSource.find(pureEventMarker) != std::string::npos)
         {
-            return fail("pure-event compute-word default and explicit zero sources should be byte-identical");
+            return fail("pure-event compute-word default and explicit zero option sources should be byte-identical");
         }
         const std::size_t pureEventMarkerCount = countSubstring(pureEventEnabledSched, pureEventMarker);
         if (pureEventMarkerCount == 0)
@@ -6550,12 +6587,39 @@ int main()
             return fail("pure-event compute-word wrapper should retain inner exact-event guards");
         }
 
+        const std::string pureEventProfileOnlySource = readPureEventGenerated(*pureEventProfileOnlyDir);
+        const std::string pureEventProfileOnlySched =
+            readFiles(collectSchedFiles(*pureEventProfileOnlyDir, "grhsim_top_sched_"));
+        const std::string pureEventProfileBypassSource = readPureEventGenerated(*pureEventProfileBypassDir);
+        const std::string pureEventProfileBypassSched =
+            readFiles(collectSchedFiles(*pureEventProfileBypassDir, "grhsim_top_sched_"));
+        if (pureEventProfileOnlySource.find("kPureEventComputeWordEligibleCount = 2u") == std::string::npos ||
+            pureEventProfileOnlySource.find("pure_event_word_active_hit_by_batch_") == std::string::npos ||
+            pureEventProfileOnlySource.find("pure_event_word_active_miss_by_batch_") == std::string::npos ||
+            pureEventProfileOnlySched.find(pureEventMarker) != std::string::npos ||
+            countSubstring(pureEventProfileOnlySched, "++pure_event_word_active_hit_by_batch_[") != 2u ||
+            countSubstring(pureEventProfileOnlySched, "++pure_event_word_active_miss_by_batch_[") != 2u)
+        {
+            return fail("pure-event profile-only source should count two eligible words without bypass wrappers");
+        }
+        if (countSubstring(pureEventProfileBypassSched, pureEventMarker) != 2u ||
+            countSubstring(pureEventProfileBypassSched, "const bool grhsim_pure_event_word_hit_") != 2u ||
+            countSubstring(pureEventProfileBypassSched, "++pure_event_word_active_hit_by_batch_[") != 2u ||
+            pureEventProfileBypassSource.find("PureEventComputeWordProfile") == std::string::npos)
+        {
+            return fail("combined pure-event profile and bypass should share one hit temporary per eligible word");
+        }
+
         const std::string pureEventOnceSched =
             readFiles(collectSchedFiles(*pureEventOnceDir, "grhsim_top_sched_"));
         const std::string pureEventMultiSched =
             readFiles(collectSchedFiles(*pureEventMultiDir, "grhsim_top_sched_"));
         if (pureEventOnceSched.find(pureEventMarker) != std::string::npos ||
-            pureEventMultiSched.find(pureEventMarker) != std::string::npos)
+            pureEventMultiSched.find(pureEventMarker) != std::string::npos ||
+            readPureEventGenerated(*pureEventOnceDir).find("kPureEventComputeWordEligibleCount = 0u") ==
+                std::string::npos ||
+            readPureEventGenerated(*pureEventMultiDir).find("kPureEventComputeWordEligibleCount = 0u") ==
+                std::string::npos)
         {
             return fail("once-only and multi-event compute words must not use the pure-event bypass");
         }
@@ -6568,6 +6632,11 @@ int main()
 
         const std::string pureEventFullWordConsumeSched =
             readFiles(collectSchedFiles(*pureEventFullWordConsumeDir, "grhsim_top_sched_"));
+        if (readPureEventGenerated(*pureEventFullWordConsumeDir)
+                .find("kPureEventComputeWordEligibleCount = 0u") == std::string::npos)
+        {
+            return fail("full-active-word consume fixture should have zero profile-eligible words");
+        }
         constexpr std::string_view pureEventDispatchMarker =
             "constexpr std::uint8_t dispatchMask = UINT8_C(";
         bool sawPureEventFullWord = false;
@@ -6604,7 +6673,8 @@ int main()
             return fail("pure-event fixture should contain a complete active word");
         }
 
-        const auto runPureEventHarness = [&](const std::filesystem::path &dir) -> std::optional<std::string>
+        const auto runPureEventHarness = [&](const std::filesystem::path &dir,
+                                             bool expectProfile = false) -> std::optional<std::string>
         {
             const std::filesystem::path harnessPath = dir / "grhsim_top_harness.cpp";
             {
@@ -6622,6 +6692,10 @@ int main()
                 harness << "    sim.aux_clk = true;\n";
                 harness << "    sim.data = static_cast<std::uint8_t>(1);\n";
                 harness << "    sim.eval();\n";
+                if (expectProfile)
+                {
+                    harness << "    sim.set_runtime_profile_enabled(true);\n";
+                }
                 harness << "    sim.data = static_cast<std::uint8_t>(2);\n";
                 harness << "    sim.eval();\n";
                 harness << "    sim.clk = true;\n";
@@ -6632,6 +6706,14 @@ int main()
                 harness << "    sim.eval();\n";
                 harness << "    sim.clk = true;\n";
                 harness << "    sim.eval();\n";
+                if (expectProfile)
+                {
+                    harness << "    const auto profile = sim.pure_event_compute_word_profile();\n";
+                    harness << "    if (profile.eligibleWordCount != UINT64_C(2)) return 2;\n";
+                    harness << "    if (profile.activeHitCount != UINT64_C(4)) return 3;\n";
+                    harness << "    if (profile.activeMissCount != UINT64_C(6)) return 4;\n";
+                    harness << "    sim.dump_runtime_profile();\n";
+                }
                 harness << "    return sim.data_out == static_cast<std::uint8_t>(3) ? 0 : 1;\n";
                 harness << "}\n";
             }
@@ -6654,7 +6736,12 @@ int main()
                 return std::nullopt;
             }
             const std::filesystem::path log = dir / "grhsim_top_harness.log";
-            command = exe.string() + " > " + log.string() + " 2>&1";
+            const std::filesystem::path profileTsv = dir / "pure_event_word_profile.tsv";
+            std::filesystem::remove(profileTsv);
+            command = (expectProfile
+                           ? "WOLVRIX_GRHSIM_PURE_EVENT_WORD_TSV=" + profileTsv.string() + " "
+                           : std::string()) +
+                      exe.string() + " > " + log.string() + " 2>&1";
             if (std::system(command.c_str()) != 0)
             {
                 return std::nullopt;
@@ -6667,6 +6754,24 @@ int main()
             countSubstring(*pureEventEnabledLog, "pure-event=") != 32u)
         {
             return fail("pure-event compute-word hit/miss harness output mismatch");
+        }
+        const auto pureEventProfileOnlyLog = runPureEventHarness(*pureEventProfileOnlyDir, true);
+        const auto pureEventProfileBypassLog = runPureEventHarness(*pureEventProfileBypassDir, true);
+        const auto validatePureEventProfile = [&](const std::filesystem::path &dir,
+                                                  const std::optional<std::string> &log) {
+            if (!log || countSubstring(*log, "pure-event=") != 32u ||
+                log->find("eligible=2 hit=4 miss=6 total=10 miss_ratio=0.600000") == std::string::npos)
+            {
+                return false;
+            }
+            const std::string tsv = readFile(dir / "pure_event_word_profile.tsv");
+            return tsv.starts_with("batch_id\teligible_words\tactive_hit\tactive_miss\tactive_total\n") &&
+                   countSubstring(tsv, "\t1\t2\t3\t5\n") == 2u;
+        };
+        if (!validatePureEventProfile(*pureEventProfileOnlyDir, pureEventProfileOnlyLog) ||
+            !validatePureEventProfile(*pureEventProfileBypassDir, pureEventProfileBypassLog))
+        {
+            return fail("pure-event compute-word dynamic profile counts or TSV mismatch");
         }
 
         const std::filesystem::path systemTaskDir = std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) / "grhsim_cpp_systemtask";
