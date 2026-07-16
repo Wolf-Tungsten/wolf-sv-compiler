@@ -1698,10 +1698,10 @@ int main()
     }
 
     {
-        currentCase = "coarsen_respects_compute_supernode_op_limit";
+        currentCase = "coarsen_uses_expanded_merge_limit";
         wolvrix::lib::grh::Design design;
-        auto &graph = design.createGraph("coarsen_respects_compute_supernode_op_limit");
-        design.markAsTop("coarsen_respects_compute_supernode_op_limit");
+        auto &graph = design.createGraph("coarsen_uses_expanded_merge_limit");
+        design.markAsTop("coarsen_uses_expanded_merge_limit");
 
         const auto a = makeValue(graph, "a", 8);
         const auto b = makeValue(graph, "b", 8);
@@ -1709,8 +1709,8 @@ int main()
         graph.bindInputPort("b", b);
 
         std::vector<wolvrix::lib::grh::ValueId> leaves;
-        leaves.reserve(10);
-        for (int i = 0; i < 10; ++i)
+        leaves.reserve(100);
+        for (int i = 0; i < 100; ++i)
         {
             const auto result = makeValue(graph, "leaf_" + std::to_string(i), 8);
             const auto op = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
@@ -1738,7 +1738,7 @@ int main()
         PassManager manager;
         manager.options().session = &session;
         manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
-            .path = "coarsen_respects_compute_supernode_op_limit",
+            .path = "coarsen_uses_expanded_merge_limit",
             .maxOpInComputeSupernode = 3,
             .maxOpInComputeNode = 1,
             .enableCoarsen = true,
@@ -1748,20 +1748,30 @@ int main()
         const PassManagerResult runResult = manager.run(design, diags);
         if (!runResult.success || diags.hasError())
         {
-            return fail("Expected coarsen op-limit schedule to succeed");
+            return fail("Expected expanded-limit coarsen schedule to succeed");
         }
-        const auto schedule = loadSchedule(session, "coarsen_respects_compute_supernode_op_limit");
+        const auto schedule = loadSchedule(session, "coarsen_uses_expanded_merge_limit");
         if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
         {
             return rc;
         }
+        bool exceededDpLimit = false;
         for (uint32_t supernodeId = 0; supernodeId < schedule.supernodeToOps->size(); ++supernodeId)
         {
-            if ((*schedule.supernodeKinds)[supernodeId] == ActivityScheduleSupernodeKind::Compute &&
-                (*schedule.supernodeToOps)[supernodeId].size() > 3)
+            if ((*schedule.supernodeKinds)[supernodeId] != ActivityScheduleSupernodeKind::Compute)
             {
-                return fail("Expected coarsened compute supernodes to obey maxOpInComputeSupernode");
+                continue;
             }
+            const std::size_t opCount = (*schedule.supernodeToOps)[supernodeId].size();
+            exceededDpLimit = exceededDpLimit || opCount > 3;
+            if (opCount > 96)
+            {
+                return fail("Expected coarsen to stay within 32 times maxOpInComputeSupernode");
+            }
+        }
+        if (!exceededDpLimit)
+        {
+            return fail("Expected coarsen to preserve an oversized cluster after DP");
         }
     }
 
@@ -1854,6 +1864,163 @@ int main()
             if (supernodeOps.size() > 2)
             {
                 return fail("Expected split final compute supernodes to obey maxOpInComputeSupernode");
+            }
+        }
+    }
+
+    {
+        currentCase = "ordered external DPI instance group";
+        wolvrix::lib::grh::Design design;
+        auto &graph = design.createGraph("ordered_external_dpi_group");
+        design.markAsTop("ordered_external_dpi_group");
+
+        const auto x = makeValue(graph, "x", 8);
+        const auto y = makeValue(graph, "y", 8);
+        const auto clk = makeValue(graph, "clk", 1);
+        graph.bindInputPort("x", x);
+        graph.bindInputPort("y", y);
+        graph.bindInputPort("clk", clk);
+
+        const auto address = makeValue(graph, "address", 8);
+        const auto addressOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                     graph.internSymbol("address_op"));
+        graph.addOperand(addressOp, x);
+        graph.addResult(addressOp, address);
+
+        const auto data = makeValue(graph, "data", 8);
+        const auto dataOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kXor,
+                                                  graph.internSymbol("data_op"));
+        graph.addOperand(dataOp, x);
+        graph.addOperand(dataOp, y);
+        graph.addResult(dataOp, data);
+
+        const auto eventClock = makeValue(graph, "event_clock", 1);
+        const auto eventClockOp = graph.createOperation(wolvrix::lib::grh::OperationKind::kNot,
+                                                        graph.internSymbol("event_clock_op"));
+        graph.addOperand(eventClockOp, clk);
+        graph.addResult(eventClockOp, eventClock);
+
+        // Deliberately create the write first. The external ordinal contract must
+        // still place the read before the write in the materialized supernode.
+        const auto writeCall = graph.createOperation(wolvrix::lib::grh::OperationKind::kDpicCall,
+                                                     graph.internSymbol("ram_write"));
+        graph.addOperand(writeCall, address);
+        graph.addOperand(writeCall, data);
+        graph.addOperand(writeCall, eventClock);
+        graph.setAttr(writeCall, "eventEdge", std::vector<std::string>{"posedge"});
+        graph.setAttr(writeCall, "gsim.external_instance_group", std::string("ram0"));
+        graph.setAttr(writeCall, "gsim.external_call_ordinal", static_cast<int64_t>(1));
+
+        const auto readCall = graph.createOperation(wolvrix::lib::grh::OperationKind::kDpicCall,
+                                                    graph.internSymbol("ram_read"));
+        graph.addOperand(readCall, address);
+        graph.addOperand(readCall, eventClock);
+        const auto readResult = makeValue(graph, "read_result", 8);
+        graph.addResult(readCall, readResult);
+        graph.setAttr(readCall, "eventEdge", std::vector<std::string>{"posedge"});
+        graph.setAttr(readCall, "gsim.external_instance_group", std::string("ram0"));
+        graph.setAttr(readCall, "gsim.external_call_ordinal", static_cast<int64_t>(0));
+
+        // A returned call with no observable users is still an intrinsic effect.
+        const auto unusedCall = graph.createOperation(wolvrix::lib::grh::OperationKind::kDpicCall,
+                                                      graph.internSymbol("unused_effect_call"));
+        graph.addOperand(unusedCall, x);
+        const auto unusedResult = makeValue(graph, "unused_result", 8);
+        graph.addResult(unusedCall, unusedResult);
+
+        SessionStore session;
+        PassManager manager;
+        manager.options().session = &session;
+        manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
+            .path = "ordered_external_dpi_group",
+            .maxOpInComputeSupernode = 1,
+            .maxOpInComputeNode = 16,
+            .splitOversizeComputeNodeMaxOps = 1,
+            .enableCoarsen = false,
+            .splitOversizeComputeNodes = true,
+        }));
+        PassDiagnostics diags;
+        const PassManagerResult runResult = manager.run(design, diags);
+        if (!runResult.success || diags.hasError())
+        {
+            return fail("Expected ordered external DPI group schedule to succeed");
+        }
+        const auto schedule = loadSchedule(session, "ordered_external_dpi_group");
+        if (const int rc = validateCommonScheduleShape(graph, schedule); rc != 0)
+        {
+            return rc;
+        }
+
+        const uint32_t readSupernode = (*schedule.opToSupernode)[readCall.index - 1];
+        const uint32_t writeSupernode = (*schedule.opToSupernode)[writeCall.index - 1];
+        const uint32_t unusedSupernode = (*schedule.opToSupernode)[unusedCall.index - 1];
+        if (readSupernode == kInvalidActivitySupernodeId || readSupernode != writeSupernode)
+        {
+            return fail("Ordered external DPI calls were not materialized in one supernode");
+        }
+        if (unusedSupernode == kInvalidActivitySupernodeId)
+        {
+            return fail("Unused returned DPI call was not intrinsically materialized");
+        }
+        if (readSupernode >= schedule.computeNodesBySupernode->size() ||
+            (*schedule.computeNodesBySupernode)[readSupernode].size() != 1)
+        {
+            return fail("Ordered external DPI calls were not preserved as one compute node");
+        }
+
+        const auto &groupOps = (*schedule.supernodeToOps)[readSupernode];
+        const auto readIt = std::find(groupOps.begin(), groupOps.end(), readCall);
+        const auto writeIt = std::find(groupOps.begin(), groupOps.end(), writeCall);
+        if (readIt == groupOps.end() || writeIt == groupOps.end() || readIt >= writeIt)
+        {
+            return fail("Ordered external DPI calls did not follow external call ordinals");
+        }
+        for (const auto operand : {address, data, eventClock})
+        {
+            if (!hasFanoutTo(*schedule.valueFanout, operand, readSupernode))
+            {
+                return fail("Ordered external DPI operand did not activate its group supernode");
+            }
+        }
+    }
+
+    {
+        currentCase = "invalid ordered external DPI group attrs";
+        for (int scenario = 0; scenario < 3; ++scenario)
+        {
+            const std::string graphName = "invalid_external_dpi_group_" + std::to_string(scenario);
+            wolvrix::lib::grh::Design design;
+            auto &graph = design.createGraph(graphName);
+            design.markAsTop(graphName);
+
+            const auto call0 = graph.createOperation(wolvrix::lib::grh::OperationKind::kDpicCall,
+                                                     graph.internSymbol("call0"));
+            const auto call1 = graph.createOperation(wolvrix::lib::grh::OperationKind::kDpicCall,
+                                                     graph.internSymbol("call1"));
+            graph.setAttr(call0, "gsim.external_instance_group", std::string("bad_group"));
+            if (scenario != 2)
+            {
+                graph.setAttr(call0, "gsim.external_call_ordinal", static_cast<int64_t>(0));
+            }
+            if (scenario != 2)
+            {
+                graph.setAttr(call1, "gsim.external_instance_group", std::string("bad_group"));
+                graph.setAttr(call1,
+                              "gsim.external_call_ordinal",
+                              static_cast<int64_t>(scenario == 0 ? 0 : 2));
+            }
+
+            SessionStore session;
+            PassManager manager;
+            manager.options().session = &session;
+            manager.addPass(std::make_unique<ActivitySchedulePass>(ActivityScheduleOptions{
+                .path = graphName,
+            }));
+            PassDiagnostics diags;
+            const PassManagerResult runResult = manager.run(design, diags);
+            if (runResult.success || !diags.hasError())
+            {
+                return fail("Expected invalid ordered external DPI group attrs to fail closed");
             }
         }
     }
@@ -2094,7 +2261,7 @@ int main()
             .maxOpInComputeSupernode = 1,
             .maxOpInCommitSupernode = 1,
             .enableCoarsen = false,
-            .commitGuardEventBuckets = false,
+            .commitGuardEventBuckets = true,
         }));
         PassDiagnostics diags;
         const PassManagerResult runResult = manager.run(design, diags);
@@ -2183,6 +2350,7 @@ int main()
             .maxOpInComputeSupernode = 1,
             .maxOpInCommitSupernode = 1,
             .enableCoarsen = false,
+            .commitGuardEventBuckets = true,
         }));
         PassDiagnostics diags;
         const PassManagerResult runResult = manager.run(design, diags);
@@ -2198,20 +2366,35 @@ int main()
         const uint32_t write0Supernode = (*schedule.opToSupernode)[write0.index - 1];
         const uint32_t write1Supernode = (*schedule.opToSupernode)[write1.index - 1];
         const uint32_t write2Supernode = (*schedule.opToSupernode)[write2.index - 1];
-        if (write0Supernode != write2Supernode)
+        if (write0Supernode == write2Supernode)
         {
-            return fail("Expected oversized guard bucket to remain a single commit supernode");
+            return fail("Expected oversized regular guard bucket to split at the commit op cap");
         }
-        if (write0Supernode == write1Supernode)
+        if (write0Supernode == write1Supernode || write1Supernode == write2Supernode)
         {
-            return fail("Expected oversized guard bucket not to merge with following guard bucket");
+            return fail("Expected maxOpInCommitSupernode=1 to isolate every regular sink op");
         }
-        const auto &commitOps = (*schedule.supernodeToOps)[write0Supernode];
-        if (commitOps.size() != 2 ||
-            std::find(commitOps.begin(), commitOps.end(), write0) == commitOps.end() ||
-            std::find(commitOps.begin(), commitOps.end(), write2) == commitOps.end())
+        for (const auto [write, supernode] : {std::pair{write0, write0Supernode},
+                                             std::pair{write1, write1Supernode},
+                                             std::pair{write2, write2Supernode}})
         {
-            return fail("Expected oversized guard bucket supernode to contain exactly the same-guard writes");
+            const auto &commitOps = (*schedule.supernodeToOps)[supernode];
+            if (commitOps.size() != 1 || commitOps.front() != write)
+            {
+                return fail("Expected split guard bucket commit supernodes to respect the op cap");
+            }
+        }
+        const auto write0Topo = std::find(schedule.topoOrder->begin(),
+                                          schedule.topoOrder->end(),
+                                          write0Supernode);
+        const auto write2Topo = std::find(schedule.topoOrder->begin(),
+                                          schedule.topoOrder->end(),
+                                          write2Supernode);
+        if (write0Topo == schedule.topoOrder->end() ||
+            write2Topo == schedule.topoOrder->end() ||
+            write0Topo >= write2Topo)
+        {
+            return fail("Expected split guard bucket chunks to preserve sink order");
         }
     }
 

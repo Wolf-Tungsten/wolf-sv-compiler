@@ -2653,6 +2653,7 @@ namespace wolvrix::lib::emit
             std::unordered_map<std::string, StateShadowDecl> stateShadowBySymbol;
             std::unordered_map<OperationId, EventSampleDecl, OperationIdHash> eventSamplesByOp;
             std::unordered_map<ValueId, std::string, ValueIdHash> eventEdgeFieldByValue;
+            std::unordered_set<ValueId, ValueIdHash> initialEdgeEventValues;
             std::unordered_map<std::string, DpiImportDecl> dpiImportBySymbol;
             std::vector<WriteDecl> writes;
             std::vector<StateShadowDecl> stateShadows;
@@ -5125,8 +5126,14 @@ namespace wolvrix::lib::emit
             return model.eventEdgeFieldByValue.find(value) != model.eventEdgeFieldByValue.end();
         }
 
-        std::string eventClassifyExpr(std::string_view oldExpr, std::string_view newExpr)
+        std::string eventClassifyExpr(std::string_view oldExpr,
+                                      std::string_view newExpr,
+                                      bool allowInitialEdge = false)
         {
+            if (allowInitialEdge)
+            {
+                return "grhsim_classify_edge(" + std::string(oldExpr) + ", " + std::string(newExpr) + ")";
+            }
             return "event_baseline_initialized_ ? grhsim_classify_edge(" + std::string(oldExpr) + ", " +
                    std::string(newExpr) + ") : grhsim_event_edge_kind::none";
         }
@@ -5153,7 +5160,9 @@ namespace wolvrix::lib::emit
             if (const auto eventIt = model.eventEdgeFieldByValue.find(resultValue);
                 eventIt != model.eventEdgeFieldByValue.end())
             {
-                stream << indent << eventIt->second << " = " << eventClassifyExpr(oldExpr, newExpr) << ";\n";
+                const bool allowInitialEdge = model.initialEdgeEventValues.contains(resultValue);
+                stream << indent << eventIt->second << " = "
+                       << eventClassifyExpr(oldExpr, newExpr, allowInitialEdge) << ";\n";
             }
             emitChangedValuePropagation(stream, model, resultValue, indent, context);
         }
@@ -5171,7 +5180,9 @@ namespace wolvrix::lib::emit
             if (const auto eventIt = model.eventEdgeFieldByValue.find(resultValue);
                 eventIt != model.eventEdgeFieldByValue.end())
             {
-                stream << indent << eventIt->second << " = " << eventClassifyExpr(oldExpr, newExpr) << ";\n";
+                const bool allowInitialEdge = model.initialEdgeEventValues.contains(resultValue);
+                stream << indent << eventIt->second << " = "
+                       << eventClassifyExpr(oldExpr, newExpr, allowInitialEdge) << ";\n";
                 deferredContext = nullptr;
             }
             if (context != nullptr && context->suppressComputePropagation)
@@ -7024,6 +7035,7 @@ namespace wolvrix::lib::emit
             model.sameSupernodeStateReadSlotAliasCount = 0;
             model.sameSupernodeStateReadSlotAliasGroupCount = 0;
             model.eventEdgeFieldByValue.clear();
+            model.initialEdgeEventValues.clear();
             model.allEventValues.clear();
             model.inputEventValues.clear();
             std::size_t stateLogicStorageOffset = 0;
@@ -7556,6 +7568,18 @@ namespace wolvrix::lib::emit
                 EventSampleDecl samples;
                 samples.values = std::move(info.values);
                 samples.edges = std::move(info.edges);
+                if (op.kind() == OperationKind::kRegisterWritePort &&
+                    getAttribute<std::string>(op, "gsim.reset_kind").value_or(std::string()) == "async" &&
+                    samples.values.size() > 1)
+                {
+                    // The executable-GRH async-reset contract places the base clock first and
+                    // reset events after it.  An asserted reset on the first eval must still be
+                    // observed from the zero-initialized value/input baseline.
+                    for (std::size_t i = 1; i < samples.values.size(); ++i)
+                    {
+                        model.initialEdgeEventValues.insert(samples.values[i]);
+                    }
+                }
                 for (std::size_t i = 0; i < samples.values.size(); ++i)
                 {
                     const ValueId value = samples.values[i];
@@ -22666,7 +22690,8 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 {
                     *stream << "    " << model.eventEdgeFieldByValue.at(value) << " = "
                             << eventClassifyExpr(model.prevInputFieldByValue.at(value),
-                                                 model.inputFieldByValue.at(value))
+                                                 model.inputFieldByValue.at(value),
+                                                 model.initialEdgeEventValues.contains(value))
                             << ";\n";
                 }
             }
@@ -22685,7 +22710,8 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                     }
                     const std::string edgeExpr =
                         eventClassifyExpr(model.prevInputFieldByValue.at(value),
-                                          model.inputFieldByValue.at(value));
+                                          model.inputFieldByValue.at(value),
+                                          model.initialEdgeEventValues.contains(value));
                     if (edge == "posedge")
                     {
                         commitEventBlockConditions.push_back("((" + edgeExpr +
@@ -22742,7 +22768,8 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                     {
                         inputEventEdgeConditions.push_back("((" +
                                                             eventClassifyExpr(model.prevInputFieldByValue.at(value),
-                                                                              model.inputFieldByValue.at(value)) +
+                                                                              model.inputFieldByValue.at(value),
+                                                                              model.initialEdgeEventValues.contains(value)) +
                                                             ") != grhsim_event_edge_kind::none)");
                     }
                     if (!inputEventEdgeConditions.empty())

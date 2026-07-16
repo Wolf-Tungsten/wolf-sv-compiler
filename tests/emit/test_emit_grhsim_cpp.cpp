@@ -1286,6 +1286,18 @@ namespace
         ValueId one = addConstant(graph, "const_one", "one", 1, "1'b1");
         ValueId mask = addConstant(graph, "const_mask_ff", "mask_ff", 8, "8'hFF");
 
+        ValueId rstActive = makeLogicValue(graph, "rst_active", 1);
+        OperationId rstNot = graph.createOperation(OperationKind::kNot, graph.internSymbol("rst_active_not"));
+        graph.addOperand(rstNot, rstN);
+        graph.addResult(rstNot, rstActive);
+
+        ValueId seqNext = makeLogicValue(graph, "seq_next", 8);
+        OperationId seqMux = graph.createOperation(OperationKind::kMux, graph.internSymbol("seq_reset_mux"));
+        graph.addOperand(seqMux, rstActive);
+        graph.addOperand(seqMux, rstValue);
+        graph.addOperand(seqMux, seqD);
+        graph.addResult(seqMux, seqNext);
+
         OperationId seqReg = graph.createOperation(OperationKind::kRegister, graph.internSymbol("seq_reg"));
         graph.setAttr(seqReg, "width", static_cast<int64_t>(8));
         graph.setAttr(seqReg, "isSigned", false);
@@ -1300,20 +1312,13 @@ namespace
         OperationId seqClkWrite = graph.createOperation(OperationKind::kRegisterWritePort,
                                                         graph.internSymbol("seq_clk_write"));
         graph.addOperand(seqClkWrite, one);
-        graph.addOperand(seqClkWrite, seqD);
+        graph.addOperand(seqClkWrite, seqNext);
         graph.addOperand(seqClkWrite, mask);
         graph.addOperand(seqClkWrite, clk);
+        graph.addOperand(seqClkWrite, rstActive);
         graph.setAttr(seqClkWrite, "regSymbol", std::string("seq_reg"));
-        graph.setAttr(seqClkWrite, "eventEdge", std::vector<std::string>{"posedge"});
-
-        OperationId seqRstWrite = graph.createOperation(OperationKind::kRegisterWritePort,
-                                                        graph.internSymbol("seq_rst_write"));
-        graph.addOperand(seqRstWrite, one);
-        graph.addOperand(seqRstWrite, rstValue);
-        graph.addOperand(seqRstWrite, mask);
-        graph.addOperand(seqRstWrite, rstN);
-        graph.setAttr(seqRstWrite, "regSymbol", std::string("seq_reg"));
-        graph.setAttr(seqRstWrite, "eventEdge", std::vector<std::string>{"negedge"});
+        graph.setAttr(seqClkWrite, "eventEdge", std::vector<std::string>{"posedge", "posedge"});
+        graph.setAttr(seqClkWrite, "gsim.reset_kind", std::string("async"));
 
         OperationId conflictReg = graph.createOperation(OperationKind::kRegister, graph.internSymbol("conflict_reg"));
         graph.setAttr(conflictReg, "width", static_cast<int64_t>(8));
@@ -4497,7 +4502,7 @@ int main()
             harness << "    GrhSIM_top sim;\n";
             harness << "    sim.init();\n";
             harness << "    sim.clk = false;\n";
-            harness << "    sim.rst_n = true;\n";
+            harness << "    sim.rst_n = false;\n";
             harness << "    sim.seq_d = static_cast<std::uint8_t>(0x12);\n";
             harness << "    sim.rst_value = static_cast<std::uint8_t>(0x34);\n";
             harness << "    sim.write_a = static_cast<std::uint8_t>(0x55);\n";
@@ -4505,8 +4510,11 @@ int main()
             harness << "    sim.fire_a = false;\n";
             harness << "    sim.fire_b = false;\n";
             harness << "    sim.eval();\n";
-            harness << "    if (sim.seq_q != static_cast<std::uint8_t>(0x00)) return 1;\n";
+            harness << "    if (sim.seq_q != static_cast<std::uint8_t>(0x34)) return 1;\n";
             harness << "    if (sim.had_register_write_conflict()) return 2;\n";
+            harness << "    sim.rst_n = true;\n";
+            harness << "    sim.eval();\n";
+            harness << "    if (sim.seq_q != static_cast<std::uint8_t>(0x34)) return 10;\n";
             harness << "    sim.clk = true;\n";
             harness << "    sim.eval();\n";
             harness << "    if (sim.had_register_write_conflict()) return 3;\n";

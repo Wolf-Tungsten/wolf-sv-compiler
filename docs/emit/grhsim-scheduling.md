@@ -245,8 +245,10 @@ Commit node 由 sink-class op 形成。
 1. 收集所有 `ActivityOpClass::Sink` op。
 2. 为每个 sink-class op 计算 normalized event key。
 3. 如果开启 `commitGuardEventBuckets`，把 update guard 也纳入分桶 key。
-4. 每个 event/guard bucket 按 `maxOpInCommitSupernode` 切 chunk。
+4. 每个 event/guard bucket 按 `maxOpInCommitSupernode` 和不可拆分的 ordered-memory-write unit 切 chunk。
 5. 每个 chunk 形成一个 commit node。
+
+Commit node 在最终 DAG 中按 partition 创建顺序串联，确保同一个 bucket 被切分后仍保持原 sink 顺序。
 
 Commit node 的 `inputValues` 包括 sink-class op 写入需要的 value，例如条件、
 data、mask、地址、event 相关 value。后续 compute node 构造会从这些 input value
@@ -289,8 +291,8 @@ Materialize 阶段先创建初始 cluster：
 一个 compute node -> 一个 cluster
 ```
 
-然后在 compute-node cluster DAG 上做 coarsen。当前 coarsen 受
-`maxOpInComputeSupernode` 约束：两个 cluster 合并后的 op 数不能超过该值。
+然后在 compute-node cluster DAG 上做 coarsen。当前 coarsen 上限为
+`32 * maxOpInComputeSupernode`：两个 cluster 合并后的 op 数不能超过该值。
 
 Coarsen pipeline 每轮按以下 stage 执行：
 
@@ -541,9 +543,9 @@ result 变化产生。
 
 | 选项 | 语义 |
 | --- | --- |
-| `maxOpInComputeSupernode` | compute-node coarsen 和 DP 分段的 op 数上限；不是 emit 文件大小上限。 |
+| `maxOpInComputeSupernode` | DP 分段的 op 数上限，也是 plain coarsen 32 倍上限的基数；不是 emit 文件大小上限。 |
 | `maxOpInComputeNode` | 单个 compute node 吸收 op 的上限。 |
-| `maxOpInCommitSupernode` | 单个 commit node / commit supernode chunk 的 sink-class op 上限。 |
+| `maxOpInCommitSupernode` | 单个 commit node / commit supernode chunk 的目标 sink-class op 上限；为保持 memory-write priority，单个不可拆分 ordered-write unit 可以超过该值。 |
 | `enableCoarsen` | 是否执行 compute-node cluster coarsen。 |
 | `enableChainMerge` | 是否执行 `out1` / `in1`；`siblings` 仍属于 coarsen pipeline。 |
 | `commitGuardEventBuckets` | commit 分桶是否把 update guard 纳入 key。 |

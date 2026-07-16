@@ -38,7 +38,7 @@ schedule，并把结果写入 session。当前只保留 plain 调度路径；其
 | 选项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `-path` | 无 | 目标 graph / 实例路径，必填 |
-| `-max-op-in-compute-supernode` | `128` | compute-node cluster coarsen 和连续分段的 op 数上限 |
+| `-max-op-in-compute-supernode` | `128` | DP 连续分段的 op 数上限；plain coarsen 上限为该值的 32 倍 |
 | `-max-op-in-compute-node` | `8192` | 单个 compute node 吸收 op 的上限 |
 | `-max-op-in-commit-supernode` | `4096` | 单个 commit supernode 最多包含的 sink op 数 |
 | `-local-shared-compute-max-fanout` | `4` | local shared compute clone 的 fanout 上限 |
@@ -78,11 +78,12 @@ plain coarsen 每轮按以下顺序尝试合并：
 - `in1`：consumer 只有一个 compute predecessor
 - `siblings`：拥有相同 predecessor 集合的 sibling clusters
 
-所有合并都受 `max-op-in-compute-supernode` 约束，并在批量合并后重新做 topo check。
+所有合并都受 `32 * max-op-in-compute-supernode` 约束，并在批量合并后重新做 topo check。
 `out1` / `in1` 受 `enableChainMerge` 控制；`siblings` 属于 plain coarsen 基础路径。
 
 连续分段只决定 topo 序列中相邻 cluster 如何切成 compute supernode，不做任意 DAG
-partition。分段成本是：
+partition。除单个 coarsen cluster 已经超过 DP 上限外，segment 不超过
+`max-op-in-compute-supernode`；DP 不拆开 oversized cluster。分段成本是：
 
 ```text
 incoming_boundary_activation_edges + 1

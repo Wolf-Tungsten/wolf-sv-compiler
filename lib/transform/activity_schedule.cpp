@@ -30,6 +30,9 @@ namespace wolvrix::lib::transform
 
     namespace
     {
+        constexpr std::string_view kExternalInstanceGroupAttr = "gsim.external_instance_group";
+        constexpr std::string_view kExternalCallOrdinalAttr = "gsim.external_call_ordinal";
+
         std::optional<std::string> getAttrString(const wolvrix::lib::grh::Operation &op,
                                                  std::string_view key)
         {
@@ -709,9 +712,20 @@ namespace wolvrix::lib::transform
         }
 
 
+        constexpr std::size_t kComputeNodeCoarsenMaxOpsMultiplier = 32;
         constexpr std::size_t kComputeNodeCoarsenTailLargeClusterThreshold = 100000;
         constexpr std::size_t kComputeNodeCoarsenTailMaxClusterDeltaExclusive = 1024;
         constexpr std::size_t kComputeNodeCoarsenTailMaxConsecutiveIters = 3;
+
+        std::size_t scaledCoarsenMaxOps(std::size_t maxOps) noexcept
+        {
+            const std::size_t unlimited = std::numeric_limits<std::size_t>::max();
+            if (maxOps == 0 || maxOps > unlimited / kComputeNodeCoarsenMaxOpsMultiplier)
+            {
+                return unlimited;
+            }
+            return maxOps * kComputeNodeCoarsenMaxOpsMultiplier;
+        }
 
         std::uint64_t elapsedMs(const std::chrono::steady_clock::time_point &start) noexcept
         {
@@ -1019,6 +1033,72 @@ namespace wolvrix::lib::transform
             return true;
         }
 
+        struct ExternalCallGroup
+        {
+            std::string group;
+            std::vector<wolvrix::lib::grh::OperationId> calls;
+        };
+
+        bool collectExternalCallGroups(const wolvrix::lib::grh::Graph &graph,
+                                       std::vector<ExternalCallGroup> &out,
+                                       std::string &error)
+        {
+            struct GroupBuild
+            {
+                std::map<int64_t, wolvrix::lib::grh::OperationId> callsByOrdinal;
+            };
+
+            out.clear();
+            std::map<std::string, GroupBuild> groups;
+            for (const auto opId : graph.operations())
+            {
+                const auto op = graph.getOperation(opId);
+                const auto groupAttr = op.attr(kExternalInstanceGroupAttr);
+                const auto ordinalAttr = op.attr(kExternalCallOrdinalAttr);
+                if (!groupAttr && !ordinalAttr)
+                {
+                    continue;
+                }
+
+                const auto *group = groupAttr ? std::get_if<std::string>(&*groupAttr) : nullptr;
+                const auto *ordinal = ordinalAttr ? std::get_if<int64_t>(&*ordinalAttr) : nullptr;
+                if (op.kind() != wolvrix::lib::grh::OperationKind::kDpicCall ||
+                    group == nullptr || group->empty() || ordinal == nullptr || *ordinal < 0)
+                {
+                    error = "activity-schedule invalid ordered external call attrs: " +
+                            describeOp(graph, opId);
+                    return false;
+                }
+
+                auto &callsByOrdinal = groups[*group].callsByOrdinal;
+                if (!callsByOrdinal.emplace(*ordinal, opId).second)
+                {
+                    error = "activity-schedule duplicate ordered external call ordinal: " + *group;
+                    return false;
+                }
+            }
+
+            out.reserve(groups.size());
+            for (const auto &[group, build] : groups)
+            {
+                int64_t expected = 0;
+                ExternalCallGroup collected;
+                collected.group = group;
+                collected.calls.reserve(build.callsByOrdinal.size());
+                for (const auto &[ordinal, opId] : build.callsByOrdinal)
+                {
+                    if (ordinal != expected++)
+                    {
+                        error = "activity-schedule non-contiguous ordered external call ordinals: " + group;
+                        return false;
+                    }
+                    collected.calls.push_back(opId);
+                }
+                out.push_back(std::move(collected));
+            }
+            return true;
+        }
+
         void orderMemoryWritePriorityGroups(const wolvrix::lib::grh::Graph &graph,
                                             const ActivityOpData &opData,
                                             std::vector<uint32_t> &positions)
@@ -1231,6 +1311,33 @@ namespace wolvrix::lib::transform
                         partition.clusters.push_back(std::move(positions));
                         positions = {};
                     };
+                    auto appendOversizeGuardBucket = [&](const std::vector<uint32_t> &guardPositions)
+                    {
+                        std::vector<uint32_t> chunk;
+                        for (auto &unit : buildAtomicSinkUnits(graph, opData, guardPositions))
+                        {
+                            if (unit.size() > mergeLimit)
+                            {
+                                if (!chunk.empty())
+                                {
+                                    partition.clusters.push_back(std::move(chunk));
+                                    chunk = {};
+                                }
+                                partition.clusters.push_back(std::move(unit));
+                                continue;
+                            }
+                            if (!chunk.empty() && chunk.size() + unit.size() > mergeLimit)
+                            {
+                                partition.clusters.push_back(std::move(chunk));
+                                chunk = {};
+                            }
+                            chunk.insert(chunk.end(), unit.begin(), unit.end());
+                        }
+                        if (!chunk.empty())
+                        {
+                            partition.clusters.push_back(std::move(chunk));
+                        }
+                    };
                     for (const auto &guardKey : eventBuckets.guardOrder)
                     {
                         const auto guardIt = eventBuckets.positionsByGuard.find(guardKey);
@@ -1247,7 +1354,7 @@ namespace wolvrix::lib::transform
                         if (guardPositions.size() > mergeLimit)
                         {
                             flushPositions();
-                            partition.clusters.emplace_back(guardPositions.begin(), guardPositions.end());
+                            appendOversizeGuardBucket(guardPositions);
                             continue;
                         }
                         if (!positions.empty() && positions.size() + guardPositions.size() > mergeLimit)
@@ -1368,6 +1475,7 @@ namespace wolvrix::lib::transform
             bool commonExpr = false;
             bool indivisible = false;
             std::string intentGroup;
+            std::string externalCallGroup;
         };
 
         struct CommitNode
@@ -1435,6 +1543,10 @@ namespace wolvrix::lib::transform
                 if (rewrite.computeNodes[computeNodeId].indivisible)
                 {
                     oss << ":indivisible";
+                }
+                if (!rewrite.computeNodes[computeNodeId].externalCallGroup.empty())
+                {
+                    oss << ":external=" << rewrite.computeNodes[computeNodeId].externalCallGroup;
                 }
             }
                 }
@@ -1830,7 +1942,8 @@ namespace wolvrix::lib::transform
 
         bool opHasSideEffects(const wolvrix::lib::grh::Operation &op)
         {
-            return getAttrValue<bool>(op, "hasSideEffects").value_or(false);
+            return op.kind() == wolvrix::lib::grh::OperationKind::kDpicCall ||
+                   getAttrValue<bool>(op, "hasSideEffects").value_or(false);
         }
 
         std::optional<uint64_t> parseSimpleConstUInt64(std::string_view literal)
@@ -2393,7 +2506,54 @@ namespace wolvrix::lib::transform
                 return nodeId;
             }
 
-            bool processIntentGroupNode(uint32_t nodeId)
+            std::optional<uint32_t> createExternalCallGroupNode(
+                std::string group,
+                std::vector<wolvrix::lib::grh::OperationId> calls)
+            {
+                calls = uniqueOpsPreservingOrder(calls);
+                if (group.empty() || calls.empty())
+                {
+                    return std::nullopt;
+                }
+                for (const auto opId : calls)
+                {
+                    if (!opId.valid())
+                    {
+                        continue;
+                    }
+                    ensureOpCapacity(opId);
+                    const uint32_t existingOwner = build_.computeNodeOfOp[opId.index];
+                    if (existingOwner != kInvalidActivitySupernodeId)
+                    {
+                        if (existingOwner < build_.computeNodes.size() &&
+                            build_.computeNodes[existingOwner].externalCallGroup == group)
+                        {
+                            continue;
+                        }
+                        error_ = "activity-schedule ordered external call group overlaps existing compute node group=" +
+                                 group + " op=" + describeOp(graph_, opId);
+                        return std::nullopt;
+                    }
+                }
+
+                const uint32_t nodeId = newNode(false);
+                auto &node = build_.computeNodes[nodeId];
+                node.indivisible = true;
+                node.externalCallGroup = std::move(group);
+                for (const auto opId : calls)
+                {
+                    if (!opId.valid())
+                    {
+                        continue;
+                    }
+                    ensureOpCapacity(opId);
+                    node.ops.push_back(opId);
+                    build_.computeNodeOfOp[opId.index] = nodeId;
+                }
+                return nodeId;
+            }
+
+            bool processIndivisibleGroupNode(uint32_t nodeId)
             {
                 if (nodeId >= build_.computeNodes.size())
                 {
@@ -3475,6 +3635,11 @@ namespace wolvrix::lib::transform
                     nextNodes.push_back(node);
                     continue;
                 }
+                if (node.indivisible)
+                {
+                    ++build.stats.computeNodeDeclaredCutViolationsFatal;
+                    return false;
+                }
 
                 std::vector<wolvrix::lib::grh::OperationId> orderedOps = node.ops;
                 std::sort(orderedOps.begin(), orderedOps.end(), [&](const auto lhs, const auto rhs) {
@@ -3563,6 +3728,10 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
+                if (build.computeNodes[nodeId].indivisible)
+                {
+                    continue;
+                }
                 if (splitNode[nodeId] == 0U)
                 {
                     splitNode[nodeId] = 1U;
@@ -3582,10 +3751,7 @@ namespace wolvrix::lib::transform
                 const auto &node = build.computeNodes[nodeId];
                 if (splitNode[nodeId] == 0U)
                 {
-                    ComputeNode copy;
-                    copy.ops = node.ops;
-                    copy.commonExpr = node.commonExpr;
-                    nextNodes.push_back(std::move(copy));
+                    nextNodes.push_back(node);
                     continue;
                 }
                 std::vector<wolvrix::lib::grh::OperationId> orderedOps = node.ops;
@@ -4751,6 +4917,38 @@ namespace wolvrix::lib::transform
                 }
             }
 
+            std::map<std::string, std::vector<std::pair<int64_t, wolvrix::lib::grh::OperationId>>>
+                orderedExternalCalls;
+            for (const auto opId : uniqueOps)
+            {
+                const auto op = graph.getOperation(opId);
+                if (op.kind() != wolvrix::lib::grh::OperationKind::kDpicCall)
+                {
+                    continue;
+                }
+                const auto group = getAttrString(op, kExternalInstanceGroupAttr);
+                const auto ordinal = getAttrValue<int64_t>(op, kExternalCallOrdinalAttr);
+                if (group && ordinal)
+                {
+                    orderedExternalCalls[*group].emplace_back(*ordinal, opId);
+                }
+            }
+            for (auto &[group, calls] : orderedExternalCalls)
+            {
+                (void)group;
+                std::sort(calls.begin(), calls.end(), [](const auto &lhs, const auto &rhs) {
+                    if (lhs.first != rhs.first)
+                    {
+                        return lhs.first < rhs.first;
+                    }
+                    return lhs.second.index < rhs.second.index;
+                });
+                for (std::size_t index = 1; index < calls.size(); ++index)
+                {
+                    dag.addEdge(calls[index - 1].second, calls[index].second);
+                }
+            }
+
             try
             {
                 const auto layers = dag.toposort();
@@ -4817,7 +5015,26 @@ namespace wolvrix::lib::transform
                 return false;
             }
 
-            std::vector<uint32_t> intentNodeIds;
+            std::vector<ExternalCallGroup> externalCallGroups;
+            if (!collectExternalCallGroups(graph, externalCallGroups, error))
+            {
+                return false;
+            }
+
+            std::vector<uint32_t> indivisibleNodeIds;
+            for (auto &externalGroup : externalCallGroups)
+            {
+                auto nodeId = builder.createExternalCallGroupNode(std::move(externalGroup.group),
+                                                                  std::move(externalGroup.calls));
+                if (!error.empty())
+                {
+                    return false;
+                }
+                if (nodeId)
+                {
+                    indivisibleNodeIds.push_back(*nodeId);
+                }
+            }
             for (auto &intentGroup : collectRegToMemIntentComputeGroups(graph, opClasses))
             {
                 auto nodeId = builder.createIntentGroupNode(std::move(intentGroup.group), std::move(intentGroup.ops));
@@ -4827,12 +5044,12 @@ namespace wolvrix::lib::transform
                 }
                 if (nodeId)
                 {
-                    intentNodeIds.push_back(*nodeId);
+                    indivisibleNodeIds.push_back(*nodeId);
                 }
             }
-            for (uint32_t nodeId : intentNodeIds)
+            for (uint32_t nodeId : indivisibleNodeIds)
             {
-                if (!builder.processIntentGroupNode(nodeId))
+                if (!builder.processIndivisibleGroupNode(nodeId))
                 {
                     return false;
                 }
@@ -4971,7 +5188,8 @@ namespace wolvrix::lib::transform
                 {
                     continue;
                 }
-                if (!graph.opResults(opId).empty())
+                if (graph.opKind(opId) != wolvrix::lib::grh::OperationKind::kDpicCall &&
+                    !graph.opResults(opId).empty())
                 {
                     continue;
                 }
@@ -5353,9 +5571,7 @@ namespace wolvrix::lib::transform
             const auto coarsenStart = std::chrono::steady_clock::now();
             if (options.enableCoarsen)
             {
-                const std::size_t coarsenMaxOps =
-                    maxOpsPerComputeSupernode == 0 ? std::numeric_limits<std::size_t>::max()
-                                                   : maxOpsPerComputeSupernode;
+                const std::size_t coarsenMaxOps = scaledCoarsenMaxOps(maxOpsPerComputeSupernode);
                 bool changed = true;
                 std::size_t tailIterations = 0;
                 while (changed)
@@ -5579,8 +5795,10 @@ namespace wolvrix::lib::transform
                     {
                         continue;
                     }
-                    const auto &nodeOps = rewrite.computeNodes[computeNodeId].ops;
+                    const auto &computeNode = rewrite.computeNodes[computeNodeId];
+                    const auto &nodeOps = computeNode.ops;
                     if (options.splitOversizeComputeNodes &&
+                        !computeNode.indivisible &&
                         maxOpsPerSplitComputeNode != 0 &&
                         nodeOps.size() > maxOpsPerSplitComputeNode)
                     {
@@ -5786,6 +6004,16 @@ namespace wolvrix::lib::transform
                     }
                 }
             }
+            for (uint32_t commitId = 1; commitId < rewrite.commitNodes.size(); ++commitId)
+            {
+                const uint32_t from = commitBase + commitId - 1;
+                const uint32_t to = commitBase + commitId;
+                const uint64_t packed = (static_cast<uint64_t>(from) << 32) | to;
+                if (seenEdges.insert(packed).second)
+                {
+                    build.dag[from].push_back(to);
+                }
+            }
             for (auto &succs : build.dag)
             {
                 std::sort(succs.begin(), succs.end());
@@ -5875,7 +6103,6 @@ namespace wolvrix::lib::transform
             {
                 perf->finalTopoMs = elapsedMs(finalTopoStart);
             }
-            (void)commitBase;
             return true;
         }
 
@@ -6169,6 +6396,7 @@ namespace wolvrix::lib::transform
         logInfo("activity-schedule compute-node coarsen detail: enabled=" +
                 std::string(options_.enableCoarsen ? "true" : "false") +
                 " chain_merge=" + std::string(options_.enableChainMerge ? "true" : "false") +
+                " max_ops=" + std::to_string(scaledCoarsenMaxOps(options_.maxOpInComputeSupernode)) +
                 " iterations=" + std::to_string(materializePerf.coarsenIterations) +
                 " out1_merges=" + std::to_string(materializePerf.coarsenOut1Merges) +
                 " in1_merges=" + std::to_string(materializePerf.coarsenIn1Merges) +
