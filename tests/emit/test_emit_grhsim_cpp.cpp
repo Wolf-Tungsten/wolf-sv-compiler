@@ -3221,9 +3221,68 @@ int main()
         eval.find("Run compute-phase batches in direct schedule order") == std::string::npos ||
         eval.find("this->eval_compute_batch_0();") == std::string::npos ||
         eval.find("this->eval_commit_batch_") == std::string::npos ||
-        eval.find("pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);") == std::string::npos)
+        eval.find("Forward-activation validation proved ") == std::string::npos ||
+        eval.find("pending_eval_round = commit_activated_readers_;") == std::string::npos ||
+        eval.find("pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);") != std::string::npos)
     {
         return fail("Missing compute/commit fixed-point eval loop");
+    }
+    {
+        Design fallbackDesign = design.clone();
+        SessionStore fallbackSession;
+        ActivityScheduleOptions fallbackScheduleOptions;
+        fallbackScheduleOptions.path = "top";
+        fallbackScheduleOptions.enableCoarsen = false;
+        fallbackScheduleOptions.maxOpInComputeSupernode = 1;
+        if (!runActivitySchedule(fallbackDesign, fallbackSession, fallbackScheduleOptions))
+        {
+            return fail("Forward-activation fallback activity-schedule pass failed");
+        }
+        const auto topoIt = fallbackSession.find("top.activity_schedule.topo_order");
+        auto *topoSlot = topoIt == fallbackSession.end()
+                             ? nullptr
+                             : dynamic_cast<SessionSlotValue<ActivityScheduleTopoOrder> *>(topoIt->second.get());
+        if (topoSlot == nullptr || topoSlot->value.size() < 2)
+        {
+            return fail("Missing activity-schedule topo order for forward-activation fallback coverage");
+        }
+        EmitOptions validationOptions = options;
+        validationOptions.session = &fallbackSession;
+        const std::filesystem::path provenDir = outDir / "forward_activation_proven";
+        validationOptions.outputDir = provenDir.string();
+        EmitDiagnostics provenDiag;
+        EmitGrhSimCpp provenEmitter(&provenDiag);
+        const EmitResult provenResult = provenEmitter.emit(fallbackDesign, validationOptions);
+        if (!provenResult.success || provenDiag.hasError())
+        {
+            return fail("Forward-activation nonempty proof emit failed");
+        }
+        const std::string provenEval = readFile(provenDir / "grhsim_top_eval.cpp");
+        if (provenEval.find("Forward-activation validation proved 0 compute edges") != std::string::npos ||
+            provenEval.find("Forward-activation validation proved ") == std::string::npos ||
+            provenEval.find("pending_eval_round = commit_activated_readers_;") == std::string::npos ||
+            provenEval.find("grhsim_any_active_flags(supernode_active_curr_)") != std::string::npos)
+        {
+            return fail("Nonempty forward compute activation should omit the active-bitset probe");
+        }
+
+        std::reverse(topoSlot->value.begin(), topoSlot->value.end());
+        const std::filesystem::path fallbackDir = outDir / "forward_activation_fallback";
+        validationOptions.outputDir = fallbackDir.string();
+        EmitDiagnostics fallbackDiag;
+        EmitGrhSimCpp fallbackEmitter(&fallbackDiag);
+        const EmitResult fallbackResult = fallbackEmitter.emit(fallbackDesign, validationOptions);
+        if (!fallbackResult.success || fallbackDiag.hasError())
+        {
+            return fail("Forward-activation validation fallback emit failed");
+        }
+        const std::string fallbackEval = readFile(fallbackDir / "grhsim_top_eval.cpp");
+        if (fallbackEval.find("Forward-activation validation fallback: ") == std::string::npos ||
+            fallbackEval.find("pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);") ==
+                std::string::npos)
+        {
+            return fail("Unproven compute activation should retain the active-bitset fixed-point probe");
+        }
     }
     if (header.find("trace_eval_enabled_") != std::string::npos ||
         state.find("GRHSIM_TRACE_EVAL") != std::string::npos ||
@@ -5196,7 +5255,8 @@ int main()
             gatedEvalText.find("Run compute-phase batches in direct schedule order") == std::string::npos ||
             gatedEvalText.find("this->eval_compute_batch_0();") == std::string::npos ||
             gatedEvalText.find("this->eval_commit_batch_") == std::string::npos ||
-            gatedEvalText.find("pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);") == std::string::npos)
+            gatedEvalText.find("pending_eval_round = commit_activated_readers_;") == std::string::npos ||
+            gatedEvalText.find("pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);") != std::string::npos)
         {
             return fail("gated-clock eval should iterate until compute/commit reaches a fixed point");
         }
@@ -6638,6 +6698,7 @@ int main()
             perfEval.find("trace_this_eval") == std::string::npos ||
             perfEval.find("++perf_counters_.computeBatchExecCount;") == std::string::npos ||
             perfEval.find("++perf_counters_.commitBatchExecCount;") == std::string::npos ||
+            perfEval.find("pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);") == std::string::npos ||
             perfEval.find("#include <chrono>") == std::string::npos ||
             perfEval.find("if (((supernode_active_curr_[") != std::string::npos)
         {

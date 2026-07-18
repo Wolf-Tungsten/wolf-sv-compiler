@@ -18,8 +18,9 @@
 
 `source-class op` 只是 `activity-schedule` 的内部分类名。它当前包含
 `kConstant`、`kRegisterReadPort`、`kLatchReadPort`、`kMemoryReadPort`。
-其中 `kMemoryReadPort` 有地址、使能等 operand；这些 operand 仍然是依赖，
-仍然会被 compute node builder 处理。也就是说：
+其中当前规范化 GRH 的 `kMemoryReadPort` 有地址 operand；该 operand 仍然是依赖，
+仍然会被 compute node builder 处理。同步、使能和事件条件由外围逻辑或状态写入表达。
+也就是说：
 
 ```text
 kMemoryReadPort 属于 ActivityOpClass::Source
@@ -43,22 +44,33 @@ kMemoryReadPort 属于 ActivityOpClass::Source
   开始前清零，然后只由 commit/writeback 代码在“visible state 实际变化且存在
   reader compute supernode”时重新置 true。
 
-compute batch 和 commit batch 都是生成出来的 C++ 方法。每个 round 按生成顺序调用
-所有 compute batch，然后按生成顺序调用所有 commit batch；具体 body 是否执行由
-batch 内部判断：
+compute batch 和 commit batch 都是生成出来的 C++ 方法。在默认的 generic fixed-point
+路径中，每个 round 按生成顺序调用所有 compute batch，然后按生成顺序调用所有 commit
+batch；具体 body 是否执行由 batch 内部判断：
 
 - compute batch 读取并消费 `supernode_active_curr_`，只执行 active bit 置位的
   compute supernode。
 - commit batch 不用 `supernode_active_curr_` 决定是否扫描 commit supernode；它由
   event expression / update guard 决定具体 sink op 是否执行。
 
-round 末尾用以下表达式更新 `pending_eval_round`：
+Emitter 会先校验实际生成的 compute boundary activation 是否都严格指向更大的 topo
+active id。校验通过且未启用 perf 统计时，compute 在本轮一定可以排空，因此 round
+末尾只需检查 commit 是否激活了 reader：
+
+```cpp
+pending_eval_round = commit_activated_readers_;
+```
+
+启用 perf 统计或校验无法证明严格前向时，保守路径仍使用：
 
 ```cpp
 pending_eval_round =
     commit_activated_readers_ ||
     grhsim_any_active_flags(supernode_active_curr_);
 ```
+
+Emitter 还有两个默认关闭的 full-pass specialization。它们命中时会绕过这个 generic
+round 循环并提前返回，详见“Runtime eval”一节。
 
 ## 基本对象
 
@@ -102,7 +114,8 @@ supernode。
 - `ops`：该 node 内的 source-class op 和 compute op。
 - `boundaryInputs`：该 node 读取、但不由该 node 内部 op 产生的 value。
 - `commonExpr`：共享表达式 owner 标记。
-- `indivisible` / `intentGroup`：保护特定语义形态，例如 reg-to-mem intent。
+- `indivisible` / `intentGroup` / `externalCallGroup`：保护 reg-to-mem intent 或 ordered
+  external DPIC call 等不可拆分语义形态。
 
 Builder 会从 root value 反向追依赖，尽量把局部组合 producer 吸收到当前
 compute node。以下情况会停止吸收，并把 operand 记为 boundary input：
@@ -132,8 +145,8 @@ Supernode 是最终导出给 emitter 的静态执行单元。
 
 | Supernode 类型 | 来源 | 运行时语义 |
 | --- | --- | --- |
-| Compute supernode | 一个或多个 compute node 展开后形成 | batch 每轮被调用；supernode body 只有对应 active bit 置位时才执行。 |
-| Commit supernode | 一个 commit node 形成 | batch 每轮被调用；sink op 是否执行由 event expression / update guard 决定。 |
+| Compute supernode | 一个或多个 compute node 展开后形成 | generic round 调用所属 batch；supernode body 只有对应 active bit 置位时才执行。 |
+| Commit supernode | 一个 commit node 形成 | generic round 调用所属 batch；sink op 是否执行由 event expression / update guard 决定。 |
 
 最终 supernode 不混合 compute 和 commit。Emitter 会检查这个不变量。
 
@@ -146,8 +159,9 @@ compute supernode A 产生 value v
 compute supernode B 读取 value v
 ```
 
-此时 `v` 对 B 是 boundary value。运行时如果 `v` 的缓存值实际变化，才需要激活
-读取它的 compute supernode。
+此时 `v` 对 B 是 boundary value。普通 tracked assignment 在 `v` 的缓存值实际变化时
+激活读取它的 compute supernode；少数 emitter 专用 lowering 会保守激活同一 fanout，
+允许多执行但不能漏执行。
 
 Activation edge 是“value 变化激活目标 compute supernode”的关系：
 
@@ -167,7 +181,8 @@ compute supernode 是否待执行，不表示 commit supernode 是否待执行�
 
 - 第一次 `eval()` 激活所有 compute supernode。
 - 外部输入变化激活读取该输入的 compute supernode。
-- compute result value 实际变化激活读取该 boundary value 的 compute supernode。
+- 普通 compute result 实际变化激活读取该 boundary value 的 compute supernode；
+  direct wide concat 和 packed-array lane base/assign 可保守激活。
 - commit phase 写变 visible state 后激活读取该 state 的 compute supernode。
 
 compute batch 会消费并清掉命中的 bit。commit batch 的扫描条件不使用这个 bit。
@@ -233,8 +248,9 @@ compute 用户改读 clone result。非 compute 用户不改写：
 compute node，或单独建立 owner compute node。它不改变 source-class op 自身的
 operand 依赖。
 
-对 `kMemoryReadPort`，clone 后仍然有地址、使能等 operand；这些 operand 随后仍按
-普通依赖处理。如果发生 clone，pass 会重新 `freeze()` 并重建 topo / classification。
+对 `kMemoryReadPort`，clone 后仍然保留地址 operand；该 operand 随后仍按普通依赖处理。
+同步、使能和事件条件不作为 memory read port 的额外 operand。如果发生 clone，pass 会
+重新 `freeze()` 并重建 topo / classification。
 
 ### 3. 构造 commit node
 
@@ -244,11 +260,20 @@ Commit node 由 sink-class op 形成。
 
 1. 收集所有 `ActivityOpClass::Sink` op。
 2. 为每个 sink-class op 计算 normalized event key。
-3. 如果开启 `commitGuardEventBuckets`，把 update guard 也纳入分桶 key。
-4. 每个 event/guard bucket 按 `maxOpInCommitSupernode` 和不可拆分的 ordered-memory-write unit 切 chunk。
-5. 每个 chunk 形成一个 commit node。
+3. 关闭 `commitGuardEventBuckets` 时，按 event 分组，再按
+   `maxOpInCommitSupernode` 和不可拆分的 ordered-memory-write unit 切 chunk。
+4. 开启该选项时，在每个 event 内再按 update guard 分桶；多个完整 guard bucket 会按
+   原顺序合并装入同一个 cluster，直到 `min(maxOpInCommitSupernode, 4096)`。
+5. 只有超过该 merge limit 的 guard bucket 才按 atomic unit 分片；单个 oversize
+   ordered unit 仍保持完整。每个最终 cluster 形成一个 commit node。
 
-Commit node 在最终 DAG 中按 partition 创建顺序串联，确保同一个 bucket 被切分后仍保持原 sink 顺序。
+所有 commit node 在最终 DAG 中按创建顺序串成一条链，不只串联同一个 bucket 的 chunk。
+这样既保留 bucket 切分后的 sink 顺序，也让不同 bucket 的最终执行顺序确定。
+
+Ordered memory write 使用成对的 `memoryWrite.priorityGroup` / `memoryWrite.priority`，且
+只能标在 `kMemoryWritePort` 上。group 必须非空；同组 write 必须指向同一 memory、具有
+相同 normalized event，priority 必须非负、唯一并从 0 连续。pass 按 priority 降序排列
+同组 write，所以 priority 0 最后执行并具有最高覆盖优先级；整个 group 是不可拆分 unit。
 
 Commit node 的 `inputValues` 包括 sink-class op 写入需要的 value，例如条件、
 data、mask、地址、event 相关 value。后续 compute node 构造会从这些 input value
@@ -262,6 +287,11 @@ Compute node builder 的 root 包括：
 - graph output port value。
 - inout port 的 output/oe value。
 - 没有 result 的 compute op，例如部分 side-effect op。
+
+`gsim.external_instance_group` 和 `gsim.external_call_ordinal` 必须成对出现，只能用于
+`kDpicCall`；group 不能为空，ordinal 必须非负并从 0 连续且唯一。同组 call 被放入一个
+indivisible compute node，local op topo 还会按 ordinal 加顺序边。因此 ordered external
+call group 不会被普通 producer 吸收或分割后打乱。
 
 处理某个 operand 时，builder 看该 operand 的 defining op：
 
@@ -316,19 +346,19 @@ partition；它只决定 topo 序列中相邻 cluster 如何切成 compute super
 
 约束：
 
-- 一个 segment 的 op 数不超过 `maxOpInComputeSupernode`。
+- 普通 segment 的 op 数不超过 `maxOpInComputeSupernode`。
 - 如果单个 cluster 已经超过上限，DP 不会把它和其他 cluster 合并。
 
 目标函数：
 
 ```text
-cost(segment) = incoming_boundary_activation_edges + 1
+cost(segment) = incoming_distinct_boundary_values + 1
 ```
 
 含义：
 
-- `incoming_boundary_activation_edges`：segment 读取、但 producer 不在该 segment
-  内的 boundary activation edge 数。
+- `incoming_distinct_boundary_values`：segment 读取、但 producer 不在该 segment 内的
+  不同 boundary value 数。同一 value 即使进入 segment 内多个 cluster，也只计一次。
 - `+1`：轻量 segment 数惩罚。
 - 同成本时偏向更长 segment。
 
@@ -357,8 +387,8 @@ DP 输出的 segment 会 flatten 成 compute node 列表，再展开成 compute 
 | `state_read_supernodes` | state symbol 到 reader compute supernode 的映射。 |
 | `summary_stats` | 统计信息 JSON。 |
 
-最终 DAG 的边来自跨 supernode operand def-use。Commit supernode 不作为 value
-producer 产生出边。
+最终 DAG 的边来自跨 supernode operand def-use，并额外包含上述 commit node 顺序链。
+Commit supernode 不作为 value producer 产生出边。
 
 ## Runtime model
 
@@ -370,15 +400,16 @@ Emitter 读取静态 schedule 后，会构造运行时模型。下面名字来�
 | 名字 | 来源 | 运行时用途 |
 | --- | --- | --- |
 | `activeIdBySupernode` | `topo_order` | 给 topo order 中的 supernode 分配 bit 位置；运行时 activity 语义只用于 compute supernode。 |
-| `computeSupernodeIds` | `supernode_kind` + `topo_order` | compute phase 中 batch 方法覆盖的 supernode。 |
-| `commitSupernodeIds` | `supernode_kind` + `topo_order` | commit phase 中 batch 方法覆盖的 supernode。 |
-| `boundaryFanoutByValue` | `value_fanout` 过滤出 compute target | 某个 boundary value 实际变化后，要置位哪些 compute active bit。 |
+| `computeSupernodeIds` | `supernode_kind`（缺失时按 op kind 推断）+ `topo_order` | compute phase 中 batch 方法覆盖的 supernode。 |
+| `commitSupernodeIds` | `supernode_kind`（缺失时按 op kind 推断）+ `topo_order` | commit phase 中 batch 方法覆盖的 supernode。 |
+| `boundaryFanoutByValue` | `value_fanout` 过滤出 compute target | 普通 tracked boundary value 变化后，或专用 lowering 保守传播时，要置位哪些 compute active bit。 |
 | `inputHeadSupernodesByValue` | compute supernode 的 input operand scan | 外部输入变化后，要初始激活哪些 compute active bit。 |
 | `stateHeadSupernodesBySymbol` | `state_read_supernodes` | visible state 变化后，要激活哪些 reader compute active bit。 |
 | `commitInputValues` | commit supernode 的 input operand scan | 外部输入只喂给 commit 时，也要启动一轮 commit scan。 |
 
 `value_fanout` 中指向 commit supernode 的 target 不进入 `boundaryFanoutByValue`。
-Commit supernode 每轮由 commit phase 扫描，不通过 boundary value activation 决定是否扫描。
+Generic round 中，commit supernode 由 commit phase 扫描，不通过 boundary value
+activation 决定是否扫描。
 
 ### Runtime variables
 
@@ -386,7 +417,7 @@ Commit supernode 每轮由 commit phase 扫描，不通过 boundary value activa
 | --- | --- | --- | --- | --- |
 | `first_eval_` | class field | 初始化/reset 置 true；`eval()` 结束置 false | `eval()` 开始 | 第一次 eval 需要激活所有 compute supernode。 |
 | `pending_eval_round` | `eval()` 局部变量 | eval seed；每轮开头清 false；每轮末尾重算 | `while` 条件 | 是否还要进入下一个 fixed-point round。 |
-| `supernode_active_curr_` | class field bitset | eval seed、compute value change、commit state change | compute batch；round 末尾 `any_active` | 待执行的 compute supernode 集合。 |
+| `supernode_active_curr_` | class field bitset | eval seed、compute value change、commit state change | compute batch；perf 或前向校验回退路径的 round 末尾 probe | 待执行的 compute supernode 集合。 |
 | `commit_activated_readers_` | class field；按 round 使用 | commit phase 前清 false；commit/writeback 路径按条件置 true | round 末尾；perf trace | 本轮 commit phase 是否因为 visible state 实际变化而激活 reader compute supernode。 |
 | event edge slots | class field；按 round 使用 | eval seed、compute value change | commit event expression、side-effect event expression | 本 round 内的边沿事件。 |
 | `prev_*` input fields | class field | `eval()` 结束更新 | 下一次 `eval()` 开始 | 外部输入变化检测 baseline。 |
@@ -414,13 +445,18 @@ compute activity：
 4. 如果不是第一次 eval，比较当前外部输入和 `prev_*`：
    - 输入喂给 compute supernode：置位 `inputHeadSupernodesByValue` 对应的 compute
      active bit，并设置 `pending_eval_round = true`。
-- 输入只喂给 commit supernode：不置 compute bit，只设置
+   - 输入只喂给 commit supernode：不置 compute bit，只设置
      `pending_eval_round = true`，让 commit phase 有机会扫描 event/update 条件。
 5. 对直接 input event value，更新 event edge slot。
 
-### 一个 round 的精确时序
+普通 event 只有在 `event_baseline_initialized_` 已建立后才分类边沿，因此第一次
+`eval()` 的普通 clock edge 为 `none`。`gsim.reset_kind=async` 的 register write 会把
+clock 之后的 reset event 标为可在首次 eval 分类，这是异步 reset 的特例。
 
-每个 fixed-point round 的代码等价时序如下：
+### Generic round 的精确时序
+
+两个 full-pass specialization 关闭或未命中时，校验通过且未启用 perf 的
+fixed-point round 等价时序如下：
 
 ```cpp
 while (pending_eval_round) {
@@ -437,9 +473,7 @@ while (pending_eval_round) {
     // batch 内按 event expression / update guard 判断 sink op 是否执行。
     run_all_commit_batches_in_generation_order();
 
-    pending_eval_round =
-        commit_activated_readers_ ||
-        grhsim_any_active_flags(supernode_active_curr_);
+    pending_eval_round = commit_activated_readers_;
 
     clear_event_edge_slots_for_this_round();
 }
@@ -450,25 +484,31 @@ while (pending_eval_round) {
 | 顺序 | 动作 | 读写关系 |
 | --- | --- | --- |
 | 1 | `pending_eval_round = false` | 只清本轮循环控制变量。 |
-| 2 | 按生成顺序调用所有 compute batch | batch 读取并清除命中的 `supernode_active_curr_` bit；compute result 实际变化时，按 boundary fanout 置位目标 compute bit；不写 `commit_activated_readers_`。 |
+| 2 | 按生成顺序调用所有 compute batch | batch 读取并清除命中的 `supernode_active_curr_` bit；普通 tracked result 实际变化时按 boundary fanout 置位目标 compute bit，少数专用 lowering 可保守置位；不写 `commit_activated_readers_`。 |
 | 3 | `commit_activated_readers_ = false` | 开始收集本轮 commit phase 的结果。 |
 | 4 | 按生成顺序调用所有 commit batch | commit batch 是否被调用不由 compute activity 决定；sink op 写变 visible state 且存在 reader 时，置位 reader compute bit，并把 `commit_activated_readers_` 置 true。 |
-| 5 | 重算 `pending_eval_round` | 如果 `commit_activated_readers_` 为 true，或 `supernode_active_curr_` 仍有任何 bit 置位，则下一轮继续。 |
+| 5 | 重算 `pending_eval_round` | 前向校验通过且未启用 perf 时只看 `commit_activated_readers_`；否则还扫描 `supernode_active_curr_` 作为保守回退。 |
 | 6 | 清 event edge slot | event edge 是 round-local 信号，下一轮必须重新产生。 |
 
 `commit_activated_readers_` 在第 3 步初始化，在第 4 步由 commit/writeback 路径
 更新，在第 5 步被读取。
 
+这个 `while` 没有 round 上限或不收敛诊断。若 graph 中的 activity 无法排空，
+`eval()` 不会返回。
+
 ### Compute batch
 
-Compute batch 方法每轮都会被调用。它内部按 active bit 过滤：
+Generic round 会调用每个 compute batch。它内部按 active bit 过滤：
 
 1. 读取当前 active word 中属于本 batch 的 bit。
 2. 清掉这些 bit，避免同一个 compute supernode 无条件重复执行。
 3. 对每个命中的 compute supernode，按 supernode 内 local topo order 执行 op。
-4. 如果某个 result value 实际变化：
+4. 如果某个普通 tracked result value 实际变化：
    - 若它是 event value，更新 event edge slot。
    - 若它有 `boundaryFanoutByValue`，置位目标 compute active bit。
+
+direct wide concat 和 packed-array lane base/assign 当前不保存旧值做精确比较，而是可在
+写入后直接传播 fanout。这是保守多激活，不改变可观察结果。
 
 同一个 active word 内有局部优化：如果当前 compute supernode 激活了同一 word 中
 active id 更大的目标，生成代码可以把该 bit 放入局部 `activeWordFlags`，让后续
@@ -479,16 +519,16 @@ Compute batch 不设置 `commit_activated_readers_`。
 
 ### Commit batch
 
-Commit batch 方法每轮都会被调用。它内部不看 `supernode_active_curr_` 来决定是否
-调用 commit supernode；sink op 是否真正执行，由 event expression 和 update guard
-决定。
+Generic round 会调用每个 commit batch。它内部不看 `supernode_active_curr_` 来决定
+是否调用 commit supernode；sink op 是否真正执行，由 event expression 和 update
+guard 决定。
 
 Commit sink 的效果：
 
 1. 判断 event expression 和 update condition。
 2. 如果条件命中，执行对应写入路径。
-3. 写 visible state，或通过 generated helper 把 pending write commit 到 visible
-   state。
+3. 当前普通生成路径直接写 visible state；源码保留的少数 commit helper 只封装内部
+   写回细节，不引入额外的可见 phase。
 4. 只有 visible state 实际变化时，才激活 reader compute supernode。
 5. 如果存在 reader compute supernode：
    - 置位 reader 的 `supernode_active_curr_` bit。
@@ -497,9 +537,60 @@ Commit sink 的效果：
 因为 commit phase 位于 compute phase 之后，commit 激活的 reader compute supernode
 不会在同一 round 的 compute phase 中执行；它会让 round 循环再进入下一轮。
 
+一个 sink 有多个 event operand 时，`exactEventExpr(...)` 用 OR 组合各自的边沿条件；
+任一指定边沿命中即可触发该 event expression，之后仍需通过 update condition。
+
+### Full-pass fast paths
+
+两条路径都由 emitter 选项生成，默认关闭，并且命中后不进入 generic fixed-point loop：
+
+#### Input full-pass
+
+`input_fullpass_specialization=true` 时，任一 compute-facing input 变化可成为 candidate。
+以下情况会阻止该路径：首次 eval、名为 `reset` 的端口变化、非 event commit input 变化，
+或可能触发 commit 的 input event。最终命中时：
+
+```text
+clear pending/activity
+run every compute batch in full-pass form
+clear activity/event slots
+refresh outputs
+optionally dump waveform
+save input/event baseline
+return
+```
+
+它不扫描 commit batch；生成 guard 会排除当前实现识别出的 commit-triggering 情况。
+
+#### Posedge full-pass
+
+`posedge_fullpass_specialization=true` 时，emitter 优先选择名为 `clock` 的 direct input
+event，否则选择第一个 direct input event；只有该 event 的 posedge commit 用途可形成
+fast-path 条件，并要求其他 input 稳定。命中后的顺序是：
+
+```text
+run active compute batches once with edge visible
+clear compute propagation bits
+run commit batches once
+clear consumed event edges
+if commit activated a state-reader frontier:
+  if active reader frontier <= compute supernode count / 4:
+    run sparse compute closure until activity is empty
+  else:
+    run one dense compute full-pass
+refresh outputs
+optionally dump waveform
+save input/event baseline
+return
+```
+
+两条 early-return epilogue 当前都不调用 generic path 的
+`flush_deferred_system_task_texts()`。包含 deferred task 输出时，不应假定它们与 generic
+path 的输出时机相同。
+
 ### Eval 收尾
 
-当 round 循环退出后，`eval()` 收尾：
+当 generic round 循环退出后，`eval()` 收尾：
 
 1. flush deferred system task text。
 2. `refresh_outputs()`，发布最终 output/inout out/oe。
@@ -513,11 +604,13 @@ Commit sink 的效果：
 ### `ActivityOpClass::Source`
 
 `ActivityOpClass::Source` 是调度内部分类。`kMemoryReadPort` 属于这个分类，同时仍有
-地址、使能等 operand。这些 operand 参与 compute node 构造和 boundary 判定。
+地址 operand。该 operand 参与 compute node 构造和 boundary 判定；同步、使能和事件
+条件由外围逻辑表达。
 
 ### Batch 调用和 body 执行
 
-每轮都会按生成顺序调用所有 compute batch 和所有 commit batch。
+generic fixed-point 的每轮都会按生成顺序调用所有 compute batch 和所有 commit batch。
+full-pass fast path 使用上节所述的独立 dispatch/early-return 顺序。
 
 compute batch 内部由 active bit 过滤 compute supernode body。commit batch 内部由
 event expression / update guard 过滤 sink op。
@@ -530,8 +623,8 @@ compute phase 不写这个变量。
 
 ### Commit supernode 扫描
 
-Commit supernode 每轮由 commit phase 扫描。Compute result 变化只写 compute
-activity bit。`value_fanout` 里即使有 commit target，也不会进入
+Generic round 中，commit supernode 由 commit phase 扫描。Compute result 的传播只写
+compute activity bit。`value_fanout` 里即使有 commit target，也不会进入
 `boundaryFanoutByValue`。
 
 ### Event edge slot
@@ -541,14 +634,36 @@ result 变化产生。
 
 ## 选项语义
 
-| 选项 | 语义 |
-| --- | --- |
-| `maxOpInComputeSupernode` | DP 分段的 op 数上限，也是 plain coarsen 32 倍上限的基数；不是 emit 文件大小上限。 |
-| `maxOpInComputeNode` | 单个 compute node 吸收 op 的上限。 |
-| `maxOpInCommitSupernode` | 单个 commit node / commit supernode chunk 的目标 sink-class op 上限；为保持 memory-write priority，单个不可拆分 ordered-write unit 可以超过该值。 |
-| `enableCoarsen` | 是否执行 compute-node cluster coarsen。 |
-| `enableChainMerge` | 是否执行 `out1` / `in1`；`siblings` 仍属于 coarsen pipeline。 |
-| `commitGuardEventBuckets` | commit 分桶是否把 update guard 纳入 key。 |
-| `splitOversizeComputeNodes` | 是否在最终 materialize 时切开超大 compute node。 |
-| `splitOversizeComputeNodeMaxOps` | 超大 compute node split 的 chunk 上限；为 0 时使用 `maxOpInComputeSupernode`。 |
-| `exportComputeDagPath` | 导出 compute op DAG JSON。 |
+下面是 `ActivityScheduleOptions` 的当前完整字段和默认值：
+
+| 选项 | 默认值 | 当前语义 |
+| --- | ---: | --- |
+| `path` | 空，运行时必填 | 定位单个目标 graph。 |
+| `maxOpInComputeSupernode` | 128 | 普通 DP segment 的目标上限，也是 coarsen 32 倍上限的基数；单个 oversize/indivisible cluster 可超过，且该值必须至少为 1。 |
+| `maxOpInComputeNode` | 8192 | 单个 compute node 吸收 op 的上限；0 表示不设此上限。 |
+| `maxOpInCommitSupernode` | 4096 | commit chunk 的目标 sink op 上限；不可拆分的 ordered-memory-write unit 可超过它，且该值必须至少为 1。 |
+| `localSharedComputeMaxFanout` | 4 | 保留字段和命令行参数；当前 schedule 主算法不读取。 |
+| `localSharedComputeMaxWidth` | 256 | 保留字段和命令行参数；当前 schedule 主算法不读取。 |
+| `splitOversizeComputeNodeMaxOps` | 0 | 超大 compute node split 的 chunk 上限；0 时使用 `maxOpInComputeSupernode`。 |
+| `enableCoarsen` | true | 是否执行 compute-node cluster coarsen。 |
+| `enableChainMerge` | true | 是否执行 `out1` / `in1`；`siblings` 仍属于 coarsen pipeline。 |
+| `enableLocalSharedCompute` | false | 保留字段和命令行参数；当前 schedule 主算法不读取，切换它不会启用一套新算法。 |
+| `commitGuardEventBuckets` | true | commit 分桶是否把 update guard 纳入 key。 |
+| `splitOversizeComputeNodes` | false | 是否在最终 materialize 时切开超大 compute node。 |
+| `declaredValueComputeNodeBoundary` | false | 是否把 declared/canonical value 强制作为 compute-node cut，并拆分违反该边界的 node。 |
+| `finalTopoPolicy` | `level-id` | 最终 topo 策略；只接受 `level-id`、`level-op`、`ready-op`。 |
+| `exportComputeDagPath` | 空 | 非空时导出 compute op DAG JSON。 |
+
+`finalTopoPolicy` 只在合法拓扑序之间选择确定性顺序：`level-id` 使用默认 level/id
+顺序，`level-op` 用 supernode 的最小 op index 排 level 内顺序，`ready-op` 用同一 key
+驱动 ready-stack topo。它不改变依赖边或 compute/commit phase 语义。
+
+表中三个 `localSharedCompute*` 字段虽然有 C++ option 和命令行解析入口，当前 Python
+`run_pass("activity-schedule", ...)` 既不暴露它们，schedule 主算法也不读取它们。
+
+Runtime fast path 属于 emitter 而不是 `ActivityScheduleOptions`：
+
+| emitter 选项 | 默认值 | 作用 |
+| --- | ---: | --- |
+| `input_fullpass_specialization` | false | 生成纯输入 compute settle 的 full-pass early return。 |
+| `posedge_fullpass_specialization` | false | 生成选定 direct-input posedge 的 compute/commit/adaptive-settle early return。 |

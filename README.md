@@ -149,9 +149,13 @@ Currently implemented:
 sess.store_json(*, design: str, output: str, mode="pretty-compact", top=None)
 sess.emit_sv(*, design: str, output: str, top=None, split_modules=False)
 sess.emit_verilator_repcut_package(*, design: str, output: str, top=None)
+sess.emit_grhsim_cpp(*, design: str, output: str, top=None, waveform="off", perf="off")
 ```
 
-These emitters do not yet consume extra session values, so they currently expose no `in_*` parameters. If you pass an unsupported `in_*`, the API raises an error instead of silently ignoring it.
+The JSON, SV, and Verilator RepCut emitters do not yet consume extra session values, so they
+currently expose no `in_*` parameters. GrhSIM is different: it requires `activity-schedule`
+results from the same session. If you pass an unsupported `in_*`, the API raises an error instead
+of silently ignoring it.
 
 ## Important Documents
 
@@ -160,6 +164,7 @@ If you are new to Wolvrix, read these in order:
 1. [docs/grh/grh-ir.md](docs/grh/grh-ir.md)
 2. [docs/transform/README.md](docs/transform/README.md)
 3. [docs/python/python-binding-architecture.md](docs/python/python-binding-architecture.md)
+4. [docs/emit/grhsim-model.md](docs/emit/grhsim-model.md) (GrhSIM 仿真模型总览)
 
 ## Tests
 

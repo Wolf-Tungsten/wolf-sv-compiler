@@ -43,6 +43,7 @@ namespace wolvrix::lib::emit
         using wolvrix::lib::grh::ValueIdHash;
         using wolvrix::lib::grh::ValueType;
         using wolvrix::lib::transform::ActivityScheduleStateReadSupernodes;
+        using wolvrix::lib::transform::ActivityScheduleOpToSupernode;
         using wolvrix::lib::transform::ActivityScheduleSupernodeKind;
         using wolvrix::lib::transform::ActivityScheduleComputeNodesBySupernode;
         using wolvrix::lib::transform::ActivityScheduleSupernodeKinds;
@@ -2247,6 +2248,7 @@ namespace wolvrix::lib::emit
         struct ScheduleRefs
         {
             const ActivityScheduleSupernodeToOps &supernodeToOps;
+            const ActivityScheduleOpToSupernode &opToSupernode;
             const ActivityScheduleValueFanout &valueFanout;
             const ActivityScheduleTopoOrder &topoOrder;
             const ActivityScheduleStateReadSupernodes &stateReadSupernodes;
@@ -8312,6 +8314,64 @@ namespace wolvrix::lib::emit
                                          joinStrings(args, ", ") + ");");
             }
             return true;
+        }
+
+        struct ForwardComputeActivationValidation
+        {
+            bool proven = false;
+            std::size_t edgeCount = 0;
+            std::string failure;
+        };
+
+        ForwardComputeActivationValidation validateForwardComputeActivations(
+            const Graph &graph,
+            const ScheduleRefs &schedule,
+            const EmitModel &model)
+        {
+            ForwardComputeActivationValidation validation;
+            for (const auto &[valueId, targetActiveIds] : model.boundaryFanoutByValue)
+            {
+                const OperationId defOpId = graph.valueDef(valueId);
+                if (!defOpId.valid())
+                {
+                    validation.failure = "boundary activation value has no defining operation";
+                    return validation;
+                }
+                if (defOpId.index == 0 || defOpId.index > schedule.opToSupernode.size())
+                {
+                    validation.failure = "boundary activation source has no supernode mapping";
+                    return validation;
+                }
+                const uint32_t sourceSupernode = schedule.opToSupernode[defOpId.index - 1];
+                if (!isComputeSupernode(model, sourceSupernode))
+                {
+                    validation.failure = "boundary activation source is not a scheduled compute supernode";
+                    return validation;
+                }
+                if (sourceSupernode >= model.activeIdBySupernode.size())
+                {
+                    validation.failure = "boundary activation source has no active id";
+                    return validation;
+                }
+                const std::size_t sourceActiveId = model.activeIdBySupernode[sourceSupernode];
+                if (sourceActiveId == kInvalidIndex)
+                {
+                    validation.failure = "boundary activation source has an invalid active id";
+                    return validation;
+                }
+                for (uint32_t targetActiveId : targetActiveIds)
+                {
+                    ++validation.edgeCount;
+                    if (static_cast<std::size_t>(targetActiveId) <= sourceActiveId)
+                    {
+                        validation.failure = "compute activation is not strictly forward in schedule order";
+                        return validation;
+                    }
+                }
+            }
+
+            validation.proven = true;
+            return validation;
         }
 
         std::string valueRef(const EmitModel &model, ValueId value)
@@ -15937,6 +15997,8 @@ namespace wolvrix::lib::emit
         const std::string sessionPrefix = resolveSessionPathPrefix(graph, options) + ".activity_schedule.";
         const auto *supernodeToOps =
             getSessionValue<ActivityScheduleSupernodeToOps>(options, sessionPrefix + "supernode_to_ops");
+        const auto *opToSupernode =
+            getSessionValue<ActivityScheduleOpToSupernode>(options, sessionPrefix + "op_to_supernode");
         const auto *valueFanout =
             getSessionValue<ActivityScheduleValueFanout>(options, sessionPrefix + "value_fanout");
         const auto *topoOrder =
@@ -15948,7 +16010,8 @@ namespace wolvrix::lib::emit
         const auto *computeNodesBySupernode =
             getSessionValue<ActivityScheduleComputeNodesBySupernode>(options,
                                                                      sessionPrefix + "compute_nodes_by_supernode");
-        if (supernodeToOps == nullptr || valueFanout == nullptr || topoOrder == nullptr || stateReadSupernodes == nullptr)
+        if (supernodeToOps == nullptr || opToSupernode == nullptr || valueFanout == nullptr ||
+            topoOrder == nullptr || stateReadSupernodes == nullptr)
         {
             reportError("missing activity-schedule session data", sessionPrefix);
             result.success = false;
@@ -15956,6 +16019,7 @@ namespace wolvrix::lib::emit
         }
         const ScheduleRefs schedule{
             .supernodeToOps = *supernodeToOps,
+            .opToSupernode = *opToSupernode,
             .valueFanout = *valueFanout,
             .topoOrder = *topoOrder,
             .stateReadSupernodes = *stateReadSupernodes,
@@ -16031,6 +16095,10 @@ namespace wolvrix::lib::emit
         model.inputFullpassSpecialization = inputFullpassSpecialization;
         model.posedgeFullpassSpecialization = posedgeFullpassSpecialization;
         model.commitStateChangeUnlikely = commitStateChangeUnlikely;
+        const ForwardComputeActivationValidation forwardComputeActivationValidation =
+            validateForwardComputeActivations(graph, schedule, model);
+        const bool omitRoundActiveScan =
+            forwardComputeActivationValidation.proven && !model.emitPerf;
         if (model.emitRuntimeProfile)
         {
             buildRuntimeProfileWeights(graph, schedule, model);
@@ -23103,7 +23171,26 @@ inline void grhsim_format_scalar_task_message_direct(std::ostream &out, std::str
                 *stream << "        commit_activated_readers_ = false;\n";
                 *stream << "        // Then commit sink supernodes in direct schedule order.\n";
                 emitDirectPhaseDispatch(commitScheduleBatches, "commit", "commitBatchExecCount", false);
-                *stream << "        pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);\n";
+                if (omitRoundActiveScan)
+                {
+                    *stream << "        // Forward-activation validation proved "
+                            << forwardComputeActivationValidation.edgeCount
+                            << " compute edges cannot leave deferred work.\n";
+                    *stream << "        pending_eval_round = commit_activated_readers_;\n";
+                }
+                else
+                {
+                    if (model.emitPerf)
+                    {
+                        *stream << "        // Perf mode retains the active-bitset fixed-point probe.\n";
+                    }
+                    else
+                    {
+                        *stream << "        // Forward-activation validation fallback: "
+                                << escapeCppString(forwardComputeActivationValidation.failure) << ".\n";
+                    }
+                    *stream << "        pending_eval_round = commit_activated_readers_ || grhsim_any_active_flags(supernode_active_curr_);\n";
+                }
                 if (!model.allEventValues.empty())
                 {
                     *stream << "        // Event edges are per-fixed-point-round signals, so clear them before the next round.\n";

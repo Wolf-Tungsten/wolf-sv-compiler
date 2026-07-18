@@ -1,414 +1,194 @@
-# XiangShan GrhSIM Emit Width Distribution and Wide-Op Lowering
+# XiangShan GrhSIM 宽值实现
 
-This note summarizes how wide logic values appear in the current XiangShan GrhSIM emit flow, and how those wide operations are lowered into generated C++.
+本文说明当前 `grhsim-cpp` emitter 如何存储和生成宽 logic。这里的“宽值”指位宽
+大于 64 bit 的 logic value。实现入口集中在
+[`grhsim_cpp.cpp`](../../lib/emit/grhsim_cpp.cpp)；本文不把某次生成目录中的私有字段名
+或 `sched_N.cpp` 编号当作稳定接口。
 
-## Scope
+## 先给结论
 
-- Data source: `build/xs/grhsim/wolvrix_xs_post_stats.json`
-- Counting rule: only values with `type == "logic"`
-- "Wide" in this document means result width `> 64` bits
+- 宽 logic 的统一值表示是小端 word array：
+  `std::array<std::uint64_t, ceil(width / 64)>`，`word[0]` 保存最低 64 bit。
+- materialized value 按 word 数分桶，生成固定大小的嵌套 `std::array`；不使用
+  `std::vector<std::array<...>>`。
+- register/latch state 放在对齐的 byte arena 中，通过 typed reference 访问；memory
+  则各自生成固定大小的 row array。
+- supernode 内的非 materialized 宽值生成具名局部量，普通 helper 表达式通常使用
+  `const auto`，direct concat 使用可写 word array。当前不 inline wide words 表达式。
+- 宽运算直接使用 word-level helper；生成代码不使用 `_BitInt`，但 runtime helper
+  使用 `unsigned __int128` 实现 carry、除法和不超过 128 bit 的快速路径。
+- 当前普通 commit 路径直接更新 visible state，没有额外的 shadow/pending 可见阶段。
 
-This filter matters. The raw stats file also contains non-logic values such as `string`, and those can produce very large apparent widths that are not relevant to logic op lowering.
+## 1. XiangShan 宽度分布只是快照
 
-## Width Distribution
+下面的数据来自工作区文件
+`build/xs/grhsim/wolvrix_xs_post_stats.json`，文件时间为 2026-06-16 09:35 +0800。
+它是一次 post-transform GRH 快照，不是 emitter 的固定性质；设计、pass 或生成参数变化
+后应重新统计。
 
-Observed logic-result totals in the XiangShan post-transform GRH:
+统计只计 `type == "logic"` 的 result：
 
-- total logic results: `5,119,863`
-- wide logic results (`> 64` bits): `42,461` (`0.829%`)
-- unique logic widths: `344`
-- maximum observed logic width: `79,263`
-
-Width buckets:
-
-| Width bucket | Count | Share |
-| --- | ---: | ---: |
-| `1` | 3,246,839 | 63.417% |
-| `2-8` | 1,164,351 | 22.742% |
-| `9-16` | 149,630 | 2.923% |
-| `17-32` | 83,454 | 1.630% |
-| `33-64` | 433,128 | 8.460% |
-| `65-128` | 28,887 | 0.564% |
-| `129-256` | 7,788 | 0.152% |
-| `257-512` | 2,259 | 0.044% |
-| `513-1024` | 3,166 | 0.062% |
-| `1025-4096` | 214 | 0.004% |
-| `>4096` | 147 | 0.003% |
-
-The distribution is strongly skewed toward scalar and near-scalar logic. Wide logic exists, but it is a thin tail.
-
-Most common exact widths:
-
-| Width | Count |
+| 指标 | 快照值 |
 | --- | ---: |
-| `1` | 3,246,839 |
-| `2` | 435,849 |
-| `64` | 340,141 |
-| `8` | 202,938 |
-| `3` | 123,476 |
-| `5` | 115,978 |
-| `4` | 115,672 |
-| `6` | 104,522 |
-| `7` | 65,916 |
-| `9` | 62,468 |
+| logic result 总数 | 5,119,863 |
+| 宽 logic result（`> 64`） | 42,461（0.829%） |
+| 不同 logic 位宽 | 344 |
+| 最大 logic 位宽 | 79,263 |
 
-## Which Wide Ops Show Up Most
+宽 result 中最常见的 defining op 是 `kConcat`（10,691），其次是 `kMux`（5,951）、
+`kAssign`（5,573）、`kShl`（3,388）和 `kOr`（2,966）。这说明宽值只占薄尾，但
+concat、mux、shift 和 slice 的生成质量会显著影响 XiangShan 模型。
 
-Among the `42,461` wide logic results, the most common defining op kinds are:
+## 2. 存储模型
 
-| Op kind | Count | Share among wide results |
-| --- | ---: | ---: |
-| `kConcat` | 10,691 | 25.18% |
-| `kMux` | 5,951 | 14.02% |
-| `kAssign` | 5,573 | 13.12% |
-| `kShl` | 3,388 | 7.98% |
-| `kOr` | 2,966 | 6.99% |
-| `kSliceDynamic` | 2,908 | 6.85% |
-| `kLShr` | 2,209 | 5.20% |
-| `kAnd` | 2,133 | 5.02% |
-| `kRegisterReadPort` | 1,813 | 4.27% |
-| `kAdd` | 1,673 | 3.94% |
+### 2.1 值类型
 
-This is the key pattern in XiangShan:
+`logicCppType(width)` 的映射是：
 
-- very wide values are mostly built by `kConcat`
-- datapath manipulation is then dominated by `kMux`, shifts, slices, and bitwise ops
-- arithmetic wide ops exist, but they are not the main source of very large widths
+| 位宽 | C++ 类型 |
+| --- | --- |
+| 1 | `bool` |
+| 2..8 | `std::uint8_t` |
+| 9..16 | `std::uint16_t` |
+| 17..32 | `std::uint32_t` |
+| 33..64 | `std::uint64_t` |
+| `> 64` | `std::array<std::uint64_t, ceil(width / 64)>` |
 
-Largest observed logic results:
+所有产生宽 logic 的 helper 都按声明位宽截断最高 word 的无效 bit。不要把这些 padding
+bit 当作设计状态，也不要只读写宽公开端口的 `word[0]`。
 
-| Width | Kind | Name |
-| --- | --- | --- |
-| `79,263` | `kConcat` | `endpoint$in` |
-| `65,536` | `kConcat` | `cpu$l_soc$core_with_l2$l2top$inner_busPMU_1$_GEN_112` |
-| `32,768` | `kConcat` | `cpu$l_soc$core_with_l2$core$backend$inner_ctrlBlock$rob$_GEN_8227` |
-| `25,600` | `kConcat` | `cpu$l_soc$core_with_l2$core$backend$inner_ctrlBlock$rob$_GEN_8224` |
-| `19,208` | `kConcat` / `kAssign` | `gatewayIn_packed_38_bore` family |
+### 2.2 Materialized value
 
-## Storage Model For Wide Values
-
-The current emitter uses two different wide-value storage models:
-
-- all persistent wide values, state, shadows, and pending write buffers use `std::array<std::uint64_t, N>`
-- `N = ceil(width / 64)`
-
-Representative generated storage looks like:
+需要跨 supernode、进入 commit、公开输出、event/waveform 观察或满足其他持久化条件的
+宽 value，会按 word 数放入固定槽位数组。概念上等价于：
 
 ```cpp
-std::vector<std::array<std::uint64_t, 3>> value_words_3_slots_;
-std::vector<std::array<std::uint64_t, 4>> state_logic_words_4_slots_;
-std::vector<std::vector<std::array<std::uint64_t, 3>>> state_mem_words_3_slots_;
-std::vector<std::array<std::uint64_t, 3>> state_shadow_words_3_slots_;
-std::vector<std::array<std::uint64_t, 3>> memory_write_data_words_3_slots_;
+// W 是 word 数，S 是 emit 时已知的槽位数。
+std::array<std::array<std::uint64_t, W>, S> value_words_W_slots_{};
 ```
 
-So the current rule is:
-
-- wide logic always stays on fixed-size word arrays
-- wide ops are lowered directly to words helpers, without `_BitInt` conversion on the hot path
-
-## How Wide Ops Are Lowered
-
-The main lowering entry is `emitWordLogicOperation` in `wolvrix/lib/emit/grhsim_cpp.cpp`. Wide ops are emitted as direct words helper calls.
-
-Representative lowering cases:
+槽位数量和私有字段名由当前 graph 与 materialization 决定，不是 testbench API。
+不需要持久化的宽 value 留在对应 supernode body 中：
 
 ```cpp
-case OperationKind::kAdd:
-    emitLogicAssignFromWordsExpr(stream, graph, model, resultValue,
-                                 binaryWordsBufferOpExpr(operandWords(0, resultWidth),
-                                                         operandWords(1, resultWidth),
-                                                         resultWidth,
-                                                         "grhsim_add_words"));
-    return true;
-
-case OperationKind::kShl:
-    emitLogicAssignFromWordsExpr(stream, graph, model, resultValue,
-                                 shiftWordsBufferOpExpr(operandWords(0, resultWidth),
-                                                        valueRef(model, operands[1]),
-                                                        resultWidth,
-                                                        "grhsim_shl_words"));
-    return true;
-
-case OperationKind::kConcat:
-    emitLogicAssignFromWordsExpr(stream, graph, model, resultValue,
-                                 concatWordsExpr(...));
-    return true;
+const auto local_value = grhsim_add_words(lhs, rhs, width);
 ```
 
-In practice, wide lowering falls into a small set of implementation patterns.
+即使只有一个用户，wide local 当前也保留具名临时量；只有廉价的 scalar local 可能
+直接替换到使用点。
 
-### 1. Arithmetic and Bitwise Ops
+### 2.3 State 和 memory
 
-Wide arithmetic and bitwise ops run word-by-word on `uint64_t` arrays. For example, `grhsim_add_words` uses a carry chain across 64-bit words:
+普通 register/latch 的 scalar 与 wide state 共享一个按类型对齐的 byte arena：
 
 ```cpp
-inline void grhsim_add_words(const std::uint64_t *lhs,
-                             std::size_t lhsWords,
-                             const std::uint64_t *rhs,
-                             std::size_t rhsWords,
-                             std::size_t width,
-                             std::uint64_t *out,
-                             std::size_t outWords)
-{
-    unsigned __int128 carry = 0;
-    for (std::size_t i = 0; i < outWords; ++i) {
-        const unsigned __int128 lhsWord = i < lhsWords ? lhs[i] : 0;
-        const unsigned __int128 rhsWord = i < rhsWords ? rhs[i] : 0;
-        const unsigned __int128 sum = lhsWord + rhsWord + carry;
-        out[i] = static_cast<std::uint64_t>(sum);
-        carry = sum >> 64u;
-    }
-    grhsim_trunc_words_buffer(out, outWords, width);
-}
+alignas(std::uint64_t)
+std::array<std::byte, kStateLogicStorageBytes> state_logic_storage_{};
+
+auto &state = grhsim_value_storage_ref<
+    std::array<std::uint64_t, W>>(state_logic_storage_, byte_offset);
 ```
 
-There is also a template wrapper used by generated code:
+每个 memory 则有自己的固定 row array：
 
 ```cpp
-template <std::size_t N>
-inline std::array<std::uint64_t, N> grhsim_add_words(
-    const std::array<std::uint64_t, N> &lhs,
-    const std::array<std::uint64_t, N> &rhs,
-    std::size_t width)
-{
-    unsigned __int128 lhs128 = 0;
-    unsigned __int128 rhs128 = 0;
-    if (grhsim_try_u128_words(lhs, width, lhs128) &&
-        grhsim_try_u128_words(rhs, width, rhs128)) {
-        return grhsim_from_u128_words<N>(lhs128 + rhs128, width);
-    }
-    ...
-}
+std::array<std::array<std::uint64_t, W>, RowCount> state_mem_name{};
 ```
 
-So there are two tiers:
+带 `regToMem.intent.*` 的 register group 也可使用按 element 数固定的 row storage。
+当前普通 commit 代码直接比较并更新这些 visible state/row；只有值实际变化时才激活
+state reader。源码中保留的 shadow/write-buffer 基础设施当前普通生成路径不使用，
+不能据此推导额外的 NBA phase。
 
-- widths that fit the helper's `u128` fast path can use compact arithmetic
-- truly large widths fall back to explicit multi-word loops
+## 3. 宽运算 lowering
 
-### 2. Shifts
+### 3.1 算术、位运算和比较
 
-Wide shifts decompose the shift amount into `wordShift` and `bitShift`, then move data across word boundaries:
+宽算术与位运算在 `uint64_t` word 上执行。加法按 word 传播 carry：
 
-```cpp
-inline void grhsim_shl_words(const std::uint64_t *value,
-                             std::size_t valueWords,
-                             std::size_t amount,
-                             std::size_t width,
-                             std::uint64_t *out,
-                             std::size_t outWords)
-{
-    std::fill_n(out, outWords, UINT64_C(0));
-    if (amount >= width) {
-        return;
-    }
-    const std::size_t wordShift = amount / 64u;
-    const std::size_t bitShift = amount & 63u;
-    for (std::size_t i = outWords; i-- > 0;) {
-        ...
-    }
-    grhsim_trunc_words_buffer(out, outWords, width);
-}
+```text
+carry = 0
+for i in 0 .. word_count-1:
+  sum = u128(lhs[i]) + u128(rhs[i]) + carry
+  out[i] = low64(sum)
+  carry = sum >> 64
+truncate_tail(out, width)
 ```
 
-The template form used in generated code converts the shift operand with `grhsim_index_words` and then performs the same word-level shift.
+部分不超过 128 bit 的输入会先尝试 `unsigned __int128` 快速路径；更宽的加、乘、除、
+模等操作回退到显式多 word 算法。bitwise、比较、reduction 和 cast 同样保持 word array
+表示，不经 `_BitInt` 中转。
 
-### 3. Concat and Replicate
+### 3.2 Shift 和 slice
 
-Wide concatenation is built incrementally with `grhsim_insert_words`, which writes a source word array into a destination word array at a given LSB position:
+shift 把位移量拆成 `wordShift` 和 `bitShift`，再跨相邻 word 合并。动态 slice 同样用
+`start / 64` 和 `start % 64` 找到起始 word：
 
-```cpp
-template <std::size_t DestN, std::size_t SrcN>
-inline void grhsim_insert_words(std::array<std::uint64_t, DestN> &dest,
-                                std::size_t destLsb,
-                                const std::array<std::uint64_t, SrcN> &src,
-                                std::size_t srcWidth)
-{
-    grhsim_clear_range_words(dest, destLsb, srcWidth);
-    const std::size_t srcWords = (srcWidth + 63u) / 64u;
-    const std::size_t destWord = destLsb / 64u;
-    const std::size_t bitShift = destLsb & 63u;
-    for (std::size_t i = 0; i < srcWords && i < SrcN; ++i) {
-        ...
-    }
-}
+```text
+for each destination word i:
+  out[i] = src[src_word + i] >> bit_shift
+  if bit_shift != 0:
+    out[i] |= src[src_word + i + 1] << (64 - bit_shift)
+truncate_tail(out, result_width)
 ```
 
-There is also a special helper for "many equal-width scalar pieces":
+越过输入范围的部分补零；signed cast/shift 另按声明语义做符号扩展。
 
-```cpp
-inline void grhsim_concat_uniform_scalars_words(const std::uint64_t *values,
-                                                std::size_t count,
-                                                std::size_t elemWidth,
-                                                std::size_t totalWidth,
-                                                std::uint64_t *out,
-                                                std::size_t destWords)
-{
-    std::fill_n(out, destWords, UINT64_C(0));
-    std::size_t cursor = totalWidth;
-    for (std::size_t i = 0; i < count; ++i) {
-        ...
-        grhsim_insert_scalar_words_buffer(out, destWords, cursor, values[i], elemWidth);
-    }
-    grhsim_trunc_words_buffer(out, destWords, totalWidth);
-}
+### 3.3 Concat 和 replicate
+
+普通 concat 按 GRH operand 顺序从 MSB 向 LSB 移动 cursor，再把每个 operand 插入目标
+word array。当前有三类路径：
+
+| 条件 | 生成方式 |
+| --- | --- |
+| result `>= 96` bit、operand 至少 4 个、result 不是 event | 直接清零目标 array，并生成逐 operand、逐 word 的插入 statement |
+| 至少 4 个 scalar operand | 使用 uniform/general scalar-array concat helper |
+| 其他情况 | 使用通用 words concat 表达式/helper |
+
+直接 concat 路径概念上是：
+
+```text
+out = zero_words
+cursor = result_width
+for operand in operands:
+  cursor -= operand.width
+  insert_bits(out, cursor, operand)
+truncate_tail(out, result_width)
 ```
 
-This is why wide `kConcat` is the dominant wide-op pattern in XiangShan: it maps naturally to repeated insert operations into a packed word buffer.
+不要用固定的 `grhsim_SimTop_sched_N.cpp` 路径举证。schedule batch 和文件数量会随
+graph、选项和 emitter 版本重新编号、重新分组。
 
-### 4. Slice and Cast
+### 3.4 Packed-array lane 特化
 
-Wide slices use source-word indexing plus cross-word merge when the slice start is not 64-bit aligned:
+带 `svPackedArray.*` 元数据且只被兼容 `kSliceArray` 使用的 concat，可以不建立 packed
+word array，而改成 element lane array 后直接按 index 读取。它与通用宽值 helper 是
+并列的 emitter 特化，完整约束见
+[GrhSIM emit 内部合并与特化](grhsim-emit-combines.md)。
 
-```cpp
-inline void grhsim_slice_words(const std::uint64_t *src,
-                               std::size_t srcWords,
-                               std::size_t start,
-                               std::size_t width,
-                               std::uint64_t *out,
-                               std::size_t destWords)
-{
-    std::fill_n(out, destWords, UINT64_C(0));
-    const std::size_t srcWord = start / 64u;
-    const std::size_t bitShift = start & 63u;
-    ...
-    grhsim_trunc_words_buffer(out, destWords, width);
-}
+## 4. Change propagation
+
+普通 materialized 宽 assignment 会先计算 `next_words`，逐 word 比较并写回，只有实际
+变化才传播 boundary activity。两条专用路径更保守：
+
+- direct wide concat 清零并重写目标后，会直接激活其 fanout；
+- packed-array lane base/assign 也可直接激活 fanout。
+
+这些路径可能多执行后继，但不能漏激活。visible register/latch/memory state 仍按实际
+变化激活 reader。
+
+## 5. 构建与检查
+
+生成 Makefile 使用 Clang 风格的 PCH 参数 `-include-pch`。GNU make 自带的 `CXX`
+默认值可能覆盖文件中的 `CXX ?= clang++`，所以应显式指定：
+
+```bash
+make -C build/xs/grhsim/grhsim_emit CXX=clang++ -j"$(nproc)"
 ```
 
-Cast helpers use the same word-array representation and then truncate or sign-extend as needed.
+验证宽值改动时至少检查：
 
-## Generated XiangShan Code Examples
-
-### Example 1: 548-bit concat
-
-Generated in `build/xs/grhsim/grhsim_emit/grhsim_SimTop_sched_1069.cpp`:
-
-```cpp
-const auto local_value_... = ([&]() -> std::array<std::uint64_t, 9> {
-    std::array<std::uint64_t, 9> next_words{};
-    std::size_t concat_cursor = 548;
-    concat_cursor -= 137;
-    grhsim_insert_words(next_words, concat_cursor, local_value_..., 137);
-    concat_cursor -= 137;
-    grhsim_insert_words(next_words, concat_cursor, local_value_..., 137);
-    concat_cursor -= 137;
-    grhsim_insert_words(next_words, concat_cursor, local_value_..., 137);
-    concat_cursor -= 137;
-    grhsim_insert_words(next_words, concat_cursor, local_value_..., 137);
-    return next_words;
-}());
-```
-
-This is the standard wide-concat pattern: allocate destination words, walk a cursor from MSB toward LSB, and insert each operand.
-
-### Example 2: 512-bit concat from 64 byte scalars
-
-Generated in `build/xs/grhsim/grhsim_emit/grhsim_SimTop_sched_1001.cpp`:
-
-```cpp
-const auto next_words = ([&]() -> std::array<std::uint64_t, 8> {
-    std::array<std::uint64_t, 8> out{};
-    const auto values = std::array<std::uint64_t, 64>{ ... };
-    grhsim_concat_uniform_scalars_words(values.data(), values.size(), 8, 512,
-                                        out.data(), out.size());
-    return out;
-}());
-```
-
-This is an optimized form for uniform scalar concatenation.
-
-### Example 3: 129-bit add
-
-Generated in `build/xs/grhsim/grhsim_emit/grhsim_SimTop_sched_2322.cpp`:
-
-```cpp
-const auto local_value_... = ([&]() -> std::array<std::uint64_t, 3> {
-    std::array<std::uint64_t, 3> out{};
-    const auto lhs = local_value_...;
-    const auto rhs = local_value_...;
-    out = grhsim_add_words(lhs, rhs, 129);
-    return out;
-}());
-```
-
-This shows the template helper API that generated code uses for multi-word arithmetic.
-
-### Example 4: 256-bit shift-left
-
-Generated in `build/xs/grhsim/grhsim_emit/grhsim_SimTop_sched_1431.cpp`:
-
-```cpp
-const auto local_value_... = ([&]() -> std::array<std::uint64_t, 4> {
-    std::array<std::uint64_t, 4> out{};
-    const auto value = value_words_4_slots_[271];
-    out = grhsim_shl_words(value, grhsim_index_words(value_u8_slots_[142567], 256), 256);
-    return out;
-}());
-```
-
-The shift amount is first normalized with `grhsim_index_words`, then the word-level shift helper is applied.
-
-### Example 5: dynamic slice from a 4096-bit source
-
-Generated in `build/xs/grhsim/grhsim_emit/grhsim_SimTop_sched_940.cpp`:
-
-```cpp
-const auto next_words = ([&]() -> std::array<std::uint64_t, 1> {
-    std::array<std::uint64_t, 1> out{};
-    const auto src = value_words_64_slots_[12];
-    grhsim_slice_words(src.data(), src.size(),
-                       grhsim_index_words(value_u16_slots_[33018], 4096),
-                       1, out.data(), out.size());
-    return out;
-}());
-```
-
-The source is `64` words wide (`4096` bits), and the slice helper extracts the requested bit into a one-word result.
-
-## Takeaways
-
-- XiangShan logic widths are overwhelmingly small: `99.171%` of logic results are `<= 64` bits.
-- Wide logic results are rare (`0.829%`), but they are real and sometimes very large.
-- The dominant wide-op source is `kConcat`, not arithmetic.
-- The wide-value implementation model is simple and uniform:
-  - storage: `std::array<std::uint64_t, N>`
-  - lowering: `emitWordLogicOperation`
-  - execution: word-array runtime helpers
-  - cleanup: every helper truncates back to the declared result width
-- For moderate widths, runtime helpers can sometimes use a `u128` fast path.
-- For truly large widths, GrhSIM falls back to explicit multi-word loops over `uint64_t` storage.
-
-## Update: Current Supernode Implementation
-
-The current supernode emitter stays on a single representation for wide values:
-
-- storage uses `std::array<std::uint64_t, N>`
-- supernode-internal wide temporaries also use `std::array<std::uint64_t, N>`
-- wide ops lower directly to pure words helpers
-
-### Single-user inline rule
-
-Inside a supernode, if a non-materialized logic value has exactly one user, the emitter records its expression and substitutes that expression directly at the use site.
-
-- single-user scalar locals inline as scalar expressions
-- single-user wide locals inline as words helper expressions
-- multi-user wide locals still get a named temporary, but that temporary is also a words value
-
-### Helper boundary
-
-The current hot-path helpers are all words-based, for example:
-
-- `grhsim_cast_words<...>(...)`
-- `grhsim_add_words(...)`
-- `grhsim_shl_words(...)`
-- `grhsim_slice_words<...>(...)`
-- `grhsim_concat_words<...>(...)`
-- `grhsim_replicate_words<...>(...)`
-
-So state writes, task args, DPI wide inputs, and supernode-local wide ops all stay on the same array representation.
-
-### Toolchain note
-
-Because generated GrhSIM C++ no longer depends on `_BitInt(N)`, the emitter no longer needs a clang-only requirement for wide-value support.
+1. 生成测试覆盖标量/宽值边界、tail truncation、concat、shift、slice 和 memory row；
+2. 运行结果或 difftest 与参考模型一致；
+3. 生成代码中没有意外的大 packed concat 物化或失控的源文件膨胀；
+4. 性能分析按 op 形态和 materialization 解释，不把上述一次宽度快照当作永久分布。
