@@ -21,10 +21,11 @@ DPI 均属于 GRHSIM-AM，但其具体指令留待后续定义；constant 和通
 opcode %dst, %src... [, immediate...]
 ```
 
-`%n` 表示 `[0, VariableCount)` 中的 VarId `n`。控制区位于 Variable 之后，没有 VarId，
-不能写成普通指令的 `%n` 操作数。第 3 至 10 节组合指令的所有 `%dst` 和 `%src` 都必须
-是 `BV<W, S>`；Array 不参与这些指令。每条组合指令先读取全部源值和立即数，再计算并
-一次写回目标，因此目标可以与任一源使用相同 VarId，但目标不能是 constant Variable。
+`%n` 表示 VariableArea 中的 VarId `n`，即 `n in [0, VariableCount)`。ControlArea
+和 ActiveArea 没有 VarId，不能写成普通指令的 `%n` 操作数。第 3 至 10 节组合指令的
+所有 `%dst` 和 `%src` 都必须是 `BV<W, Sign>`；Array 不参与这些指令。每条组合指令先
+读取全部源值和立即数，再计算并一次写回目标，因此目标可以与任一源使用相同 VarId，
+但目标不能是 constant Variable。
 
 记：
 
@@ -38,19 +39,19 @@ truth(x) = (U_W(x) != 0)
 无下标的 `U(x)` 表示按 `width(x)` 求无符号整数值；`trunc0` 表示向 0 取整。
 
 ```text
-commonS(a, b) = signed    if type(a).S = signed and type(b).S = signed
+commonS(a, b) = signed    if type(a).Sign = signed and type(b).Sign = signed
                 unsigned  otherwise
 ```
 
-`resize(x, W, S)` 产生 W-bit 位模式：缩小时保留最低 W bit；扩大时，`S=signed`
-复制源最高位，`S=unsigned` 补 0。
+`resize(x, W, Sign)` 产生 W-bit 位模式：缩小时保留最低 W bit；扩大时，
+`Sign=signed` 复制源最高位，`Sign=unsigned` 补 0。
 
 所有宽度和下标计算使用数学整数，不允许发生宿主整数溢出。第 3 至 10 节的每个组合
 opcode 都是全函数，边界行为不得继承宿主语言的未定义行为。
 
 ### 2.1 GRH lower 规则
 
-每个 GRH Logic Value 都映射为同宽、同 Signedness 的 AM `BV<W, S>` Variable。指令
+每个 GRH Logic Value 都映射为同宽、同 Signedness 的 AM `BV<W, Sign>` Variable。指令
 根据 operand Type 自行完成下表规定的共同类型转换，不需要为 Signedness 选择不同
 opcode。
 
@@ -152,7 +153,7 @@ VarId 作为源。
 | `logic_not` | `kLogicNot` | `logic_not %d, %a` | `!truth(a)` |
 
 规约指令形式为 `opcode %d, %a`，目标为 `BV<1, unsigned>`，源为任意
-`BV<W, S>`：
+`BV<W, Sign>`：
 
 | Opcode | 对应 GRH | 结果 |
 | --- | --- | --- |
@@ -166,7 +167,7 @@ VarId 作为源。
 ## 8. 移位
 
 形式均为 `opcode %d, %value, %amount`。`%d` 与 `%value` 的 Type 必须完全相同；
-`%amount` 可为任意 `BV<A, S>`，始终按 `U(amount)` 解释，其 Signedness 被忽略。
+`%amount` 可为任意 `BV<A, Sign>`，始终按 `U(amount)` 解释，其 Signedness 被忽略。
 
 | Opcode | 对应 GRH | `U(amount) < W` | `U(amount) >= W` |
 | --- | --- | --- | --- |
@@ -178,7 +179,7 @@ VarId 作为源。
 
 | Opcode | 对应 GRH | 形式 | 语义与约束 |
 | --- | --- | --- | --- |
-| `mux` | `kMux` | `mux %d, %cond, %t, %f` | `%cond` 为任意 Signedness 的 `BV<1, S>`；分支按 result 宽度和 `commonS(t,f)` resize，目标 Type 与结果一致；条件为 1 取 `%t`，否则取 `%f`。 |
+| `mux` | `kMux` | `mux %d, %cond, %t, %f` | `%cond` 为任意 Signedness 的 `BV<1, Sign>`；分支按 result 宽度和 `commonS(t,f)` resize，目标 Type 与结果一致；条件为 1 取 `%t`，否则取 `%f`。 |
 | `concat` | `kConcat` | `concat %d, %s0, ..., %sN-1` | `N >= 1`；目标为 `BV<sum(width(si)), unsigned>`；`%s0` 位于最高位。 |
 | `replicate` | `kReplicate` | `replicate %d, %s` | 目标为 unsigned BV，且其宽度是 `width(s)` 的正整数倍；按该倍数重复拼接 `%s`。 |
 
@@ -242,8 +243,8 @@ actb %new, %old, {TargetBlockId...}
 ```
 
 `{TargetBlockId...}` 是静态确定的非空 BlockId 集合，记作 `Targets`；集合没有顺序和
-重复元素。`Active(b)` 和 `NextEpochActive(b)` 是基础设计定义的 M 控制槽别名；对它们
-的写入是 opcode 的隐式效果，不是 `%` 操作数。
+重复元素。`Active(b)` 和 `NextEpochActive(b)` 是基础设计定义的 ActiveArea 槽位
+别名；对它们的写入是 opcode 的隐式效果，不是 `%` 操作数。
 
 两条指令同时读取 `%new` 和 `%old`，要求二者 Type 完全相同，并使用基础设计中定义的
 `sameValue` 比较完整 Value：
@@ -260,8 +261,8 @@ actb %new, %old, {TargetBlockId...}
 - 每条 act 独占一个 old Variable，且无论 Targets 包含多少 Block 都只比较并更新这一个
   old；new 和 old 必须是不同 VarId。因此 AM 语义中的 old 数量按 act 数量计算；后端
   可在保持行为时合并物理存储和比较；
-- old 只记录所属 act 的变动检测基线，不得出现在其他指令中，也不得由外部写入。实例
-  完成 Init 后先统一执行 `old = new`；
+- old 只记录所属 act 的变动检测基线，不得出现在其他指令中，也不得由外部修改。
+  Machine 完成 Init 后先统一执行 `old = new`；
 - 仿真边沿检测必须使用不同的 Variable，具体边沿检测 opcode 待定义。
 
 例如，同一输入变化需要激活 Block 3 和 5 时，一条 act 即可完成：
@@ -273,17 +274,18 @@ actf %0, %1, {3, 5}
 执行后 `Active(3) = Active(5) = true`，且 `%1` 等于 `%0`。
 
 BlockId 0 的 EntryBlock 每次 `eval()` 开始时执行一次且只包含 `actf`，由其中的 act
-设置 `Active` 区中的相应 Bool 槽，形成初始激活状态。除 `M[FirstEvalId]` 控制的首次
-全量激活外，`actf/actb` 是唯一的 Block 激活来源。每个 `actf`-Target 对直接派生一条
-Forward 依赖，每个 `actb`-Target 对直接派生一条 Backward 依赖。
+设置 ActiveArea 中的相应 Bool 槽，形成初始激活状态。除
+`S[FirstEvalId]` 控制的首次全量激活外，`actf/actb` 是唯一的 Block 激活来源。每个
+`actf`-Target 对直接派生一条 Forward 依赖，每个 `actb`-Target 对直接派生一条
+Backward 依赖。
 
 ## 16. 合法性检查
 
 加载 Program 时，对本稿指令至少验证：
 
 - opcode、源数量、立即数数量和立即数取值合法；
-- 所有 `%` 操作数均为 `[0, VariableCount)` 中的合法 VarId，不引用控制区；组合指令
-  引用的 Variable 类型为其要求的 `BV`；
+- 所有 `%` 操作数均为 VariableArea 中的合法 VarId，不引用 ControlArea 或
+  ActiveArea；组合指令引用的 Variable 类型为其要求的 `BV`；
 - 组合指令目标、源和结果的宽度与 Signedness 满足各指令约束；
 - constant Variable 只能作为源，不能作为任何 opcode 的目标；
 - 每个 GRH Logic Value 的 `width/isSigned` 与对应 Variable Type 完全一致；

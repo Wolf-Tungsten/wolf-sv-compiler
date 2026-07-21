@@ -1,433 +1,390 @@
-# GRHSIM Abstract Machine 基础设计
+# GRHSIM 抽象机
 
-> 状态：讨论稿 v0。本文只定义 GRHSIM-AM 的最小执行语义。
+> GRHSIM-AM（Abstract Machine）是 GRH 与具体仿真后端之间的统一执行模型。
+> 本文只介绍核心概念和执行流程；具体 opcode 见
+> [GRHSIM-AM 指令集](grhsim-am-instructions.md)。
 
-## 1. 定位
+## 1. 它解决什么问题
 
-GRHSIM-AM 执行由 GRH 静态 lower 得到的仿真程序，位于 GRH 与解释器、JIT、C++ 等
-后端之间。它不解释 SystemVerilog，不动态创建 Variable，也不隐式推进仿真时间。
-
-一次 Program 执行对应一次 `eval()`：先执行 EntryBlock，再执行零个或多个 epoch，直到
-没有新的反向激活。
-
-## 2. 核心对象
+GRH 描述 RTL 的结构和行为，但解释器、JIT 和 C++ 代码生成器需要一套共同的运行时
+语义。GRHSIM-AM 将 GRH 静态 lower 成后端无关的 Program，各后端只需保证相同的
+可观察行为：
 
 ```text
-Program  = (Variables, Blocks)
+SystemVerilog -> GRH -> GRHSIM-AM Program -> Interpreter / JIT / C++
+```
+
+抽象机记为：
+
+```text
+Machine M = (Program P, State S)
+```
+
+- `P` 是静态程序，创建后不再改变；
+- `S` 是运行状态，`eval(M)` 只更新 `S`。
+
+调用方与 Machine 的基本交互是：
+
+```text
+写入输入状态 -> eval(M) -> 读取输出状态
+```
+
+`eval()` 不自动翻转时钟，也不推进仿真时间。调用方需要自行修改时钟值，并在每个需要
+求值的电平调用 `eval()`。
+
+## 2. Program：变量和 Block
+
+一个 Program 只有两部分：
+
+```text
+Program = (Variables, Blocks)
 Variable = (VarId, Type, Label, Init)
-Block    = (BlockId, Instructions)
+Block = (BlockId, Instructions)
 ```
 
-- `Variables` 和 `Blocks` 都是有限集合；
-- Program 不存储独立的依赖对象；依赖由 act 的 Targets 完整表达；
-- `M` 是 AM 的全部可变实例状态，不属于 Program，定义见 3.3 节。
+### 2.1 Variable
 
-本文将 `actf`、`actb` 统称为 act；其完整指令语义见
-[GRHSIM-AM 指令集：Block 激活](grhsim-am-instructions.md#15-block-激活)。本文只规定
-act 与 Block 依赖及执行调度的关系。
+Variable 是有固定类型的逻辑存储对象。`VarId` 从 0 开始连续编号，既是变量标识，
+也是它在状态区中的逻辑地址。`Label` 仅用于阅读和诊断，不要求唯一，也不参与执行。
 
-## 3. Variable 与理想存储
-
-### 3.1 Variable
-
-- `VarId`：Variable 在 M 中的逻辑地址。令 `VariableCount = |Variables|`，Program 的
-  VarId 集合必须恰为 `[0, VariableCount)`；
-- `Type`：编译期确定的值类型；
-- `Label`：字符串，仅用于诊断和可读输出，不要求唯一，不参与执行语义；
-- `Init`：Variable 的常量值或有序初始化动作序列。
-
-GRHSIM-AM 的 Type 和运行时 Value 定义为：
+当前类型包括：
 
 ```text
-Signedness = unsigned | signed
-ScalarType = BV<W, S> | Real | String
-Type       = ScalarType | Array<N, BV<W, S>>
-
-Value(BV<W, S>)           = 恰好 W 个二态 bit
-Value(Real)               = IEEE-754 binary64 的 64-bit 位模式
-Value(String)             = 有限 8-bit byte 序列
-Value(Array<N, BV<W, S>>) = N 个 Value(BV<W, S>) 的有序序列
+BV<W, signed | unsigned>
+Real
+String
+Array<N, BV<W, signed | unsigned>>
 ```
 
-其中 `W > 0`、`N > 0`。GRHSIM-AM 的 `BV` 固定为二态；GRH Logic 中含 X/Z 的值
-不能 lower。
-Signedness 只属于 `BV`，不改变 W 个存储 bit；它决定 literal 赋值、宽度扩展以及类型
-驱动指令的有符号或无符号解释。`Real` 保留包括正负零、无穷和 NaN payload 在内的
-完整位模式；`String` 不规定文本编码。
+- `BV` 是只含 0 和 1 的固定位宽位向量；GRH Logic 中仍含 X/Z 的值不能 lower 为 BV；
+- signedness 不改变存储的 bit，只影响扩展、比较和算术解释；
+- `Real` 保存 IEEE-754 binary64 的完整位模式；
+- `String` 是有限 byte 序列；
+- Array 长度固定，整个 Array 只占一个 VarId。
 
-各 Type 的零值依次为全 0 bit、binary64 正零、空 byte 序列和逐元素零。两个同 Type
-Value 的 `sameValue` 定义为：`BV` 逐 bit 相同，`Real` 的 64-bit 位模式相同，`String`
-长度和各 byte 相同，`Array` 逐元素相同。不同 Type 的 Value 不可比较。
+`sameValue(x, y)` 用来判断两个同类型值的表示是否完全相同：BV 逐 bit 比较，Real
+比较完整 64-bit 位模式，String 逐 byte 比较，Array 逐元素比较。因此两个不同编码的
+NaN 也不视为相同值。
 
-Program 的 Variable 集合及每个 Array 的长度均为静态；`String` payload 的长度是
-Value 的一部分，不会创建新的 Variable 或 VarId。
+每个 Variable 创建时按 `Init` 初始化：
 
-### 3.2 Init
+- `constant(value)`：标量常量，运行期间不可写；
+- `[]`：以类型零值初始化；
+- `set(expr)`：初始化标量；
+- `fill(start, count, expr)`：初始化 Array 的一段区间；
+- `load(path, hex | bin, range)`：从文件初始化 Array。
 
-`Init` 定义为：
+初始化动作按顺序执行，后面的动作覆盖前面的动作，并且只在创建 Machine 时执行一次。
+`random` 初始化目前保留语法但尚未定义确定语义。完整规则见
+[Variable Init 规范](#9-variable-init-规范)。
 
-```text
-Init       = constant(ScalarValue)
-           | [InitAction...]
-InitAction = set(InitExpr)
-           | fill(Start, Count, InitExpr)
-           | load(Path, Format, Range)
-InitExpr   = literal(ScalarValue)
-           | random
-           | random(SeedValue)
-SeedValue  : Value(BV<64, unsigned>)
-Path       = string
-Format     = hex | bin
-Range      = all | from(Start) | span(Start, Count)
-```
+### 2.2 Block 和 Instruction
 
-`Start`、`Count`、load cursor 和 `@address` 均为数学非负整数，运算不发生宿主整数
-回绕；使用 `Count` 时要求 `Count > 0`。
-
-`ScalarValue` 是任意 `ScalarType` 的 Value。typed value 已在 lower 时解析为与目标
-Type 完全匹配的值；`random` 和 `random(SeedValue)` 只可用于目标 `BV`。
-
-- `constant(value)`：只用于 ScalarType；创建实例时确定值，在 epoch 0 前即可读取，
-  此后跨所有 epoch 和 `eval()` 保持不变；
-- `set`：设置整个 ScalarType Variable；
-- `fill`：按索引递增设置 `Array` 的 `[Start, Start + Count)`，每个元素依次求值
-  `InitExpr`；
-- `load`：在创建 AM 实例时从文件系统读取文本，并按 `Format` 和 `Range` 初始化
-  `Array`。
-
-创建 AM 实例时，`constant(value)` Variable 直接取 value；其他 Variable 先置为其 Type
-的零值，再按 Init 序列顺序执行动作，后动作覆盖先前写入。`Init = []` 表示 GRH 没有
-指定初始化；其运行时初值仍为零，但它与显式零初始化在 IR 中保持可区分。
-同一个 value 放入 `constant(value)` 时不可写，放入 `[set(literal(value))]` 时仍可写。
-
-所有 Init 完成后，AM 为每条 act 执行一次基线初始化 `old = new`。act 的 old 必须使用
-`Init = []`；该基线初始化不是 InitAction，并覆盖其 Type 零值。
-
-实例初始化上下文为：
-
-```text
-InitContext = (FileRoot: Path)
-```
-
-`FileRoot` 是运行期指定的绝对目录。GRH `initFile` 原样成为 `Path`；绝对 `Path`
-直接使用，相对 `Path` 与 `FileRoot` 拼接后做 `.`、`..` 词法归一化。`FileRoot` 只是
-基准目录，`..` 可以越出它；不展开 `~`、环境变量或 shell 表达式。`load` 在每个 AM
-实例创建时执行一次，因此实例创建前对文件的修改可见，但文件不会在后续 `eval()`
-中重读。
-
-`random` 和 `random(SeedValue)` 保留 GRH 的两种随机初始化形式；GRH `$random(seed)`
-的 seed 按二进制补码取最低 64 bit，映射为 Type 为 `BV<64, unsigned>` 的 SeedValue。
-当前版本不定义 PRNG、seed 作用或取位规则；执行任何求值到这两种 `InitExpr` 的 Init
-动作均为 UB，AM 不约束实例状态及其后续可观察行为，也不要求实现诊断。该 UB 只
-适用于 InitExpr；运行期 SystemFunction 随机调用的语义另行定义。
-
-每个 Variable 只在创建 AM 实例时应用一次 Init，之后其值保留在 M 中。Program 不区分
-input、output、state 或 temporary。调用方只应在实例创建完成后且 `eval()` 尚未开始，
-或一次 `eval()` 返回后访问 M；AM 不为访问时机提供防护或检测，在实例创建或 `eval()`
-执行期间访问不属于合法用法。这里的外部访问不限制 SystemFunction、SystemTask 或
-DPI 指令自身定义的外部效果。
-
-AM 不为 Variable 增加 input 标记。哪些外部变化应启动哪些 Block，由 EntryBlock 中的
-`actf` 显式表达；EntryBlock 比较的是两次 `eval()` 采样之间的净变化，中间发生但在
-本次调用前恢复原值的外部写不可见。外部写本身不隐式激活 Block；未被 EntryBlock
-观察的写入不会设置初始 `Active` 控制槽。
-
-#### GRH 到 Init 的规范化
-
-| GRH | GRHSIM-AM Init |
-| --- | --- |
-| `kConstant.constValue` | 结果 Value 对应一个 `Init = constant(value)` 的 Variable；不生成指令、Block 或 Block 激活。 |
-| `kRegister.initValue` | `[set(InitExpr)]`；普通 literal、`$random`、`$random(seed)` 分别映射为三种 `InitExpr`。 |
-| 无初始化属性 | 空序列 `[]`。 |
-| `kMemory` 的 `literal` | 一个 `fill`；缺省 `initValue` 按 literal 0。 |
-| `kMemory` 的 `readmemh/readmemb` | 分别映射为 `load(Path, hex, Range)` 和 `load(Path, bin, Range)`。 |
-
-GRH lowering 还遵循以下规则：
-
-- `kConstant.constValue` 必须解析为与 result Variable ScalarType 完全匹配的 value；
-  Logic constant 映射为 `BV`，含 X/Z 时 lower 失败，Real 和 String constant 分别
-  映射为对应的 ScalarValue；
-- `kRegister(width=W, isSigned=B)` 映射为 `BV<W, S>`，其中 B 为 true 时 S 为
-  signed，否则为 unsigned；`kMemory(row=N, width=W, isSigned=B)` 同理映射为
-  `Array<N, BV<W, S>>`，memory row `i` 对应 array index `i`；
-- 普通 GRH Logic literal 按 GRH 的赋值规则消解为与目标 `BV<W, S>` 完全匹配的值；
-  含 X/Z 的结果必须在 lower 时报告错误；
-- `literal`：`start < 0` 表示全数组；否则必须 `start >= 0 && len > 0`，表示
-  `[start, start + len)`；
-- `readmemh/readmemb`：`start < 0` 表示省略范围，`start >= 0 && len <= 0` 表示从
-  `start` 到数组末尾，`start >= 0 && len > 0` 表示 `[start, start + len)`；
-- 上述三种情况分别映射为 `all`、`from(start)`、`span(start, len)`；
-- `all`、`from(s)`、`span(s, n)` 分别选择地址集合 `[0, +inf)`、`[s, +inf)`、
-  `[s, s + n)`；实际写入地址还须与 Array 的 `[0, N)` 取交集；
-- `load` cursor 在 `all` 时从 0 开始，在 `from` 或 `span` 时从 `Start` 开始；数据
-  token 写入 cursor 后令其加一，`@address` 将 cursor 设为绝对十六进制行号；
-- `_` 在数值中被忽略；去掉 `_` 后，hex 数据 token 必须是非空 `[0-9a-fA-F]+`，
-  bin 数据 token 必须是非空 `[01]+`，address 必须是 `@` 后跟非空十六进制数；
-  忽略空白、`//` 行注释和 `/*...*/` 块注释；
-- 数据 token 少于 W bit 时高位补零，多于 W bit 时只保留最低 W bit；Signedness
-  不影响该补位规则，结果类型为目标 `BV<W, S>`。含 X/Z 的 token 非法。
-  cursor 位于选定 Range 或数组边界外时不写入，但仍递增；
-- 空文件合法且不写入任何值；
-- literal 区间与数组 `[0, N)` 取交集后 lower；空区间不产生动作；
-- Path 解析、文件打开或读取、注释或 token 解析任一步失败，都使 AM 实例创建失败，
-  不产生可用的部分初始化实例。多个 Init 动作的顺序及重叠覆盖关系必须保留。
-
-例如 `Array<4, BV<8, unsigned>>` 的 `mem.hex` 内容为 `0A 0B @3 FF`，先执行全范围
-`readmemh`，再用 literal 初始化第 0 行，得到：
-
-```text
-[load("mem.hex", hex, all), fill(0, 1, literal(8'h7E))]
-```
-
-最后一个动作覆盖第 0 行。`kMemoryFillPort` 是运行期写入，不属于 Init。
-
-### 3.3 分区理想存储
-
-M 是从 MemId 到 MemValue 的有限映射，是 AM 的理想存储和全部可变实例状态。Variable
-位于前缀，所有非 Variable 控制槽位于其后的连续后缀：
-
-```text
-Bool         = {false, true}
-Nat          = {0, 1, ...}
-MemId        = Nat
-ControlValue = Bool | Nat
-MemValue     = ControlValue | Value(Type)
-M            = finite_map<MemId, MemValue>
-
-VariableCount = |Program.Variables|
-BlockCount    = |Program.Blocks|
-
-FirstEvalId         = VariableCount
-EpochId             = VariableCount + 1
-ActiveBias          = VariableCount + 2
-NextEpochActiveBias = ActiveBias + BlockCount
-MemorySize          = NextEpochActiveBias + BlockCount
-
-VariableRegion = [0, VariableCount):
-  M[VarId] = Value(Type(VarId))
-
-ControlRegion = [VariableCount, MemorySize):
-  M[FirstEvalId]                  : Bool
-  M[EpochId]                      : Nat
-  M[ActiveBias + b]               : Bool, 0 <= b < BlockCount
-  M[NextEpochActiveBias + b]      : Bool, 0 <= b < BlockCount
-
-dom(M) = [0, MemorySize)
-```
-
-下文用 `Active(b)` 和 `NextEpochActive(b)` 分别作为 `M[ActiveBias + b]` 和
-`M[NextEpochActiveBias + b]` 的可读写别名。它们不是独立于 M 的集合或状态。
-后端可以将每个 Bool 区压缩为 bitset，只要保持按 BlockId 读写的语义。
-
-`Bool` 和 `Nat` 是不同的带类型值，只用于控制区，不能与 `BV` 混用，也不是 Variable
-Type。控制槽是 M 中的 typed cell，但不是 Program 的 Variable 记录。Nat 运算使用数学
-整数，不发生回绕。
-
-创建实例时，所有 Variable 按 3.2 节完成 Init 并写入变量区，随后建立 act 的 old
-基线；再设置 `M[FirstEvalId] = true`、`M[EpochId] = 0`，并将两个激活区的所有 Bool
-置为 false。`M[FirstEvalId]` 表示首次全量激活是否尚未发出；首次全量激活发出后立即
-将其清零。
-
-MemId/VarId 与 BlockId 是独立命名空间；BlockId 只通过上述 bias 映射到对应控制槽。
-实例创建完成后，调用方与 AM 之间的设计数据和控制状态交互都通过 M 完成；`eval()`
-是唯一的非访存执行命令。控制区由 AM 写入，调用方只可读取。变量区的外部写是一次
-存储变动，不表示持续驱动，也不是 InitAction；写入 Value 必须与 Variable Type 完全
-相同，且目标不能是 constant 或 act 的 old Variable。外部写本身不隐式激活 Block。
-
-外部 `read(MemId)` 可读取 `[0, MemorySize)` 中任一槽；越界读取失败。外部
-`write(MemId, x)` 只能写 `[0, VariableCount)` 中类型匹配且可写的 Variable；写控制区、
-越界 MemId、constant 或 act 的 old Variable 均失败且不修改 M。
-
-普通指令只能显式引用 `[0, VariableCount)` 中的 VarId。指令的 `read(v)` 和
-`write(v, x)` 直接访问变量 `v` 的完整 Value；`write` 要求 `type(x) = Type(v)` 且目标
-可写，否则不修改 M。constant Variable 仍保留 VarId；后端可以内联其值而不分配物理
-存储。不存在字节寻址、指针运算、地址别名或运行时创建 Variable。
-
-`Array` 通过 `(base VarId, element index)` 访问元素；index 是指令操作数，不参与
-VarId 算术。后端可以拆分、合并、缓存或消除物理存储，只要保持 AM 语义。
-
-## 4. 指令与基本块
-
-### 4.1 指令
-
-普通指令采用直接访存的 CISC 形式：
-
-```text
-opcode dst..., src... [attributes]
-```
-
-例如：
+Block 是按文本顺序完整执行的指令序列。Block 内没有隐式分支或提前退出；数据选择由
+`mux` 等显式指令表达。
 
 ```text
 and %2, %0, %1
 ```
 
-表示读取 VarId 0 和 1，按位与后写入 VarId 2。每个 opcode 必须完整定义操作数数量、
-类型约束、结果函数、截断或越界规则，以及对理想存储或外部环境的效果。核心 opcode
-中的纯计算结果必须是全函数，不能继承宿主语言的未定义行为。
+这里 `%n` 表示 VarId `n`。普通组合指令先读取全部源，再计算并写回，因此在类型允许
+时目标可以与源相同。各指令的类型和边界规则见
+[GRHSIM-AM 指令集](grhsim-am-instructions.md)。
 
-具体 opcode 见 [GRHSIM-AM 指令集](grhsim-am-instructions.md)。
+`BlockId` 同样从 0 开始连续编号，但与 VarId 属于不同命名空间：
 
-### 4.2 Block
+- `B0` 是 EntryBlock，每次 `eval()` 开始时执行一次；
+- `B1` 及之后是普通 Block，只在被激活时执行。
 
-令 `BlockCount = |Blocks|`。Program 必须满足 `BlockCount >= 1`，BlockId 集合恰为
-`[0, BlockCount)`；BlockId 0 固定为 EntryBlock，其余是普通 Block。普通 Block 未被
-激活时不执行；一旦被激活，就按文本顺序执行全部 Instructions，不分支、不 trap、
-不提前退出。EntryBlock 的特殊执行规则见第 5、6 节。
+## 3. State：值和调度状态
 
-动态数据选择由 `mux` 等显式 opcode 表达。指令的源和目标操作数可用于派生读写集合，
-但这些集合不是 Block 字段。
-
-## 5. BlockId 与依赖
-
-act 的 Targets 是依赖关系的唯一来源。定义：
+State 分为三个逻辑区域：
 
 ```text
-Forward = {(B.BlockId, t) |
-           actf(_, _, Targets) in B.Instructions,
-           t in Targets}
-
-Backward = {(B.BlockId, t) |
-            actb(_, _, Targets) in B.Instructions,
-            t in Targets}
+State S
+├── VariableArea   每个 Variable 的当前 Value
+├── ControlArea    FirstEval、EpochCounter
+└── ActiveArea     Active、NextEpochActive
 ```
 
-每个 Targets 都是静态非空 BlockId 集合。对任意 `(s, t) in Forward`，必须满足
-`s < t < BlockCount`；对任意 `(s, t) in Backward`，必须满足
-`1 <= t < BlockCount`，不约束 s 与 t 的大小关系，因此允许指向自身。关系使用集合
-语义，不同 act 可以派生相同的依赖。
+关键字段如下：
 
-EntryBlock 满足以下约束：
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `Values[v]` | `Value(Type(v))` | VarId `v` 的当前值 |
+| `FirstEval` | `Bool` | 是否尚未进行首次全量求值 |
+| `EpochCounter` | `Nat` | 当前 epoch 编号，从 0 开始 |
+| `Active[b]` | `Bool` | Block `b` 是否应在当前 epoch 执行 |
+| `NextEpochActive[b]` | `Bool` | Block `b` 是否应在下一 epoch 执行 |
 
-- `BlockId = 0`，Program 中恰好存在一个 EntryBlock；
-- Instructions 只包含 `actf`；
-- 每次 `eval()` 开始时无条件执行一次，不设置 `Active(0)`，也不在 epoch 中再次执行；
-- `Active(0)` 和 `NextEpochActive(0)` 是统一寻址保留的槽，始终为 false；
-- EntryBlock 中每个 `actf` 的 new Variable 不是 constant，在 `eval()` 期间只读，不能
-  作为任何指令的目标。
+其中 `Bool = {false, true}`，`Nat = {0, 1, 2, ...}`。两者是 Machine 内部类型，
+不是 Program 可以声明的 Variable Type；`Nat` 使用数学自然数语义，不发生固定位宽回绕。
 
-因为 Forward 中每条依赖的 target ID 都严格大于 source ID，BlockId 的整数升序就是
-Forward 的拓扑序，不需要另存 topo order。`actf` 派生的 Forward 在当前 epoch 生效，
-`actb` 派生的 Backward 在下一 epoch 生效。首次全量激活不属于这两个关系。
-
-Backward 逻辑上是跨 epoch 的二分关系：
+规范给出了一种连续的逻辑布局，便于统一寻址：
 
 ```text
-source(epoch k, BlockId) -> target(epoch k + 1, BlockId)
+VariableArea          [0, VariableCount)
+FirstEval             VariableCount
+EpochCounter          VariableCount + 1
+Active                接下来的 BlockCount 个槽
+NextEpochActive       再接下来的 BlockCount 个槽
 ```
 
-同一普通 BlockId 可以同时作为 source 和 target，因此允许跨 epoch 自反馈。
-实现可以缓存 Forward 和 Backward，但缓存不参与 AM 语义。
+这是语义布局，不是物理实现要求。后端可以内联常量、压缩激活位或消除不需要物化的槽，
+只要外部可观察行为一致。
 
-## 6. 一次 eval 的执行
+## 4. 变化驱动调度
 
-`Active` 和 `NextEpochActive` 是 M 中的瞬时控制区，不是 `eval()` 的局部集合。每次
-`eval()` 开始时清零，正常返回时也全部为 false，因此不会跨调用传递激活。
+GRHSIM-AM 不在每次求值时无条件运行所有 Block。它用变化检测只激活受影响的 Block，
+并按 epoch 传播变化。
 
-一次 Program 执行按以下伪代码求不动点；`inout` 表示被调用过程可修改该参数：
+### 4.1 `actf` 与 `actb`
+
+两种激活指令都比较一个当前值 `new` 和该指令独占的上次观察值 `old`：
 
 ```text
-procedure executeBlock(B, inout M):
-    for I in B.Instructions in text order:
-        match I:
-            case actf(new, old, Targets):
-                newValue <- M[new]
-                oldValue <- M[old]
-                if not sameValue(newValue, oldValue):
-                    for b in Targets:
-                        Active(b) <- true
-                M[old] <- newValue
+actf %new, %old, {Targets...}
+actb %new, %old, {Targets...}
+```
 
-            case actb(new, old, Targets):
-                newValue <- M[new]
-                oldValue <- M[old]
-                if not sameValue(newValue, oldValue):
-                    for b in Targets:
-                        NextEpochActive(b) <- true
-                M[old] <- newValue
+如果两者不同：
 
-            case _:
-                execute I according to its opcode semantics
+- `actf` 将 Targets 加入当前 epoch 的 `Active`；
+- `actb` 将 Targets 加入下一 epoch 的 `NextEpochActive`。
 
-procedure eval(inout M):
-    M[EpochId] <- 0
-    for b in [0, BlockCount):
-        Active(b) <- false
-        NextEpochActive(b) <- false
+比较后总会执行 `old = new`。多个来源重复激活同一 Block 仍只记录一个布尔值，因此
+同一 Block 在一个 epoch 内最多执行一次。
 
-    executeBlock(Blocks[0], M)
+每条 act 必须独占自己的 `old` Variable。这个 Variable 只保存变化检测基线，不能被
+其他指令或调用方使用。Machine 初始化完成后会先执行一次 `old = new`，避免把初始值
+误判成外部变化。
 
-    if M[FirstEvalId] = true:
-        for b in [1, BlockCount):
-            Active(b) <- true
-        M[FirstEvalId] <- false
+### 4.2 Forward 和 Backward
 
-    while exists b in [1, BlockCount) where Active(b) = true:
-        for b in [1, BlockCount) in ascending order:
-            if Active(b) = true:
-                Active(b) <- false
-                executeBlock(Blocks[b], M)
+一个 epoch 按 BlockId 从小到大扫描普通 Block。
 
-        if not exists b in [1, BlockCount) where NextEpochActive(b) = true:
+- `actf` 只能指向更大的 BlockId，因此目标尚未被扫描，可以在当前 epoch 执行；
+- `actb` 总是把目标放入下一 epoch，目标可以在源 Block 的前面、后面或就是它自己。
+
+这里的 backward 表示“跨到下一 epoch”，不要求 BlockId 数值向后。
+
+```text
+epoch k:      B1 ----actf----> B3
+                              |
+                             actb
+                              v
+epoch k + 1: B2
+```
+
+### 4.3 EntryBlock
+
+EntryBlock 是 `B0`，只包含 `actf`。它在每次 `eval()` 开始时无条件执行，将两次调用
+之间的外部净变化转成 epoch 0 的初始激活。
+
+外部写入本身不会直接激活 Block。例如输入从 0 改成 1、又在调用 `eval()` 前改回 0，
+EntryBlock 只看到最终值 0，因此不会观察到中间变化。
+
+### 4.4 首次求值
+
+第一次 `eval()` 会额外激活所有普通 Block。这保证即使初始值没有触发 EntryBlock，
+整个 Program 仍会完成一次初始求值。此后只执行由变化传播激活的 Block。
+
+## 5. `eval()` 流程
+
+一次求值可以概括为：
+
+```text
+1. 清空激活状态，EpochCounter = 0
+2. 执行 EntryBlock，检测调用间的外部变化
+3. 若 FirstEval = true，激活全部普通 Block，并清除 FirstEval
+4. 按 BlockId 升序执行当前 epoch 的激活 Block
+5. 若 NextEpochActive 非空，将其移入 Active，EpochCounter += 1，回到步骤 4
+6. 没有待执行 Block 时返回
+```
+
+更接近实现的伪代码如下：
+
+```text
+eval(S):
+    EpochCounter = 0
+    clear Active and NextEpochActive
+    execute B0
+
+    if FirstEval:
+        activate B1 ... Bn
+        FirstEval = false
+
+    while Active is not empty:
+        for b = 1 ... n:
+            if Active[b]:
+                Active[b] = false
+                execute Bb
+
+        if NextEpochActive is empty:
             return
 
-        M[EpochId] <- M[EpochId] + 1
-        for b in [1, BlockCount):
-            Active(b) <- NextEpochActive(b)
-            NextEpochActive(b) <- false
-
-    return
+        Active = NextEpochActive
+        clear NextEpochActive
+        EpochCounter += 1
 ```
 
-两个 Bool 区分别是当前 epoch 和下一 epoch 激活集合的特征函数；重复置 true 没有额外
-效果，同一普通 Block 在一个 epoch 中最多执行一次。执行 Block 前先清除其 `Active`
-槽；Forward 满足 `source < target`，保证当前扫描尚未越过随后置 true 的目标。Backward
-激活只设置 `NextEpochActive`，在下一 epoch 生效。
+正常返回时两组激活位都为空，Variable 的值和 act 基线则保留到下一次调用。如果每个
+epoch 都继续产生下一 epoch 的激活，`eval()` 将不收敛；实现可以设置 epoch 上限并
+报告错误。
 
-除首次全量激活外，`actf` 和 `actb` 是唯一的激活来源；完整语义见指令集。正常返回时
-两个激活区必然全为 false。`M[EpochId]` 是从 0 开始的当前 epoch 编号；若没有执行
-epoch，其值仍为 0。
+## 6. 一个最小例子
 
-调用方须在一次 `eval()` 开始前完成对 M 的外部访问，并在其返回前不再访问 M。
-若每个 epoch barrier 都存在值为 true 的 `NextEpochActive` 槽，Program 不收敛；实现
-可以设置 epoch 上限并报告错误，但该上限不改变 AM 语义。
+下面的 Program 计算 `y = ~x`。为便于阅读，示例用 Variable Label 代替实际的数字
+VarId：
 
-## 7. 合法性检查
+```text
+B0:                         // EntryBlock
+    actf %x, %x_seen, {1}
 
-加载 Program 时至少验证：
+B1:
+    not  %n, %x
+    actf %n, %n_seen, {2}
 
-- VarId 集合恰为 `[0, VariableCount)`；`BlockCount >= 1`，BlockId 集合恰为
-  `[0, BlockCount)`，其中 BlockId 0 是唯一的 EntryBlock；
-- Type 符合 3.1 节文法，其中 W、N 为正整数，Signedness 为 `unsigned` 或 `signed`，
-  Label 是字符串；
-- Init 必须且只能选择 `constant(value)` 或动作序列之一；
-- `constant` 只用于 ScalarType，其 value 与 Variable Type 完全匹配；`BV` value 不含
-  X/Z；
-- 动作序列中的 `set` 只用于 ScalarType，`fill`、`load` 只用于 `Array`；`literal` 的
-  typed value 必须与目标 ScalarType 或 Array 元素 Type 完全匹配；`random` 只用于
-  `BV`，`load` 产生 Array 元素 Type；
-- ScalarType 的动作序列最多包含一个 `set`，`Array` 的动作序列不包含 `set`；`Path`
-  必须是非空字符串，`Format` 必须是 `hex` 或 `bin`；
-- `random(SeedValue)` 的 SeedValue Type 必须为 `BV<64, unsigned>`；
-- 对 `Array<N, ...>`，`fill` 必须满足 `Start >= 0`、`Count > 0`、
-  `Start + Count <= N`；`from(Start)` 只要求 `Start >= 0`，
-  `span(Start, Count)` 只要求 `Start >= 0`、`Count > 0`；
-- 所有作为 Variable 引用的指令操作数使用 `[0, VariableCount)` 中的合法 VarId，不引用
-  控制区，并满足 opcode 的类型约束；constant Variable 不得作为指令目标；
-- EntryBlock 只包含 `actf`；
-- `actf`、`actb` 的 new/old Variable 是不同 VarId、Type 完全相同，old 不是 constant；
-  每个 old 只由一条 act 使用，不出现于任何其他指令，且 `Init = []`；
-- 每条 `actf`、`actb` 的 Targets 是静态非空 BlockId 集合，且每个 Target 都位于
-  `[1, BlockCount)`；`actf` 的每个 Target 还必须大于所在 Block 的 BlockId；EntryBlock
-  中 actf 的 new 不作为任何指令目标且不是 constant。
+B2:
+    assign %y, %n
+```
 
-本文不统一约定 Program 加载、实例创建、合法阶段的外部访问操作或执行失败的承载
-方式；“失败”、“非法”和“报告错误”只规定必须被拒绝的条件，具体 API、诊断和恢复
-策略由实现决定。违反 3.2 节的外部访问时机属于调用契约之外，AM 不必检测或拒绝。
+第一次 `eval()` 会执行 B1、B2，得到初始结果。之后调用方修改 `x` 再调用 `eval()`：
 
-## 8. 待续定义
+```text
+x 变化 -> B0 激活 B1 -> B1 更新 n 并激活 B2 -> B2 更新 y
+```
 
-- Reg、Mem、Latch、Real/String 运算的具体指令；
-- 边沿检测指令及其首次 `eval()` 的基线语义；
-- SystemFunction、SystemTask 和 DPI 的具体指令及外部效果；
-- random 初始化的确定语义；在此之前按 3.2 节的 UB 处理。
+所有边都是 forward，因此整个传播在 epoch 0 内完成。如果 B1 需要重新触发一个已经
+扫描过的 Block，就应使用 `actb`，由下一 epoch 继续处理。
+
+## 7. Machine 生命周期与外部访问
+
+创建 Machine 时：
+
+1. 验证 Program；
+2. 初始化全部 Variable；
+3. 为每条 act 建立 `old = new` 基线；
+4. 设置 `FirstEval = true`、`EpochCounter = 0`；
+5. 清空全部激活位。
+
+调用方只能在 Machine 空闲时访问 State，即创建完成后、第一次 `eval()` 前，或两次
+`eval()` 之间。调用方可以读取状态，但只能修改满足以下条件的 Variable：
+
+- 写入值与 Variable Type 完全一致；
+- Variable 不是 constant；
+- Variable 不是 act 的 `old` 基线。
+
+ControlArea 和 ActiveArea 对调用方只读。Program 本身不区分 input、output、state 和
+temporary；端口到 VarId 的映射属于集成层契约，不能依赖不唯一的 Label。
+
+## 8. Lowering 和合法性要点
+
+从 GRH lower 到 GRHSIM-AM 时，需要保证：
+
+- VarId 和 BlockId 各自连续、无空洞，且至少存在 EntryBlock；
+- 每个操作数类型满足 opcode 约束，constant 不作为指令目标；
+- GRH Logic 映射成同宽、同 signedness 的 BV，含 X/Z 时 lower 失败；
+- `kConstant` 直接成为 constant Variable，不生成计算指令；
+- `kRegister` 映射为 BV，`kMemory` 映射为固定长度的 BV Array；
+- EntryBlock 只包含 `actf`，且目标都是普通 Block；
+- `actf` 的目标 BlockId 大于源 BlockId，`actb` 不得指向 EntryBlock；
+- 每条 act 的 `new` 和 `old` 类型相同，`old` 独占且使用空初始化。
+
+普通组合 Operation 的精确映射、位宽转换和边界行为见
+[GRHSIM-AM 指令集](grhsim-am-instructions.md)。状态单元、层次引用、系统调用、DPI、
+边沿检测以及确定性的 random 初始化仍待后续定义。
+
+## 9. Variable Init 规范
+
+Init 是 Program 的静态组成部分，只在创建 Machine 时执行一次。后续 `eval()` 不会
+重新初始化 Variable，也不会重新读取初始化文件。
+
+### 9.1 文法
+
+```text
+Init       = constant(ScalarValue)
+           | [InitAction...]
+
+InitAction = set(InitExpr)
+           | fill(Start, Count, InitExpr)
+           | load(Path, Format, Range)
+
+InitExpr   = literal(ScalarValue)
+           | random
+           | random(SeedValue)
+
+ScalarType = BV<W, Sign> | Real | String
+ScalarValue: Value(ScalarType)
+SeedValue  : Value(BV<64, unsigned>)
+Format     = hex | bin
+Range      = all | from(Start) | span(Start, Count)
+```
+
+`Start` 和 `Count` 是数学自然数；出现 `Count` 时必须满足 `Count > 0`，相关计算不发生
+宿主整数回绕。`Path` 是 Program 元数据中的非空路径字符串，不是 AM 的 String Value。
+
+### 9.2 零值
+
+动作序列执行前，Variable 先取对应 Type 的零值：
+
+| Type | `zero(Type)` |
+| --- | --- |
+| `BV<W, Sign>` | W 个 0 bit |
+| `Real` | IEEE-754 binary64 正零的位模式 |
+| `String` | 空 byte 序列 |
+| `Array<N, BV<W, Sign>>` | N 个零值元素 |
+
+### 9.3 初始化形式
+
+| 形式 | 合法目标 | 语义 |
+| --- | --- | --- |
+| `constant(value)` | ScalarType | 直接使用 value，并使 Variable 在整个生命周期内不可写 |
+| `[]` | 任意 Type | 保持 `zero(Type)`，Variable 仍可写 |
+| `set(expr)` | ScalarType | 设置整个标量 |
+| `fill(start, count, expr)` | Array | 按索引递增设置 `[start, start + count)` |
+| `load(path, format, range)` | Array | 从文本文件依次读取 Array 元素 |
+
+`constant(value)` 和动作序列是互斥的两种 Init。动作从左到右执行，后面的动作覆盖前面
+的动作；空序列 `[]` 与显式设置零值在 Program 中仍是不同表示。
+
+`constant` 和 `literal` 中的 Value 必须与目标 ScalarType 或 Array 元素 Type 完全
+一致。标量动作序列最多包含一个 `set`；Array 动作序列不能包含 `set`。`fill` 必须满足
+`start + count <= N`，并对区间内的每个元素分别求值一次 `expr`。
+
+### 9.4 Random
+
+`random` 和 `random(seed)` 只能用于 BV；seed 必须是 `BV<64, unsigned>`。当前版本尚未
+定义 PRNG、seed 作用和取位规则，因此任何实际求值到 random 的初始化均为未定义行为；
+实现不需要产生诊断。该规则仅适用于 InitExpr，不影响运行期随机系统函数。
+
+### 9.5 文件加载
+
+Machine 创建时由运行环境提供绝对目录 `FileRoot`。绝对 Path 直接使用；相对 Path 与
+`FileRoot` 拼接后对 `.` 和 `..` 做词法归一化。路径不展开 `~`、环境变量或 shell
+表达式，`..` 可以越出 `FileRoot`。
+
+Range 决定允许写入的数学地址区间：
+
+```text
+all            -> [0, +inf)
+from(start)    -> [start, +inf)
+span(start, n) -> [start, start + n)
+```
+
+实际写入范围还要与 Array 的 `[0, N)` 取交集。cursor 在 `all` 时从 0 开始，在
+`from` 和 `span` 时从 start 开始。每读取一个数据 token，尝试写入 cursor 后将其加一；
+`@address` 将 cursor 设置为指定的绝对十六进制元素地址。即使 cursor 位于有效范围外，
+读取数据 token 后仍会递增。
+
+文件词法规则如下：
+
+- 忽略空白、`//` 行注释和 `/* ... */` 块注释；
+- 数值 token 中的 `_` 被忽略；
+- hex 数据只能包含十六进制数字，bin 数据只能包含 `0` 或 `1`；
+- address token 是 `@` 加非空十六进制地址；
+- X/Z token 非法；空文件合法。
+
+数据短于元素位宽时高位补零，长于元素位宽时只保留最低位；Signedness 不影响补位和
+截断。路径解析、文件访问、注释或 token 解析任一步失败，Machine 创建失败，不产生
+可用的部分初始化 State。
