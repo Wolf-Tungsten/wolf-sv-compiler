@@ -1,0 +1,1476 @@
+#include "grhsim/am/builder.hpp"
+#include "grhsim/am/activity_schedule.hpp"
+#include "grhsim/am/opcode_traits.hpp"
+#include "grhsim/am/pipeline.hpp"
+
+#include <array>
+#include <cstddef>
+#include <filesystem>
+#include <iostream>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+using namespace wolvrix::lib::grhsim::am;
+
+namespace
+{
+
+    int fail(const std::string &message)
+    {
+        std::cerr << "[grhsim_am_pipeline] " << message << '\n';
+        return 1;
+    }
+
+    bool containsError(const ValidationResult &result, std::string_view needle)
+    {
+        for (const std::string &error : result.errors)
+        {
+            if (error.find(needle) != std::string::npos)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    enum class LowerBehavior
+    {
+        Success,
+        ReturnFailure,
+        InvalidInterface,
+        InvalidSchedulingFacts,
+    };
+
+    enum class ScheduleBehavior
+    {
+        Success,
+        ReturnFailure,
+        InvalidInterface,
+    };
+
+    enum class EmitBehavior
+    {
+        Success,
+        ReturnFailure,
+    };
+
+    struct MockState
+    {
+        std::vector<std::string> calls;
+        bool lowerSawGraph = false;
+        bool schedulerSawLinearProgram = false;
+        bool schedulerSawInterface = false;
+        bool schedulerSawSchedulingFacts = false;
+        bool schedulerSawOptions = false;
+        bool emitterSawScheduledProgram = false;
+        bool emitterSawInterface = false;
+        bool emitterSawOptions = false;
+    };
+
+    LinearProgramArtifact makeLinearArtifact()
+    {
+        LinearProgramBuilder builder;
+        const TypeId type = builder.addType(Type::bitVector(1));
+        const StringId portName = builder.addString("clock");
+        const StringId variableName = builder.addString("top.clock");
+        const VariableId input = builder.addVariable(type, builder.zeroInit(), variableName);
+
+        ProgramInterface interface;
+        interface.ports.push_back(PortBinding{
+            .name = portName,
+            .direction = PortDirection::Input,
+            .input = input,
+            .output = VariableId::invalid(),
+            .outputEnable = VariableId::invalid(),
+        });
+        interface.declaredVariables.push_back(VariableLabel{
+            .variable = input,
+            .label = variableName,
+        });
+
+        SchedulingFacts facts;
+        facts.variableRoles.push_back(VariableRole::ExternalInput | VariableRole::Observable);
+
+        return LinearProgramArtifact{
+            .program = builder.finish(),
+            .interface = std::move(interface),
+            .schedulingFacts = std::move(facts),
+        };
+    }
+
+    class MockLowering final : public GrhToAmLoweringStage
+    {
+    public:
+        MockLowering(MockState &state, LowerBehavior behavior)
+            : state_(state), behavior_(behavior)
+        {
+        }
+
+        std::optional<LinearProgramArtifact>
+        lower(const wolvrix::lib::grh::Graph &graph,
+              wolvrix::lib::diag::Diagnostics &diagnostics) override
+        {
+            state_.calls.emplace_back("lower");
+            state_.lowerSawGraph = graph.symbol() == "pipeline_top";
+            if (behavior_ == LowerBehavior::ReturnFailure)
+            {
+                diagnostics.error("mock lowering failed", "mock-lower");
+                return std::nullopt;
+            }
+
+            LinearProgramArtifact artifact = makeLinearArtifact();
+            if (behavior_ == LowerBehavior::InvalidInterface)
+            {
+                artifact.interface.ports.front().output =
+                    artifact.interface.ports.front().input;
+            }
+            else if (behavior_ == LowerBehavior::InvalidSchedulingFacts)
+            {
+                artifact.schedulingFacts.variableRoles.clear();
+            }
+            return std::optional<LinearProgramArtifact>(std::move(artifact));
+        }
+
+    private:
+        MockState &state_;
+        LowerBehavior behavior_;
+    };
+
+    class MockScheduler final : public AmActivityScheduleStage
+    {
+    public:
+        MockScheduler(MockState &state, ScheduleBehavior behavior)
+            : state_(state), behavior_(behavior)
+        {
+        }
+
+        std::optional<ExecutableModel>
+        schedule(LinearProgramArtifact &&linear,
+                 const ActivityScheduleOptions &options,
+                 wolvrix::lib::diag::Diagnostics &diagnostics) override
+        {
+            state_.calls.emplace_back("schedule");
+            const ProgramView view = linear.program.view();
+            state_.schedulerSawLinearProgram =
+                linear.program.valid() && view.variableCount() == 1 &&
+                view.instructionCount() == 0;
+            state_.schedulerSawInterface =
+                linear.interface.ports.size() == 1 &&
+                linear.interface.ports.front().direction == PortDirection::Input &&
+                linear.interface.ports.front().input == VariableId{0} &&
+                linear.interface.declaredVariables.size() == 1;
+            state_.schedulerSawSchedulingFacts =
+                linear.schedulingFacts.variableRoles.size() == 1 &&
+                linear.schedulingFacts.instructionEffects.empty() &&
+                linear.schedulingFacts.orderedEffects.empty();
+            state_.schedulerSawOptions =
+                options.maxInstructionsPerBlock == 17 &&
+                options.maxStateWritesPerBlock == 23 && !options.enableCoarsening &&
+                options.collectStats;
+
+            if (behavior_ == ScheduleBehavior::ReturnFailure)
+            {
+                diagnostics.error("mock scheduling failed", "mock-schedule");
+                return std::nullopt;
+            }
+
+            ProgramInterface interface = std::move(linear.interface);
+            ScheduledProgramBuilder builder(std::move(linear.program));
+            const TypeId type = builder.view().variable(VariableId{0}).type;
+            const VariableId oldValue = builder.addVariable(type, builder.undefInit());
+            const VariableId event = builder.addVariable(type, builder.zeroInit());
+            const std::array<VariableId, 1> changedResults = {event};
+            const std::array<VariableId, 2> changedOperands = {VariableId{0}, oldValue};
+            const InstructionId changed =
+                builder.addInstruction(Opcode::ChangedAny, changedResults, changedOperands);
+            const std::array<VariableId, 1> actOperands = {event};
+            const InstructionId activate =
+                builder.addInstruction(Opcode::ActForward, {}, actOperands);
+            const std::array<BlockId, 1> targets = {BlockId{1}};
+            builder.setActivationTargets(activate, targets);
+            const std::array<InstructionId, 2> entryInstructions = {changed, activate};
+            builder.addBlock(entryInstructions);
+            builder.addBlock({});
+            ExecutableModel model{
+                .program = builder.finish(),
+                .interface = std::move(interface),
+            };
+            if (behavior_ == ScheduleBehavior::InvalidInterface)
+            {
+                model.interface.ports.front().input = VariableId::invalid();
+            }
+            return std::optional<ExecutableModel>(std::move(model));
+        }
+
+    private:
+        MockState &state_;
+        ScheduleBehavior behavior_;
+    };
+
+    class MockEmitter final : public GrhSimAmCppEmitStage
+    {
+    public:
+        MockEmitter(MockState &state, EmitBehavior behavior)
+            : state_(state), behavior_(behavior)
+        {
+        }
+
+        GrhSimAmCppResult
+        emit(const ExecutableModel &model,
+             const GrhSimAmCppOptions &options,
+             wolvrix::lib::diag::Diagnostics &diagnostics) override
+        {
+            state_.calls.emplace_back("emit");
+            state_.emitterSawScheduledProgram =
+                model.program.valid() && model.program.blockCount() == 2;
+            state_.emitterSawInterface =
+                model.interface.ports.size() == 1 &&
+                model.interface.ports.front().input == VariableId{0};
+            state_.emitterSawOptions =
+                options.outputDirectory == std::filesystem::path("pipeline-output") &&
+                options.maxOutputFileBytes == 4096 &&
+                options.attributes.size() == 1 &&
+                options.attributes.at("mode") == "test";
+
+            if (behavior_ == EmitBehavior::ReturnFailure)
+            {
+                diagnostics.error("mock emit failed", "mock-emit");
+                return GrhSimAmCppResult{
+                    .success = false,
+                    .artifacts = {"partial.cpp"},
+                };
+            }
+            return GrhSimAmCppResult{
+                .success = true,
+                .artifacts = {"model.cpp", "support.cpp"},
+            };
+        }
+
+    private:
+        MockState &state_;
+        EmitBehavior behavior_;
+    };
+
+    struct CaseOutcome
+    {
+        bool success = false;
+        bool hasModel = false;
+        bool diagnosticsHaveError = false;
+        std::size_t modelBlockCount = 0;
+        std::vector<std::string> artifacts;
+        MockState state;
+    };
+
+    CaseOutcome runCase(LowerBehavior lowerBehavior,
+                        ScheduleBehavior scheduleBehavior,
+                        EmitBehavior emitBehavior)
+    {
+        MockState state;
+        MockLowering lowering(state, lowerBehavior);
+        MockScheduler scheduler(state, scheduleBehavior);
+        MockEmitter emitter(state, emitBehavior);
+        GrhSimAmPipeline pipeline(lowering, scheduler, emitter);
+
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("pipeline_top");
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        const ActivityScheduleOptions scheduleOptions{
+            .maxInstructionsPerBlock = 17,
+            .maxStateWritesPerBlock = 23,
+            .enableCoarsening = false,
+            .collectStats = true,
+        };
+        GrhSimAmCppOptions emitOptions{
+            .outputDirectory = "pipeline-output",
+            .maxOutputFileBytes = 4096,
+            .attributes = {},
+        };
+        emitOptions.attributes.emplace("mode", "test");
+
+        GrhSimAmPipelineResult result = pipeline.run(
+            graph,
+            scheduleOptions,
+            emitOptions,
+            diagnostics);
+        const std::size_t blockCount =
+            result.model ? result.model->program.blockCount() : 0;
+        return CaseOutcome{
+            .success = result.success,
+            .hasModel = result.model.has_value(),
+            .diagnosticsHaveError = diagnostics.hasError(),
+            .modelBlockCount = blockCount,
+            .artifacts = std::move(result.artifacts),
+            .state = std::move(state),
+        };
+    }
+
+    int testStrictSuccessOrder()
+    {
+        const CaseOutcome outcome = runCase(
+            LowerBehavior::Success,
+            ScheduleBehavior::Success,
+            EmitBehavior::Success);
+        if (!outcome.success || !outcome.hasModel || outcome.diagnosticsHaveError ||
+            outcome.modelBlockCount != 2 ||
+            outcome.artifacts != std::vector<std::string>{"model.cpp", "support.cpp"})
+        {
+            return fail("successful pipeline must return its ScheduledProgram and emitted artifacts");
+        }
+        if (outcome.state.calls != std::vector<std::string>{"lower", "schedule", "emit"})
+        {
+            return fail("pipeline stages must run strictly as Linear -> Scheduled -> emit");
+        }
+        if (!outcome.state.lowerSawGraph || !outcome.state.schedulerSawLinearProgram ||
+            !outcome.state.schedulerSawInterface ||
+            !outcome.state.schedulerSawSchedulingFacts ||
+            !outcome.state.schedulerSawOptions ||
+            !outcome.state.emitterSawScheduledProgram ||
+            !outcome.state.emitterSawInterface || !outcome.state.emitterSawOptions)
+        {
+            return fail("pipeline must preserve stage inputs, metadata, and options");
+        }
+        return 0;
+    }
+
+    int testStagedPipelineDoesNotRetainGraph()
+    {
+        MockState state;
+        MockLowering lowering(state, LowerBehavior::Success);
+        MockScheduler scheduler(state, ScheduleBehavior::Success);
+        MockEmitter emitter(state, EmitBehavior::Success);
+        GrhSimAmPipeline pipeline(lowering, scheduler, emitter);
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        std::optional<LinearProgramArtifact> linear;
+        {
+            wolvrix::lib::grh::Design design;
+            wolvrix::lib::grh::Graph &graph = design.createGraph("pipeline_top");
+            linear = pipeline.lower(graph, diagnostics);
+        }
+        if (!linear || diagnostics.hasError() ||
+            state.calls != std::vector<std::string>{"lower"})
+        {
+            return fail("staged pipeline lowering must return an owned artifact");
+        }
+
+        const ActivityScheduleOptions scheduleOptions{
+            .maxInstructionsPerBlock = 17,
+            .maxStateWritesPerBlock = 23,
+            .enableCoarsening = false,
+            .collectStats = true,
+        };
+        GrhSimAmCppOptions emitOptions{
+            .outputDirectory = "pipeline-output",
+            .maxOutputFileBytes = 4096,
+            .attributes = {},
+        };
+        emitOptions.attributes.emplace("mode", "test");
+        GrhSimAmPipelineResult result = pipeline.run(
+            std::move(*linear),
+            scheduleOptions,
+            emitOptions,
+            diagnostics);
+        if (!result.success || !result.model || diagnostics.hasError() ||
+            result.artifacts != std::vector<std::string>{"model.cpp", "support.cpp"} ||
+            state.calls != std::vector<std::string>{"lower", "schedule", "emit"})
+        {
+            return fail("staged pipeline must run after its source Graph has been destroyed");
+        }
+        return 0;
+    }
+
+    int testExistingDiagnosticsDoNotConsumeArtifact()
+    {
+        MockState state;
+        MockLowering lowering(state, LowerBehavior::Success);
+        MockScheduler scheduler(state, ScheduleBehavior::Success);
+        MockEmitter emitter(state, EmitBehavior::Success);
+        GrhSimAmPipeline pipeline(lowering, scheduler, emitter);
+        LinearProgramArtifact linear = makeLinearArtifact();
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        diagnostics.error("existing failure", "test");
+        const GrhSimAmPipelineResult result = pipeline.run(
+            std::move(linear),
+            ActivityScheduleOptions{},
+            GrhSimAmCppOptions{},
+            diagnostics);
+        if (result.success || result.model || !result.artifacts.empty() ||
+            !linear.program.valid() || !state.calls.empty())
+        {
+            return fail("an existing diagnostic error must not consume the staged artifact");
+        }
+        return 0;
+    }
+
+    int testLoweringInterfaceGate()
+    {
+        const CaseOutcome outcome = runCase(
+            LowerBehavior::InvalidInterface,
+            ScheduleBehavior::Success,
+            EmitBehavior::Success);
+        if (outcome.success || outcome.hasModel || !outcome.diagnosticsHaveError ||
+            outcome.state.calls != std::vector<std::string>{"lower"})
+        {
+            return fail("invalid lowering ProgramInterface must gate scheduler and emitter");
+        }
+        return 0;
+    }
+
+    int testSchedulingFactsGate()
+    {
+        const CaseOutcome outcome = runCase(
+            LowerBehavior::InvalidSchedulingFacts,
+            ScheduleBehavior::Success,
+            EmitBehavior::Success);
+        if (outcome.success || outcome.hasModel || !outcome.diagnosticsHaveError ||
+            outcome.state.calls != std::vector<std::string>{"lower"})
+        {
+            return fail("invalid SchedulingFacts must gate scheduler and emitter");
+        }
+        return 0;
+    }
+
+    int testExternalInputRoleMustMatchInterface()
+    {
+        LinearProgramArtifact artifact = makeLinearArtifact();
+        artifact.schedulingFacts.variableRoles.front() = VariableRole::None;
+        const ValidationResult validation = validate(
+            artifact,
+            ValidationOptions{.level = ValidationLevel::Semantic});
+        if (validation.success() ||
+            !containsError(validation, "external-input roles do not match ProgramInterface"))
+        {
+            return fail("ProgramInterface inputs must carry the ExternalInput scheduling role");
+        }
+        return 0;
+    }
+
+    int testArtifactRolesAndInterfaceExposureContracts()
+    {
+        {
+            LinearProgramBuilder builder;
+            const TypeId eventType = builder.addType(Type::bitVector(1));
+            const TypeId valueType = builder.addType(Type::bitVector(8));
+            const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
+            const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
+            const VariableId nextValue = builder.addVariable(valueType, builder.zeroInit());
+            const VariableId target = builder.addVariable(valueType, builder.zeroInit());
+            const VariableId event = builder.addVariable(eventType, builder.zeroInit());
+            const std::array<VariableId, 5> operands = {
+                condition,
+                mask,
+                nextValue,
+                target,
+                event,
+            };
+            const InstructionId write =
+                builder.addInstruction(Opcode::RegisterWrite, {}, operands);
+            SchedulingFacts facts;
+            facts.variableRoles.assign(5, VariableRole::None);
+            facts.instructionEffects = {InstructionEffect::StateReadWrite};
+            facts.orderedEffects = {
+                OrderedEffect{.instruction = write, .group = 0, .ordinal = 0},
+            };
+            LinearProgramArtifact artifact{
+                .program = builder.finish(),
+                .schedulingFacts = std::move(facts),
+            };
+            if (validate(artifact, ValidationOptions{.level = ValidationLevel::Semantic}).success())
+            {
+                return fail("state instruction targets must carry the State scheduling role");
+            }
+        }
+
+        {
+            LinearProgramBuilder builder;
+            const TypeId type = builder.addType(Type::bitVector(8));
+            const StringId outputName = builder.addString("output");
+            const VariableId output = builder.addVariable(type, builder.zeroInit());
+            ProgramInterface interface;
+            interface.ports = {
+                PortBinding{
+                    .name = outputName,
+                    .direction = PortDirection::Output,
+                    .output = output,
+                },
+            };
+            SchedulingFacts facts;
+            facts.variableRoles = {VariableRole::None};
+            LinearProgramArtifact artifact{
+                .program = builder.finish(),
+                .interface = std::move(interface),
+                .schedulingFacts = std::move(facts),
+            };
+            if (validate(artifact, ValidationOptions{.level = ValidationLevel::Semantic}).success())
+            {
+                return fail("ProgramInterface outputs must carry the ExternalOutput role");
+            }
+        }
+
+        {
+            LinearProgramBuilder builder;
+            const TypeId valueType = builder.addType(Type::bitVector(8));
+            const TypeId eventType = builder.addType(Type::bitVector(1));
+            const StringId portName = builder.addString("old_value");
+            const VariableId value = builder.addVariable(valueType, builder.zeroInit());
+            const VariableId oldValue = builder.addVariable(valueType, builder.undefInit());
+            const VariableId event = builder.addVariable(eventType, builder.zeroInit());
+            const std::array<VariableId, 1> results = {event};
+            const std::array<VariableId, 2> operands = {value, oldValue};
+            builder.addInstruction(Opcode::ChangedAny, results, operands);
+            ProgramInterface interface;
+            interface.ports = {
+                PortBinding{
+                    .name = portName,
+                    .direction = PortDirection::Output,
+                    .output = oldValue,
+                },
+            };
+            SchedulingFacts facts;
+            facts.variableRoles = {
+                VariableRole::None,
+                VariableRole::ExternalOutput,
+                VariableRole::None,
+            };
+            facts.instructionEffects = {InstructionEffect::StateReadWrite};
+            LinearProgramArtifact artifact{
+                .program = builder.finish(),
+                .interface = std::move(interface),
+                .schedulingFacts = std::move(facts),
+            };
+            if (validate(artifact, ValidationOptions{.level = ValidationLevel::Semantic}).success())
+            {
+                return fail("ProgramInterface ports must not expose changed old storage");
+            }
+        }
+
+        {
+            LinearProgramBuilder builder;
+            const TypeId valueType = builder.addType(Type::bitVector(8));
+            const TypeId eventType = builder.addType(Type::bitVector(1));
+            const StringId eventName = builder.addString("event");
+            const VariableId value = builder.addVariable(valueType, builder.zeroInit());
+            const VariableId oldValue = builder.addVariable(valueType, builder.undefInit());
+            const VariableId event = builder.addVariable(eventType, builder.zeroInit());
+            const std::array<VariableId, 1> results = {event};
+            const std::array<VariableId, 2> operands = {value, oldValue};
+            builder.addInstruction(Opcode::ChangedAny, results, operands);
+            ProgramInterface interface;
+            interface.declaredVariables = {
+                VariableLabel{.variable = event, .label = eventName},
+            };
+            SchedulingFacts facts;
+            facts.variableRoles = {
+                VariableRole::None,
+                VariableRole::None,
+                VariableRole::Observable,
+            };
+            facts.instructionEffects = {InstructionEffect::StateReadWrite};
+            LinearProgramArtifact artifact{
+                .program = builder.finish(),
+                .interface = std::move(interface),
+                .schedulingFacts = std::move(facts),
+            };
+            if (validate(artifact, ValidationOptions{.level = ValidationLevel::Semantic}).success())
+            {
+                return fail("declared-variable mappings must not expose changed results");
+            }
+        }
+
+        {
+            LinearProgramBuilder builder;
+            const TypeId type = builder.addType(Type::bitVector(8));
+            const StringId inputName = builder.addString("input");
+            const VariableId input = builder.addVariable(type, builder.zeroInit());
+            const VariableId replacement = builder.addVariable(type, builder.zeroInit());
+            const std::array<VariableId, 1> results = {input};
+            const std::array<VariableId, 1> operands = {replacement};
+            builder.addInstruction(Opcode::Assign, results, operands);
+            ProgramInterface interface;
+            interface.ports = {
+                PortBinding{
+                    .name = inputName,
+                    .direction = PortDirection::Input,
+                    .input = input,
+                },
+            };
+            SchedulingFacts facts;
+            facts.variableRoles = {
+                VariableRole::ExternalInput,
+                VariableRole::None,
+            };
+            facts.instructionEffects = {InstructionEffect::Pure};
+            LinearProgramArtifact artifact{
+                .program = builder.finish(),
+                .interface = std::move(interface),
+                .schedulingFacts = std::move(facts),
+            };
+            const ValidationResult validation = validate(
+                artifact,
+                ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(validation, "writes a ProgramInterface input"))
+            {
+                return fail("LinearProgram instructions must not write interface inputs");
+            }
+        }
+        return 0;
+    }
+
+    int testInoutAcceptsEquivalentLogicalTypes()
+    {
+        LinearProgramBuilder builder;
+        const TypeId inputType = builder.addType(Type::bitVector(8));
+        const TypeId outputType = builder.addType(Type::bitVector(8));
+        const TypeId enableType = builder.addType(Type::bitVector(1));
+        const StringId portName = builder.addString("bus");
+        const VariableId input = builder.addVariable(inputType, builder.zeroInit());
+        const VariableId output = builder.addVariable(outputType, builder.zeroInit());
+        const VariableId outputEnable = builder.addVariable(enableType, builder.zeroInit());
+        const LinearProgram program = builder.finish();
+        ProgramInterface interface;
+        interface.ports = {
+            PortBinding{
+                .name = portName,
+                .direction = PortDirection::Inout,
+                .input = input,
+                .output = output,
+                .outputEnable = outputEnable,
+            },
+        };
+        if (!validate(interface,
+                      program.view(),
+                      ValidationOptions{.level = ValidationLevel::Semantic})
+                 .success())
+        {
+            return fail("inout must accept equal logical Types with distinct TypeIds");
+        }
+        return 0;
+    }
+
+    int testExecutableRequiresChangedAnyInputCoverage()
+    {
+        {
+            LinearProgramBuilder linearBuilder;
+            const TypeId eventType = linearBuilder.addType(Type::bitVector(1));
+            const StringId inputName = linearBuilder.addString("input");
+            const VariableId input =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            ScheduledProgramBuilder scheduledBuilder(linearBuilder.finish());
+            const std::array<InstructionId, 0> noInstructions = {};
+            scheduledBuilder.addBlock(noInstructions);
+            ExecutableModel model{
+                .program = scheduledBuilder.finish(),
+                .interface = ProgramInterface{
+                    .ports = {
+                        PortBinding{
+                            .name = inputName,
+                            .direction = PortDirection::Input,
+                            .input = input,
+                        },
+                    },
+                },
+            };
+            const ValidationResult validation = validate(
+                model,
+                ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(validation, "does not activate from every ProgramInterface input"))
+            {
+                return fail("ExecutableModel must reject an input with no EntryBlock watch");
+            }
+        }
+
+        {
+            LinearProgramBuilder linearBuilder;
+            const TypeId eventType = linearBuilder.addType(Type::bitVector(1));
+            const StringId inputName = linearBuilder.addString("input");
+            const VariableId input =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const VariableId oldValue =
+                linearBuilder.addVariable(eventType, linearBuilder.undefInit());
+            const VariableId event =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const std::array<VariableId, 1> changedResults = {event};
+            const std::array<VariableId, 2> changedOperands = {input, oldValue};
+            const InstructionId changed = linearBuilder.addInstruction(
+                Opcode::ChangedPos,
+                changedResults,
+                changedOperands);
+
+            ScheduledProgramBuilder scheduledBuilder(linearBuilder.finish());
+            const std::array<VariableId, 1> activationOperands = {event};
+            const InstructionId activate = scheduledBuilder.addInstruction(
+                Opcode::ActForward,
+                {},
+                activationOperands);
+            const std::array<BlockId, 1> targets = {BlockId{1}};
+            scheduledBuilder.setActivationTargets(activate, targets);
+            const std::array<InstructionId, 2> entryInstructions = {changed, activate};
+            const std::array<InstructionId, 0> noInstructions = {};
+            scheduledBuilder.addBlock(entryInstructions);
+            scheduledBuilder.addBlock(noInstructions);
+            ExecutableModel model{
+                .program = scheduledBuilder.finish(),
+                .interface = ProgramInterface{
+                    .ports = {
+                        PortBinding{
+                            .name = inputName,
+                            .direction = PortDirection::Input,
+                            .input = input,
+                        },
+                    },
+                },
+            };
+            const ValidationResult validation = validate(
+                model,
+                ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(validation, "does not activate from every ProgramInterface input"))
+            {
+                return fail("edge-only EntryBlock watches must not count as full input coverage");
+            }
+        }
+        return 0;
+    }
+
+    int testExecutableInputCoverageTracksEntryBlockDataflow()
+    {
+        {
+            LinearProgramBuilder linearBuilder;
+            const TypeId eventType = linearBuilder.addType(Type::bitVector(1));
+            const StringId firstName = linearBuilder.addString("first");
+            const StringId secondName = linearBuilder.addString("second");
+            const VariableId firstInput =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const VariableId secondInput =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const VariableId firstOld =
+                linearBuilder.addVariable(eventType, linearBuilder.undefInit());
+            const VariableId secondOld =
+                linearBuilder.addVariable(eventType, linearBuilder.undefInit());
+            const VariableId firstEvent =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const VariableId secondEvent =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const VariableId combinedEvent =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const std::array<VariableId, 1> firstResults = {firstEvent};
+            const std::array<VariableId, 2> firstOperands = {firstInput, firstOld};
+            const InstructionId firstChanged = linearBuilder.addInstruction(
+                Opcode::ChangedAny,
+                firstResults,
+                firstOperands);
+            const std::array<VariableId, 1> secondResults = {secondEvent};
+            const std::array<VariableId, 2> secondOperands = {secondInput, secondOld};
+            const InstructionId secondChanged = linearBuilder.addInstruction(
+                Opcode::ChangedAny,
+                secondResults,
+                secondOperands);
+            const std::array<VariableId, 1> combinedResults = {combinedEvent};
+            const std::array<VariableId, 2> combinedOperands = {firstEvent, secondEvent};
+            const InstructionId combine = linearBuilder.addInstruction(
+                Opcode::LogicOr,
+                combinedResults,
+                combinedOperands);
+
+            ScheduledProgramBuilder scheduledBuilder(linearBuilder.finish());
+            const std::array<VariableId, 1> activationOperands = {combinedEvent};
+            const InstructionId activate = scheduledBuilder.addInstruction(
+                Opcode::ActForward,
+                {},
+                activationOperands);
+            const std::array<BlockId, 1> targets = {BlockId{1}};
+            scheduledBuilder.setActivationTargets(activate, targets);
+            const std::array<InstructionId, 4> entryInstructions = {
+                firstChanged,
+                secondChanged,
+                combine,
+                activate,
+            };
+            const std::array<InstructionId, 0> noInstructions = {};
+            scheduledBuilder.addBlock(entryInstructions);
+            scheduledBuilder.addBlock(noInstructions);
+            ExecutableModel model{
+                .program = scheduledBuilder.finish(),
+                .interface = ProgramInterface{
+                    .ports = {
+                        PortBinding{
+                            .name = firstName,
+                            .direction = PortDirection::Input,
+                            .input = firstInput,
+                        },
+                        PortBinding{
+                            .name = secondName,
+                            .direction = PortDirection::Input,
+                            .input = secondInput,
+                        },
+                    },
+                },
+            };
+            if (!validate(model, ValidationOptions{.level = ValidationLevel::Semantic}).success())
+            {
+                return fail("an OR of direct B0 ChangedAny events must cover both inputs");
+            }
+        }
+
+        {
+            LinearProgramBuilder linearBuilder;
+            const TypeId eventType = linearBuilder.addType(Type::bitVector(1));
+            const StringId inputName = linearBuilder.addString("input");
+            const VariableId input =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const VariableId oldValue =
+                linearBuilder.addVariable(eventType, linearBuilder.undefInit());
+            const VariableId event =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const VariableId replacement =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const std::array<VariableId, 1> changedResults = {event};
+            const std::array<VariableId, 2> changedOperands = {input, oldValue};
+            const InstructionId changed = linearBuilder.addInstruction(
+                Opcode::ChangedAny,
+                changedResults,
+                changedOperands);
+
+            ScheduledProgramBuilder scheduledBuilder(linearBuilder.finish());
+            const std::array<VariableId, 1> overwriteResults = {event};
+            const std::array<VariableId, 1> overwriteOperands = {replacement};
+            const InstructionId overwrite = scheduledBuilder.addInstruction(
+                Opcode::Assign,
+                overwriteResults,
+                overwriteOperands);
+            const std::array<VariableId, 1> activationOperands = {event};
+            const InstructionId activate = scheduledBuilder.addInstruction(
+                Opcode::ActForward,
+                {},
+                activationOperands);
+            const std::array<BlockId, 1> targets = {BlockId{1}};
+            scheduledBuilder.setActivationTargets(activate, targets);
+            const std::array<InstructionId, 3> entryInstructions = {
+                changed,
+                overwrite,
+                activate,
+            };
+            const std::array<InstructionId, 0> noInstructions = {};
+            scheduledBuilder.addBlock(entryInstructions);
+            scheduledBuilder.addBlock(noInstructions);
+            ExecutableModel model{
+                .program = scheduledBuilder.finish(),
+                .interface = ProgramInterface{
+                    .ports = {
+                        PortBinding{
+                            .name = inputName,
+                            .direction = PortDirection::Input,
+                            .input = input,
+                        },
+                    },
+                },
+            };
+            const ValidationResult validation = validate(
+                model,
+                ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(validation, "does not activate from every ProgramInterface input"))
+            {
+                return fail("a ChangedAny event overwritten before act must not cover its input");
+            }
+        }
+
+        {
+            LinearProgramBuilder linearBuilder;
+            const TypeId eventType = linearBuilder.addType(Type::bitVector(1));
+            const StringId inputName = linearBuilder.addString("input");
+            const VariableId input =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const VariableId replacement =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const VariableId oldValue =
+                linearBuilder.addVariable(eventType, linearBuilder.undefInit());
+            const VariableId event =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const std::array<VariableId, 1> overwriteResults = {input};
+            const std::array<VariableId, 1> overwriteOperands = {replacement};
+            const InstructionId overwrite = linearBuilder.addInstruction(
+                Opcode::Assign,
+                overwriteResults,
+                overwriteOperands);
+            const std::array<VariableId, 1> changedResults = {event};
+            const std::array<VariableId, 2> changedOperands = {input, oldValue};
+            const InstructionId changed = linearBuilder.addInstruction(
+                Opcode::ChangedAny,
+                changedResults,
+                changedOperands);
+
+            ScheduledProgramBuilder scheduledBuilder(linearBuilder.finish());
+            const std::array<VariableId, 1> activationOperands = {event};
+            const InstructionId activate = scheduledBuilder.addInstruction(
+                Opcode::ActForward,
+                {},
+                activationOperands);
+            const std::array<BlockId, 1> targets = {BlockId{1}};
+            scheduledBuilder.setActivationTargets(activate, targets);
+            const std::array<InstructionId, 3> entryInstructions = {
+                overwrite,
+                changed,
+                activate,
+            };
+            const std::array<InstructionId, 0> noInstructions = {};
+            scheduledBuilder.addBlock(entryInstructions);
+            scheduledBuilder.addBlock(noInstructions);
+            ExecutableModel model{
+                .program = scheduledBuilder.finish(),
+                .interface = ProgramInterface{
+                    .ports = {
+                        PortBinding{
+                            .name = inputName,
+                            .direction = PortDirection::Input,
+                            .input = input,
+                        },
+                    },
+                },
+            };
+            const ValidationResult validation = validate(
+                model,
+                ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(validation, "does not activate from every ProgramInterface input") ||
+                !containsError(validation, "writes a ProgramInterface input"))
+            {
+                return fail("a ChangedAny after an EntryBlock input overwrite must not prove coverage");
+            }
+        }
+
+        {
+            LinearProgramBuilder linearBuilder;
+            const TypeId eventType = linearBuilder.addType(Type::bitVector(1));
+            const StringId inputName = linearBuilder.addString("input");
+            const VariableId input =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const VariableId replacement =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const VariableId oldValue =
+                linearBuilder.addVariable(eventType, linearBuilder.undefInit());
+            const VariableId event =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const std::array<VariableId, 1> changedResults = {event};
+            const std::array<VariableId, 2> changedOperands = {input, oldValue};
+            const InstructionId changed = linearBuilder.addInstruction(
+                Opcode::ChangedAny,
+                changedResults,
+                changedOperands);
+            const std::array<VariableId, 1> overwriteResults = {input};
+            const std::array<VariableId, 1> overwriteOperands = {replacement};
+            const InstructionId overwrite = linearBuilder.addInstruction(
+                Opcode::Assign,
+                overwriteResults,
+                overwriteOperands);
+
+            ScheduledProgramBuilder scheduledBuilder(linearBuilder.finish());
+            const std::array<VariableId, 1> activationOperands = {event};
+            const InstructionId activate = scheduledBuilder.addInstruction(
+                Opcode::ActForward,
+                {},
+                activationOperands);
+            const std::array<BlockId, 1> targets = {BlockId{1}};
+            scheduledBuilder.setActivationTargets(activate, targets);
+            const std::array<InstructionId, 2> entryInstructions = {changed, activate};
+            const std::array<InstructionId, 1> bodyInstructions = {overwrite};
+            scheduledBuilder.addBlock(entryInstructions);
+            scheduledBuilder.addBlock(bodyInstructions);
+            ExecutableModel model{
+                .program = scheduledBuilder.finish(),
+                .interface = ProgramInterface{
+                    .ports = {
+                        PortBinding{
+                            .name = inputName,
+                            .direction = PortDirection::Input,
+                            .input = input,
+                        },
+                    },
+                },
+            };
+            const ValidationResult validation = validate(
+                model,
+                ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(validation, "writes a ProgramInterface input"))
+            {
+                return fail("normal Blocks must not overwrite interface inputs");
+            }
+        }
+        return 0;
+    }
+
+    int testScheduledInterfaceGate()
+    {
+        const CaseOutcome outcome = runCase(
+            LowerBehavior::Success,
+            ScheduleBehavior::InvalidInterface,
+            EmitBehavior::Success);
+        if (outcome.success || outcome.hasModel || !outcome.diagnosticsHaveError ||
+            outcome.state.calls != std::vector<std::string>{"lower", "schedule"})
+        {
+            return fail("invalid scheduled ProgramInterface must gate the emitter");
+        }
+        return 0;
+    }
+
+    int testFailureShortCircuiting()
+    {
+        const CaseOutcome lowerFailure = runCase(
+            LowerBehavior::ReturnFailure,
+            ScheduleBehavior::Success,
+            EmitBehavior::Success);
+        if (lowerFailure.success || lowerFailure.hasModel ||
+            !lowerFailure.diagnosticsHaveError ||
+            lowerFailure.state.calls != std::vector<std::string>{"lower"})
+        {
+            return fail("lowering failure must short-circuit scheduler and emitter");
+        }
+
+        const CaseOutcome scheduleFailure = runCase(
+            LowerBehavior::Success,
+            ScheduleBehavior::ReturnFailure,
+            EmitBehavior::Success);
+        if (scheduleFailure.success || scheduleFailure.hasModel ||
+            !scheduleFailure.diagnosticsHaveError ||
+            scheduleFailure.state.calls != std::vector<std::string>{"lower", "schedule"})
+        {
+            return fail("scheduler failure must short-circuit the emitter");
+        }
+
+        const CaseOutcome emitFailure = runCase(
+            LowerBehavior::Success,
+            ScheduleBehavior::Success,
+            EmitBehavior::ReturnFailure);
+        if (emitFailure.success || !emitFailure.hasModel ||
+            !emitFailure.diagnosticsHaveError ||
+            emitFailure.state.calls != std::vector<std::string>{"lower", "schedule", "emit"} ||
+            emitFailure.artifacts != std::vector<std::string>{"partial.cpp"})
+        {
+            return fail("emitter failure must preserve the scheduled model and partial artifact list");
+        }
+        return 0;
+    }
+
+    int testBaselineRejectsReversedOrderedEffects()
+    {
+        LinearProgramBuilder builder;
+        const TypeId eventType = builder.addType(Type::bitVector(1));
+        const TypeId valueType = builder.addType(Type::bitVector(8));
+        const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
+        const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId nextValue = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId target = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId event = builder.addVariable(eventType, builder.zeroInit());
+        const std::array<VariableId, 5> operands = {
+            condition,
+            mask,
+            nextValue,
+            target,
+            event,
+        };
+        const InstructionId first = builder.addInstruction(Opcode::RegisterWrite, {}, operands);
+        const InstructionId second = builder.addInstruction(Opcode::RegisterWrite, {}, operands);
+
+        SchedulingFacts facts;
+        facts.variableRoles = {
+            VariableRole::None,
+            VariableRole::None,
+            VariableRole::None,
+            VariableRole::State,
+            VariableRole::None,
+        };
+        facts.instructionEffects = {
+            InstructionEffect::StateReadWrite,
+            InstructionEffect::StateReadWrite,
+        };
+        facts.orderedEffects = {
+            OrderedEffect{.instruction = second, .group = 3, .ordinal = 0},
+            OrderedEffect{.instruction = first, .group = 3, .ordinal = 1},
+        };
+        LinearProgramArtifact linear{
+            .program = builder.finish(),
+            .schedulingFacts = std::move(facts),
+        };
+        if (!validate(linear, ValidationOptions{.level = ValidationLevel::Semantic}).success())
+        {
+            return fail("reversed linear instruction order is a valid ordered-effect fact input");
+        }
+
+        BaselineActivityScheduleStage scheduler;
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        const std::optional<ExecutableModel> model =
+            scheduler.schedule(std::move(linear), ActivityScheduleOptions{}, diagnostics);
+        if (model || !diagnostics.hasError())
+        {
+            return fail("baseline scheduler must reject ordered effects it cannot preserve");
+        }
+        return 0;
+    }
+
+    int testBaselineRejectsForwardDefUseOrder()
+    {
+        LinearProgramBuilder builder;
+        const TypeId type = builder.addType(Type::bitVector(8));
+        const VariableId input = builder.addVariable(type, builder.zeroInit());
+        const VariableId temporary = builder.addVariable(type, builder.undefInit());
+        const VariableId output = builder.addVariable(type, builder.undefInit());
+        const std::array<VariableId, 1> firstResults = {output};
+        const std::array<VariableId, 1> firstOperands = {temporary};
+        builder.addInstruction(Opcode::Assign, firstResults, firstOperands);
+        const std::array<VariableId, 1> secondResults = {temporary};
+        const std::array<VariableId, 1> secondOperands = {input};
+        builder.addInstruction(Opcode::Assign, secondResults, secondOperands);
+        SchedulingFacts facts;
+        facts.variableRoles.assign(3, VariableRole::None);
+        facts.instructionEffects.assign(2, InstructionEffect::Pure);
+        LinearProgramArtifact linear{
+            .program = builder.finish(),
+            .schedulingFacts = std::move(facts),
+        };
+        if (!validate(linear, ValidationOptions{.level = ValidationLevel::Semantic}).success())
+        {
+            return fail("forward def-use is valid LinearProgram input to a real scheduler");
+        }
+
+        BaselineActivityScheduleStage scheduler;
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        const std::optional<ExecutableModel> model =
+            scheduler.schedule(std::move(linear), ActivityScheduleOptions{}, diagnostics);
+        if (model || !diagnostics.hasError())
+        {
+            return fail("baseline smoke scheduler must reject non-executable linear order");
+        }
+        return 0;
+    }
+
+    int testBaselineRejectsHostInteractions()
+    {
+        {
+            LinearProgramBuilder builder;
+            const TypeId valueType = builder.addType(Type::bitVector(8));
+            const StringId functionName = builder.addString("host_read");
+            const VariableId result = builder.addVariable(valueType, builder.undefInit());
+            const std::array<VariableId, 1> results = {result};
+            const InstructionId call =
+                builder.addInstruction(Opcode::SystemFunction, results, {});
+            builder.setSystemFunctionAttributes(
+                call,
+                SystemFunctionAttributes{
+                    .name = functionName,
+                    .schedule = CallSchedule::Normal,
+                    .hasSideEffects = false,
+                });
+            SchedulingFacts facts;
+            facts.variableRoles = {VariableRole::None};
+            facts.instructionEffects = {InstructionEffect::HostRead};
+            facts.orderedEffects = {
+                OrderedEffect{.instruction = call, .group = 0, .ordinal = 0},
+            };
+            LinearProgramArtifact linear{
+                .program = builder.finish(),
+                .schedulingFacts = std::move(facts),
+            };
+            if (!validate(linear, ValidationOptions{.level = ValidationLevel::Semantic}).success())
+            {
+                return fail("valid HostRead artifact must pass the lowering validation gate");
+            }
+            BaselineActivityScheduleStage scheduler;
+            wolvrix::lib::diag::Diagnostics diagnostics;
+            const std::optional<ExecutableModel> model =
+                scheduler.schedule(std::move(linear), ActivityScheduleOptions{}, diagnostics);
+            if (model || !diagnostics.hasError())
+            {
+                return fail("baseline scheduler must reject HostRead instructions");
+            }
+        }
+
+        {
+            LinearProgramBuilder builder;
+            const TypeId eventType = builder.addType(Type::bitVector(1));
+            const StringId taskName = builder.addString("host_effect");
+            const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
+            const std::array<VariableId, 1> operands = {condition};
+            const InstructionId call =
+                builder.addInstruction(Opcode::SystemTask, {}, operands);
+            builder.setSystemTaskAttributes(
+                call,
+                SystemTaskAttributes{
+                    .name = taskName,
+                    .eventCount = 0,
+                    .schedule = CallSchedule::Normal,
+                });
+            SchedulingFacts facts;
+            facts.variableRoles = {VariableRole::None};
+            facts.instructionEffects = {InstructionEffect::HostEffect};
+            facts.orderedEffects = {
+                OrderedEffect{.instruction = call, .group = 0, .ordinal = 0},
+            };
+            LinearProgramArtifact linear{
+                .program = builder.finish(),
+                .schedulingFacts = std::move(facts),
+            };
+            if (!validate(linear, ValidationOptions{.level = ValidationLevel::Semantic}).success())
+            {
+                return fail("valid HostEffect artifact must pass the lowering validation gate");
+            }
+            BaselineActivityScheduleStage scheduler;
+            wolvrix::lib::diag::Diagnostics diagnostics;
+            const std::optional<ExecutableModel> model =
+                scheduler.schedule(std::move(linear), ActivityScheduleOptions{}, diagnostics);
+            if (model || !diagnostics.hasError())
+            {
+                return fail("baseline scheduler must reject HostEffect instructions");
+            }
+        }
+        return 0;
+    }
+
+    int testBaselineWatchesOtherwiseUnusedInputs()
+    {
+        LinearProgramArtifact linear = makeLinearArtifact();
+        BaselineActivityScheduleStage scheduler;
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        std::optional<ExecutableModel> model =
+            scheduler.schedule(std::move(linear), ActivityScheduleOptions{}, diagnostics);
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 2 ||
+            model->program.blockSize(BlockId{0}) != 2 ||
+            model->program.blockSize(BlockId{1}) != 0)
+        {
+            return fail("baseline scheduler must materialize a watch Block for an otherwise unused input");
+        }
+        const InstructionId changed = model->program.blockInstruction(BlockId{0}, 0);
+        const InstructionId activate = model->program.blockInstruction(BlockId{0}, 1);
+        if (model->program.view().opcode(changed) != Opcode::ChangedAny ||
+            model->program.view().opcode(activate) != Opcode::ActForward ||
+            !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success())
+        {
+            return fail("otherwise unused inputs must satisfy ExecutableModel B0 coverage");
+        }
+        return 0;
+    }
+
+    int testBaselineDerivesReadWriteStateTargets()
+    {
+        LinearProgramBuilder builder;
+        const TypeId eventType = builder.addType(Type::bitVector(1));
+        const TypeId valueType = builder.addType(Type::bitVector(8));
+        const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
+        const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId nextValue = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId target = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId event = builder.addVariable(eventType, builder.zeroInit());
+        const std::array<VariableId, 5> operands = {
+            condition,
+            mask,
+            nextValue,
+            target,
+            event,
+        };
+        const InstructionId write =
+            builder.addInstruction(Opcode::RegisterWrite, {}, operands);
+        SchedulingFacts facts;
+        facts.variableRoles.assign(5, VariableRole::None);
+        facts.instructionEffects = {InstructionEffect::StateReadWrite};
+        facts.orderedEffects = {
+            OrderedEffect{.instruction = write, .group = 0, .ordinal = 0},
+        };
+        LinearProgramArtifact linear{
+            .program = builder.finish(),
+            .schedulingFacts = std::move(facts),
+        };
+        if (validate(linear, ValidationOptions{.level = ValidationLevel::Semantic}).success())
+        {
+            return fail("artifact validation must still require the explicit State role");
+        }
+
+        BaselineActivityScheduleStage scheduler;
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        const std::optional<ExecutableModel> model =
+            scheduler.schedule(std::move(linear), ActivityScheduleOptions{}, diagnostics);
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 2 ||
+            model->program.blockSize(BlockId{1}) != 3)
+        {
+            return fail("baseline must derive read-write state targets from opcode traits");
+        }
+        const ProgramView view = model->program.view();
+        const InstructionId changed = model->program.blockInstruction(BlockId{1}, 1);
+        const auto changedOperands = view.operands(changed);
+        if (view.opcode(changed) != Opcode::ChangedAny || changedOperands.size() != 2 ||
+            changedOperands.front() != target ||
+            !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success())
+        {
+            return fail("derived state target must drive the baseline convergence watch");
+        }
+        return 0;
+    }
+
+    int testBaselineActivityScheduleMaterializesProgramSemantics()
+    {
+        LinearProgramBuilder builder;
+        const TypeId valueType = builder.addType(Type::bitVector(8));
+        const StringId inputName = builder.addString("input");
+        const StringId outputName = builder.addString("output");
+        const VariableId input = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId state = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId output = builder.addVariable(valueType, builder.undefInit());
+        const std::array<VariableId, 1> assignResults = {output};
+        const std::array<VariableId, 1> assignOperands = {state};
+        const InstructionId assign =
+            builder.addInstruction(Opcode::Assign, assignResults, assignOperands);
+
+        ProgramInterface interface;
+        interface.ports = {
+            PortBinding{
+                .name = inputName,
+                .direction = PortDirection::Input,
+                .input = input,
+            },
+            PortBinding{
+                .name = outputName,
+                .direction = PortDirection::Output,
+                .output = output,
+            },
+        };
+        SchedulingFacts facts;
+        facts.variableRoles = {
+            VariableRole::ExternalInput,
+            VariableRole::State,
+            VariableRole::ExternalOutput,
+        };
+        facts.instructionEffects = {InstructionEffect::Pure};
+        LinearProgramArtifact linear{
+            .program = builder.finish(),
+            .interface = std::move(interface),
+            .schedulingFacts = std::move(facts),
+        };
+
+        BaselineActivityScheduleStage scheduler;
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        std::optional<ExecutableModel> model =
+            scheduler.schedule(std::move(linear), ActivityScheduleOptions{}, diagnostics);
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 2 ||
+            model->program.blockSize(BlockId{0}) != 2 ||
+            model->program.blockSize(BlockId{1}) != 3)
+        {
+            return fail("baseline scheduler must materialize B0 and a conservative normal Block");
+        }
+
+        const ProgramView view = model->program.view();
+        const InstructionId entryChanged = model->program.blockInstruction(BlockId{0}, 0);
+        const InstructionId entryAct = model->program.blockInstruction(BlockId{0}, 1);
+        const InstructionId bodyAssign = model->program.blockInstruction(BlockId{1}, 0);
+        const InstructionId stateChanged = model->program.blockInstruction(BlockId{1}, 1);
+        const InstructionId stateAct = model->program.blockInstruction(BlockId{1}, 2);
+        const auto entryTargets = view.activationAttributes(entryAct);
+        const auto stateTargets = view.activationAttributes(stateAct);
+        if (view.opcode(entryChanged) != Opcode::ChangedAny ||
+            view.opcode(entryAct) != Opcode::ActForward || bodyAssign != assign ||
+            view.opcode(stateChanged) != Opcode::ChangedAny ||
+            view.opcode(stateAct) != Opcode::ActBackward || !entryTargets || !stateTargets ||
+            entryTargets->targets.size() != 1 || stateTargets->targets.size() != 1 ||
+            entryTargets->targets.front() != BlockId{1} ||
+            stateTargets->targets.front() != BlockId{1})
+        {
+            return fail("baseline scheduler emitted the wrong changed/activation structure");
+        }
+        if (!validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success())
+        {
+            return fail("baseline scheduler output must satisfy executable-model validation");
+        }
+
+        const OpcodeTraits readTraits = opcodeTraits(Opcode::MemoryRead);
+        const OpcodeTraits writeTraits = opcodeTraits(Opcode::MemoryWrite);
+        if (!readTraits.memoryAccess || readTraits.effect != OpcodeEffect::StateRead ||
+            readTraits.stateTargetOperand != 0 || !writeTraits.memoryAccess ||
+            writeTraits.effect != OpcodeEffect::StateReadWrite ||
+            writeTraits.stateTargetOperand != 4 || !writeTraits.hasOrderedEffect)
+        {
+            return fail("opcode traits must expose memory access and ordering semantics");
+        }
+        return 0;
+    }
+
+} // namespace
+
+int main()
+{
+    if (const int result = testStrictSuccessOrder(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testStagedPipelineDoesNotRetainGraph(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testExistingDiagnosticsDoNotConsumeArtifact(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testLoweringInterfaceGate(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testSchedulingFactsGate(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testExternalInputRoleMustMatchInterface(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testArtifactRolesAndInterfaceExposureContracts(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testInoutAcceptsEquivalentLogicalTypes(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testExecutableRequiresChangedAnyInputCoverage(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testExecutableInputCoverageTracksEntryBlockDataflow(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testScheduledInterfaceGate(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testFailureShortCircuiting(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testBaselineRejectsReversedOrderedEffects(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testBaselineRejectsForwardDefUseOrder(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testBaselineRejectsHostInteractions(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testBaselineWatchesOtherwiseUnusedInputs(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testBaselineDerivesReadWriteStateTargets(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testBaselineActivityScheduleMaterializesProgramSemantics(); result != 0)
+    {
+        return result;
+    }
+    return 0;
+}

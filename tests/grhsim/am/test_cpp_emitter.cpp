@@ -1,0 +1,1419 @@
+#include "grhsim/am/activity_schedule.hpp"
+#include "grhsim/am/builder.hpp"
+#include "grhsim/am/cpp_emitter.hpp"
+#include "grhsim/am/interpreter.hpp"
+
+#include <array>
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <initializer_list>
+#include <iostream>
+#include <optional>
+#include <span>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+using namespace wolvrix::lib::grhsim::am;
+
+namespace
+{
+
+    int fail(const std::string &message)
+    {
+        std::cerr << message << '\n';
+        return 1;
+    }
+
+    bool hasArtifact(const GrhSimAmCppResult &result, std::string_view filename)
+    {
+        for (const std::string &artifact : result.artifacts)
+        {
+            if (std::filesystem::path(artifact).filename() == filename)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool hasDiagnosticContaining(const wolvrix::lib::diag::Diagnostics &diagnostics,
+                                 std::string_view needle)
+    {
+        for (const wolvrix::lib::diag::Diagnostic &diagnostic : diagnostics.messages())
+        {
+            if (diagnostic.message.find(needle) != std::string::npos)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool hasExactMakefileSources(const GrhSimAmCppResult &result,
+                                 const std::filesystem::path &outputDirectory,
+                                 std::initializer_list<std::string_view> expectedSources)
+    {
+        std::ifstream makefile(outputDirectory / "Makefile");
+        std::string line;
+        while (std::getline(makefile, line) && !line.starts_with("SRCS := "))
+        {
+        }
+        if (!makefile || !line.starts_with("SRCS := "))
+        {
+            return false;
+        }
+
+        std::istringstream sourceList(line.substr(std::string_view("SRCS := ").size()));
+        std::vector<std::string> listedSources;
+        for (std::string source; sourceList >> source;)
+        {
+            listedSources.push_back(std::move(source));
+        }
+        std::vector<std::string> artifactSources;
+        for (const std::string &artifact : result.artifacts)
+        {
+            const std::filesystem::path path(artifact);
+            if (path.extension() == ".cpp")
+            {
+                artifactSources.push_back(path.filename().string());
+            }
+        }
+        std::vector<std::string> expected;
+        expected.reserve(expectedSources.size());
+        for (std::string_view source : expectedSources)
+        {
+            expected.emplace_back(source);
+        }
+        return listedSources == expected && artifactSources == expected;
+    }
+
+    std::optional<std::string> readTextFile(const std::filesystem::path &path)
+    {
+        std::ifstream input(path, std::ios::binary);
+        if (!input)
+        {
+            return std::nullopt;
+        }
+        std::ostringstream contents;
+        contents << input.rdbuf();
+        if (!input && !input.eof())
+        {
+            return std::nullopt;
+        }
+        return contents.str();
+    }
+
+    std::size_t countOccurrences(std::string_view text, std::string_view needle)
+    {
+        if (needle.empty())
+        {
+            return 0;
+        }
+        std::size_t count = 0;
+        std::size_t position = 0;
+        while ((position = text.find(needle, position)) != std::string_view::npos)
+        {
+            ++count;
+            position += needle.size();
+        }
+        return count;
+    }
+
+    LinearProgramArtifact makeAddProgram()
+    {
+        LinearProgramBuilder builder;
+        const TypeId valueType = builder.addType(Type::bitVector(8));
+        const TypeId wideType = builder.addType(Type::bitVector(130));
+        const StringId inputName = builder.addString("input_value");
+        const StringId outputName = builder.addString("output_value");
+        const StringId initializedName = builder.addString("initialized_value");
+        const StringId randomName = builder.addString("random_value");
+        const StringId wideInputName = builder.addString("wide_input");
+        const StringId wideOutputName = builder.addString("wide_output");
+        const StringId wideInitializedName = builder.addString("wide_initialized");
+        const VariableId input = builder.addVariable(valueType, builder.zeroInit());
+        const std::array<uint64_t, 1> oneWords = {1};
+        const LiteralId oneLiteral = builder.addBitLiteral(valueType, oneWords);
+        const VariableId one =
+            builder.addVariable(valueType, builder.addConstantInit(oneLiteral));
+        const VariableId output = builder.addVariable(valueType, builder.zeroInit());
+        const std::array<uint64_t, 1> initializedWords = {0x5a};
+        const LiteralId initializedLiteral =
+            builder.addBitLiteral(valueType, initializedWords);
+        const InitAction initializedAction{
+            .kind = InitActionKind::Set,
+            .expression = InitExpr{
+                .kind = InitExprKind::Literal,
+                .literal = initializedLiteral,
+            },
+        };
+        const VariableId initialized = builder.addVariable(
+            valueType,
+            builder.addActionsInit(std::span<const InitAction>(&initializedAction, 1)));
+        const InitAction randomAction{
+            .kind = InitActionKind::Set,
+            .expression = InitExpr{
+                .kind = InitExprKind::Random,
+            },
+        };
+        const VariableId random = builder.addVariable(
+            valueType,
+            builder.addActionsInit(std::span<const InitAction>(&randomAction, 1)));
+        const VariableId wideInput = builder.addVariable(wideType, builder.zeroInit());
+        const VariableId wideOutput = builder.addVariable(wideType, builder.zeroInit());
+        const std::array<uint64_t, 3> wideInitializedWords = {
+            UINT64_C(0x0123456789abcdef),
+            UINT64_C(0xfedcba9876543210),
+            UINT64_C(0x2),
+        };
+        const LiteralId wideInitializedLiteral =
+            builder.addBitLiteral(wideType, wideInitializedWords);
+        const InitAction wideInitializedAction{
+            .kind = InitActionKind::Set,
+            .expression = InitExpr{
+                .kind = InitExprKind::Literal,
+                .literal = wideInitializedLiteral,
+            },
+        };
+        const VariableId wideInitialized = builder.addVariable(
+            wideType,
+            builder.addActionsInit(std::span<const InitAction>(&wideInitializedAction, 1)));
+        const std::array<VariableId, 1> results = {output};
+        const std::array<VariableId, 2> operands = {input, one};
+        builder.addInstruction(Opcode::Add, results, operands);
+        const std::array<VariableId, 1> wideResults = {wideOutput};
+        const std::array<VariableId, 1> wideOperands = {wideInput};
+        builder.addInstruction(Opcode::Assign, wideResults, wideOperands);
+
+        ProgramInterface interface;
+        interface.ports = {
+            PortBinding{
+                .name = inputName,
+                .direction = PortDirection::Input,
+                .input = input,
+            },
+            PortBinding{
+                .name = outputName,
+                .direction = PortDirection::Output,
+                .output = output,
+            },
+            PortBinding{
+                .name = initializedName,
+                .direction = PortDirection::Output,
+                .output = initialized,
+            },
+            PortBinding{
+                .name = randomName,
+                .direction = PortDirection::Output,
+                .output = random,
+            },
+            PortBinding{
+                .name = wideInputName,
+                .direction = PortDirection::Input,
+                .input = wideInput,
+            },
+            PortBinding{
+                .name = wideOutputName,
+                .direction = PortDirection::Output,
+                .output = wideOutput,
+            },
+            PortBinding{
+                .name = wideInitializedName,
+                .direction = PortDirection::Output,
+                .output = wideInitialized,
+            },
+        };
+        SchedulingFacts facts;
+        facts.variableRoles = {
+            VariableRole::ExternalInput,
+            VariableRole::None,
+            VariableRole::ExternalOutput,
+            VariableRole::ExternalOutput,
+            VariableRole::ExternalOutput,
+            VariableRole::ExternalInput,
+            VariableRole::ExternalOutput,
+            VariableRole::ExternalOutput,
+        };
+        facts.instructionEffects = {
+            InstructionEffect::Pure,
+            InstructionEffect::Pure,
+        };
+        return LinearProgramArtifact{
+            .program = builder.finish(),
+            .interface = std::move(interface),
+            .schedulingFacts = std::move(facts),
+        };
+    }
+
+    VariableId addBitConstant(LinearProgramBuilder &builder,
+                              TypeId type,
+                              std::span<const uint64_t> words)
+    {
+        return builder.addVariable(
+            type, builder.addConstantInit(builder.addBitLiteral(type, words)));
+    }
+
+    struct WidePureFixture
+    {
+        LinearProgramArtifact artifact;
+        std::vector<std::pair<std::string, VariableId>> outputs;
+    };
+
+    WidePureFixture makeWidePureProgram()
+    {
+        LinearProgramBuilder builder;
+        const TypeId u1Type = builder.addType(Type::bitVector(1));
+        const TypeId u8Type = builder.addType(Type::bitVector(8));
+        const TypeId u65Type = builder.addType(Type::bitVector(65));
+        const TypeId s65Type =
+            builder.addType(Type::bitVector(65, Signedness::Signed));
+        const TypeId u96Type = builder.addType(Type::bitVector(96));
+        const TypeId s96Type =
+            builder.addType(Type::bitVector(96, Signedness::Signed));
+        const TypeId u130Type = builder.addType(Type::bitVector(130));
+
+        const std::array<uint64_t, 1> one = {1};
+        const std::array<uint64_t, 1> four = {4};
+        const std::array<uint64_t, 1> sixtySeven = {67};
+        const std::array<uint64_t, 2> indexOne = {1, 0};
+        const std::array<uint64_t, 2> indexSixtyOne = {61, 0};
+        const std::array<uint64_t, 2> u65A = {
+            UINT64_C(0xfedcba9876543210), UINT64_C(1)};
+        const std::array<uint64_t, 2> u65B = {
+            UINT64_C(0x0123456789abcdef), UINT64_C(0)};
+        const std::array<uint64_t, 2> s65Negative = {
+            UINT64_C(0xfffffffffffffff9), UINT64_C(1)};
+        const std::array<uint64_t, 2> s65Positive = {UINT64_C(5), UINT64_C(0)};
+        const std::array<uint64_t, 2> u96A = {
+            UINT64_C(0x1122334455667788), UINT64_C(0x00000002)};
+        const std::array<uint64_t, 2> u96HighBit = {
+            UINT64_C(0x0123456789abcdef), UINT64_C(0x80000000)};
+        const std::array<uint64_t, 2> u96Ones = {
+            UINT64_MAX, UINT64_C(0xffffffff)};
+        const std::array<uint64_t, 2> s96Negative = {
+            UINT64_C(0xfffffffffffffffd), UINT64_C(0xffffffff)};
+        const std::array<uint64_t, 2> s96Positive = {
+            UINT64_C(0x123456789abcdef0), UINT64_C(0)};
+        const std::array<uint64_t, 3> u130Base = {
+            UINT64_C(0x0123456789abcdef),
+            UINT64_C(0xfedcba9876543210),
+            UINT64_C(2),
+        };
+        const std::array<uint64_t, 3> u130Ones = {
+            UINT64_MAX, UINT64_MAX, UINT64_C(3)};
+
+        const VariableId condition = addBitConstant(builder, u1Type, one);
+        const VariableId amountFour = addBitConstant(builder, u8Type, four);
+        const VariableId amountSixtySeven =
+            addBitConstant(builder, u8Type, sixtySeven);
+        const VariableId dynamicIndex =
+            addBitConstant(builder, u65Type, indexSixtyOne);
+        const VariableId arrayIndex = addBitConstant(builder, u65Type, indexOne);
+        const VariableId unsigned65A = addBitConstant(builder, u65Type, u65A);
+        const VariableId unsigned65B = addBitConstant(builder, u65Type, u65B);
+        const VariableId signed65Negative =
+            addBitConstant(builder, s65Type, s65Negative);
+        const VariableId signed65Positive =
+            addBitConstant(builder, s65Type, s65Positive);
+        const VariableId unsigned96A = addBitConstant(builder, u96Type, u96A);
+        const VariableId unsigned96HighBit =
+            addBitConstant(builder, u96Type, u96HighBit);
+        const VariableId unsigned96Ones =
+            addBitConstant(builder, u96Type, u96Ones);
+        const VariableId signed96Negative =
+            addBitConstant(builder, s96Type, s96Negative);
+        const VariableId signed96Positive =
+            addBitConstant(builder, s96Type, s96Positive);
+        const VariableId unsigned130Base =
+            addBitConstant(builder, u130Type, u130Base);
+        const VariableId unsigned130Ones =
+            addBitConstant(builder, u130Type, u130Ones);
+
+        ProgramInterface interface;
+        std::vector<std::pair<std::string, VariableId>> outputs;
+        const auto addOutput = [&](TypeId type, std::string_view name) {
+            const StringId nameId = builder.addString(name);
+            const VariableId variable = builder.addVariable(type, builder.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = nameId,
+                .direction = PortDirection::Output,
+                .output = variable,
+            });
+            outputs.emplace_back(std::string(name), variable);
+            return variable;
+        };
+        const auto addPure = [&](Opcode opcode,
+                                 VariableId result,
+                                 std::initializer_list<VariableId> operands) {
+            const std::array<VariableId, 1> results = {result};
+            return builder.addInstruction(
+                opcode,
+                results,
+                std::span<const VariableId>(operands.begin(), operands.size()));
+        };
+
+        addPure(Opcode::Add, addOutput(u96Type, "unsigned_add"),
+                {unsigned96A, unsigned65B});
+        addPure(Opcode::Sub, addOutput(u96Type, "unsigned_sub"),
+                {unsigned96A, unsigned65B});
+        addPure(Opcode::Add, addOutput(s96Type, "signed_add"),
+                {signed96Negative, signed65Positive});
+        addPure(Opcode::Sub, addOutput(s96Type, "signed_sub"),
+                {signed96Negative, signed65Negative});
+        addPure(Opcode::Add, addOutput(u96Type, "mixed_add"),
+                {signed65Negative, unsigned96A});
+        addPure(Opcode::And, addOutput(u96Type, "mixed_and"),
+                {signed65Negative, unsigned96Ones});
+        addPure(Opcode::Xor, addOutput(u96Type, "unsigned_xor"),
+                {unsigned96A, unsigned65A});
+        addPure(Opcode::Not, addOutput(s96Type, "signed_not"),
+                {signed96Negative});
+        addPure(Opcode::Lt, addOutput(u1Type, "signed_lt"),
+                {signed65Negative, signed96Positive});
+        addPure(Opcode::Lt, addOutput(u1Type, "mixed_lt"),
+                {signed65Negative, unsigned96A});
+        addPure(Opcode::Ge, addOutput(u1Type, "unsigned_ge"),
+                {unsigned96A, unsigned65A});
+        addPure(Opcode::Mux, addOutput(u130Type, "mixed_mux"),
+                {condition, signed65Negative, unsigned96A});
+        addPure(Opcode::Shl, addOutput(u65Type, "shift_left_65"),
+                {unsigned65A, amountFour});
+        addPure(Opcode::LogicalShr, addOutput(u130Type, "logical_shift_130"),
+                {unsigned130Base, amountSixtySeven});
+        addPure(Opcode::ArithmeticShr,
+                addOutput(u96Type, "unsigned_arithmetic_shift"),
+                {unsigned96HighBit, amountFour});
+        addPure(Opcode::ArithmeticShr,
+                addOutput(s96Type, "signed_arithmetic_shift"),
+                {signed96Negative, amountFour});
+        addPure(Opcode::ReduceAnd, addOutput(u1Type, "reduce_and"),
+                {unsigned130Ones});
+        addPure(Opcode::ReduceOr, addOutput(u1Type, "reduce_or"),
+                {unsigned130Base});
+        addPure(Opcode::ReduceXor, addOutput(u1Type, "reduce_xor"),
+                {unsigned130Base});
+        addPure(Opcode::Mul, addOutput(u130Type, "mixed_mul"),
+                {signed65Negative, unsigned65B});
+        addPure(Opcode::Concat, addOutput(u130Type, "concat_130"),
+                {unsigned65A, unsigned65B});
+        addPure(Opcode::Replicate, addOutput(u130Type, "replicate_130"),
+                {unsigned65B});
+        const InstructionId staticSlice =
+            addPure(Opcode::SliceStatic, addOutput(u96Type, "slice_static_96"),
+                    {unsigned130Base});
+        builder.setSliceStaticAttributes(staticSlice, 17);
+        addPure(Opcode::SliceDynamic, addOutput(u65Type, "slice_dynamic_65"),
+                {unsigned130Base, dynamicIndex});
+        addPure(Opcode::SliceArray, addOutput(u65Type, "slice_array_65"),
+                {unsigned130Base, arrayIndex});
+
+        LinearProgram program = builder.finish();
+        SchedulingFacts facts;
+        facts.variableRoles.assign(program.view().variableCount(), VariableRole::None);
+        for (const auto &[name, variable] : outputs)
+        {
+            (void)name;
+            facts.variableRoles[variable.value] = VariableRole::ExternalOutput;
+        }
+        facts.instructionEffects.assign(program.view().instructionCount(),
+                                        InstructionEffect::Pure);
+        return WidePureFixture{
+            .artifact = LinearProgramArtifact{
+                .program = std::move(program),
+                .interface = std::move(interface),
+                .schedulingFacts = std::move(facts),
+            },
+            .outputs = std::move(outputs),
+        };
+    }
+
+    int testWidePureOperations(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        WidePureFixture fixture = makeWidePureProgram();
+        BaselineActivityScheduleStage scheduler;
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        std::optional<ExecutableModel> model = scheduler.schedule(
+            std::move(fixture.artifact), ActivityScheduleOptions{}, diagnostics);
+        if (!model || diagnostics.hasError())
+        {
+            return fail("failed to build the wide AM emitter fixture");
+        }
+
+        Interpreter reference(*model);
+        if (!reference.ready() || !reference.eval().success())
+        {
+            return fail("AM reference executor failed the wide pure-op fixture");
+        }
+
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            *model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "WideTop",
+                .maxOutputFileBytes = 4 * 1024 * 1024,
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the wide pure-op model");
+        }
+
+        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << "#include \"grhsim_WideTop.hpp\"\n"
+                   "#include <array>\n"
+                   "#include <cstdint>\n\n"
+                   "int main()\n"
+                   "{\n"
+                   "    GrhSIM_WideTop model;\n"
+                   "    model.init();\n"
+                   "    model.eval();\n";
+        const ProgramView program = model->program.view();
+        int returnCode = 1;
+        for (const auto &[name, variable] : fixture.outputs)
+        {
+            const Type &type = program.type(program.variable(variable).type);
+            const std::span<const uint64_t> expected = reference.value(variable).words();
+            if (type.bitWidth <= 64)
+            {
+                harness << "    if (static_cast<std::uint64_t>(model." << name
+                        << ") != UINT64_C(" << expected.front() << ")) return "
+                        << returnCode << ";\n";
+            }
+            else
+            {
+                harness << "    if (model." << name
+                        << " != std::array<std::uint64_t, " << expected.size() << ">{";
+                for (std::size_t word = 0; word < expected.size(); ++word)
+                {
+                    if (word != 0)
+                    {
+                        harness << ", ";
+                    }
+                    harness << "UINT64_C(" << expected[word] << ")";
+                }
+                harness << "}) return " << returnCode << ";\n";
+            }
+            ++returnCode;
+        }
+        harness << "    return 0;\n}\n";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the wide generated model harness");
+        }
+
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated wide AM model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (outputDirectory / "libgrhsim_WideTop.a").string() + "' -o '" +
+            harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated wide AM model harness failed to compile");
+        }
+        const std::string runCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(runCommand.c_str()) != 0)
+        {
+            return fail("generated wide AM model disagreed with the Interpreter");
+        }
+        return 0;
+    }
+
+    struct MemoryEmitterFixture
+    {
+        ExecutableModel model;
+        VariableId fillEnable;
+        VariableId writeEnable;
+        VariableId address;
+        VariableId writeMask;
+        VariableId writeData;
+        VariableId fillData;
+        VariableId readData;
+        VariableId memoryChanged;
+    };
+
+    MemoryEmitterFixture makeMemoryEmitterFixture()
+    {
+        LinearProgramBuilder linear;
+        const TypeId u1Type = linear.addType(Type::bitVector(1));
+        const TypeId u8Type = linear.addType(Type::bitVector(8));
+        const TypeId u32Type = linear.addType(Type::bitVector(32));
+        const TypeId memoryType = linear.addType(Type::array(4, 8));
+
+        ProgramInterface interface;
+        const auto addInput = [&](TypeId type, std::string_view name) {
+            const VariableId variable = linear.addVariable(type, linear.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Input,
+                .input = variable,
+            });
+            return variable;
+        };
+        const auto addOutput = [&](TypeId type, std::string_view name) {
+            const VariableId variable = linear.addVariable(type, linear.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Output,
+                .output = variable,
+            });
+            return variable;
+        };
+        const auto addInstruction = [&](Opcode opcode,
+                                        std::initializer_list<VariableId> results,
+                                        std::initializer_list<VariableId> operands) {
+            return linear.addInstruction(
+                opcode,
+                std::span<const VariableId>(results.begin(), results.size()),
+                std::span<const VariableId>(operands.begin(), operands.size()));
+        };
+
+        const VariableId fillEnable = addInput(u1Type, "fill_enable");
+        const VariableId writeEnable = addInput(u1Type, "write_enable");
+        const VariableId address = addInput(u8Type, "address");
+        const VariableId writeMask = addInput(u8Type, "write_mask");
+        const VariableId writeData = addInput(u8Type, "write_data");
+        const VariableId fillData = addInput(u32Type, "fill_data");
+        const VariableId readData = addOutput(u8Type, "read_data");
+        const VariableId memoryChanged = addOutput(u1Type, "memory_changed");
+
+        const std::array<uint64_t, 1> oneWords = {1};
+        const VariableId event = addBitConstant(linear, u1Type, oneWords);
+        const VariableId memory = linear.addVariable(memoryType, linear.zeroInit());
+        const VariableId memoryOld = linear.addVariable(memoryType, linear.undefInit());
+        const VariableId changedEvent = linear.addVariable(u1Type, linear.zeroInit());
+
+        const InstructionId fill = addInstruction(
+            Opcode::MemoryFill, {}, {fillEnable, fillData, memory, event});
+        const InstructionId write = addInstruction(
+            Opcode::MemoryWrite,
+            {},
+            {writeEnable, address, writeMask, writeData, memory, event});
+        const InstructionId read = addInstruction(
+            Opcode::MemoryRead, {readData}, {memory, address});
+        const InstructionId changed = addInstruction(
+            Opcode::ChangedAny, {changedEvent}, {memory, memoryOld});
+        const InstructionId exposeChanged = addInstruction(
+            Opcode::Assign, {memoryChanged}, {changedEvent});
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        std::vector<InstructionId> entry;
+        const std::array<VariableId, 6> inputs = {
+            fillEnable, writeEnable, address, writeMask, writeData, fillData,
+        };
+        for (VariableId input : inputs)
+        {
+            const TypeId type = scheduled.view().variable(input).type;
+            const VariableId oldValue = scheduled.addVariable(type, scheduled.undefInit());
+            const VariableId inputChanged =
+                scheduled.addVariable(u1Type, scheduled.zeroInit());
+            const std::array<VariableId, 1> changedResults = {inputChanged};
+            const std::array<VariableId, 2> changedOperands = {input, oldValue};
+            const InstructionId detect = scheduled.addInstruction(
+                Opcode::ChangedAny, changedResults, changedOperands);
+            const std::array<VariableId, 1> activateOperands = {inputChanged};
+            const InstructionId activate = scheduled.addInstruction(
+                Opcode::ActForward, {}, activateOperands);
+            const std::array<BlockId, 1> targets = {BlockId{1}};
+            scheduled.setActivationTargets(activate, targets);
+            entry.push_back(detect);
+            entry.push_back(activate);
+        }
+        scheduled.addBlock(entry);
+        const std::array<InstructionId, 5> body = {
+            fill, write, read, changed, exposeChanged,
+        };
+        scheduled.addBlock(body);
+
+        return MemoryEmitterFixture{
+            .model = ExecutableModel{
+                .program = scheduled.finish(),
+                .interface = std::move(interface),
+            },
+            .fillEnable = fillEnable,
+            .writeEnable = writeEnable,
+            .address = address,
+            .writeMask = writeMask,
+            .writeData = writeData,
+            .fillData = fillData,
+            .readData = readData,
+            .memoryChanged = memoryChanged,
+        };
+    }
+
+    struct MemoryTransaction
+    {
+        uint64_t fillEnable;
+        uint64_t writeEnable;
+        uint64_t address;
+        uint64_t writeMask;
+        uint64_t writeData;
+        uint64_t fillData;
+        uint64_t expectedRead;
+        uint64_t expectedChanged;
+    };
+
+    int testMemoryOperations(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        MemoryEmitterFixture fixture = makeMemoryEmitterFixture();
+        Interpreter reference(fixture.model);
+        if (!reference.ready())
+        {
+            return fail("failed to build the AM memory reference fixture");
+        }
+
+        const std::array<MemoryTransaction, 6> transactions = {
+            MemoryTransaction{1, 0, 0, 0x00, 0x00, 0x44332211, 0x11, 1},
+            MemoryTransaction{0, 0, 2, 0x00, 0x00, 0x44332211, 0x33, 0},
+            MemoryTransaction{0, 1, 1, 0x0f, 0xab, 0x44332211, 0x2b, 1},
+            MemoryTransaction{0, 1, 1, 0x00, 0xcd, 0x44332211, 0x2b, 0},
+            MemoryTransaction{0, 1, 4, 0xff, 0x5a, 0x44332211, 0x00, 0},
+            MemoryTransaction{0, 0, 1, 0xff, 0x5a, 0x44332211, 0x2b, 0},
+        };
+        std::vector<std::array<uint64_t, 2>> oracle;
+        oracle.reserve(transactions.size());
+        const auto writeValue = [&](VariableId variable, uint32_t width, uint64_t value) {
+            const std::array<uint64_t, 1> words = {value};
+            return reference
+                .write(variable,
+                       InterpreterValue::bitVector(width, Signedness::Unsigned, words))
+                .success();
+        };
+        for (const MemoryTransaction &transaction : transactions)
+        {
+            if (!writeValue(fixture.fillEnable, 1, transaction.fillEnable) ||
+                !writeValue(fixture.writeEnable, 1, transaction.writeEnable) ||
+                !writeValue(fixture.address, 8, transaction.address) ||
+                !writeValue(fixture.writeMask, 8, transaction.writeMask) ||
+                !writeValue(fixture.writeData, 8, transaction.writeData) ||
+                !writeValue(fixture.fillData, 32, transaction.fillData) ||
+                !reference.eval().success())
+            {
+                return fail("AM Interpreter failed a memory transaction");
+            }
+            const uint64_t read = reference.value(fixture.readData).lowWord();
+            const uint64_t changed = reference.value(fixture.memoryChanged).lowWord();
+            if (read != transaction.expectedRead ||
+                changed != transaction.expectedChanged)
+            {
+                return fail("AM Interpreter disagreed with the memory transaction oracle");
+            }
+            oracle.push_back({read, changed});
+        }
+
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "MemoryTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the memory model");
+        }
+
+        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << "#include \"grhsim_MemoryTop.hpp\"\n"
+                   "#include <cstdint>\n\n"
+                   "int main()\n"
+                   "{\n"
+                   "    GrhSIM_MemoryTop model;\n"
+                   "    model.init();\n";
+        int returnCode = 1;
+        for (std::size_t index = 0; index < transactions.size(); ++index)
+        {
+            const MemoryTransaction &transaction = transactions[index];
+            harness << "    model.fill_enable = " << transaction.fillEnable << ";\n"
+                    << "    model.write_enable = " << transaction.writeEnable << ";\n"
+                    << "    model.address = " << transaction.address << ";\n"
+                    << "    model.write_mask = " << transaction.writeMask << ";\n"
+                    << "    model.write_data = " << transaction.writeData << ";\n"
+                    << "    model.fill_data = UINT32_C(" << transaction.fillData << ");\n"
+                    << "    model.eval();\n"
+                    << "    if (static_cast<std::uint64_t>(model.read_data) != UINT64_C("
+                    << oracle[index][0] << ")) return " << returnCode++ << ";\n"
+                    << "    if (static_cast<std::uint64_t>(model.memory_changed) != UINT64_C("
+                    << oracle[index][1] << ")) return " << returnCode++ << ";\n";
+        }
+        harness << "    return 0;\n}\n";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the generated memory model harness");
+        }
+
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated memory AM model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (outputDirectory / "libgrhsim_MemoryTop.a").string() + "' -o '" +
+            harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated memory AM model harness failed to compile");
+        }
+        const std::string runCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(runCommand.c_str()) != 0)
+        {
+            return fail("generated memory AM model disagreed with the Interpreter");
+        }
+        return 0;
+    }
+
+    struct PackedActivityFixture
+    {
+        ExecutableModel model;
+        VariableId input;
+        VariableId forwardOutput;
+        VariableId backwardOutput;
+        VariableId inputChanged;
+        VariableId backwardChanged;
+    };
+
+    PackedActivityFixture makePackedActivityFixture()
+    {
+        constexpr uint32_t kBoundaryBlock = 17;
+        constexpr uint32_t kForwardBlock = 64;
+        constexpr uint32_t kBackwardBlock = 65;
+        constexpr uint32_t kFinalBlock = 130;
+
+        LinearProgramBuilder linear;
+        const TypeId u1Type = linear.addType(Type::bitVector(1));
+        const StringId inputName = linear.addString("activity_input");
+        const StringId forwardOutputName = linear.addString("forward_output");
+        const StringId backwardOutputName = linear.addString("backward_output");
+        const VariableId input = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId inputOld = linear.addVariable(u1Type, linear.undefInit());
+        const VariableId inputChanged = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId forwardStage = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId forwardOld = linear.addVariable(u1Type, linear.undefInit());
+        const VariableId backwardChanged = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId forwardOutput = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId backwardOutput = linear.addVariable(u1Type, linear.zeroInit());
+
+        const auto addInstruction = [&](Opcode opcode,
+                                        std::initializer_list<VariableId> results,
+                                        std::initializer_list<VariableId> operands) {
+            return linear.addInstruction(
+                opcode,
+                std::span<const VariableId>(results.begin(), results.size()),
+                std::span<const VariableId>(operands.begin(), operands.size()));
+        };
+        const InstructionId detectInput =
+            addInstruction(Opcode::ChangedAny, {inputChanged}, {input, inputOld});
+        const InstructionId assignForwardStage =
+            addInstruction(Opcode::Assign, {forwardStage}, {input});
+        const InstructionId assignForwardOutput =
+            addInstruction(Opcode::Assign, {forwardOutput}, {forwardStage});
+        const InstructionId detectBackward = addInstruction(
+            Opcode::ChangedAny, {backwardChanged}, {forwardStage, forwardOld});
+        const InstructionId assignBackwardOutput =
+            addInstruction(Opcode::Assign, {backwardOutput}, {forwardStage});
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        const auto addScheduledInstruction = [&](Opcode opcode,
+                                                 std::initializer_list<VariableId> results,
+                                                 std::initializer_list<VariableId> operands) {
+            return scheduled.addInstruction(
+                opcode,
+                std::span<const VariableId>(results.begin(), results.size()),
+                std::span<const VariableId>(operands.begin(), operands.size()));
+        };
+        const InstructionId activateForward =
+            addScheduledInstruction(Opcode::ActForward, {}, {inputChanged});
+        const InstructionId activateFinal =
+            addScheduledInstruction(Opcode::ActForward, {}, {forwardStage});
+        const InstructionId activateBackward =
+            addScheduledInstruction(Opcode::ActBackward, {}, {backwardChanged});
+        const std::array<BlockId, 2> entryTargets = {
+            BlockId{kBoundaryBlock},
+            BlockId{kForwardBlock},
+        };
+        const std::array<BlockId, 1> finalTargets = {BlockId{kFinalBlock}};
+        const std::array<BlockId, 1> backwardTargets = {BlockId{kBackwardBlock}};
+        scheduled.setActivationTargets(activateForward, entryTargets);
+        scheduled.setActivationTargets(activateFinal, finalTargets);
+        scheduled.setActivationTargets(activateBackward, backwardTargets);
+
+        for (uint32_t block = 0; block <= kFinalBlock; ++block)
+        {
+            if (block == 0)
+            {
+                const std::array<InstructionId, 2> entry = {
+                    detectInput,
+                    activateForward,
+                };
+                scheduled.addBlock(entry);
+            }
+            else if (block == kForwardBlock)
+            {
+                const std::array<InstructionId, 2> forward = {
+                    assignForwardStage,
+                    activateFinal,
+                };
+                scheduled.addBlock(forward);
+            }
+            else if (block == kBackwardBlock)
+            {
+                const std::array<InstructionId, 1> backward = {
+                    assignBackwardOutput,
+                };
+                scheduled.addBlock(backward);
+            }
+            else if (block == kFinalBlock)
+            {
+                const std::array<InstructionId, 3> final = {
+                    assignForwardOutput,
+                    detectBackward,
+                    activateBackward,
+                };
+                scheduled.addBlock(final);
+            }
+            else
+            {
+                scheduled.addBlock(std::span<const InstructionId>{});
+            }
+        }
+
+        ProgramInterface interface;
+        interface.ports = {
+            PortBinding{
+                .name = inputName,
+                .direction = PortDirection::Input,
+                .input = input,
+            },
+            PortBinding{
+                .name = forwardOutputName,
+                .direction = PortDirection::Output,
+                .output = forwardOutput,
+            },
+            PortBinding{
+                .name = backwardOutputName,
+                .direction = PortDirection::Output,
+                .output = backwardOutput,
+            },
+        };
+        return PackedActivityFixture{
+            .model = ExecutableModel{
+                .program = scheduled.finish(),
+                .interface = std::move(interface),
+            },
+            .input = input,
+            .forwardOutput = forwardOutput,
+            .backwardOutput = backwardOutput,
+            .inputChanged = inputChanged,
+            .backwardChanged = backwardChanged,
+        };
+    }
+
+    int testPackedActivityRuntime(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        PackedActivityFixture fixture = makePackedActivityFixture();
+        const ValidationResult validation =
+            validate(fixture.model, ValidationOptions{.level = ValidationLevel::Semantic});
+        if (!validation.success())
+        {
+            return fail("packed activity fixture failed AM semantic validation: " +
+                        validation.errors.front());
+        }
+
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        GrhSimAmCppEmitter emitter;
+        wolvrix::lib::diag::Diagnostics invalidDiagnostics;
+        const GrhSimAmCppResult invalidResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "invalid-block-count",
+                .modelName = "InvalidBlockCountTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"blocksPerSource", "0"}},
+            },
+            invalidDiagnostics);
+        if (invalidResult.success || !invalidDiagnostics.hasError() ||
+            !invalidResult.artifacts.empty())
+        {
+            return fail("AM C++ emitter accepted an invalid blocksPerSource attribute");
+        }
+
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "PackedActivityTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"blocksPerSource", "17"}},
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the packed activity model");
+        }
+
+        const std::optional<std::string> headerText =
+            readTextFile(outputDirectory / "grhsim_PackedActivityTop.hpp");
+        const std::optional<std::string> runtimeText =
+            readTextFile(outputDirectory / "grhsim_PackedActivityTop_runtime.cpp");
+        if (!headerText || !runtimeText)
+        {
+            return fail("packed activity model did not emit its header and runtime source");
+        }
+        if (emitResult.artifacts.size() != 12 ||
+            !hasExactMakefileSources(
+                emitResult,
+                outputDirectory,
+                {"grhsim_PackedActivityTop_runtime.cpp",
+                 "grhsim_PackedActivityTop_blocks_0.cpp",
+                 "grhsim_PackedActivityTop_blocks_1.cpp",
+                 "grhsim_PackedActivityTop_blocks_2.cpp",
+                 "grhsim_PackedActivityTop_blocks_3.cpp",
+                 "grhsim_PackedActivityTop_blocks_4.cpp",
+                 "grhsim_PackedActivityTop_blocks_5.cpp",
+                 "grhsim_PackedActivityTop_blocks_6.cpp",
+                 "grhsim_PackedActivityTop_blocks_7.cpp"}))
+        {
+            return fail("packed activity model emitted an invalid shard manifest");
+        }
+        const std::optional<std::string> firstShardText =
+            readTextFile(outputDirectory / "grhsim_PackedActivityTop_blocks_0.cpp");
+        const std::optional<std::string> secondShardText =
+            readTextFile(outputDirectory / "grhsim_PackedActivityTop_blocks_1.cpp");
+        const std::optional<std::string> lastShardText =
+            readTextFile(outputDirectory / "grhsim_PackedActivityTop_blocks_7.cpp");
+        if (!firstShardText || !secondShardText || !lastShardText ||
+            firstShardText->find("    case 0: {") == std::string::npos ||
+            firstShardText->find("    case 16: {") == std::string::npos ||
+            firstShardText->find("    case 17: {") != std::string::npos ||
+            secondShardText->find("    case 17: {") == std::string::npos ||
+            secondShardText->find("    case 33: {") == std::string::npos ||
+            secondShardText->find("    case 16: {") != std::string::npos ||
+            secondShardText->find("    case 34: {") != std::string::npos ||
+            lastShardText->find("    case 119: {") == std::string::npos ||
+            lastShardText->find("    case 130: {") == std::string::npos ||
+            lastShardText->find("    case 118: {") != std::string::npos ||
+            lastShardText->find("    case 131: {") != std::string::npos)
+        {
+            return fail("packed activity model emitted an invalid shard Block range");
+        }
+        std::string generatedSourceText = *runtimeText;
+        for (const std::string &artifact : emitResult.artifacts)
+        {
+            const std::filesystem::path sourcePath(artifact);
+            if (sourcePath.extension() != ".cpp" ||
+                sourcePath.filename() == "grhsim_PackedActivityTop_runtime.cpp")
+            {
+                continue;
+            }
+            const std::optional<std::string> sourceText = readTextFile(sourcePath);
+            if (!sourceText)
+            {
+                return fail("packed activity model did not emit a readable block source");
+            }
+            generatedSourceText += *sourceText;
+        }
+
+        const std::size_t blockCount = fixture.model.program.blockCount();
+        const std::size_t activityWordCount = (blockCount + 63U) / 64U;
+        const std::size_t activitySummaryWordCount = (activityWordCount + 63U) / 64U;
+        const std::string oldActiveArray =
+            "std::array<bool, " + std::to_string(blockCount) + "> active_{};";
+        const std::string oldNextActiveArray =
+            "std::array<bool, " + std::to_string(blockCount) + "> nextActive_{};";
+        if (headerText->find(oldActiveArray) != std::string::npos ||
+            headerText->find(oldNextActiveArray) != std::string::npos ||
+            headerText->find("kActivityWordCount = " +
+                             std::to_string(activityWordCount)) == std::string::npos ||
+            headerText->find("kActivitySummaryWordCount = " +
+                             std::to_string(activitySummaryWordCount)) == std::string::npos ||
+            headerText->find("std::array<std::uint64_t, kActivityWordCount> activeWords_{};") ==
+                std::string::npos ||
+            headerText->find("std::array<std::uint64_t, kActivityWordCount> nextActiveWords_{};") ==
+                std::string::npos ||
+            headerText->find(
+                "std::array<std::uint64_t, kActivitySummaryWordCount> activeSummary_{};") ==
+                std::string::npos ||
+            headerText->find(
+                "std::array<std::uint64_t, kActivitySummaryWordCount> nextActiveSummary_{};") ==
+                std::string::npos ||
+            headerText->find("dirtyChangedResults_") == std::string::npos ||
+            headerText->find("dirtyChangedBits_") == std::string::npos)
+        {
+            return fail("generated activity runtime did not use packed activity and dirty-change tracking");
+        }
+        if (runtimeText->find("activate_forward(") == std::string::npos ||
+            runtimeText->find("activate_backward(") == std::string::npos ||
+            countOccurrences(generatedSourceText, "set_changed_result(") < 3 ||
+            runtimeText->find("dirtyChangedResults_") == std::string::npos ||
+            runtimeText->find("dirtyChangedBits_") == std::string::npos ||
+            runtimeText->find("if (block >= kBlockCount)") == std::string::npos ||
+            runtimeText->find("switch (block / 17U)") == std::string::npos ||
+            runtimeText->find("case 0: execute_blocks_0(block); return;") ==
+                std::string::npos ||
+            runtimeText->find("if (block < 17)") != std::string::npos ||
+            runtimeText->find("std::none_of(nextActive_.begin()") != std::string::npos ||
+            runtimeText->find("for (std::size_t block = 1; block < active_.size();") !=
+                std::string::npos)
+        {
+            return fail("generated activity runtime retained dense activation or changed-result paths");
+        }
+        for (std::size_t source = 0; source < 8; ++source)
+        {
+            const std::string dispatch = "case " + std::to_string(source) +
+                                         ": execute_blocks_" + std::to_string(source) +
+                                         "(block); return;";
+            if (runtimeText->find(dispatch) == std::string::npos)
+            {
+                return fail("generated activity runtime omitted a shard dispatch case");
+            }
+        }
+        const std::string legacyInputClear =
+            "values_[" + std::to_string(fixture.inputChanged.value) + "] = 0;";
+        const std::string legacyBackwardClear =
+            "values_[" + std::to_string(fixture.backwardChanged.value) + "] = 0;";
+        if (runtimeText->find(legacyInputClear) != std::string::npos ||
+            runtimeText->find(legacyBackwardClear) != std::string::npos)
+        {
+            return fail("generated activity runtime statically clears every changed result");
+        }
+
+        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << R"CPP(#include "grhsim_PackedActivityTop.hpp"
+int main()
+{
+    GrhSIM_PackedActivityTop model;
+    model.init();
+    model.activity_input = 0;
+    model.eval();
+    if (model.forward_output != 0 || model.backward_output != 0)
+        return 1;
+    model.activity_input = 1;
+    model.eval();
+    if (model.forward_output != 1 || model.backward_output != 1)
+        return 2;
+    model.eval();
+    if (model.forward_output != 1 || model.backward_output != 1)
+        return 3;
+    model.activity_input = 0;
+    model.eval();
+    if (model.forward_output != 1 || model.backward_output != 1)
+        return 4;
+    return 0;
+}
+)CPP";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the packed activity model harness");
+        }
+
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated packed activity model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (outputDirectory / "libgrhsim_PackedActivityTop.a").string() + "' -o '" +
+            harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated packed activity model harness failed to compile");
+        }
+        const std::string runCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(runCommand.c_str()) != 0)
+        {
+            return fail("generated packed activity model violated activation semantics");
+        }
+        return 0;
+    }
+
+} // namespace
+
+int main()
+{
+    const std::filesystem::path outputDirectory =
+        std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) / "cpp-emitter";
+    std::filesystem::remove_all(outputDirectory);
+
+    BaselineActivityScheduleStage scheduler;
+    wolvrix::lib::diag::Diagnostics diagnostics;
+    std::optional<ExecutableModel> model =
+        scheduler.schedule(makeAddProgram(), ActivityScheduleOptions{}, diagnostics);
+    if (!model || diagnostics.hasError())
+    {
+        return fail("failed to build the scalar AM emitter fixture");
+    }
+    const VariableId input = model->interface.ports[0].input;
+    const VariableId output = model->interface.ports[1].output;
+    const VariableId initialized = model->interface.ports[2].output;
+    const VariableId random = model->interface.ports[3].output;
+    const VariableId wideInput = model->interface.ports[4].input;
+    const VariableId wideOutput = model->interface.ports[5].output;
+    const VariableId wideInitialized = model->interface.ports[6].output;
+    Interpreter reference(*model);
+    const std::array<uint64_t, 1> firstInput = {41};
+    const std::array<uint64_t, 3> firstWideInput = {
+        UINT64_C(0x1111222233334444),
+        UINT64_C(0xaaaabbbbccccdddd),
+        UINT64_C(0x7),
+    };
+    if (!reference.ready() ||
+        !reference.write(
+                      input,
+                      InterpreterValue::bitVector(
+                          8, Signedness::Unsigned, firstInput))
+             .success() ||
+        !reference.write(
+                      wideInput,
+                      InterpreterValue::bitVector(
+                          130, Signedness::Unsigned, firstWideInput))
+             .success() ||
+        !reference.eval().success() || reference.value(output).lowWord() != 42 ||
+        reference.value(initialized).lowWord() != 0x5a ||
+        reference.value(random).lowWord() != 0xaf ||
+        reference.value(wideOutput).words()[2] != 0x3 ||
+        reference.value(wideInitialized).words()[2] != 0x2)
+    {
+        return fail("AM reference executor disagreed on the first scalar eval");
+    }
+    const std::array<uint64_t, 1> secondInput = {5};
+    if (!reference.write(
+                      input,
+                      InterpreterValue::bitVector(
+                          8, Signedness::Unsigned, secondInput))
+             .success() ||
+        !reference.eval().success() || reference.value(output).lowWord() != 6)
+    {
+        return fail("AM reference executor disagreed after an input change");
+    }
+
+    GrhSimAmCppEmitter emitter;
+    for (const std::string_view invalidValue : {std::string_view{"0"},
+                                                std::string_view{"not-a-number"}})
+    {
+        wolvrix::lib::diag::Diagnostics invalidSourceBytesDiagnostics;
+        const GrhSimAmCppResult invalidSourceBytesResult = emitter.emit(
+            *model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory /
+                                   ("invalid-source-bytes-" + std::string(invalidValue)),
+                .modelName = "InvalidSourceBytesTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"maxSourceBytes", std::string(invalidValue)}},
+            },
+            invalidSourceBytesDiagnostics);
+        if (invalidSourceBytesResult.success ||
+            !invalidSourceBytesDiagnostics.hasError() ||
+            !invalidSourceBytesResult.artifacts.empty() ||
+            !hasDiagnosticContaining(invalidSourceBytesDiagnostics, "maxSourceBytes"))
+        {
+            return fail("AM C++ emitter accepted an invalid maxSourceBytes attribute");
+        }
+    }
+    const GrhSimAmCppResult emitResult = emitter.emit(
+        *model,
+        GrhSimAmCppOptions{
+            .outputDirectory = outputDirectory,
+            .modelName = "TestTop",
+            .maxOutputFileBytes = 1024 * 1024,
+            .attributes = {{"blocksPerSource", "16"}, {"maxSourceBytes", "1"}},
+        },
+        diagnostics);
+    if (!emitResult.success || diagnostics.hasError())
+    {
+        return fail("AM C++ emitter failed to generate the scalar model");
+    }
+    if (!hasArtifact(emitResult, "grhsim_TestTop.hpp") ||
+        !hasArtifact(emitResult, "grhsim_TestTop_support.hpp") ||
+        !hasArtifact(emitResult, "grhsim_TestTop_runtime.cpp") ||
+        !hasArtifact(emitResult, "grhsim_TestTop_blocks_0.cpp") ||
+        !hasArtifact(emitResult, "grhsim_TestTop_blocks_0_part_1.cpp") ||
+        !hasArtifact(emitResult, "Makefile") ||
+        !hasExactMakefileSources(
+            emitResult,
+            outputDirectory,
+            {"grhsim_TestTop_runtime.cpp",
+             "grhsim_TestTop_blocks_0.cpp",
+             "grhsim_TestTop_blocks_0_part_1.cpp"}))
+    {
+        return fail("AM C++ emitter produced an incomplete multi-source artifact manifest");
+    }
+    const std::optional<std::string> splitHeaderText =
+        readTextFile(outputDirectory / "grhsim_TestTop.hpp");
+    const std::optional<std::string> splitRuntimeText =
+        readTextFile(outputDirectory / "grhsim_TestTop_runtime.cpp");
+    const std::optional<std::string> splitFirstPartText =
+        readTextFile(outputDirectory / "grhsim_TestTop_blocks_0.cpp");
+    const std::optional<std::string> splitSecondPartText =
+        readTextFile(outputDirectory / "grhsim_TestTop_blocks_0_part_1.cpp");
+    if (!splitHeaderText || !splitRuntimeText || !splitFirstPartText ||
+        !splitSecondPartText ||
+        splitHeaderText->find("void execute_blocks_0(std::size_t block);") ==
+            std::string::npos ||
+        splitHeaderText->find("void execute_blocks_0_part_1(std::size_t block);") ==
+            std::string::npos ||
+        splitHeaderText->find("void execute_blocks_1(std::size_t block);") !=
+            std::string::npos ||
+        splitRuntimeText->find("switch (block / 16U)") == std::string::npos ||
+        splitRuntimeText->find(
+            "case 0:\n        if (block < 1U) { execute_blocks_0(block); return; }\n"
+            "        execute_blocks_0_part_1(block); return;") == std::string::npos ||
+        splitRuntimeText->find("\n    case 1:") != std::string::npos ||
+        splitFirstPartText->find("void GrhSIM_TestTop::execute_blocks_0(") ==
+            std::string::npos ||
+        splitFirstPartText->find("    case 0: {") == std::string::npos ||
+        splitFirstPartText->find("    case 1: {") != std::string::npos ||
+        splitSecondPartText->find(
+            "void GrhSIM_TestTop::execute_blocks_0_part_1(") == std::string::npos ||
+        splitSecondPartText->find("    case 0: {") != std::string::npos ||
+        splitSecondPartText->find("    case 1: {") == std::string::npos)
+    {
+        return fail("AM C++ emitter produced an inconsistent physical source split");
+    }
+
+    const std::filesystem::path stagingOutputDirectory =
+        std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) / "cpp-emitter-staging";
+    std::filesystem::remove_all(stagingOutputDirectory);
+    wolvrix::lib::diag::Diagnostics stagingDiagnostics;
+    const GrhSimAmCppResult stagingResult = emitter.emit(
+        *model,
+        GrhSimAmCppOptions{
+            .outputDirectory = stagingOutputDirectory,
+            .modelName = "StagingTop",
+            .maxOutputFileBytes = 1,
+            .attributes = {{"blocksPerSource", "1"}},
+        },
+        stagingDiagnostics);
+    if (stagingResult.success || !stagingDiagnostics.hasError() ||
+        !stagingResult.artifacts.empty() ||
+        std::filesystem::exists(stagingOutputDirectory / "grhsim_StagingTop.hpp") ||
+        std::filesystem::exists(stagingOutputDirectory / "grhsim_StagingTop_support.hpp") ||
+        std::filesystem::exists(stagingOutputDirectory / "grhsim_StagingTop_runtime.cpp") ||
+        !std::filesystem::is_empty(stagingOutputDirectory))
+    {
+        return fail("AM C++ emitter published a partial artifact after a staging failure");
+    }
+
+    const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
+    std::ofstream harness(harnessPath);
+    harness << R"CPP(#include "grhsim_TestTop.hpp"
+int main()
+{
+    GrhSIM_TestTop model;
+    model.init();
+    model.input_value = 41;
+    model.eval();
+    if (model.output_value != 42)
+        return 1;
+    if (model.initialized_value != 0x5a)
+        return 4;
+    if (model.random_value != 0xaf)
+        return 5;
+    model.wide_input = {
+        UINT64_C(0x1111222233334444),
+        UINT64_C(0xaaaabbbbccccdddd),
+        UINT64_C(0x7),
+    };
+    model.eval();
+    if (model.wide_output != std::array<std::uint64_t, 3>{
+                                 UINT64_C(0x1111222233334444),
+                                 UINT64_C(0xaaaabbbbccccdddd),
+                                 UINT64_C(0x3),
+                             })
+        return 6;
+    if (model.wide_initialized != std::array<std::uint64_t, 3>{
+                                      UINT64_C(0x0123456789abcdef),
+                                      UINT64_C(0xfedcba9876543210),
+                                      UINT64_C(0x2),
+                                  })
+        return 7;
+    model.input_value = 5;
+    model.eval();
+    if (model.output_value != 6)
+        return 2;
+    model.eval();
+    if (model.output_value != 6)
+        return 3;
+    return 0;
+}
+)CPP";
+    harness.close();
+    if (!harness)
+    {
+        return fail("failed to write the generated model harness");
+    }
+
+    const std::string buildCommand =
+        "make -C '" + outputDirectory.string() +
+        "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+    if (std::system(buildCommand.c_str()) != 0)
+    {
+        return fail("generated AM model failed to compile");
+    }
+    const std::filesystem::path harnessExecutable = outputDirectory / "harness";
+    const std::string harnessCompileCommand =
+        "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
+        harnessPath.string() + "' '" +
+        (outputDirectory / "libgrhsim_TestTop.a").string() + "' -o '" +
+        harnessExecutable.string() + "'";
+    if (std::system(harnessCompileCommand.c_str()) != 0)
+    {
+        return fail("generated AM model harness failed to compile");
+    }
+    const std::string runCommand = "'" + harnessExecutable.string() + "'";
+    if (std::system(runCommand.c_str()) != 0)
+    {
+        return fail("generated AM model produced the wrong eval result");
+    }
+    if (const int result = testWidePureOperations(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-wide");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testMemoryOperations(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-memory");
+        result != 0)
+    {
+        return result;
+    }
+    return testPackedActivityRuntime(
+        std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+        "cpp-emitter-packed-activity");
+}

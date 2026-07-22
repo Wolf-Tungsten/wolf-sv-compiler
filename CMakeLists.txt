@@ -110,6 +110,15 @@ set(WOLVRIX_LIB_SOURCES
     lib/core/load.cpp
     lib/core/emit.cpp
     lib/core/toposort.cpp
+    lib/grhsim/am/program.cpp
+    lib/grhsim/am/builder.cpp
+    lib/grhsim/am/validate.cpp
+    lib/grhsim/am/pipeline.cpp
+    lib/grhsim/am/lowering.cpp
+    lib/grhsim/am/activity_schedule.cpp
+    lib/grhsim/am/production_activity_schedule.cpp
+    lib/grhsim/am/interpreter.cpp
+    lib/grhsim/am/cpp_emitter.cpp
     lib/emit/grhsim_cpp.cpp
     lib/emit/system_verilog.cpp
     lib/emit/verilator_repcut_package.cpp
@@ -414,6 +423,119 @@ target_compile_definitions(emit-sv-storage-ports
 )
 
 register_test_exe(emit-sv-storage-ports)
+
+# GRHSIM-AM framework tests
+add_executable(grhsim-am-program
+    tests/grhsim/am/test_program.cpp
+)
+
+target_link_libraries(grhsim-am-program
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(grhsim-am-program)
+
+add_executable(grhsim-am-pipeline
+    tests/grhsim/am/test_pipeline.cpp
+)
+
+target_link_libraries(grhsim-am-pipeline
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(grhsim-am-pipeline)
+
+add_executable(grhsim-am-cpp-emitter
+    tests/grhsim/am/test_cpp_emitter.cpp
+)
+
+target_link_libraries(grhsim-am-cpp-emitter
+    PRIVATE
+        wolvrix-lib
+)
+
+target_compile_definitions(grhsim-am-cpp-emitter
+    PRIVATE
+        WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+)
+
+register_test_exe(grhsim-am-cpp-emitter)
+
+add_executable(grhsim-am-cpp-emitter-host
+    tests/grhsim/am/test_cpp_emitter_host.cpp
+)
+
+target_link_libraries(grhsim-am-cpp-emitter-host
+    PRIVATE
+        wolvrix-lib
+)
+
+target_compile_definitions(grhsim-am-cpp-emitter-host
+    PRIVATE
+        WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+)
+
+register_test_exe(grhsim-am-cpp-emitter-host)
+
+add_executable(grhsim-am-interpreter
+    tests/grhsim/am/test_interpreter.cpp
+)
+
+target_link_libraries(grhsim-am-interpreter
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(grhsim-am-interpreter)
+
+add_executable(grhsim-am-production-schedule
+    tests/grhsim/am/test_production_activity_schedule.cpp
+)
+
+target_link_libraries(grhsim-am-production-schedule
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(grhsim-am-production-schedule)
+
+add_executable(grhsim-am-lowering
+    tests/grhsim/am/test_lowering.cpp
+)
+
+target_link_libraries(grhsim-am-lowering
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(grhsim-am-lowering)
+
+add_executable(grhsim-am-end-to-end
+    tests/grhsim/am/test_end_to_end.cpp
+)
+
+target_link_libraries(grhsim-am-end-to-end
+    PRIVATE
+        wolvrix-lib
+)
+
+target_compile_definitions(grhsim-am-end-to-end
+    PRIVATE
+        WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+)
+
+register_test_exe(grhsim-am-end-to-end)
+
+add_executable(grhsim-am-lower-json
+    tests/grhsim/am/lower_json_smoke.cpp
+)
+
+target_link_libraries(grhsim-am-lower-json
+    PRIVATE
+        wolvrix-lib
+)
 
 add_executable(emit-sv-top-reachable
     tests/emit/test_emit_sv_top_reachable.cpp

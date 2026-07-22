@@ -4,6 +4,10 @@
 > 本文只介绍核心概念和执行流程；具体 opcode 见
 > [GRHSIM-AM 指令集](grhsim-am-instructions.md)，宿主服务边界见
 > [HostEnvironment 参考定义](grhsim-host-environment.md)。
+> 从 normalized GRH 经不可执行的 `am::LinearProgram`、AM activity scheduler 到最终
+> Program 和 C++ emitter 的代码框架与分阶段迁移计划见
+> [GRHSIM-AM lowering、调度与 C++ emit 流水线](grhsim-am-pipeline.md)。该流水线文档
+> 只定义构建阶段和工程边界；最终 Program 的执行语义仍以本文为准。
 
 ## 1. 它解决什么问题
 
