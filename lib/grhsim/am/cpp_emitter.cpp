@@ -152,6 +152,11 @@ namespace wolvrix::lib::grhsim::am
             uint64_t stringValues = 0;
             std::unordered_map<uint32_t, uint32_t> onceSlotByInstruction;
             uint32_t onceSlotCount = 0;
+            std::unordered_map<uint32_t, uint32_t> pendingEventSlotByInstruction;
+            uint32_t pendingEventSlotCount = 0;
+            std::unordered_map<uint32_t, uint32_t> completedCommitWriteSlotByInstruction;
+            uint32_t completedCommitWriteSlotCount = 0;
+            std::vector<uint32_t> commitEventSlotByVariable;
             std::unordered_map<uint32_t, DpiImportId> dpiImportBySymbol;
             std::vector<bool> referencedDpiImports;
             std::vector<InstructionId> finalSystemTasks;
@@ -165,6 +170,16 @@ namespace wolvrix::lib::grhsim::am
         const EmitState::Storage &variableStorage(const EmitState &state, VariableId variable)
         {
             return state.variableStorage.at(variable.value);
+        }
+
+        std::string changedResultCallPrefix(const EmitState &state, VariableId variable)
+        {
+            const uint32_t slot = state.commitEventSlotByVariable.at(variable.value);
+            if (slot == std::numeric_limits<uint32_t>::max())
+            {
+                return "set_changed_result(" + std::to_string(variable.value) + ", ";
+            }
+            return "set_commit_changed_result(" + std::to_string(slot) + ", ";
         }
 
         bool isWideBitVector(const EmitState &state, VariableId variable)
@@ -403,6 +418,28 @@ namespace wolvrix::lib::grhsim::am
             return expression;
         }
 
+        std::string eventHitExpr(const EmitState &state,
+                                 std::span<const VariableId> operands,
+                                 uint32_t eventCount)
+        {
+            if (eventCount == 0)
+            {
+                return "true";
+            }
+            std::string expression = "(";
+            const std::size_t eventBegin = operands.size() - eventCount;
+            for (std::size_t index = eventBegin; index < operands.size(); ++index)
+            {
+                if (index != eventBegin)
+                {
+                    expression += " || ";
+                }
+                expression += boolExpr(operands[index]);
+            }
+            expression += ")";
+            return expression;
+        }
+
         std::optional<std::string> emitSystemTaskInstruction(const EmitState &state,
                                                              InstructionId instruction,
                                                              bool finalPhase,
@@ -434,7 +471,29 @@ namespace wolvrix::lib::grhsim::am
                 return std::nullopt;
             }
 
-            std::string fire = eventFireExpr(state, operands, attributes->eventCount, finalPhase);
+            std::string preamble;
+            std::optional<uint32_t> pendingEventSlot;
+            std::string fire;
+            if (attributes->eventCount != 0 &&
+                attributes->eventMode == HostEventMode::Pending && !finalPhase)
+            {
+                const auto slot = state.pendingEventSlotByInstruction.find(instruction.value);
+                if (slot == state.pendingEventSlotByInstruction.end())
+                {
+                    error = "eventful system.task is missing a pending-event slot";
+                    return std::nullopt;
+                }
+                pendingEventSlot = slot->second;
+                const std::string pending =
+                    "pendingHostEvents_[" + std::to_string(*pendingEventSlot) + "]";
+                preamble = "if (" + eventHitExpr(state, operands, attributes->eventCount) +
+                           ") " + pending + " = true;\n";
+                fire = boolExpr(operands.front()) + " && " + pending;
+            }
+            else
+            {
+                fire = eventFireExpr(state, operands, attributes->eventCount, finalPhase);
+            }
             if (attributes->schedule == CallSchedule::Once)
             {
                 const auto slot = state.onceSlotByInstruction.find(instruction.value);
@@ -446,7 +505,7 @@ namespace wolvrix::lib::grhsim::am
                 fire = "!onceCompleted_[" + std::to_string(slot->second) + "] && (" + fire + ")";
             }
 
-            std::string code = "if (" + fire + ") {\n";
+            std::string code = preamble + "if (" + fire + ") {\n";
             if (name == "fwrite")
             {
                 if (argumentCount < 2)
@@ -514,6 +573,11 @@ namespace wolvrix::lib::grhsim::am
                     return std::nullopt;
                 }
                 code += "onceCompleted_[" + std::to_string(slot->second) + "] = true;\n";
+            }
+            if (pendingEventSlot)
+            {
+                code += "pendingHostEvents_[" + std::to_string(*pendingEventSlot) +
+                        "] = false;\n";
             }
             code += "}\n";
             return code;
@@ -641,9 +705,31 @@ namespace wolvrix::lib::grhsim::am
             }
             call += ")";
 
-            std::string code = "if (" +
-                               eventFireExpr(state, operands, attributes->eventCount, false) +
-                               ") {\n";
+            std::string preamble;
+            std::optional<uint32_t> pendingEventSlot;
+            std::string fire;
+            if (attributes->eventCount != 0 &&
+                attributes->eventMode == HostEventMode::Pending)
+            {
+                const auto slot = state.pendingEventSlotByInstruction.find(instruction.value);
+                if (slot == state.pendingEventSlotByInstruction.end())
+                {
+                    error = "eventful dpi.call is missing a pending-event slot";
+                    return std::nullopt;
+                }
+                pendingEventSlot = slot->second;
+                const std::string pending =
+                    "pendingHostEvents_[" + std::to_string(*pendingEventSlot) + "]";
+                preamble = "if (" + eventHitExpr(state, operands, attributes->eventCount) +
+                           ") " + pending + " = true;\n";
+                fire = boolExpr(operands.front()) + " && " + pending;
+            }
+            else
+            {
+                fire = eventFireExpr(state, operands, attributes->eventCount, false);
+            }
+
+            std::string code = preamble + "if (" + fire + ") {\n";
             for (const std::string &declaration : declarations)
             {
                 code += declaration;
@@ -676,6 +762,11 @@ namespace wolvrix::lib::grhsim::am
             for (const std::string &commit : commits)
             {
                 code += commit;
+            }
+            if (pendingEventSlot)
+            {
+                code += "pendingHostEvents_[" + std::to_string(*pendingEventSlot) +
+                        "] = false;\n";
             }
             code += "}\n";
             return code;
@@ -930,6 +1021,29 @@ namespace wolvrix::lib::grhsim::am
                     state, operands[1], resultType.bitWidth, resultType.signedness);
                 return std::array<std::string, 2>{lhs, rhs};
             };
+            const auto emitEventfulStateWrite =
+                [&](std::size_t eventBegin, std::string condition, std::string body) {
+                    const std::string eventHit = eventHitExpr(
+                        state, operands,
+                        static_cast<uint32_t>(operands.size() - eventBegin));
+                    const auto slot =
+                        state.completedCommitWriteSlotByInstruction.find(instruction.value);
+                    if (slot == state.completedCommitWriteSlotByInstruction.end())
+                    {
+                        return "if (" + condition + " && " + eventHit + ") { " + body +
+                               " }\n";
+                    }
+
+                    const std::string completed =
+                        "completedCommitWrites_[" + std::to_string(slot->second) + "]";
+                    const std::string event =
+                        "commit_event_hit_" + std::to_string(instruction.value);
+                    return "{ const bool " + event + " = " + eventHit + ";\n" +
+                           "if (" + event + " && !" + completed + ") {\n" +
+                           completed + " = true;\n" +
+                           "if (" + condition + ") { " + body + " }\n" +
+                           "}\n}\n";
+                };
 
             if (opcode == Opcode::Assign &&
                 (isWideBitVector(state, results.front()) ||
@@ -966,7 +1080,7 @@ namespace wolvrix::lib::grhsim::am
                 opcode == Opcode::ChangedNeg)
             {
                 const std::string setResult =
-                    "set_changed_result(" + std::to_string(results.front().value) + ", ";
+                    changedResultCallPrefix(state, results.front());
                 const Type &type = variableType(state, operands.front());
                 if (type.kind == TypeKind::Array)
                 {
@@ -1046,26 +1160,17 @@ namespace wolvrix::lib::grhsim::am
             if ((opcode == Opcode::RegisterWrite || opcode == Opcode::LatchWrite) &&
                 isWideBitVector(state, operands[3]))
             {
-                std::string enabled = boolExpr(operands[0]);
-                if (opcode == Opcode::RegisterWrite && operands.size() > 4)
-                {
-                    enabled += " && (";
-                    for (std::size_t index = 4; index < operands.size(); ++index)
-                    {
-                        if (index != 4)
-                        {
-                            enabled += " || ";
-                        }
-                        enabled += boolExpr(operands[index]);
-                    }
-                    enabled += ")";
-                }
                 const uint32_t width = variableType(state, operands[3]).bitWidth;
-                return "if (" + enabled + ") { masked_write_words(" +
-                       wideDataExpr(state, operands[3]) + ", " +
-                       wideDataExpr(state, operands[2]) + ", " +
-                       wideDataExpr(state, operands[1]) + ", " +
-                       std::to_string(width) + "); }\n";
+                const std::string body =
+                    "masked_write_words(" + wideDataExpr(state, operands[3]) + ", " +
+                    wideDataExpr(state, operands[2]) + ", " +
+                    wideDataExpr(state, operands[1]) + ", " +
+                    std::to_string(width) + ");";
+                if (opcode == Opcode::RegisterWrite)
+                {
+                    return emitEventfulStateWrite(4, boolExpr(operands[0]), body);
+                }
+                return "if (" + boolExpr(operands[0]) + ") { " + body + " }\n";
             }
 
             const bool deferredUnsupported =
@@ -1291,31 +1396,19 @@ namespace wolvrix::lib::grhsim::am
                         event = "(" + valueExpr(operands[1]) + " != 0 && " +
                                 valueExpr(operands[0]) + " == 0)";
                     }
-                    return "set_changed_result(" + std::to_string(results.front().value) +
-                           ", " + event + ");\n" +
+                    return changedResultCallPrefix(state, results.front()) + event +
+                           ");\n" +
                            valueExpr(operands[1]) + " = " + valueExpr(operands[0]) + ";\n";
                 }
                 case Opcode::RegisterWrite:
                 {
-                    std::string enabled = boolExpr(operands[0]);
-                    if (operands.size() > 4)
-                    {
-                        enabled += " && (";
-                        for (std::size_t index = 4; index < operands.size(); ++index)
-                        {
-                            if (index != 4)
-                            {
-                                enabled += " || ";
-                            }
-                            enabled += boolExpr(operands[index]);
-                        }
-                        enabled += ")";
-                    }
                     const VariableId target = operands[3];
-                    return "if (" + enabled + ") { " + valueExpr(target) + " = ((" +
-                           valueExpr(target) + " & ~" + valueExpr(operands[1]) + ") | (" +
-                           valueExpr(operands[2]) + " & " + valueExpr(operands[1]) + ")) & " +
-                           maskExpr(variableType(state, target).bitWidth) + "; }\n";
+                    const std::string body =
+                        valueExpr(target) + " = ((" + valueExpr(target) + " & ~" +
+                        valueExpr(operands[1]) + ") | (" + valueExpr(operands[2]) + " & " +
+                        valueExpr(operands[1]) + ")) & " +
+                        maskExpr(variableType(state, target).bitWidth) + ";";
+                    return emitEventfulStateWrite(4, boolExpr(operands[0]), body);
                 }
                 case Opcode::LatchWrite:
                 {
@@ -1365,26 +1458,20 @@ namespace wolvrix::lib::grhsim::am
                     const uint32_t stride = variableStorage(state, operands[4]).wordCount;
                     const std::string suffix = std::to_string(instruction.value);
                     const std::string index = "memory_index_" + suffix;
-                    std::string enabled = boolExpr(operands[0]) + " && (";
-                    for (std::size_t operand = 5; operand < operands.size(); ++operand)
-                    {
-                        if (operand != 5)
-                        {
-                            enabled += " || ";
-                        }
-                        enabled += boolExpr(operands[operand]);
-                    }
-                    enabled += ")";
                     std::string code = "{ const std::size_t " + index + " = index_words(" +
                                        wordDataExpr(state, operands[1]) + ", " +
                                        std::to_string(addressType.bitWidth) + ", " +
                                        std::to_string(memoryType.elementCount) + ");\n";
-                    code += "if (" + enabled + " && " + index + " != " +
-                            std::to_string(memoryType.elementCount) + ") { masked_write_words(" +
-                            wordDataExpr(state, operands[4]) + " + " + index + " * " +
-                            std::to_string(stride) + ", " + wordDataExpr(state, operands[3]) +
-                            ", " + wordDataExpr(state, operands[2]) + ", " +
-                            std::to_string(memoryType.bitWidth) + "); }\n}\n";
+                    const std::string condition =
+                        boolExpr(operands[0]) + " && " + index + " != " +
+                        std::to_string(memoryType.elementCount);
+                    const std::string body =
+                        "masked_write_words(" + wordDataExpr(state, operands[4]) + " + " +
+                        index + " * " + std::to_string(stride) + ", " +
+                        wordDataExpr(state, operands[3]) + ", " +
+                        wordDataExpr(state, operands[2]) + ", " +
+                        std::to_string(memoryType.bitWidth) + ");";
+                    code += emitEventfulStateWrite(5, condition, body) + "}\n";
                     return code;
                 }
                 case Opcode::MemoryFill:
@@ -1394,39 +1481,28 @@ namespace wolvrix::lib::grhsim::am
                     const uint32_t stride = variableStorage(state, operands[2]).wordCount;
                     const std::string suffix = std::to_string(instruction.value);
                     const std::string element = "memory_element_" + suffix;
-                    std::string enabled = boolExpr(operands[0]) + " && (";
-                    for (std::size_t operand = 3; operand < operands.size(); ++operand)
-                    {
-                        if (operand != 3)
-                        {
-                            enabled += " || ";
-                        }
-                        enabled += boolExpr(operands[operand]);
-                    }
-                    enabled += ")";
-                    std::string code = "if (" + enabled + ") { for (std::size_t " + element +
-                                       " = 0; " + element + " < " +
-                                       std::to_string(memoryType.elementCount) + "; ++" + element +
-                                       ") { ";
+                    std::string body = "for (std::size_t " + element + " = 0; " + element +
+                                       " < " + std::to_string(memoryType.elementCount) + "; ++" +
+                                       element + ") { ";
                     const std::string target = wordDataExpr(state, operands[2]) + " + " + element +
                                                " * " + std::to_string(stride);
                     if (dataType.bitWidth == memoryType.bitWidth)
                     {
-                        code += "assign_words(" + target + ", " +
+                        body += "assign_words(" + target + ", " +
                                 std::to_string(memoryType.bitWidth) + ", " +
                                 wordDataExpr(state, operands[1]) + ", " +
                                 std::to_string(dataType.bitWidth) + ", false);";
                     }
                     else
                     {
-                        code += "slice_words(" + target + ", " +
+                        body += "slice_words(" + target + ", " +
                                 std::to_string(memoryType.bitWidth) + ", " +
                                 wordDataExpr(state, operands[1]) + ", " +
                                 std::to_string(dataType.bitWidth) + ", " + element + " * " +
                                 std::to_string(memoryType.bitWidth) + ");";
                     }
-                    code += " } }\n";
-                    return code;
+                    body += " }";
+                    return emitEventfulStateWrite(3, boolExpr(operands[0]), body);
                 }
                 case Opcode::ActForward:
                 case Opcode::ActBackward:
@@ -1923,7 +1999,79 @@ namespace wolvrix::lib::grhsim::am
         }
 
         const ProgramView program = model.program.view();
+        std::vector<uint32_t> commitEventVariables;
+        std::vector<uint32_t> commitWriteInstructions;
+        if (model.commitBlockBegin != 0)
+        {
+            std::vector<bool> changedVariable(program.variableCount(), false);
+            for (uint32_t instructionIndex = 0;
+                 instructionIndex < program.instructionCount(); ++instructionIndex)
+            {
+                const InstructionId instruction{instructionIndex};
+                const Opcode opcode = program.opcode(instruction);
+                if (opcode == Opcode::ChangedAny || opcode == Opcode::ChangedPos ||
+                    opcode == Opcode::ChangedNeg)
+                {
+                    changedVariable[program.results(instruction).front().value] = true;
+                }
+            }
+            for (uint32_t blockIndex = model.commitBlockBegin;
+                 blockIndex < model.commitBlockEnd; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                for (std::size_t position = 0;
+                     position < model.program.blockSize(block); ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    const Opcode opcode = program.opcode(instruction);
+                    const auto operands = program.operands(instruction);
+                    std::size_t eventBegin = operands.size();
+                    if (opcode == Opcode::RegisterWrite)
+                    {
+                        commitWriteInstructions.push_back(instruction.value);
+                        eventBegin = 4;
+                    }
+                    else if (opcode == Opcode::MemoryWrite)
+                    {
+                        commitWriteInstructions.push_back(instruction.value);
+                        eventBegin = 5;
+                    }
+                    else if (opcode == Opcode::MemoryFill)
+                    {
+                        commitWriteInstructions.push_back(instruction.value);
+                        eventBegin = 3;
+                    }
+                    for (std::size_t index = eventBegin; index < operands.size(); ++index)
+                    {
+                        if (changedVariable[operands[index].value])
+                        {
+                            commitEventVariables.push_back(operands[index].value);
+                        }
+                    }
+                }
+            }
+            std::sort(commitEventVariables.begin(), commitEventVariables.end());
+            commitEventVariables.erase(
+                std::unique(commitEventVariables.begin(), commitEventVariables.end()),
+                commitEventVariables.end());
+            std::sort(commitWriteInstructions.begin(), commitWriteInstructions.end());
+            commitWriteInstructions.erase(
+                std::unique(commitWriteInstructions.begin(), commitWriteInstructions.end()),
+                commitWriteInstructions.end());
+        }
         EmitState state{.program = program};
+        state.commitEventSlotByVariable.assign(
+            program.variableCount(), std::numeric_limits<uint32_t>::max());
+        for (uint32_t slot = 0; slot < commitEventVariables.size(); ++slot)
+        {
+            state.commitEventSlotByVariable[commitEventVariables[slot]] = slot;
+        }
+        for (uint32_t instruction : commitWriteInstructions)
+        {
+            state.completedCommitWriteSlotByInstruction.emplace(
+                instruction, state.completedCommitWriteSlotCount++);
+        }
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
         for (uint32_t index = 0; index < program.variableCount(); ++index)
@@ -1972,10 +2120,21 @@ namespace wolvrix::lib::grhsim::am
                 for (const InitAction &action :
                      program.initActions(program.variable(VariableId{index}).init))
                 {
-                    if (type.kind == TypeKind::Array || action.kind != InitActionKind::Set)
+                    if (action.kind == InitActionKind::Load)
                     {
                         diagnostics.error(
-                            "initial AM C++ emitter supports only non-Array Set actions: variable=" +
+                            "AM C++ emitter does not support Array Load initialization: variable=" +
+                                std::to_string(index),
+                            std::string(kContext));
+                        return result;
+                    }
+                    if ((type.kind == TypeKind::Array &&
+                         action.kind != InitActionKind::Fill) ||
+                        (type.kind != TypeKind::Array &&
+                         action.kind != InitActionKind::Set))
+                    {
+                        diagnostics.error(
+                            "AM C++ emitter encountered an init action incompatible with its target: variable=" +
                                 std::to_string(index),
                             std::string(kContext));
                         return result;
@@ -2011,6 +2170,12 @@ namespace wolvrix::lib::grhsim::am
                 {
                     state.onceSlotByInstruction.emplace(index, state.onceSlotCount++);
                 }
+                if (attributes && attributes->eventCount != 0 &&
+                    attributes->eventMode == HostEventMode::Pending)
+                {
+                    state.pendingEventSlotByInstruction.emplace(
+                        index, state.pendingEventSlotCount++);
+                }
             }
             else if (program.opcode(instruction) == Opcode::DpiCall)
             {
@@ -2030,6 +2195,12 @@ namespace wolvrix::lib::grhsim::am
                                           std::to_string(index),
                                       std::string(kContext));
                     return result;
+                }
+                if (attributes->eventCount != 0 &&
+                    attributes->eventMode == HostEventMode::Pending)
+                {
+                    state.pendingEventSlotByInstruction.emplace(
+                        index, state.pendingEventSlotCount++);
                 }
                 state.referencedDpiImports[importIt->second.value] = true;
             }
@@ -2201,6 +2372,8 @@ namespace wolvrix::lib::grhsim::am
         const std::size_t activitySummaryWordCount = (activityWordCount + 63U) / 64U;
         const std::size_t dirtyChangedWordCount =
             (static_cast<std::size_t>(program.variableCount()) + 63U) / 64U;
+        const std::size_t commitEventWordCount =
+            (commitEventVariables.size() + 63U) / 64U;
 
         const std::string prefix = "grhsim_" + options.modelName;
         const std::string className = "GrhSIM_" + options.modelName;
@@ -2267,10 +2440,30 @@ namespace wolvrix::lib::grhsim::am
                << "    void activate_backward(std::size_t block);\n"
                << "    void activate_all_blocks();\n"
                << "    void execute_active_blocks();\n"
+               << "    bool execute_next_commit_group();\n"
+               << "    void capture_pending_commit_operands();\n"
+               << "    [[nodiscard]] bool has_active_blocks() const;\n"
                << "    [[nodiscard]] bool has_next_active_blocks() const;\n"
-               << "    void set_changed_result(std::size_t variable, bool event);\n"
+               << "    [[nodiscard]] bool has_pending_commit_blocks() const;\n"
+               << "    [[nodiscard]] static bool is_commit_block(std::size_t block);\n"
+               << "    void capture_commit_events();\n"
+               << "    void restore_commit_events();\n"
+               << "    void clear_pending_commit_events();\n"
+               << "    void set_changed_result(std::size_t variable, bool event) {\n"
+               << "        values_[variable] = event ? 1 : 0;\n"
+               << "        if (event) mark_changed_result(variable);\n"
+               << "    }\n"
+               << "    void set_commit_changed_result(std::uint32_t commitEventSlot, bool event) {\n"
+               << "        const std::size_t variable = kCommitEventVariables_[commitEventSlot];\n"
+               << "        values_[variable] = event ? 1 : 0;\n"
+               << "        if (event) mark_commit_changed_result(variable, commitEventSlot);\n"
+               << "    }\n"
+               << "    void mark_changed_result(std::size_t variable);\n"
+               << "    void mark_commit_changed_result(std::size_t variable, std::uint32_t commitEventSlot);\n"
                << "    void clear_changed_results();\n"
-               << "    static std::uint64_t bit_mask(std::uint32_t width);\n"
+               << "    static constexpr std::uint64_t bit_mask(std::uint32_t width) {\n"
+               << "        return width >= 64 ? UINT64_MAX : ((UINT64_C(1) << width) - 1);\n"
+               << "    }\n"
                << "    static std::size_t word_count(std::uint32_t width);\n"
                << "    static bool any_words(const std::uint64_t *value, std::uint32_t width);\n"
                << "    static bool equal_words(const std::uint64_t *lhs, const std::uint64_t *rhs, std::uint32_t width);\n"
@@ -2292,34 +2485,76 @@ namespace wolvrix::lib::grhsim::am
                << "    static void slice_array_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, const std::uint64_t *index, std::uint32_t indexWidth);\n"
                << "    static void shift_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, bool sourceSigned, const std::uint64_t *amount, std::uint32_t amountWidth, std::uint32_t operation);\n"
                << "    static std::uint64_t split_mix64(std::uint64_t &state);\n"
-               << "    static std::uint64_t resize_value(std::uint64_t value, std::uint32_t sourceWidth, bool signExtend, std::uint32_t targetWidth);\n"
+               << "    static constexpr std::uint64_t resize_value(std::uint64_t value, std::uint32_t sourceWidth, bool signExtend, std::uint32_t targetWidth) {\n"
+               << "        value &= bit_mask(sourceWidth);\n"
+               << "        if (signExtend && sourceWidth < targetWidth && ((value >> (sourceWidth - 1)) & 1U)) value |= ~bit_mask(sourceWidth);\n"
+               << "        return value & bit_mask(targetWidth);\n"
+               << "    }\n"
                << "    static std::int64_t signed_value(std::uint64_t value, std::uint32_t width);\n"
                << "    static std::uint64_t divide_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned);\n"
                << "    static std::uint64_t modulo_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned);\n"
                << "    static std::uint64_t shift_left(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool);\n"
                << "    static std::uint64_t shift_right(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool);\n"
                << "    static std::uint64_t arithmetic_shift_right(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool isSigned);\n"
-               << "    static std::uint64_t concat_value(std::uint64_t accumulated, std::uint32_t accumulatedWidth, std::uint64_t value, std::uint32_t valueWidth);\n"
+               << "    static constexpr std::uint64_t concat_value(std::uint64_t accumulated, std::uint32_t accumulatedWidth, std::uint64_t value, std::uint32_t valueWidth) {\n"
+               << "        if (valueWidth >= 64) return value;\n"
+               << "        return ((accumulated & bit_mask(accumulatedWidth)) << valueWidth) | (value & bit_mask(valueWidth));\n"
+               << "    }\n"
                << "    static std::uint64_t slice_value(std::uint64_t value, std::uint64_t start, std::uint32_t width);\n"
                << "    static std::uint64_t slice_array_value(std::uint64_t value, std::uint64_t index, std::uint32_t width, std::uint32_t baseWidth);\n"
                << "    static constexpr std::size_t kBlockCount = " << blockCount << ";\n"
+               << "    static constexpr std::size_t kCommitBlockBegin = "
+               << model.commitBlockBegin << ";\n"
+               << "    static constexpr std::size_t kCommitBlockEnd = "
+               << model.commitBlockEnd << ";\n"
+               << "    static constexpr std::size_t kCommitBlockCount = "
+               << (model.commitBlockEnd - model.commitBlockBegin) << ";\n"
                << "    static constexpr std::size_t kActivityWordCount = " << activityWordCount
                << ";\n"
                << "    static constexpr std::size_t kActivitySummaryWordCount = "
                << activitySummaryWordCount << ";\n"
                << "    static constexpr std::size_t kDirtyChangedWordCount = "
                << dirtyChangedWordCount << ";\n"
+               << "    static constexpr std::size_t kCommitEventCount = "
+               << commitEventVariables.size() << ";\n"
+               << "    static constexpr std::size_t kCommitEventWordCount = "
+               << commitEventWordCount << ";\n"
+               << "    static const std::array<std::uint32_t, kCommitEventCount> "
+                  "kCommitEventVariables_;\n"
+               << "    static constexpr std::size_t kCommitOperandCaptureCount = "
+               << model.commitOperandCaptures.size() << ";\n"
+               << "    static const std::array<std::uint32_t, kCommitBlockCount + 1> "
+                  "kCommitOperandCaptureOffsets_;\n"
+               << "    static const std::array<std::uint32_t, kCommitOperandCaptureCount> "
+                  "kCommitOperandCaptureSources_;\n"
+               << "    static const std::array<std::uint32_t, kCommitOperandCaptureCount> "
+                  "kCommitOperandCaptureTargets_;\n"
+               << "    static const std::array<std::uint32_t, kCommitOperandCaptureCount> "
+                  "kCommitOperandCaptureWords_;\n"
                << "    std::array<std::uint64_t, " << program.variableCount() << "> values_{};\n"
                << "    std::array<std::uint64_t, " << state.wideWords << "> wideValues_{};\n"
                << "    std::array<std::uint64_t, " << state.realValues << "> realValues_{};\n"
                << "    std::array<std::string, " << state.stringValues << "> stringValues_{};\n"
                << "    std::array<std::uint64_t, kActivityWordCount> activeWords_{};\n"
                << "    std::array<std::uint64_t, kActivityWordCount> nextActiveWords_{};\n"
+               << "    std::array<std::uint64_t, kActivityWordCount> pendingCommitWords_{};\n"
+               << "    std::array<std::uint64_t, kActivityWordCount> forcedCommitWords_{};\n"
+               << "    std::array<std::uint64_t, kActivityWordCount> nextCommitWords_{};\n"
+               << "    std::array<std::uint64_t, kActivityWordCount> capturedCommitWords_{};\n"
                << "    std::array<std::uint64_t, kActivitySummaryWordCount> activeSummary_{};\n"
                << "    std::array<std::uint64_t, kActivitySummaryWordCount> nextActiveSummary_{};\n"
+               << "    std::array<std::uint64_t, kActivitySummaryWordCount> pendingCommitSummary_{};\n"
+               << "    std::array<std::uint64_t, kActivitySummaryWordCount> nextCommitSummary_{};\n"
                << "    std::array<std::uint64_t, kDirtyChangedWordCount> dirtyChangedBits_{};\n"
                << "    std::vector<std::uint32_t> dirtyChangedResults_;\n"
+               << "    std::vector<std::uint32_t> dirtyCommitEventSlots_;\n"
+               << "    std::vector<std::uint32_t> pendingCommitEventSlots_;\n"
+               << "    std::array<std::uint64_t, kCommitEventWordCount> pendingCommitEventBits_{};\n"
+               << "    std::array<bool, " << state.completedCommitWriteSlotCount
+               << "> completedCommitWrites_{};\n"
                << "    std::array<bool, " << state.onceSlotCount << "> onceCompleted_{};\n"
+               << "    std::array<bool, " << state.pendingEventSlotCount
+               << "> pendingHostEvents_{};\n"
                << "    bool firstEval_ = true;\n"
                << "    std::uint64_t epochCounter_ = 0;\n"
                << "    std::uint64_t randomSeed_ = 0;\n"
@@ -2814,10 +3049,95 @@ namespace
         std::ostringstream runtime;
         runtime << "#include \"" << prefix << ".hpp\"\n"
                 << "#include \"" << prefix << "_support.hpp\"\n\n";
+        runtime << "const std::array<std::uint32_t, " << commitEventVariables.size()
+                << "> " << className << "::kCommitEventVariables_ = {\n";
+        constexpr std::size_t commitEventsPerLine = 16;
+        for (std::size_t index = 0; index < commitEventVariables.size(); ++index)
+        {
+            if (index % commitEventsPerLine == 0)
+            {
+                runtime << "    ";
+            }
+            runtime << commitEventVariables[index];
+            if (index + 1 != commitEventVariables.size())
+            {
+                runtime << ", ";
+            }
+            if (index % commitEventsPerLine + 1 == commitEventsPerLine ||
+                index + 1 == commitEventVariables.size())
+            {
+                runtime << '\n';
+            }
+        }
+        runtime << "};\n\n";
+        const auto emitUint32Array = [&](std::string_view name,
+                                         std::span<const uint32_t> values,
+                                         std::size_t declaredSize) {
+            runtime << "const std::array<std::uint32_t, " << declaredSize << "> "
+                    << className << "::" << name << " = {\n";
+            constexpr std::size_t valuesPerLine = 16;
+            for (std::size_t index = 0; index < values.size(); ++index)
+            {
+                if (index % valuesPerLine == 0)
+                {
+                    runtime << "    ";
+                }
+                runtime << values[index];
+                if (index + 1 != values.size())
+                {
+                    runtime << ", ";
+                }
+                if (index % valuesPerLine + 1 == valuesPerLine ||
+                    index + 1 == values.size())
+                {
+                    runtime << '\n';
+                }
+            }
+            runtime << "};\n\n";
+        };
+        std::vector<uint32_t> captureOffsets = model.commitOperandCaptureOffsets;
+        if (captureOffsets.empty())
+        {
+            captureOffsets.resize(
+                static_cast<std::size_t>(model.commitBlockEnd - model.commitBlockBegin) + 1,
+                0);
+        }
+        std::vector<uint32_t> captureSources;
+        std::vector<uint32_t> captureTargets;
+        std::vector<uint32_t> captureWords;
+        captureSources.reserve(model.commitOperandCaptures.size());
+        captureTargets.reserve(model.commitOperandCaptures.size());
+        captureWords.reserve(model.commitOperandCaptures.size());
+        for (const CommitOperandCapture &capture : model.commitOperandCaptures)
+        {
+            const Type &type = variableType(state, capture.source);
+            if (type.bitWidth <= 64)
+            {
+                captureSources.push_back(capture.source.value);
+                captureTargets.push_back(capture.target.value);
+                captureWords.push_back(0);
+            }
+            else
+            {
+                const EmitState::Storage &sourceStorage =
+                    variableStorage(state, capture.source);
+                const EmitState::Storage &targetStorage =
+                    variableStorage(state, capture.target);
+                captureSources.push_back(sourceStorage.offset);
+                captureTargets.push_back(targetStorage.offset);
+                captureWords.push_back(sourceStorage.wordCount);
+            }
+        }
+        emitUint32Array("kCommitOperandCaptureOffsets_", captureOffsets,
+                        captureOffsets.size());
+        emitUint32Array("kCommitOperandCaptureSources_", captureSources,
+                        captureSources.size());
+        emitUint32Array("kCommitOperandCaptureTargets_", captureTargets,
+                        captureTargets.size());
+        emitUint32Array("kCommitOperandCaptureWords_", captureWords,
+                        captureWords.size());
         runtime << className << "::" << className << "() = default;\n"
                << className << "::~" << className << "() { finalize(); }\n\n"
-               << "std::uint64_t " << className
-               << "::bit_mask(std::uint32_t width) { return width >= 64 ? UINT64_MAX : ((UINT64_C(1) << width) - 1); }\n"
                << "std::size_t " << className
                << "::word_count(std::uint32_t width) { return (static_cast<std::size_t>(width) + 63U) / 64U; }\n"
                << "bool " << className
@@ -3047,11 +3367,6 @@ namespace
                << "    value = (value ^ (value >> 30U)) * UINT64_C(0xbf58476d1ce4e5b9);\n"
                << "    value = (value ^ (value >> 27U)) * UINT64_C(0x94d049bb133111eb);\n"
                << "    return value ^ (value >> 31U);\n}\n"
-               << "std::uint64_t " << className
-               << "::resize_value(std::uint64_t value, std::uint32_t sourceWidth, bool signExtend, std::uint32_t targetWidth) {\n"
-               << "    value &= bit_mask(sourceWidth);\n"
-               << "    if (signExtend && sourceWidth < targetWidth && ((value >> (sourceWidth - 1)) & 1U)) value |= ~bit_mask(sourceWidth);\n"
-               << "    return value & bit_mask(targetWidth);\n}\n"
                << "std::int64_t " << className
                << "::signed_value(std::uint64_t value, std::uint32_t width) {\n"
                << "    value &= bit_mask(width);\n"
@@ -3084,9 +3399,6 @@ namespace
                << "    const std::uint64_t fill = width == 64 ? (~UINT64_C(0) << (64 - amount)) : (bit_mask(static_cast<std::uint32_t>(amount)) << (width - amount));\n"
                << "    return (shift_right(value, amount, width, false) | fill) & bit_mask(width);\n}\n"
                << "std::uint64_t " << className
-               << "::concat_value(std::uint64_t accumulated, std::uint32_t accumulatedWidth, std::uint64_t value, std::uint32_t valueWidth) {\n"
-               << "    if (valueWidth >= 64) return value; return ((accumulated & bit_mask(accumulatedWidth)) << valueWidth) | (value & bit_mask(valueWidth));\n}\n"
-               << "std::uint64_t " << className
                << "::slice_value(std::uint64_t value, std::uint64_t start, std::uint32_t width) { return start >= 64 ? 0 : (value >> start) & bit_mask(width); }\n"
                << "std::uint64_t " << className
                << "::slice_array_value(std::uint64_t value, std::uint64_t index, std::uint32_t width, std::uint32_t baseWidth) {\n"
@@ -3097,6 +3409,11 @@ namespace
                << "    for (std::string &value : stringValues_) value.clear();\n"
                << "    activeWords_.fill(0); nextActiveWords_.fill(0);\n"
                << "    activeSummary_.fill(0); nextActiveSummary_.fill(0);\n"
+               << "    pendingCommitWords_.fill(0); forcedCommitWords_.fill(0); nextCommitWords_.fill(0);\n"
+               << "    pendingCommitSummary_.fill(0); nextCommitSummary_.fill(0);\n"
+               << "    pendingCommitEventBits_.fill(0);\n"
+               << "    dirtyCommitEventSlots_.clear(); pendingCommitEventSlots_.clear();\n"
+               << "    completedCommitWrites_.fill(false);\n"
                << "    dirtyChangedBits_.fill(0); dirtyChangedResults_.clear(); onceCompleted_.fill(false);\n"
                << "    firstEval_ = true; epochCounter_ = 0; finalized_ = false;\n"
                << "    finishRequested_ = false; stopRequested_ = false; fatalRequested_ = false; systemExitCode_ = 0;\n"
@@ -3178,6 +3495,82 @@ namespace
                 runtime << "    }\n";
             }
         };
+        const auto emitFillInitialization = [&](VariableId variable,
+                                                const InitAction &action,
+                                                std::size_t actionIndex) {
+            const Type &type = variableType(state, variable);
+            const EmitState::Storage &storage = variableStorage(state, variable);
+            const bool seeded = action.expression.kind == InitExprKind::RandomSeeded;
+            const std::string suffix = std::to_string(variable.value) + "_" +
+                                       std::to_string(actionIndex);
+            const std::string seedName = "seededInitState_" + suffix;
+            const std::string elementName = "initElement_" + suffix;
+            if (seeded)
+            {
+                runtime << "    { std::uint64_t " << seedName << " = UINT64_C("
+                        << action.expression.seed << ");\n";
+            }
+            const std::string randomState = seeded ? seedName : "initRandomState";
+            std::optional<LiteralView> literal;
+            if (action.expression.kind == InitExprKind::Literal)
+            {
+                literal = program.literal(action.expression.literal);
+            }
+            if (literal && storage.wordCount == 1)
+            {
+                const uint64_t payload = literal->words.empty() ? 0 : literal->words.front();
+                runtime << "    std::fill_n(wideValues_.data() + "
+                        << storage.offset + action.start << ", " << action.count
+                        << ", (UINT64_C(" << payload << ")) & "
+                        << maskExpr(type.bitWidth) << ");\n";
+                return;
+            }
+            runtime << "    for (std::size_t " << elementName << " = " << action.start
+                    << "; " << elementName << " < " << action.start + action.count
+                    << "; ++" << elementName << ") {\n";
+            for (uint32_t word = 0; word < storage.wordCount; ++word)
+            {
+                std::string value;
+                if (literal)
+                {
+                    const uint64_t payload =
+                        word < literal->words.size() ? literal->words[word] : 0;
+                    value = "UINT64_C(" + std::to_string(payload) + ")";
+                }
+                else
+                {
+                    value = "split_mix64(" + randomState + ")";
+                }
+                const uint32_t bits = word + 1U == storage.wordCount
+                                          ? type.bitWidth - word * 64U
+                                          : 64U;
+                runtime << "        wideValues_[" << storage.offset << " + " << elementName
+                        << " * " << storage.wordCount << " + " << word << "] = (" << value
+                        << ") & " << maskExpr(bits) << ";\n";
+            }
+            runtime << "    }\n";
+            if (seeded)
+            {
+                runtime << "    }\n";
+            }
+        };
+        const auto sameLiteralExpression = [&](const InitExpr &lhs, const InitExpr &rhs) {
+            if (lhs.kind != InitExprKind::Literal || rhs.kind != InitExprKind::Literal)
+            {
+                return false;
+            }
+            if (lhs.literal == rhs.literal)
+            {
+                return true;
+            }
+            const LiteralView lhsLiteral = program.literal(lhs.literal);
+            const LiteralView rhsLiteral = program.literal(rhs.literal);
+            return lhsLiteral.type == rhsLiteral.type &&
+                   lhsLiteral.words.size() == rhsLiteral.words.size() &&
+                   std::equal(lhsLiteral.words.begin(), lhsLiteral.words.end(),
+                              rhsLiteral.words.begin()) &&
+                   lhsLiteral.bytes == rhsLiteral.bytes;
+        };
         for (uint32_t index = 0; index < program.variableCount(); ++index)
         {
             const VariableId variable{index};
@@ -3193,24 +3586,67 @@ namespace
             }
             else if (init.kind == InitKind::Actions)
             {
+                const std::span<const InitAction> actions =
+                    program.initActions(program.variable(variable).init);
                 std::size_t actionIndex = 0;
-                for (const InitAction &action : program.initActions(program.variable(variable).init))
+                while (actionIndex < actions.size())
                 {
-                    emitSetInitialization(variable, action.expression, actionIndex);
-                    ++actionIndex;
+                    const InitAction &action = actions[actionIndex];
+                    std::size_t nextActionIndex = actionIndex + 1;
+                    if (action.kind == InitActionKind::Fill)
+                    {
+                        InitAction mergedAction = action;
+                        while (mergedAction.expression.kind == InitExprKind::Literal &&
+                               nextActionIndex < actions.size())
+                        {
+                            const InitAction &next = actions[nextActionIndex];
+                            if (next.kind != InitActionKind::Fill ||
+                                mergedAction.start + mergedAction.count != next.start ||
+                                !sameLiteralExpression(mergedAction.expression,
+                                                       next.expression))
+                            {
+                                break;
+                            }
+                            mergedAction.count += next.count;
+                            ++nextActionIndex;
+                        }
+                        emitFillInitialization(variable, mergedAction, actionIndex);
+                    }
+                    else
+                    {
+                        emitSetInitialization(variable, action.expression, actionIndex);
+                    }
+                    actionIndex = nextActionIndex;
                 }
             }
         }
-        runtime << "}\n\nvoid " << className
+        runtime << "}\n\nbool " << className
+                << "::is_commit_block(std::size_t block) {\n"
+                << "    return kCommitBlockBegin != 0 && block >= kCommitBlockBegin && block < kCommitBlockEnd;\n"
+                << "}\n\nvoid " << className
                 << "::activate_forward(std::size_t block) {\n"
                 << "    if (block >= kBlockCount) throw std::runtime_error(\"invalid AM BlockId\");\n"
                 << "    const std::size_t word = block / 64U;\n"
+                << "    if (is_commit_block(block)) {\n"
+                << "        const std::uint64_t bit = UINT64_C(1) << (block % 64U);\n"
+                << "        if ((pendingCommitWords_[word] & bit) == 0) capturedCommitWords_[word] &= ~bit;\n"
+                << "        pendingCommitWords_[word] |= UINT64_C(1) << (block % 64U);\n"
+                << "        pendingCommitSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
+                << "        return;\n"
+                << "    }\n"
                 << "    activeWords_[word] |= UINT64_C(1) << (block % 64U);\n"
                 << "    activeSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
                 << "}\n\nvoid " << className
                 << "::activate_backward(std::size_t block) {\n"
                 << "    if (block >= kBlockCount) throw std::runtime_error(\"invalid AM BlockId\");\n"
                 << "    const std::size_t word = block / 64U;\n"
+                << "    if (is_commit_block(block)) {\n"
+                << "        const std::uint64_t bit = UINT64_C(1) << (block % 64U);\n"
+                << "        if ((pendingCommitWords_[word] & bit) == 0) capturedCommitWords_[word] &= ~bit;\n"
+                << "        nextCommitWords_[word] |= UINT64_C(1) << (block % 64U);\n"
+                << "        nextCommitSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
+                << "        return;\n"
+                << "    }\n"
                 << "    nextActiveWords_[word] |= UINT64_C(1) << (block % 64U);\n"
                 << "    nextActiveSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
                 << "}\n\nvoid " << className
@@ -3219,6 +3655,13 @@ namespace
                 << "    const std::size_t tailBits = kBlockCount - (kActivityWordCount - 1U) * 64U;\n"
                 << "    activeWords_.back() &= bit_mask(static_cast<std::uint32_t>(tailBits));\n"
                 << "    activeWords_[0] &= ~UINT64_C(1);\n"
+                << "    for (std::size_t block = kCommitBlockBegin; block < kCommitBlockEnd; ++block) {\n"
+                << "        const std::size_t word = block / 64U;\n"
+                << "        const std::uint64_t bit = UINT64_C(1) << (block % 64U);\n"
+                << "        activeWords_[word] &= ~bit;\n"
+                << "        forcedCommitWords_[word] |= bit;\n"
+                << "        pendingCommitSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
+                << "    }\n"
                 << "    activeSummary_.fill(0);\n"
                 << "    for (std::size_t word = 0; word < kActivityWordCount; ++word) {\n"
                 << "        if (activeWords_[word] != 0) activeSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
@@ -3245,15 +3688,130 @@ namespace
                 << "        }\n"
                 << "    }\n"
                 << "}\n\nbool " << className
+                << "::has_active_blocks() const {\n"
+                << "    for (const std::uint64_t summary : activeSummary_) {\n"
+                << "        if (summary != 0) return true;\n"
+                << "    }\n"
+                << "    return false;\n"
+                << "}\n\nbool " << className
                 << "::has_next_active_blocks() const {\n"
-                << "    for (const std::uint64_t summary : nextActiveSummary_) {\n"
+                << "    for (std::size_t word = 0; word < kActivitySummaryWordCount; ++word) {\n"
+                << "        if (nextActiveSummary_[word] != 0 || nextCommitSummary_[word] != 0) return true;\n"
+                << "    }\n"
+                << "    return false;\n"
+                << "}\n\nbool " << className
+                << "::has_pending_commit_blocks() const {\n"
+                << "    for (const std::uint64_t summary : pendingCommitSummary_) {\n"
                 << "        if (summary != 0) return true;\n"
                 << "    }\n"
                 << "    return false;\n"
                 << "}\n\nvoid " << className
-                << "::set_changed_result(std::size_t variable, bool event) {\n"
-                << "    if (!event) { values_[variable] = 0; return; }\n"
-                << "    values_[variable] = 1;\n"
+                << "::capture_pending_commit_operands() {\n"
+                << "    for (std::size_t word = 0; word < kActivityWordCount; ++word) {\n"
+                << "        std::uint64_t uncaptured = (pendingCommitWords_[word] | forcedCommitWords_[word]) & ~capturedCommitWords_[word];\n"
+                << "        while (uncaptured != 0) {\n"
+                << "            const std::size_t bit = static_cast<std::size_t>(std::countr_zero(uncaptured));\n"
+                << "            uncaptured &= ~(UINT64_C(1) << bit);\n"
+                << "            const std::size_t block = word * 64U + bit;\n"
+                << "            if (block < kCommitBlockBegin || block >= kCommitBlockEnd) continue;\n"
+                << "            const std::size_t local = block - kCommitBlockBegin;\n"
+                << "            for (std::uint32_t index = kCommitOperandCaptureOffsets_[local]; index < kCommitOperandCaptureOffsets_[local + 1]; ++index) {\n"
+                << "                const std::uint32_t words = kCommitOperandCaptureWords_[index];\n"
+                << "                if (words == 0) values_[kCommitOperandCaptureTargets_[index]] = values_[kCommitOperandCaptureSources_[index]];\n"
+                << "                else std::copy_n(wideValues_.data() + kCommitOperandCaptureSources_[index], words, wideValues_.data() + kCommitOperandCaptureTargets_[index]);\n"
+                << "            }\n"
+                << "            capturedCommitWords_[word] |= UINT64_C(1) << bit;\n"
+                << "        }\n"
+                << "    }\n"
+                << "}\n\nbool " << className
+                << "::execute_next_commit_group() {\n";
+        for (std::size_t group = 0; group + 1 < model.commitGroupOffsets.size(); ++group)
+        {
+            const uint32_t begin = model.commitGroupOffsets[group];
+            const uint32_t end = model.commitGroupOffsets[group + 1];
+            runtime << "    if (";
+            for (uint32_t index = begin; index < end; ++index)
+            {
+                if (index != begin)
+                {
+                    runtime << " || ";
+                }
+                const uint32_t block = model.commitBlockOrder[index].value;
+                runtime << "((pendingCommitWords_[" << block / 64U
+                        << "] | forcedCommitWords_[" << block / 64U
+                        << "]) & capturedCommitWords_[" << block / 64U
+                        << "] & (UINT64_C(1) << " << block % 64U << ")) != 0";
+            }
+            runtime << ") {\n";
+            for (uint32_t index = begin; index < end; ++index)
+            {
+                const uint32_t block = model.commitBlockOrder[index].value;
+                runtime << "        const bool selectedCommitBlock" << block
+                        << " = ((pendingCommitWords_[" << block / 64U
+                        << "] | forcedCommitWords_[" << block / 64U
+                        << "]) & capturedCommitWords_[" << block / 64U
+                        << "] & (UINT64_C(1) << " << block % 64U << ")) != 0;\n";
+            }
+            for (uint32_t index = begin; index < end; ++index)
+            {
+                const uint32_t block = model.commitBlockOrder[index].value;
+                runtime << "        if (selectedCommitBlock" << block << ") {\n"
+                        << "            pendingCommitWords_[" << block / 64U
+                        << "] &= ~(UINT64_C(1) << " << block % 64U << ");\n"
+                        << "            forcedCommitWords_[" << block / 64U
+                        << "] &= ~(UINT64_C(1) << " << block % 64U << ");\n"
+                        << "            if ((pendingCommitWords_[" << block / 64U
+                        << "] | forcedCommitWords_[" << block / 64U
+                        << "]) == 0) pendingCommitSummary_[" << (block / 64U) / 64U
+                        << "] &= ~(UINT64_C(1) << " << (block / 64U) % 64U << ");\n"
+                        << "            capturedCommitWords_[" << block / 64U
+                        << "] &= ~(UINT64_C(1) << " << block % 64U << ");\n"
+                        << "        }\n";
+            }
+            for (uint32_t index = begin; index < end; ++index)
+            {
+                const uint32_t block = model.commitBlockOrder[index].value;
+                runtime << "        if (selectedCommitBlock" << block
+                        << ") execute_block(" << block << ");\n";
+            }
+            runtime << "        return true;\n"
+                    << "    }\n";
+        }
+        runtime << "    return false;\n"
+                << "}\n\nvoid " << className
+                << "::capture_commit_events() {\n"
+                << "    for (const std::uint32_t slot : dirtyCommitEventSlots_) {\n"
+                << "        const std::uint32_t variable = kCommitEventVariables_[slot];\n"
+                << "        if (values_[variable] == 0) continue;\n"
+                << "        const std::size_t word = slot / 64U;\n"
+                << "        const std::uint64_t bit = UINT64_C(1) << (slot % 64U);\n"
+                << "        if ((pendingCommitEventBits_[word] & bit) == 0) {\n"
+                << "            pendingCommitEventBits_[word] |= bit;\n"
+                << "            pendingCommitEventSlots_.push_back(slot);\n"
+                << "        }\n"
+                << "    }\n"
+                << "}\n\nvoid " << className
+                << "::restore_commit_events() {\n"
+                << "    for (const std::uint32_t slot : pendingCommitEventSlots_) {\n"
+                << "        set_commit_changed_result(slot, true);\n"
+                << "    }\n"
+                << "}\n\nvoid " << className
+                << "::clear_pending_commit_events() {\n"
+                << "    for (const std::uint32_t slot : pendingCommitEventSlots_) {\n"
+                << "        pendingCommitEventBits_[slot / 64U] &= ~(UINT64_C(1) << (slot % 64U));\n"
+                << "    }\n"
+                << "    pendingCommitEventSlots_.clear();\n"
+                << "}\n\nvoid " << className
+                << "::mark_commit_changed_result(std::size_t variable, std::uint32_t commitEventSlot) {\n"
+                << "    const std::size_t word = variable / 64U;\n"
+                << "    const std::uint64_t bit = UINT64_C(1) << (variable % 64U);\n"
+                << "    if ((dirtyChangedBits_[word] & bit) == 0) {\n"
+                << "        dirtyChangedBits_[word] |= bit;\n"
+                << "        dirtyChangedResults_.push_back(static_cast<std::uint32_t>(variable));\n"
+                << "        dirtyCommitEventSlots_.push_back(commitEventSlot);\n"
+                << "    }\n"
+                << "}\n\nvoid " << className
+                << "::mark_changed_result(std::size_t variable) {\n"
                 << "    const std::size_t word = variable / 64U;\n"
                 << "    const std::uint64_t bit = UINT64_C(1) << (variable % 64U);\n"
                 << "    if ((dirtyChangedBits_[word] & bit) == 0) {\n"
@@ -3267,6 +3825,7 @@ namespace
                 << "        dirtyChangedBits_[variable / 64U] &= ~(UINT64_C(1) << (variable % 64U));\n"
                 << "    }\n"
                 << "    dirtyChangedResults_.clear();\n"
+                << "    dirtyCommitEventSlots_.clear();\n"
                 << "}\n\nvoid " << className << "::execute_block(std::size_t block) {\n"
                 << "    if (block >= kBlockCount) throw std::runtime_error(\"invalid AM BlockId\");\n"
                 << "    switch (block / " << *blocksPerSource << "U) {\n";
@@ -3350,22 +3909,69 @@ namespace
                 }
             }
         }
+        for (const PreCommitSnapshot &snapshot : model.preCommitSnapshots)
+        {
+            const Type &type = variableType(state, snapshot.source);
+            runtime << "    "
+                    << assignVariableStatement(state, snapshot.target,
+                                               snapshot.source,
+                                               type.signedness);
+        }
         runtime << "    const bool initial = firstEval_;\n"
                 << "    epochCounter_ = 0;\n"
                 << "    activeWords_.fill(0); activeSummary_.fill(0);\n"
                 << "    nextActiveWords_.fill(0); nextActiveSummary_.fill(0);\n"
+                << "    pendingCommitWords_.fill(0); forcedCommitWords_.fill(0); pendingCommitSummary_.fill(0);\n"
+                << "    nextCommitWords_.fill(0); nextCommitSummary_.fill(0);\n"
+                << "    capturedCommitWords_.fill(0);\n"
+                << "    clear_pending_commit_events();\n"
+                << "    completedCommitWrites_.fill(false);\n"
+                << "    pendingHostEvents_.fill(false);\n"
                 << "    clear_changed_results();\n"
                 << "    execute_block(0);\n"
                 << "    if (initial) activate_all_blocks();\n"
                 << "    while (true) {\n"
                 << "        execute_active_blocks();\n"
-                << "        if (!has_next_active_blocks()) break;\n"
-                << "        activeWords_ = nextActiveWords_;\n"
-                << "        activeSummary_ = nextActiveSummary_;\n"
-                << "        nextActiveWords_.fill(0); nextActiveSummary_.fill(0);\n"
-                << "        ++epochCounter_;\n"
-                << "        clear_changed_results();\n"
-                << "        if (epochCounter_ > UINT64_C(1000000)) throw std::runtime_error(\"AM eval did not converge\");\n"
+                << "        if (has_next_active_blocks()) {\n"
+                << "            activeWords_ = nextActiveWords_;\n"
+                << "            activeSummary_ = nextActiveSummary_;\n"
+                << "            for (std::size_t word = 0; word < kActivityWordCount; ++word) pendingCommitWords_[word] |= nextCommitWords_[word];\n"
+                << "            for (std::size_t word = 0; word < kActivitySummaryWordCount; ++word) pendingCommitSummary_[word] |= nextCommitSummary_[word];\n"
+                << "            nextActiveWords_.fill(0); nextActiveSummary_.fill(0);\n"
+                << "            nextCommitWords_.fill(0); nextCommitSummary_.fill(0);\n"
+                << "            if (has_pending_commit_blocks()) capture_commit_events();\n"
+                << "            ++epochCounter_;\n"
+                << "            clear_changed_results();\n"
+                << "            if (epochCounter_ > UINT64_C(1000000)) throw std::runtime_error(\"AM eval did not converge\");\n"
+                << "            continue;\n"
+                << "        }\n"
+                << "        if (has_pending_commit_blocks()) {\n"
+                << "            capture_pending_commit_operands();\n"
+                << "            capture_commit_events();\n"
+                << "            restore_commit_events();\n"
+                << "            if (!execute_next_commit_group()) throw std::runtime_error(\"pending commit Block is absent from its execution plan\");\n"
+                << "            if (has_next_active_blocks()) {\n"
+                << "                for (std::size_t word = 0; word < kActivityWordCount; ++word) {\n"
+                << "                    activeWords_[word] |= nextActiveWords_[word];\n"
+                << "                    pendingCommitWords_[word] |= nextCommitWords_[word];\n"
+                << "                }\n"
+                << "                for (std::size_t word = 0; word < kActivitySummaryWordCount; ++word) {\n"
+                << "                    activeSummary_[word] |= nextActiveSummary_[word];\n"
+                << "                    pendingCommitSummary_[word] |= nextCommitSummary_[word];\n"
+                << "                }\n"
+                << "                nextActiveWords_.fill(0); nextActiveSummary_.fill(0);\n"
+                << "                nextCommitWords_.fill(0); nextCommitSummary_.fill(0);\n"
+                << "                if (has_pending_commit_blocks()) capture_commit_events();\n"
+                << "                ++epochCounter_;\n"
+                << "                clear_changed_results();\n"
+                << "                if (epochCounter_ > UINT64_C(1000000)) throw std::runtime_error(\"AM eval did not converge\");\n"
+                << "                continue;\n"
+                << "            }\n"
+                << "            if (has_active_blocks()) { clear_changed_results(); continue; }\n"
+                << "            if (!has_pending_commit_blocks()) { clear_pending_commit_events(); clear_changed_results(); }\n"
+                << "            continue;\n"
+                << "        }\n"
+                << "        break;\n"
                 << "    }\n"
                 << "    if (initial) firstEval_ = false;\n";
         for (const PortBinding &port : model.interface.ports)

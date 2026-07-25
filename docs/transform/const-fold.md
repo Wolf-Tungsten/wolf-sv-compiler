@@ -22,6 +22,10 @@
 | 位操作 | `kConcat`, `kReplicate`, `kSliceStatic`, `kSliceDynamic`, `kSliceArray` |
 | 其他 | `kAssign`, `kSystemFunction` |
 
+常量移位遵循 GRH 的上下文定宽规则：先按 lhs signedness 把 lhs resize 到
+result 宽度，再执行 `kShl` / `kLShr` / `kAShr`。不能先在 lhs 原宽度上移位再
+扩宽，否则超出 lhs 宽度的有效位会被不可逆地截断。
+
 ### 优化步骤
 
 1. **常量收集**：识别并收集所有常量运算

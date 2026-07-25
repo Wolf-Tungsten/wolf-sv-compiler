@@ -465,11 +465,29 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kXnor:
             case wolvrix::lib::grh::OperationKind::kLogicAnd:
             case wolvrix::lib::grh::OperationKind::kLogicOr:
+                folded = foldBinary(op, op.kind(), operands);
+                break;
             case wolvrix::lib::grh::OperationKind::kShl:
             case wolvrix::lib::grh::OperationKind::kLShr:
             case wolvrix::lib::grh::OperationKind::kAShr:
+            {
+                const auto result = op.results().front();
+                if (!result.valid())
+                {
+                    onError("Shift result missing during constant propagation");
+                    return std::nullopt;
+                }
+                const int32_t resultWidth = graph.getValue(result).width();
+                if (resultWidth <= 0)
+                {
+                    onError("Shift result width must be positive during constant propagation");
+                    return std::nullopt;
+                }
+                operands[0] = operands[0].resize(
+                    static_cast<slang::bitwidth_t>(resultWidth));
                 folded = foldBinary(op, op.kind(), operands);
                 break;
+            }
             case wolvrix::lib::grh::OperationKind::kNot:
             case wolvrix::lib::grh::OperationKind::kLogicNot:
             case wolvrix::lib::grh::OperationKind::kReduceAnd:

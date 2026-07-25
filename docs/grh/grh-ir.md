@@ -692,9 +692,18 @@ res[0] = constValue
 - `oper[1]`: 移位位数（无符号解释）
 
 **results**:
-- `res[0]`: 移位结果，位宽 `L`
+- `res[0]`: 移位结果；位宽 `W` 由 SystemVerilog 上下文定宽，可以与 `L` 不同
 
 **attrs**: 无
+
+计算前先把 `oper[0]` resize 到 `W` bit，扩宽时保留 `oper[0]` 的 signedness，
+再执行移位；移位量仍是 self-determined unsigned value。结果 Value 的 signedness
+只影响移位后的解释，不能改变 `kAShr` 是否复制 lhs 符号位。例如：
+
+```text
+u1(1) << 65, W=130      -> bit 65 为 1
+s8(0x80) >>> 1, W=8     -> 8'hc0（即使 result Value 是 unsigned）
+```
 
 | 操作符 | 语义 |
 |--------|------|

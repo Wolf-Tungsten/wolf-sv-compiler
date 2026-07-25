@@ -245,6 +245,12 @@ namespace wolvrix::lib::grhsim::am
         Final = 2,
     };
 
+    enum class HostEventMode : uint8_t
+    {
+        Immediate = 0,
+        Pending = 1,
+    };
+
     struct SliceStaticAttributes
     {
         uint32_t lsb = 0;
@@ -262,12 +268,14 @@ namespace wolvrix::lib::grhsim::am
         StringId name;
         uint32_t eventCount = 0;
         CallSchedule schedule = CallSchedule::Normal;
+        HostEventMode eventMode = HostEventMode::Immediate;
     };
 
     struct DpiCallAttributes
     {
         StringId importSymbol;
         uint32_t eventCount = 0;
+        HostEventMode eventMode = HostEventMode::Immediate;
     };
 
     struct ActivationAttributesView

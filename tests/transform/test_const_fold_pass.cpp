@@ -7,6 +7,7 @@
 #include <iostream>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace wolvrix::lib::transform;
@@ -280,6 +281,76 @@ int main()
         if (!value || *value != 3u)
         {
             return fail("Unexpected $clog2 constant value");
+        }
+    }
+
+    // Case 5: context-sized shifts resize the lhs before constant evaluation.
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g5");
+        const wolvrix::lib::grh::ValueId one =
+            makeConst(graph, "one", "one_op", 1, false, "1'b1");
+        const wolvrix::lib::grh::ValueId negative =
+            makeConst(graph, "negative", "negative_op", 8, true, "8'h80");
+        const wolvrix::lib::grh::ValueId amount =
+            makeConst(graph, "amount", "amount_op", 32, false, "32'd65");
+
+        const auto addShift = [&](wolvrix::lib::grh::OperationKind kind,
+                                  std::string_view name,
+                                  wolvrix::lib::grh::ValueId lhs) {
+            const auto result = graph.createValue(
+                graph.internSymbol(name), 130, false);
+            const auto op = graph.createOperation(
+                kind, graph.internSymbol(std::string(name) + "_op"));
+            graph.addOperand(op, lhs);
+            graph.addOperand(op, amount);
+            graph.addResult(op, result);
+            graph.bindOutputPort(name, result);
+        };
+        addShift(wolvrix::lib::grh::OperationKind::kShl, "shl", one);
+        addShift(wolvrix::lib::grh::OperationKind::kLShr, "lshr", negative);
+        addShift(wolvrix::lib::grh::OperationKind::kAShr, "ashr", negative);
+
+        PassManager manager;
+        manager.addPass(std::make_unique<ConstantFoldPass>());
+        PassDiagnostics diags;
+        const PassManagerResult res = manager.run(design, diags);
+        if (!res.success || !res.changed || diags.hasError())
+        {
+            return fail("Expected context-sized shifts to fold");
+        }
+
+        const auto checkOutput = [&](std::string_view name,
+                                     slang::SVInt expected) {
+            const auto output = graph.outputPortValue(name);
+            if (!output.valid())
+            {
+                return false;
+            }
+            const auto definition = graph.getValue(output).definingOp();
+            if (!definition.valid())
+            {
+                return false;
+            }
+            const auto operation = graph.getOperation(definition);
+            const auto literal = getConstLiteral(graph, operation);
+            if (operation.kind() != wolvrix::lib::grh::OperationKind::kConstant ||
+                !literal)
+            {
+                return false;
+            }
+            slang::SVInt actual = literal->resize(130);
+            actual.setSigned(false);
+            expected.setSigned(false);
+            return static_cast<bool>(actual == expected);
+        };
+
+        const slang::SVInt allOnes = ~slang::SVInt(130, 0, false);
+        if (!checkOutput("shl", slang::SVInt(130, 1, false).shl(65)) ||
+            !checkOutput("lshr", allOnes.lshr(65)) ||
+            !checkOutput("ashr", allOnes))
+        {
+            return fail("Context-sized shift constant value mismatch");
         }
     }
 

@@ -3317,7 +3317,7 @@ private:
                                  const slang::ast::SubroutineSymbol& subroutine,
                                  const slang::ast::Expression* cacheKey)
     {
-        if (!ensureEdgeSensitive(call.sourceRange.start(), "dpi"))
+        if (!ensureDpiExpressionContext(call.sourceRange.start()))
         {
             return kInvalidPlanIndex;
         }
@@ -3719,6 +3719,25 @@ private:
             message.append(label);
             message.append(" call without edge-sensitive timing control");
             diagnostics->warn(location, std::move(message));
+        }
+        return false;
+    }
+
+    bool ensureDpiExpressionContext(slang::SourceLocation location)
+    {
+        if (eventContext.edgeSensitive && !eventContext.operands.empty())
+        {
+            return true;
+        }
+        if (domain == ControlDomain::Combinational)
+        {
+            return true;
+        }
+        if (diagnostics)
+        {
+            diagnostics->warn(
+                location,
+                "Ignoring dpi expression call without edge-sensitive or combinational timing context");
         }
         return false;
     }
@@ -18400,16 +18419,6 @@ private:
             }
             return;
         }
-        if (stmt.eventEdges.empty())
-        {
-            if (context_.diagnostics)
-            {
-                context_.diagnostics->warn(stmt.location,
-                                           "Skipping DPI call without edge-sensitive timing");
-            }
-            return;
-        }
-
         const DpiCallStmt& dpi = stmt.dpiCall;
         const DpiImportInfo* importInfo = findDpiImport(dpi.targetImportSymbol);
         if (!importInfo)

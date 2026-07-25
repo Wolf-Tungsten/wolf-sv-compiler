@@ -128,6 +128,9 @@ namespace wolvrix::lib::grhsim::am
         InstructionId addInstruction(Opcode opcode,
                                      std::span<const VariableId> results,
                                      std::span<const VariableId> operands);
+        void setInstructionOperand(InstructionId instruction,
+                                   std::size_t position,
+                                   VariableId operand);
         void setSliceStaticAttributes(InstructionId instruction, uint32_t lsb);
         void setSystemFunctionAttributes(InstructionId instruction,
                                          const SystemFunctionAttributes &attributes);

@@ -86,7 +86,7 @@ namespace
         constexpr std::array<uint64_t, static_cast<std::size_t>(ProgramArena::Count)>
             expectedElementBytes = {
                 12, 4, 1, 12, 48, 20, 8, 1, 8, 8, 1, 4, 4,
-                4, 4, 8, 12, 16, 12, 12, 4, 20, 12, 4, 4,
+                4, 4, 8, 12, 16, 16, 12, 4, 20, 12, 4, 4,
             };
         uint64_t sizeBytes = 0;
         uint64_t capacityBytes = 0;
@@ -240,6 +240,7 @@ namespace
                 .name = taskName,
                 .eventCount = 0,
                 .schedule = CallSchedule::Final,
+                .eventMode = HostEventMode::Immediate,
             });
         const InstructionId dpiCall =
             addInstruction(builder, Opcode::DpiCall, {dpiReturn, dpiOutput}, {event, source});
@@ -248,6 +249,7 @@ namespace
             DpiCallAttributes{
                 .importSymbol = dpiSymbol,
                 .eventCount = 0,
+                .eventMode = HostEventMode::Pending,
             });
         const std::array<InstructionId, 5> instructions = {
             assign,
@@ -362,8 +364,10 @@ namespace
             functionAttributes->name != functionName ||
             functionAttributes->schedule != CallSchedule::Once || !taskAttributes ||
             taskAttributes->name != taskName || taskAttributes->eventCount != 0 ||
-            taskAttributes->schedule != CallSchedule::Final || !callAttributes ||
-            callAttributes->importSymbol != dpiSymbol || callAttributes->eventCount != 0)
+            taskAttributes->schedule != CallSchedule::Final ||
+            taskAttributes->eventMode != HostEventMode::Immediate || !callAttributes ||
+            callAttributes->importSymbol != dpiSymbol || callAttributes->eventCount != 0 ||
+            callAttributes->eventMode != HostEventMode::Pending)
         {
             return fail("typed instruction attributes did not round-trip");
         }
@@ -951,6 +955,30 @@ namespace
             if (!rejects(program, ValidationLevel::Structural, "typed attributes"))
             {
                 return fail("validator must reject an invalid CallSchedule");
+            }
+        }
+        {
+            LinearProgramBuilder builder;
+            const TypeId eventType = builder.addType(Type::bitVector(1));
+            const StringId name = builder.addString("task");
+            const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
+            const InstructionId task = addInstruction(
+                builder,
+                Opcode::SystemTask,
+                {},
+                {condition});
+            builder.setSystemTaskAttributes(
+                task,
+                SystemTaskAttributes{
+                    .name = name,
+                    .eventCount = 0,
+                    .schedule = CallSchedule::Normal,
+                    .eventMode = static_cast<HostEventMode>(255),
+                });
+            const LinearProgram program = builder.finish();
+            if (!rejects(program, ValidationLevel::Structural, "typed attributes"))
+            {
+                return fail("validator must reject an invalid HostEventMode");
             }
         }
         {

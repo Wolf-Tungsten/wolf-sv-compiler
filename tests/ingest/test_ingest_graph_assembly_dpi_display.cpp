@@ -1,12 +1,15 @@
 #include "core/ingest.hpp"
+#include "emit/system_verilog.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <variant>
 
@@ -19,6 +22,15 @@ namespace {
 int fail(const std::string& message) {
     std::cerr << "[ingest-graph-assembly-dpi-display] " << message << '\n';
     return 1;
+}
+
+std::string readFile(const std::filesystem::path& path) {
+    std::ifstream stream(path);
+    if (!stream.is_open()) {
+        return {};
+    }
+    return std::string(std::istreambuf_iterator<char>(stream),
+                       std::istreambuf_iterator<char>());
 }
 
 struct CompilationBundle {
@@ -146,6 +158,33 @@ std::optional<std::string> getConstLiteral(const wolvrix::lib::grh::Graph& graph
         return std::nullopt;
     }
     return getAttrString(defOp, "constValue");
+}
+
+bool valueDependsOn(const wolvrix::lib::grh::Graph& graph,
+                    wolvrix::lib::grh::ValueId value,
+                    wolvrix::lib::grh::ValueId source,
+                    std::unordered_set<wolvrix::lib::grh::ValueId,
+                                       wolvrix::lib::grh::ValueIdHash>& visited) {
+    if (!value.valid()) {
+        return false;
+    }
+    if (value == source) {
+        return true;
+    }
+    if (!visited.insert(value).second) {
+        return false;
+    }
+    const wolvrix::lib::grh::OperationId definingOp = graph.getValue(value).definingOp();
+    if (!definingOp.valid()) {
+        return false;
+    }
+    const wolvrix::lib::grh::Operation operation = graph.getOperation(definingOp);
+    for (const auto operand : operation.operands()) {
+        if (valueDependsOn(graph, operand, source, visited)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 int testGraphAssemblyDpiDisplay(const std::filesystem::path& sourcePath) {
@@ -391,9 +430,175 @@ int testGraphAssemblyDpiDisplay(const std::filesystem::path& sourcePath) {
     return 0;
 }
 
+int testGraphAssemblyDpiCombReturn(const std::filesystem::path& sourcePath) {
+    auto bundle = compileInput(sourcePath, "graph_assembly_dpi_comb_return");
+    if (!bundle || !bundle->compilation) {
+        return fail("Failed to compile combinational DPI return fixture");
+    }
+
+    wolvrix::lib::ingest::ConvertDriver driver;
+    wolvrix::lib::grh::Design design = driver.convert(bundle->compilation->getRoot());
+    const wolvrix::lib::grh::Graph* graph =
+        design.findGraph("graph_assembly_dpi_comb_return");
+    if (!graph) {
+        return fail("Missing graph_assembly_dpi_comb_return graph");
+    }
+
+    wolvrix::lib::grh::OperationId importId =
+        wolvrix::lib::grh::OperationId::invalid();
+    wolvrix::lib::grh::OperationId callId =
+        wolvrix::lib::grh::OperationId::invalid();
+    for (const auto opId : graph->operations()) {
+        const wolvrix::lib::grh::Operation op = graph->getOperation(opId);
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kDpicImport &&
+            op.symbolText() == "difftest_ram_read") {
+            importId = opId;
+        }
+        if (op.kind() == wolvrix::lib::grh::OperationKind::kDpicCall) {
+            const auto target = getAttrString(op, "targetImportSymbol");
+            if (target && *target == "difftest_ram_read") {
+                if (callId.valid()) {
+                    return fail("Expected one combinational difftest_ram_read call");
+                }
+                callId = opId;
+            }
+        }
+    }
+    if (!importId.valid() || !callId.valid()) {
+        return fail("Missing combinational DPI import or call op");
+    }
+
+    const wolvrix::lib::grh::Operation call = graph->getOperation(callId);
+    const auto callEdges = getAttrStrings(call, "eventEdge");
+    const auto inputNames = getAttrStrings(call, "inArgName");
+    const auto outputNames = getAttrStrings(call, "outArgName");
+    const auto hasReturn = getAttrBool(call, "hasReturn");
+    if (!callEdges || !callEdges->empty()) {
+        return fail("Combinational DPI call should have an empty eventEdge list");
+    }
+    if (!inputNames || inputNames->size() != 1 || inputNames->front() != "rIdx" ||
+        !outputNames || !outputNames->empty() || !hasReturn || !*hasReturn) {
+        return fail("Combinational DPI call metadata mismatch");
+    }
+    if (call.operands().size() != 2 || call.results().size() != 1) {
+        return fail("Combinational DPI call operand/result count mismatch");
+    }
+    if (graph->getValue(call.operands()[0]).symbolText() != "r_enable" ||
+        graph->getValue(call.operands()[1]).symbolText() != "r_index") {
+        return fail("Combinational DPI call guard/input binding mismatch");
+    }
+    const wolvrix::lib::grh::Value result = graph->getValue(call.results().front());
+    if (result.width() != 64 || !result.isSigned()) {
+        return fail("Combinational DPI return type mismatch");
+    }
+
+    const wolvrix::lib::grh::ValueId output = graph->outputPortValue("r_data");
+    std::unordered_set<wolvrix::lib::grh::ValueId,
+                       wolvrix::lib::grh::ValueIdHash> visited;
+    if (!valueDependsOn(*graph, output, call.results().front(), visited)) {
+        return fail("r_data does not depend on the combinational DPI result");
+    }
+
+    const std::filesystem::path artifactDir =
+        std::filesystem::path(WOLF_SV_EMIT_ARTIFACT_DIR) /
+        "ingest_graph_assembly_dpi_comb_return";
+    const std::filesystem::path emittedPath = artifactDir / "dpi_comb_return.sv";
+    std::error_code ec;
+    std::filesystem::remove(emittedPath, ec);
+
+    wolvrix::lib::emit::EmitDiagnostics emitDiagnostics;
+    wolvrix::lib::emit::EmitSystemVerilog emitter(&emitDiagnostics);
+    wolvrix::lib::emit::EmitOptions emitOptions;
+    emitOptions.outputDir = artifactDir.string();
+    emitOptions.outputFilename = emittedPath.filename().string();
+    emitOptions.topOverrides = {"graph_assembly_dpi_comb_return"};
+    const wolvrix::lib::emit::EmitResult emitResult = emitter.emit(design, emitOptions);
+    if (!emitResult.success || emitDiagnostics.hasError()) {
+        return fail("Failed to emit combinational DPI return fixture");
+    }
+    if (emitResult.artifacts.size() != 1) {
+        return fail("Combinational DPI return emit artifact count mismatch");
+    }
+
+    const std::string emitted = readFile(emittedPath);
+    if (emitted.empty()) {
+        return fail("Failed to read emitted combinational DPI return fixture");
+    }
+    const std::string resultName(result.symbolText());
+    if (emitted.find("import \"DPI-C\" function longint difftest_ram_read") ==
+            std::string::npos ||
+        emitted.find("always @* begin") == std::string::npos ||
+        emitted.find("if (r_enable) begin") == std::string::npos ||
+        emitted.find(resultName + "_intm = difftest_ram_read(r_index);") ==
+            std::string::npos ||
+        emitted.find("assign " + resultName + " = " + resultName + "_intm;") ==
+            std::string::npos ||
+        emitted.find("posedge") != std::string::npos) {
+        return fail("Emitted combinational DPI return lost guard, input, or result binding");
+    }
+
+    auto readbackBundle =
+        compileInput(emittedPath, "graph_assembly_dpi_comb_return");
+    if (!readbackBundle || !readbackBundle->compilation) {
+        return fail("Slang failed to read emitted combinational DPI return fixture");
+    }
+    if (!readbackBundle->driver.reportDiagnostics(/* quiet */ true)) {
+        return fail("Slang reported diagnostics for emitted combinational DPI return fixture");
+    }
+    wolvrix::lib::ingest::ConvertDriver readbackDriver;
+    wolvrix::lib::grh::Design readbackDesign =
+        readbackDriver.convert(readbackBundle->compilation->getRoot());
+    const wolvrix::lib::grh::Graph* readbackGraph =
+        readbackDesign.findGraph("graph_assembly_dpi_comb_return");
+    if (!readbackGraph) {
+        return fail("Readback design is missing graph_assembly_dpi_comb_return");
+    }
+
+    wolvrix::lib::grh::OperationId readbackCallId =
+        wolvrix::lib::grh::OperationId::invalid();
+    for (const auto opId : readbackGraph->operations()) {
+        const wolvrix::lib::grh::Operation op = readbackGraph->getOperation(opId);
+        if (op.kind() != wolvrix::lib::grh::OperationKind::kDpicCall) {
+            continue;
+        }
+        const auto target = getAttrString(op, "targetImportSymbol");
+        if (!target || *target != "difftest_ram_read") {
+            continue;
+        }
+        if (readbackCallId.valid()) {
+            return fail("Readback contains multiple combinational difftest_ram_read calls");
+        }
+        readbackCallId = opId;
+    }
+    if (!readbackCallId.valid()) {
+        return fail("Readback lost combinational difftest_ram_read call");
+    }
+
+    const wolvrix::lib::grh::Operation readbackCall =
+        readbackGraph->getOperation(readbackCallId);
+    const auto readbackEdges = getAttrStrings(readbackCall, "eventEdge");
+    if (!readbackEdges || !readbackEdges->empty() ||
+        readbackCall.operands().size() != 2 || readbackCall.results().size() != 1) {
+        return fail("Readback combinational DPI call shape mismatch");
+    }
+    if (readbackGraph->getValue(readbackCall.operands()[0]).symbolText() != "r_enable" ||
+        readbackGraph->getValue(readbackCall.operands()[1]).symbolText() != "r_index") {
+        return fail("Readback combinational DPI guard/input binding mismatch");
+    }
+    const wolvrix::lib::grh::Value readbackResult =
+        readbackGraph->getValue(readbackCall.results().front());
+    if (readbackResult.width() != 64 || !readbackResult.isSigned()) {
+        return fail("Readback combinational DPI return type mismatch");
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
     const std::filesystem::path sourcePath = WOLF_SV_INGEST_GRAPH_ASSEMBLY_DPI_DISPLAY_DATA_PATH;
-    return testGraphAssemblyDpiDisplay(sourcePath);
+    if (int status = testGraphAssemblyDpiDisplay(sourcePath); status != 0) {
+        return status;
+    }
+    return testGraphAssemblyDpiCombReturn(sourcePath);
 }

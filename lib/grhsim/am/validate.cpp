@@ -577,6 +577,7 @@ namespace wolvrix::lib::grhsim::am
                 {
                     attributesPresent = validString(view, attributes->name) &&
                                         attributes->schedule <= CallSchedule::Final &&
+                                        attributes->eventMode <= HostEventMode::Pending &&
                                         attributes->eventCount < operandCount;
                 }
                 else
@@ -588,6 +589,7 @@ namespace wolvrix::lib::grhsim::am
                 if (auto attributes = view.dpiCallAttributes(instruction))
                 {
                     attributesPresent = validString(view, attributes->importSymbol) &&
+                                        attributes->eventMode <= HostEventMode::Pending &&
                                         attributes->eventCount < operandCount;
                 }
                 else

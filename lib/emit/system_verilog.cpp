@@ -1782,6 +1782,12 @@ namespace wolvrix::lib::emit
                 simpleBlocks.push_back(
                     SimpleBlock{std::move(header), std::vector<std::string>{std::move(stmt)}, sourceOp});
             };
+            auto addStandaloneSimpleStmt = [&](std::string header, std::string stmt,
+                                               wolvrix::lib::grh::OperationId sourceOp)
+            {
+                simpleBlocks.push_back(
+                    SimpleBlock{std::move(header), std::vector<std::string>{std::move(stmt)}, sourceOp});
+            };
             auto addCombAssign = [&](const std::string &lhs, const std::string &rhs,
                                      wolvrix::lib::grh::OperationId sourceOp)
             {
@@ -5452,11 +5458,6 @@ namespace wolvrix::lib::emit
                         reportError("kDpicCall missing metadata", opContext);
                         break;
                     }
-                    if (eventEdges->empty())
-                    {
-                        reportError("kDpicCall missing eventEdge entries", opContext);
-                        break;
-                    }
                     if (operands.size() < 1 + eventEdges->size())
                     {
                         reportError("kDpicCall operand count does not match eventEdge", opContext);
@@ -5481,10 +5482,14 @@ namespace wolvrix::lib::emit
                         reportError("kDpicCall result count does not match args", opContext);
                         break;
                     }
-                    auto seqKey = buildEventKey(op, eventStart);
-                    if (!seqKey)
+                    std::optional<SeqKey> seqKey;
+                    if (!eventEdges->empty())
                     {
-                        break;
+                        seqKey = buildEventKey(op, eventStart);
+                        if (!seqKey)
+                        {
+                            break;
+                        }
                     }
                     auto itImport = dpicImports.find(*targetImport);
                     if (itImport == dpicImports.end() || itImport->second.graph == nullptr)
@@ -5619,7 +5624,14 @@ namespace wolvrix::lib::emit
                     {
                         appendIndented(stmt, 2, "end");
                     }
-                    addSequentialStmt(*seqKey, stmt.str(), opId);
+                    if (seqKey)
+                    {
+                        addSequentialStmt(*seqKey, stmt.str(), opId);
+                    }
+                    else
+                    {
+                        addStandaloneSimpleStmt("always @*", stmt.str(), opId);
+                    }
                     break;
                 }
                 case wolvrix::lib::grh::OperationKind::kXMRRead:

@@ -86,13 +86,18 @@ namespace wolvrix::lib::grhsim::am
         }
 
         std::vector<VariableId> externalInputs;
-        externalInputs.reserve(linear.interface.ports.size());
+        externalInputs.reserve(linear.interface.ports.size() +
+                               linear.preCommitSnapshots.size());
         for (const PortBinding &port : linear.interface.ports)
         {
             if (port.direction == PortDirection::Input || port.direction == PortDirection::Inout)
             {
                 externalInputs.push_back(port.input);
             }
+        }
+        for (const PreCommitSnapshot &snapshot : linear.preCommitSnapshots)
+        {
+            externalInputs.push_back(snapshot.target);
         }
         std::sort(externalInputs.begin(), externalInputs.end());
         externalInputs.erase(std::unique(externalInputs.begin(), externalInputs.end()),
@@ -185,6 +190,8 @@ namespace wolvrix::lib::grhsim::am
             havePreviousEffect = true;
         }
         linear.schedulingFacts.clearAndRelease();
+        std::vector<PreCommitSnapshot> preCommitSnapshots =
+            std::move(linear.preCommitSnapshots);
 
         const std::size_t semanticInstructionCount = linearView.instructionCount();
         TypeId eventType;
@@ -276,6 +283,7 @@ namespace wolvrix::lib::grhsim::am
         ExecutableModel model{
             .program = builder.finish(),
             .interface = std::move(interface),
+            .preCommitSnapshots = std::move(preCommitSnapshots),
         };
         if (options.collectStats)
         {

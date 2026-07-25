@@ -6,6 +6,7 @@
 #include "slang/numeric/SVInt.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cctype>
 #include <cstdint>
@@ -118,6 +119,13 @@ namespace wolvrix::lib::grhsim::am
             uint32_t ordinal = 0;
         };
 
+        struct PendingStateOrderedEffect
+        {
+            InstructionId instruction;
+            VariableId target;
+            std::optional<ExplicitOrder> explicitOrder;
+        };
+
         struct PendingOrderedGroup
         {
             bool memoryPriority = false;
@@ -158,6 +166,7 @@ namespace wolvrix::lib::grhsim::am
                     {
                         return std::nullopt;
                     }
+                    materializeStateOrderedEffects();
 
                     std::sort(orderedEffects_.begin(), orderedEffects_.end(),
                               [](const OrderedEffect &lhs, const OrderedEffect &rhs) {
@@ -176,6 +185,8 @@ namespace wolvrix::lib::grhsim::am
                             .instructionEffects = std::move(instructionEffects_),
                             .orderedEffects = std::move(orderedEffects_),
                         },
+                        .preCommitSnapshots =
+                            std::move(preCommitSnapshotBindings_),
                     };
                     const ValidationResult validation =
                         validate(artifact, ValidationOptions{.level = ValidationLevel::Semantic,
@@ -489,6 +500,7 @@ namespace wolvrix::lib::grhsim::am
             {
                 std::size_t stateCount = 0;
                 std::size_t eventCount = 0;
+                std::size_t preCommitSnapshotUpperBound = 0;
                 std::size_t instructionCount = 0;
                 std::size_t operandCount = 0;
                 std::size_t resultCount = 0;
@@ -526,6 +538,28 @@ namespace wolvrix::lib::grhsim::am
                             eventCount += typed->size();
                         }
                     }
+                    std::size_t sampledOperandCount = 0;
+                    switch (op.kind())
+                    {
+                    case OperationKind::kRegisterWritePort:
+                        sampledOperandCount = std::min<std::size_t>(3, op.operands().size());
+                        break;
+                    case OperationKind::kMemoryWritePort:
+                        sampledOperandCount = std::min<std::size_t>(4, op.operands().size());
+                        break;
+                    case OperationKind::kMemoryFillPort:
+                        sampledOperandCount = std::min<std::size_t>(2, op.operands().size());
+                        break;
+                    default:
+                        break;
+                    }
+                    for (std::size_t index = 0; index < sampledOperandCount; ++index)
+                    {
+                        const OperationId definition = graph_.valueDef(op.operands()[index]);
+                        preCommitSnapshotUpperBound +=
+                            definition.valid() &&
+                            graph_.opKind(definition) == OperationKind::kRegisterReadPort;
+                    }
                 }
                 instructionCount += eventCount;
                 operandCount += 2 * eventCount;
@@ -539,7 +573,8 @@ namespace wolvrix::lib::grhsim::am
                 reserve.initActions = graph_.operations().size() / 16;
                 reserve.literals = graph_.operations().size() / 16;
                 reserve.literalWords = graph_.operations().size() / 8;
-                reserve.variables = graph_.values().size() + stateCount + 2 * eventCount;
+                reserve.variables = graph_.values().size() + stateCount + 2 * eventCount +
+                                    preCommitSnapshotUpperBound;
                 reserve.variableLabels = exposedValues_.size() + stateCount;
                 reserve.instructions = instructionCount;
                 reserve.operands = operandCount;
@@ -1322,6 +1357,35 @@ namespace wolvrix::lib::grhsim::am
                 return valueMap_[value.index];
             }
 
+            VariableId preCommitValue(ValueId value, VariableId source,
+                                      const Operation &user)
+            {
+                if (!source.valid())
+                {
+                    return source;
+                }
+                const OperationId definition = graph_.valueDef(value);
+                if (!definition.valid() ||
+                    graph_.opKind(definition) != OperationKind::kRegisterReadPort)
+                {
+                    return source;
+                }
+                if (const auto found = preCommitSnapshots_.find(source.value);
+                    found != preCommitSnapshots_.end())
+                {
+                    return found->second;
+                }
+
+                const TypeId type = builder_.view().variable(source).type;
+                const VariableId snapshot = addVariable(type, builder_.undefInit());
+                preCommitSnapshots_.emplace(source.value, snapshot);
+                preCommitSnapshotBindings_.push_back(PreCommitSnapshot{
+                    .source = source,
+                    .target = snapshot,
+                });
+                return snapshot;
+            }
+
             void createInterface()
             {
                 for (const grh::Port &port : graph_.inputPorts())
@@ -1571,10 +1635,12 @@ namespace wolvrix::lib::grhsim::am
                 case OperationKind::kReduceXnor:
                     return Type::bitVector(1, Signedness::Unsigned);
                 case OperationKind::kNot:
+                    return typeForValue(operands[0]);
                 case OperationKind::kShl:
                 case OperationKind::kLShr:
                 case OperationKind::kAShr:
-                    return typeForValue(operands[0]);
+                    return Type::bitVector(
+                        resultType.bitWidth, typeForValue(operands[0]).signedness);
                 case OperationKind::kMux:
                     return Type::bitVector(resultType.bitWidth,
                                            commonSign(operands[1], operands[2]));
@@ -1776,6 +1842,18 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return;
                 }
+                if (opcode == Opcode::Shl || opcode == Opcode::LogicalShr ||
+                    opcode == Opcode::ArithmeticShr)
+                {
+                    loweredOperands[0] = coerceToType(
+                        loweredOperands[0], typeForValue(operands[0]), *nativeType);
+                    if (!loweredOperands[0].valid())
+                    {
+                        error("shift operand cannot be coerced to its native type",
+                              opContext(op));
+                        return;
+                    }
+                }
                 const VariableId destination = mappedValue(results.front(), op);
                 if (!destination.valid())
                 {
@@ -1866,29 +1944,94 @@ namespace wolvrix::lib::grhsim::am
                 return group;
             }
 
+            void materializeStateOrderedEffects()
+            {
+                std::map<uint32_t, std::vector<PendingStateOrderedEffect>> effectsByTarget;
+                for (const PendingStateOrderedEffect &effect : pendingStateOrderedEffects_)
+                {
+                    effectsByTarget[effect.target.value].push_back(effect);
+                }
+
+                for (auto &[targetValue, effects] : effectsByTarget)
+                {
+                    std::map<uint32_t, std::vector<PendingStateOrderedEffect>>
+                        explicitGroups;
+                    for (const PendingStateOrderedEffect &effect : effects)
+                    {
+                        if (effect.explicitOrder)
+                        {
+                            explicitGroups[effect.explicitOrder->group].push_back(effect);
+                        }
+                    }
+
+                    for (auto &[explicitGroup, members] : explicitGroups)
+                    {
+                        (void)explicitGroup;
+                        std::sort(members.begin(), members.end(),
+                                  [](const PendingStateOrderedEffect &lhs,
+                                     const PendingStateOrderedEffect &rhs) {
+                                      return lhs.explicitOrder->ordinal <
+                                             rhs.explicitOrder->ordinal;
+                                  });
+                    }
+
+                    std::vector<PendingStateOrderedEffect> ordered;
+                    ordered.reserve(effects.size());
+                    std::unordered_set<uint32_t> emittedExplicitGroups;
+                    for (const PendingStateOrderedEffect &effect : effects)
+                    {
+                        if (!effect.explicitOrder)
+                        {
+                            ordered.push_back(effect);
+                            continue;
+                        }
+                        const uint32_t explicitGroup = effect.explicitOrder->group;
+                        if (!emittedExplicitGroups.insert(explicitGroup).second)
+                        {
+                            continue;
+                        }
+                        const std::vector<PendingStateOrderedEffect> &members =
+                            explicitGroups.at(explicitGroup);
+                        ordered.insert(ordered.end(), members.begin(), members.end());
+                    }
+
+                    const uint32_t group = stateOrderGroup(VariableId{targetValue});
+                    for (std::size_t ordinal = 0; ordinal < ordered.size(); ++ordinal)
+                    {
+                        orderedEffects_.push_back(OrderedEffect{
+                            .instruction = ordered[ordinal].instruction,
+                            .group = group,
+                            .ordinal = static_cast<uint32_t>(ordinal),
+                        });
+                    }
+                }
+                pendingStateOrderedEffects_.clear();
+            }
+
             void addOrderedEffect(const Operation &op, InstructionId instruction,
                                   VariableId stateTarget = VariableId::invalid())
             {
-                if (op.id().index < explicitOrderByOperation_.size() &&
-                    explicitOrderByOperation_[op.id().index])
+                const std::optional<ExplicitOrder> explicitOrder =
+                    op.id().index < explicitOrderByOperation_.size()
+                        ? explicitOrderByOperation_[op.id().index]
+                        : std::nullopt;
+                if (stateTarget.valid())
                 {
-                    const ExplicitOrder order = *explicitOrderByOperation_[op.id().index];
-                    orderedEffects_.push_back(OrderedEffect{
+                    pendingStateOrderedEffects_.push_back(PendingStateOrderedEffect{
                         .instruction = instruction,
-                        .group = order.group,
-                        .ordinal = order.ordinal,
+                        .target = stateTarget,
+                        .explicitOrder = explicitOrder,
                     });
                     return;
                 }
-                if (!stateTarget.valid())
+                if (explicitOrder)
                 {
-                    return;
+                    orderedEffects_.push_back(OrderedEffect{
+                        .instruction = instruction,
+                        .group = explicitOrder->group,
+                        .ordinal = explicitOrder->ordinal,
+                    });
                 }
-                orderedEffects_.push_back(OrderedEffect{
-                    .instruction = instruction,
-                    .group = stateOrderGroup(stateTarget),
-                    .ordinal = stateOrderOrdinals_[stateTarget.value]++,
-                });
             }
 
             void lowerRegisterWrite(const Operation &op)
@@ -1920,17 +2063,17 @@ namespace wolvrix::lib::grhsim::am
                     }
                     return;
                 }
-                const VariableId nextSource = mappedValue(op.operands()[1], op);
-                VariableId next = coerceToType(nextSource, typeForValue(op.operands()[1]),
-                                               targetType);
+                VariableId next = coerceToType(mappedValue(op.operands()[1], op),
+                                               typeForValue(op.operands()[1]), targetType);
                 if (!next.valid())
                 {
                     error("register nextValue cannot be converted to target Type", opContext(op));
                     return;
                 }
+                next = preCommitValue(op.operands()[1], next, op);
                 std::vector<VariableId> operands{
-                    mappedValue(op.operands()[0], op),
-                    mappedValue(op.operands()[2], op),
+                    preCommitValue(op.operands()[0], mappedValue(op.operands()[0], op), op),
+                    preCommitValue(op.operands()[2], mappedValue(op.operands()[2], op), op),
                     next,
                     *target,
                 };
@@ -2052,18 +2195,18 @@ namespace wolvrix::lib::grhsim::am
                     }
                     return;
                 }
-                const VariableId data = coerceToType(
-                    mappedValue(op.operands()[2], op), typeForValue(op.operands()[2]),
-                    elementType);
+                VariableId data = coerceToType(mappedValue(op.operands()[2], op),
+                                               typeForValue(op.operands()[2]), elementType);
                 if (!data.valid())
                 {
                     error("memory write data cannot be converted to element Type", opContext(op));
                     return;
                 }
+                data = preCommitValue(op.operands()[2], data, op);
                 std::vector<VariableId> operands{
-                    mappedValue(op.operands()[0], op),
-                    mappedValue(op.operands()[1], op),
-                    mappedValue(op.operands()[3], op),
+                    preCommitValue(op.operands()[0], mappedValue(op.operands()[0], op), op),
+                    preCommitValue(op.operands()[1], mappedValue(op.operands()[1], op), op),
+                    preCommitValue(op.operands()[3], mappedValue(op.operands()[3], op), op),
                     data,
                     *target,
                 };
@@ -2114,8 +2257,8 @@ namespace wolvrix::lib::grhsim::am
                     return;
                 }
                 std::vector<VariableId> operands{
-                    mappedValue(op.operands()[0], op),
-                    mappedValue(op.operands()[1], op),
+                    preCommitValue(op.operands()[0], mappedValue(op.operands()[0], op), op),
+                    preCommitValue(op.operands()[1], mappedValue(op.operands()[1], op), op),
                     *target,
                 };
                 operands.insert(operands.end(), events->begin(), events->end());
@@ -2258,6 +2401,7 @@ namespace wolvrix::lib::grhsim::am
                         .name = internString(name),
                         .eventCount = static_cast<uint32_t>(events->size()),
                         .schedule = schedule,
+                        .eventMode = HostEventMode::Immediate,
                     });
                 addOrderedEffect(op, instruction);
             }
@@ -2485,6 +2629,8 @@ namespace wolvrix::lib::grhsim::am
                     DpiCallAttributes{
                         .importSymbol = import.symbolId,
                         .eventCount = static_cast<uint32_t>(events->size()),
+                        .eventMode = results.empty() ? HostEventMode::Immediate
+                                                     : HostEventMode::Pending,
                     });
                 addOrderedEffect(op, instruction);
                 for (const ResultBridge &bridge : resultBridges)
@@ -2583,9 +2729,11 @@ namespace wolvrix::lib::grhsim::am
             std::vector<VariableRole> variableRoles_;
             std::vector<InstructionEffect> instructionEffects_;
             std::vector<OrderedEffect> orderedEffects_;
+            std::vector<PendingStateOrderedEffect> pendingStateOrderedEffects_;
             uint32_t nextOrderedGroup_ = 0;
             std::unordered_map<uint32_t, uint32_t> stateOrderGroups_;
-            std::unordered_map<uint32_t, uint32_t> stateOrderOrdinals_;
+            std::unordered_map<uint32_t, VariableId> preCommitSnapshots_;
+            std::vector<PreCommitSnapshot> preCommitSnapshotBindings_;
             uint64_t freshTemporaryCount_ = 0;
             std::size_t flattenedUnknownLiterals_ = 0;
         };

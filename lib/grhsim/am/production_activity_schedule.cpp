@@ -43,49 +43,6 @@ namespace wolvrix::lib::grhsim::am
             return validation.success();
         }
 
-        class DisjointSet
-        {
-          public:
-            explicit DisjointSet(std::size_t size) : parent_(size), rank_(size, 0)
-            {
-                std::iota(parent_.begin(), parent_.end(), uint32_t{0});
-            }
-
-            uint32_t find(uint32_t value)
-            {
-                uint32_t root = value;
-                while (parent_[root] != root) {
-                    root = parent_[root];
-                }
-                while (parent_[value] != value) {
-                    const uint32_t next = parent_[value];
-                    parent_[value] = root;
-                    value = next;
-                }
-                return root;
-            }
-
-            void unite(uint32_t lhs, uint32_t rhs)
-            {
-                lhs = find(lhs);
-                rhs = find(rhs);
-                if (lhs == rhs) {
-                    return;
-                }
-                if (rank_[lhs] < rank_[rhs]) {
-                    std::swap(lhs, rhs);
-                }
-                parent_[rhs] = lhs;
-                if (rank_[lhs] == rank_[rhs]) {
-                    ++rank_[lhs];
-                }
-            }
-
-          private:
-            std::vector<uint32_t> parent_;
-            std::vector<uint8_t> rank_;
-        };
-
         struct DefUseIndex
         {
             std::vector<uint32_t> definitions;
@@ -165,12 +122,11 @@ namespace wolvrix::lib::grhsim::am
             std::vector<uint32_t> targets;
         };
 
-        CsrGraph buildUnitGraph(uint32_t unitCount, const DefUseIndex &defUse,
-                                std::span<const uint32_t> instructionUnit,
-                                std::span<const OrderEdge> orderedEdges)
+        CsrGraph buildInstructionGraph(uint32_t instructionCount, const DefUseIndex &defUse,
+                                       std::span<const OrderEdge> orderedEdges)
         {
             CsrGraph graph;
-            graph.offsets.assign(static_cast<std::size_t>(unitCount) + 1, 0);
+            graph.offsets.assign(static_cast<std::size_t>(instructionCount) + 1, 0);
             for (uint32_t variable = 0; variable < defUse.definitions.size(); ++variable) {
                 const uint32_t definition = defUse.definitions[variable];
                 if (definition == kInvalidIndex) {
@@ -178,18 +134,16 @@ namespace wolvrix::lib::grhsim::am
                 }
                 for (uint32_t offset = defUse.useOffsets[variable];
                      offset < defUse.useOffsets[variable + 1]; ++offset) {
-                    const uint32_t source = instructionUnit[definition];
-                    const uint32_t target = instructionUnit[defUse.uses[offset]];
+                    const uint32_t source = definition;
+                    const uint32_t target = defUse.uses[offset];
                     if (source != target) {
                         ++graph.offsets[source + 1];
                     }
                 }
             }
             for (const OrderEdge &edge : orderedEdges) {
-                const uint32_t source = instructionUnit[edge.source];
-                const uint32_t target = instructionUnit[edge.target];
-                if (source != target) {
-                    ++graph.offsets[source + 1];
+                if (edge.source != edge.target) {
+                    ++graph.offsets[edge.source + 1];
                 }
             }
             std::partial_sum(graph.offsets.begin(), graph.offsets.end(), graph.offsets.begin());
@@ -202,18 +156,16 @@ namespace wolvrix::lib::grhsim::am
                 }
                 for (uint32_t offset = defUse.useOffsets[variable];
                      offset < defUse.useOffsets[variable + 1]; ++offset) {
-                    const uint32_t source = instructionUnit[definition];
-                    const uint32_t target = instructionUnit[defUse.uses[offset]];
+                    const uint32_t source = definition;
+                    const uint32_t target = defUse.uses[offset];
                     if (source != target) {
                         graph.targets[cursor[source]++] = target;
                     }
                 }
             }
             for (const OrderEdge &edge : orderedEdges) {
-                const uint32_t source = instructionUnit[edge.source];
-                const uint32_t target = instructionUnit[edge.target];
-                if (source != target) {
-                    graph.targets[cursor[source]++] = target;
+                if (edge.source != edge.target) {
+                    graph.targets[cursor[edge.source]++] = edge.target;
                 }
             }
             return graph;
@@ -344,6 +296,20 @@ namespace wolvrix::lib::grhsim::am
             return traits.stateTargetOperand < operands.size()
                        ? std::optional<VariableId>(operands[traits.stateTargetOperand])
                        : std::nullopt;
+        }
+
+        std::size_t commitOperandCaptureCount(Opcode opcode) noexcept
+        {
+            switch (opcode) {
+            case Opcode::RegisterWrite:
+                return 3;
+            case Opcode::MemoryWrite:
+                return 4;
+            case Opcode::MemoryFill:
+                return 2;
+            default:
+                return 0;
+            }
         }
 
         using CommitEventPart = std::pair<uint8_t, uint32_t>;
@@ -603,6 +569,254 @@ namespace wolvrix::lib::grhsim::am
             std::size_t targets = 0;
         };
 
+        struct CommitExecutionPlan
+        {
+            std::vector<BlockId> order;
+            std::vector<uint32_t> groupOffsets;
+        };
+
+        CommitExecutionPlan buildCommitExecutionPlan(
+            uint32_t blockCount, uint32_t commitBegin, uint32_t commitEnd,
+            std::span<const ActivationEdge> activationEdges,
+            std::span<const OrderEdge> extraEdges)
+        {
+            CommitExecutionPlan plan;
+            if (commitBegin == commitEnd) {
+                return plan;
+            }
+
+            std::vector<std::vector<uint32_t>> blockTargets(blockCount);
+            for (const ActivationEdge &edge : activationEdges) {
+                blockTargets[edge.sourceBlock].push_back(edge.targetBlock);
+            }
+            for (const OrderEdge &edge : extraEdges) {
+                blockTargets[edge.source].push_back(edge.target);
+            }
+            for (std::vector<uint32_t> &targets : blockTargets) {
+                std::sort(targets.begin(), targets.end());
+                targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+            }
+
+            const uint32_t commitCount = commitEnd - commitBegin;
+            using ActivationKey = std::tuple<uint32_t, uint32_t, bool, uint32_t>;
+            std::vector<ActivationKey> firstActivation;
+            firstActivation.reserve(commitCount);
+            for (uint32_t block = commitBegin; block < commitEnd; ++block) {
+                firstActivation.emplace_back(kInvalidIndex, kInvalidIndex, true, block);
+            }
+            for (const ActivationEdge &edge : activationEdges) {
+                if (edge.targetBlock < commitBegin || edge.targetBlock >= commitEnd) {
+                    continue;
+                }
+                const ActivationKey candidate{edge.sourceBlock, edge.variable,
+                                              edge.directEvent, edge.targetBlock};
+                ActivationKey &current = firstActivation[edge.targetBlock - commitBegin];
+                current = std::min(current, candidate);
+            }
+
+            std::vector<std::vector<uint32_t>> hardCommitTargets(commitCount);
+            for (const OrderEdge &edge : extraEdges) {
+                if (edge.source < commitBegin || edge.source >= commitEnd ||
+                    edge.target < commitBegin || edge.target >= commitEnd ||
+                    edge.source == edge.target) {
+                    continue;
+                }
+                hardCommitTargets[edge.source - commitBegin].push_back(
+                    edge.target - commitBegin);
+            }
+            for (std::vector<uint32_t> &targets : hardCommitTargets) {
+                std::sort(targets.begin(), targets.end());
+                targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+            }
+
+            std::vector<std::vector<uint32_t>> commitTargets(commitCount);
+            std::vector<uint32_t> visited(blockCount, 0);
+            std::vector<uint32_t> worklist;
+            uint32_t stamp = 0;
+            for (uint32_t source = commitBegin; source < commitEnd; ++source) {
+                ++stamp;
+                worklist.clear();
+                visited[source] = stamp;
+                for (uint32_t target : blockTargets[source]) {
+                    if (visited[target] != stamp) {
+                        visited[target] = stamp;
+                        worklist.push_back(target);
+                    }
+                }
+                for (std::size_t cursor = 0; cursor < worklist.size(); ++cursor) {
+                    const uint32_t block = worklist[cursor];
+                    if (block >= commitBegin && block < commitEnd) {
+                        if (block != source) {
+                            commitTargets[source - commitBegin].push_back(block - commitBegin);
+                        }
+                        continue;
+                    }
+                    for (uint32_t target : blockTargets[block]) {
+                        if (visited[target] == stamp) {
+                            continue;
+                        }
+                        visited[target] = stamp;
+                        worklist.push_back(target);
+                    }
+                }
+                std::vector<uint32_t> &targets = commitTargets[source - commitBegin];
+                std::sort(targets.begin(), targets.end());
+                targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+            }
+
+            CsrGraph commitGraph;
+            commitGraph.offsets.resize(static_cast<std::size_t>(commitCount) + 1, 0);
+            for (uint32_t source = 0; source < commitCount; ++source) {
+                commitGraph.offsets[source + 1] =
+                    commitGraph.offsets[source] + commitTargets[source].size();
+                commitGraph.targets.insert(commitGraph.targets.end(),
+                                           commitTargets[source].begin(),
+                                           commitTargets[source].end());
+            }
+            const SccResult scc = findStronglyConnectedComponents(commitGraph);
+            std::vector<std::vector<uint32_t>> members(scc.count);
+            std::vector<uint32_t> minimumBlock(scc.count, kInvalidIndex);
+            for (uint32_t block = 0; block < commitCount; ++block) {
+                const uint32_t component = scc.component[block];
+                members[component].push_back(block);
+                minimumBlock[component] =
+                    std::min(minimumBlock[component], commitBegin + block);
+            }
+
+            std::vector<std::vector<uint32_t>> componentTargets(scc.count);
+            std::vector<uint32_t> indegree(scc.count, 0);
+            for (uint32_t source = 0; source < commitCount; ++source) {
+                const uint32_t sourceComponent = scc.component[source];
+                for (uint32_t target : commitTargets[source]) {
+                    const uint32_t targetComponent = scc.component[target];
+                    if (sourceComponent != targetComponent) {
+                        componentTargets[sourceComponent].push_back(targetComponent);
+                    }
+                }
+            }
+            for (std::vector<uint32_t> &targets : componentTargets) {
+                std::sort(targets.begin(), targets.end());
+                targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+                for (uint32_t target : targets) {
+                    ++indegree[target];
+                }
+            }
+
+            using ComponentCandidate = std::pair<uint32_t, uint32_t>;
+            std::priority_queue<ComponentCandidate, std::vector<ComponentCandidate>,
+                                std::greater<>> ready;
+            for (uint32_t component = 0; component < scc.count; ++component) {
+                if (indegree[component] == 0) {
+                    ready.emplace(minimumBlock[component], component);
+                }
+            }
+            plan.order.reserve(commitCount);
+            plan.groupOffsets.reserve(static_cast<std::size_t>(commitCount) + 1);
+            plan.groupOffsets.push_back(0);
+            std::vector<uint32_t> localIndex(commitCount, kInvalidIndex);
+            while (!ready.empty()) {
+                const uint32_t component = ready.top().second;
+                ready.pop();
+
+                std::vector<uint32_t> &componentMembers = members[component];
+                for (uint32_t local = 0; local < componentMembers.size(); ++local) {
+                    localIndex[componentMembers[local]] = local;
+                }
+                std::vector<uint32_t> localIndegree(componentMembers.size(), 0);
+                std::vector<uint32_t> localHardIndegree(componentMembers.size(), 0);
+                for (uint32_t source : componentMembers) {
+                    for (uint32_t target : commitTargets[source]) {
+                        if (scc.component[target] == component) {
+                            ++localIndegree[localIndex[target]];
+                        }
+                    }
+                    for (uint32_t target : hardCommitTargets[source]) {
+                        if (scc.component[target] == component) {
+                            ++localHardIndegree[localIndex[target]];
+                        }
+                    }
+                }
+
+                using BlockCandidate = std::tuple<ActivationKey, uint32_t, uint32_t>;
+                std::priority_queue<BlockCandidate, std::vector<BlockCandidate>,
+                                    std::greater<>> localReady;
+                std::priority_queue<BlockCandidate, std::vector<BlockCandidate>,
+                                    std::greater<>> cutReady;
+                const auto makeCandidate = [&](uint32_t local) {
+                    const uint32_t block = componentMembers[local];
+                    return BlockCandidate{firstActivation[block], commitBegin + block, local};
+                };
+                for (uint32_t local = 0; local < componentMembers.size(); ++local) {
+                    if (localIndegree[local] == 0) {
+                        localReady.push(makeCandidate(local));
+                    }
+                    if (localHardIndegree[local] == 0) {
+                        cutReady.push(makeCandidate(local));
+                    }
+                }
+
+                std::vector<uint8_t> placed(componentMembers.size(), 0);
+                for (std::size_t placedCount = 0; placedCount < componentMembers.size();
+                     ++placedCount) {
+                    uint32_t local = kInvalidIndex;
+                    while (!localReady.empty()) {
+                        const uint32_t candidate = std::get<2>(localReady.top());
+                        localReady.pop();
+                        if (!placed[candidate] && localIndegree[candidate] == 0) {
+                            local = candidate;
+                            break;
+                        }
+                    }
+                    if (local == kInvalidIndex) {
+                        while (!cutReady.empty()) {
+                            const uint32_t candidate = std::get<2>(cutReady.top());
+                            cutReady.pop();
+                            if (!placed[candidate] && localHardIndegree[candidate] == 0) {
+                                local = candidate;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Writer-frontier edges are ordered by increasing commit BlockId, so their
+                    // subgraph is acyclic and always leaves at least one legal cycle cut.
+                    if (local == kInvalidIndex) {
+                        break;
+                    }
+                    const uint32_t block = componentMembers[local];
+                    placed[local] = 1;
+                    plan.order.push_back(BlockId{commitBegin + block});
+                    for (uint32_t target : commitTargets[block]) {
+                        if (scc.component[target] != component) {
+                            continue;
+                        }
+                        const uint32_t targetLocal = localIndex[target];
+                        if (!placed[targetLocal] && --localIndegree[targetLocal] == 0) {
+                            localReady.push(makeCandidate(targetLocal));
+                        }
+                    }
+                    for (uint32_t target : hardCommitTargets[block]) {
+                        if (scc.component[target] == component) {
+                            const uint32_t targetLocal = localIndex[target];
+                            if (!placed[targetLocal] && --localHardIndegree[targetLocal] == 0) {
+                                cutReady.push(makeCandidate(targetLocal));
+                            }
+                        }
+                    }
+                }
+                plan.groupOffsets.push_back(static_cast<uint32_t>(plan.order.size()));
+                for (uint32_t block : componentMembers) {
+                    localIndex[block] = kInvalidIndex;
+                }
+                for (uint32_t target : componentTargets[component]) {
+                    if (--indegree[target] == 0) {
+                        ready.emplace(minimumBlock[target], target);
+                    }
+                }
+            }
+            return plan;
+        }
+
         MaterializationCounts countMaterialization(std::span<const ActivationEdge> edges)
         {
             MaterializationCounts counts;
@@ -713,19 +927,29 @@ namespace wolvrix::lib::grhsim::am
         const uint32_t instructionCount = static_cast<uint32_t>(program.instructionCount());
         const uint32_t variableCount = static_cast<uint32_t>(program.variableCount());
         const DefUseIndex defUse = buildDefUseIndex(program);
-        DisjointSet sets(instructionCount);
-
         std::vector<OrderEdge> orderedEdges;
         orderedEdges.reserve(linear.schedulingFacts.orderedEffects.size());
         std::vector<uint8_t> hasExplicitOrder(instructionCount, 0);
+        std::vector<uint32_t> explicitOrderGroup(instructionCount, kInvalidIndex);
         uint32_t previousGroup = 0;
         uint32_t previousInstruction = kInvalidIndex;
         bool havePrevious = false;
         for (const OrderedEffect &effect : linear.schedulingFacts.orderedEffects) {
             const uint32_t instruction = effect.instruction.value;
+            if (hasExplicitOrder[instruction] &&
+                explicitOrderGroup[instruction] != effect.group) {
+                diagnostics.error(
+                    "AM instruction appears in multiple explicit ordered-effect groups: "
+                    "instruction=" +
+                        std::to_string(instruction) +
+                        " first_group=" + std::to_string(explicitOrderGroup[instruction]) +
+                        " second_group=" + std::to_string(effect.group),
+                    std::string(kDiagnosticContext));
+                return std::nullopt;
+            }
             hasExplicitOrder[instruction] = 1;
+            explicitOrderGroup[instruction] = effect.group;
             if (havePrevious && effect.group == previousGroup) {
-                sets.unite(previousInstruction, instruction);
                 orderedEdges.push_back(OrderEdge{
                     .source = previousInstruction,
                     .target = instruction,
@@ -759,34 +983,56 @@ namespace wolvrix::lib::grhsim::am
             if (!target) {
                 continue;
             }
+            if (defUse.definitions[target->value] != kInvalidIndex) {
+                diagnostics.error(
+                    "state-write target also has a normal instruction definition: target=" +
+                        std::to_string(target->value),
+                    std::string(kDiagnosticContext));
+                return std::nullopt;
+            }
             stateWriteTargets.push_back(target->value);
-            if (firstStateWriter[target->value] == kInvalidIndex) {
+            const uint32_t first = firstStateWriter[target->value];
+            if (first == kInvalidIndex) {
                 firstStateWriter[target->value] = index;
-            } else {
-                sets.unite(firstStateWriter[target->value], index);
+                continue;
+            }
+            const uint32_t firstGroup = explicitOrderGroup[first];
+            const uint32_t currentGroup = explicitOrderGroup[index];
+            if ((firstGroup == kInvalidIndex) != (currentGroup == kInvalidIndex) ||
+                (firstGroup != kInvalidIndex && firstGroup != currentGroup)) {
+                const auto targetLabelId = program.variableLabel(*target);
+                const std::string targetLabel = targetLabelId
+                                                    ? std::string(program.string(*targetLabelId))
+                                                    : std::string("<unlabeled>");
+                const auto groupText = [](uint32_t group) {
+                    return group == kInvalidIndex ? std::string("implicit")
+                                                  : std::to_string(group);
+                };
+                diagnostics.error(
+                    "multiple writes to one state target require one complete ordered-effect "
+                    "group or must all remain implicit: target=" +
+                        std::to_string(target->value) + " label=" + targetLabel +
+                        " first_instruction=" + std::to_string(first) +
+                        " first_opcode=" + std::string(toString(program.opcode(InstructionId{first}))) +
+                        " first_group=" + groupText(firstGroup) +
+                        " current_instruction=" + std::to_string(index) +
+                        " current_opcode=" + std::string(toString(program.opcode(InstructionId{index}))) +
+                        " current_group=" + groupText(currentGroup),
+                    std::string(kDiagnosticContext));
+                return std::nullopt;
             }
         }
         std::sort(stateWriteTargets.begin(), stateWriteTargets.end());
         stateWriteTargets.erase(std::unique(stateWriteTargets.begin(), stateWriteTargets.end()),
                                 stateWriteTargets.end());
 
-        std::vector<uint32_t> rootToUnit(instructionCount, kInvalidIndex);
-        std::vector<uint32_t> instructionUnit(instructionCount, kInvalidIndex);
-        uint32_t unitCount = 0;
-        for (uint32_t index = 0; index < instructionCount; ++index) {
-            const uint32_t root = sets.find(index);
-            if (rootToUnit[root] == kInvalidIndex) {
-                rootToUnit[root] = unitCount++;
-            }
-            instructionUnit[index] = rootToUnit[root];
-        }
-
-        const CsrGraph unitGraph = buildUnitGraph(unitCount, defUse, instructionUnit, orderedEdges);
-        const SccResult scc = findStronglyConnectedComponents(unitGraph);
+        const CsrGraph instructionGraph =
+            buildInstructionGraph(instructionCount, defUse, orderedEdges);
+        const SccResult scc = findStronglyConnectedComponents(instructionGraph);
         const uint32_t atomCount = scc.count;
         std::vector<uint32_t> instructionAtom(instructionCount, kInvalidIndex);
         for (uint32_t index = 0; index < instructionCount; ++index) {
-            instructionAtom[index] = scc.component[instructionUnit[index]];
+            instructionAtom[index] = scc.component[index];
         }
 
         std::vector<uint32_t> atomMemberOffsets(atomCount + 1, 0);
@@ -811,12 +1057,12 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
-        const CsrGraph atomGraph = buildCondensationGraph(unitGraph, scc.component, atomCount);
+        const CsrGraph atomGraph =
+            buildCondensationGraph(instructionGraph, scc.component, atomCount);
         enum class BlockClass : uint8_t
         {
             Compute = 0,
             Commit = 1,
-            Isolated = 2,
         };
         struct AtomCost
         {
@@ -836,12 +1082,9 @@ namespace wolvrix::lib::grhsim::am
             cost.instructions = atomMemberOffsets[atom + 1] - atomMemberOffsets[atom];
             bool hasCommit = false;
             bool hasCompute = false;
-            bool hasIsolatedEffect = false;
             for (uint32_t offset = atomMemberOffsets[atom]; offset < atomMemberOffsets[atom + 1];
                  ++offset) {
                 const uint32_t instruction = atomMembers[offset];
-                const InstructionEffect effect =
-                    linear.schedulingFacts.instructionEffects[instruction];
                 if (stateWriteTarget(program, InstructionId{instruction})) {
                     CommitInstructionBucketKey bucket = commitInstructionBucketKey(
                         program, defUse, InstructionId{instruction});
@@ -851,24 +1094,15 @@ namespace wolvrix::lib::grhsim::am
                     hasCommit = true;
                     continue;
                 }
-                if (isChanged(program.opcode(InstructionId{instruction})) ||
-                    effect == InstructionEffect::Pure || effect == InstructionEffect::StateRead) {
-                    hasCompute = true;
-                } else {
-                    // Host calls retain their own scheduling boundary until a typed
-                    // AM rule can prove a safe merge.
-                    hasIsolatedEffect = true;
-                }
+                hasCompute = true;
             }
-            if (hasCommit && (hasCompute || hasIsolatedEffect)) {
+            if (hasCommit && hasCompute) {
                 diagnostics.error(
                     "AM scheduling atom mixes state commit and pre-commit instructions",
                     std::string(kDiagnosticContext));
                 return std::nullopt;
             }
-            if (hasIsolatedEffect) {
-                cost.blockClass = BlockClass::Isolated;
-            } else if (hasCommit) {
+            if (hasCommit) {
                 cost.blockClass = BlockClass::Commit;
             }
             std::sort(cost.commitEvents.begin(), cost.commitEvents.end());
@@ -954,7 +1188,7 @@ namespace wolvrix::lib::grhsim::am
         using AtomCandidate = std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>;
         using ReadyQueue =
             std::priority_queue<AtomCandidate, std::vector<AtomCandidate>, std::greater<>>;
-        std::array<ReadyQueue, 3> readyByClass;
+        std::array<ReadyQueue, 2> readyByClass;
         const auto readyIndex = [](BlockClass blockClass) {
             return static_cast<std::size_t>(blockClass);
         };
@@ -974,17 +1208,10 @@ namespace wolvrix::lib::grhsim::am
             remainingPreCommitAtoms += cost.blockClass != BlockClass::Commit;
         }
         const auto popNextReady = [&]() -> uint32_t {
-            constexpr std::array<BlockClass, 2> preCommitPhaseOrder = {
-                BlockClass::Compute,
-                BlockClass::Isolated,
-            };
-            for (BlockClass blockClass : preCommitPhaseOrder) {
-                ReadyQueue &ready = readyByClass[readyIndex(blockClass)];
-                if (ready.empty()) {
-                    continue;
-                }
-                const uint32_t atom = std::get<3>(ready.top());
-                ready.pop();
+            ReadyQueue &compute = readyByClass[readyIndex(BlockClass::Compute)];
+            if (!compute.empty()) {
+                const uint32_t atom = std::get<3>(compute.top());
+                compute.pop();
                 return atom;
             }
             if (remainingPreCommitAtoms != 0) {
@@ -1014,10 +1241,10 @@ namespace wolvrix::lib::grhsim::am
         uint32_t normalBlockCount = 0;
         std::size_t currentInstructions = 0;
         std::size_t currentStateWrites = 0;
-        BlockClass currentClass = BlockClass::Isolated;
+        BlockClass currentClass = BlockClass::Compute;
         uint32_t currentBucketAtom = kInvalidIndex;
         bool haveCurrent = false;
-        std::array<uint32_t, 3> blockCountsByClass{};
+        std::array<uint32_t, 2> blockCountsByClass{};
         while (atomTopo.size() != atomCount) {
             uint32_t atom = kInvalidIndex;
             if (!haveCurrent) {
@@ -1038,7 +1265,7 @@ namespace wolvrix::lib::grhsim::am
                 currentBucketAtom = atom;
                 ++blockCountsByClass[readyIndex(currentClass)];
                 haveCurrent = true;
-            } else if (options.enableCoarsening && currentClass != BlockClass::Isolated) {
+            } else if (options.enableCoarsening) {
                 ReadyQueue &ready = readyByClass[readyIndex(currentClass)];
                 if (!ready.empty()) {
                     const uint32_t candidate = std::get<3>(ready.top());
@@ -1082,10 +1309,19 @@ namespace wolvrix::lib::grhsim::am
                     addReady(target);
                 }
             }
-            if (currentClass == BlockClass::Isolated || !options.enableCoarsening) {
+            if (!options.enableCoarsening) {
                 haveCurrent = false;
             }
         }
+
+        const uint32_t commitBlockCount =
+            blockCountsByClass[readyIndex(BlockClass::Commit)];
+        const uint32_t commitBlockBegin =
+            commitBlockCount == 0
+                ? 0U
+                : 1U + blockCountsByClass[readyIndex(BlockClass::Compute)];
+        const uint32_t commitBlockEnd =
+            commitBlockCount == 0 ? 0U : commitBlockBegin + commitBlockCount;
 
         std::vector<uint32_t> instructionBlock(instructionCount, 0);
         std::vector<uint32_t> instructionPosition(instructionCount, 0);
@@ -1111,6 +1347,23 @@ namespace wolvrix::lib::grhsim::am
                 semanticInstructions[position] = instruction;
                 instructionBlock[instruction] = block;
                 instructionPosition[instruction] = position - semanticBlockOffsets[block];
+            }
+        }
+
+        std::vector<VariableId> liveSourceByPreCommitTarget(variableCount,
+                                                            VariableId::invalid());
+        for (const PreCommitSnapshot &snapshot : linear.preCommitSnapshots) {
+            liveSourceByPreCommitTarget[snapshot.target.value] = snapshot.source;
+        }
+
+        std::size_t commitOperandCaptureUpperBound = 0;
+        for (uint32_t block = commitBlockBegin; block < commitBlockEnd; ++block) {
+            for (uint32_t offset = semanticBlockOffsets[block];
+                 offset < semanticBlockOffsets[block + 1]; ++offset) {
+                const InstructionId instruction{semanticInstructions[offset]};
+                commitOperandCaptureUpperBound += std::min(
+                    commitOperandCaptureCount(program.opcode(instruction)),
+                    program.operands(instruction).size());
             }
         }
 
@@ -1187,13 +1440,20 @@ namespace wolvrix::lib::grhsim::am
 
         std::vector<uint32_t> stateWriterBlock(variableCount, 0);
         std::vector<uint32_t> finalWriterPosition(variableCount, 0);
+        std::vector<uint8_t> hasStateWriter(variableCount, 0);
         for (uint32_t instruction = 0; instruction < instructionCount; ++instruction) {
             const std::optional<VariableId> target =
                 stateWriteTarget(program, InstructionId{instruction});
             if (target) {
-                stateWriterBlock[target->value] = instructionBlock[instruction];
-                finalWriterPosition[target->value] =
-                    std::max(finalWriterPosition[target->value], instructionPosition[instruction]);
+                const uint32_t block = instructionBlock[instruction];
+                const uint32_t position = instructionPosition[instruction];
+                if (!hasStateWriter[target->value] || block > stateWriterBlock[target->value] ||
+                    (block == stateWriterBlock[target->value] &&
+                     position > finalWriterPosition[target->value])) {
+                    stateWriterBlock[target->value] = block;
+                    finalWriterPosition[target->value] = position;
+                    hasStateWriter[target->value] = 1;
+                }
             }
         }
         for (uint32_t target : stateWriteTargets) {
@@ -1211,6 +1471,33 @@ namespace wolvrix::lib::grhsim::am
                     .variable = target,
                     .targetBlock = targetBlock,
                 });
+            }
+        }
+
+        // A target split across commit Blocks has one watcher at its final writer frontier.
+        // A guarded forward activation immediately before each earlier writer makes that
+        // frontier run whenever the earlier writer can mutate the target.
+        std::vector<VariableId> writerFrontierGuards(instructionCount, VariableId::invalid());
+        std::vector<uint32_t> writerFrontierTargets(instructionCount, kInvalidIndex);
+        std::size_t writerFrontierActivations = 0;
+        for (uint32_t instruction = 0; instruction < instructionCount; ++instruction) {
+            const std::optional<VariableId> target =
+                stateWriteTarget(program, InstructionId{instruction});
+            if (!target) {
+                continue;
+            }
+            const uint32_t sourceBlock = instructionBlock[instruction];
+            const uint32_t finalBlock = stateWriterBlock[target->value];
+            if (sourceBlock != finalBlock) {
+                const auto operands = program.operands(InstructionId{instruction});
+                if (operands.empty()) {
+                    diagnostics.error("state writer is missing its firing guard",
+                                      std::string(kDiagnosticContext));
+                    return std::nullopt;
+                }
+                writerFrontierGuards[instruction] = operands.front();
+                writerFrontierTargets[instruction] = finalBlock;
+                ++writerFrontierActivations;
             }
         }
 
@@ -1232,9 +1519,25 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
+        std::vector<OrderEdge> writerFrontierEdges;
+        writerFrontierEdges.reserve(writerFrontierActivations);
+        for (uint32_t instruction = 0; instruction < instructionCount; ++instruction) {
+            if (writerFrontierTargets[instruction] != kInvalidIndex) {
+                writerFrontierEdges.push_back(OrderEdge{
+                    .source = instructionBlock[instruction],
+                    .target = writerFrontierTargets[instruction],
+                });
+            }
+        }
+        const CommitExecutionPlan commitPlan =
+            buildCommitExecutionPlan(normalBlockCount + 1, commitBlockBegin, commitBlockEnd,
+                                     activationEdges, writerFrontierEdges);
+
         const MaterializationCounts materialization = countMaterialization(activationEdges);
+        const bool needsEventType =
+            materialization.detectors != 0 || writerFrontierActivations != 0;
         TypeId eventType;
-        if (materialization.detectors != 0) {
+        if (needsEventType) {
             for (uint32_t type = 0; type < program.typeCount(); ++type) {
                 const Type &candidate = program.type(TypeId{type});
                 if (candidate.kind == TypeKind::BitVector && candidate.bitWidth == 1 &&
@@ -1246,23 +1549,88 @@ namespace wolvrix::lib::grhsim::am
         }
 
         ProgramInterface interface = std::move(linear.interface);
+        linear.preCommitSnapshots.clear();
+        linear.preCommitSnapshots.shrink_to_fit();
         linear.schedulingFacts.clearAndRelease();
         try {
             ScheduledProgramBuilder builder(std::move(linear.program));
             builder.reserve(ScheduledProgramReserve{
-                .additionalTypes = materialization.detectors != 0 && !eventType.valid() ? 1U : 0U,
-                .additionalVariables = materialization.detectors * 2,
-                .additionalInstructions = materialization.detectors + materialization.activations,
-                .additionalOperands = materialization.detectors * 2 + materialization.activations,
-                .additionalResults = materialization.detectors,
+                .additionalTypes = needsEventType && !eventType.valid() ? 1U : 0U,
+                .additionalVariables =
+                    materialization.detectors * 2 + writerFrontierActivations +
+                    commitOperandCaptureUpperBound,
+                .additionalInstructions = materialization.detectors + materialization.activations +
+                                          writerFrontierActivations * 2,
+                .additionalOperands = materialization.detectors * 2 + materialization.activations +
+                                      writerFrontierActivations * 2,
+                .additionalResults =
+                    materialization.detectors + writerFrontierActivations,
                 .blocks = static_cast<std::size_t>(normalBlockCount) + 1,
                 .blockInstructionIds = static_cast<std::size_t>(instructionCount) +
-                                       materialization.detectors + materialization.activations,
-                .activationInstructions = materialization.activations,
-                .activationTargets = materialization.targets,
+                                       materialization.detectors + materialization.activations +
+                                       writerFrontierActivations * 2,
+                .activationInstructions =
+                    materialization.activations + writerFrontierActivations,
+                .activationTargets = materialization.targets + writerFrontierActivations,
             });
-            if (materialization.detectors != 0 && !eventType.valid()) {
+            if (needsEventType && !eventType.valid()) {
                 eventType = builder.addType(Type::bitVector(1));
+            }
+
+            std::vector<CommitOperandCapture> commitOperandCaptures;
+            commitOperandCaptures.reserve(commitOperandCaptureUpperBound);
+            std::vector<uint32_t> commitOperandCaptureOffsets;
+            if (commitBlockCount != 0) {
+                commitOperandCaptureOffsets.reserve(
+                    static_cast<std::size_t>(commitBlockCount) + 1);
+                commitOperandCaptureOffsets.push_back(0);
+            }
+            for (uint32_t block = commitBlockBegin; block < commitBlockEnd; ++block) {
+                std::map<uint32_t, VariableId> captureTargetBySource;
+                for (uint32_t offset = semanticBlockOffsets[block];
+                     offset < semanticBlockOffsets[block + 1]; ++offset) {
+                    const InstructionId instruction{semanticInstructions[offset]};
+                    const std::size_t captureCount = std::min(
+                        commitOperandCaptureCount(builder.view().opcode(instruction)),
+                        builder.view().operands(instruction).size());
+                    for (std::size_t position = 0; position < captureCount; ++position) {
+                        VariableId source = builder.view().operands(instruction)[position];
+                        if (source.value < liveSourceByPreCommitTarget.size() &&
+                            liveSourceByPreCommitTarget[source.value].valid()) {
+                            source = liveSourceByPreCommitTarget[source.value];
+                        }
+                        const ProgramView current = builder.view();
+                        const auto &sourceVariable = current.variable(source);
+                        if (current.init(sourceVariable.init).kind == InitKind::Constant) {
+                            builder.setInstructionOperand(instruction, position, source);
+                            continue;
+                        }
+                        auto found = captureTargetBySource.find(source.value);
+                        if (found == captureTargetBySource.end()) {
+                            const Type &type = current.type(sourceVariable.type);
+                            if (type.kind != TypeKind::BitVector) {
+                                diagnostics.error(
+                                    "commit operand capture requires a bit-vector source",
+                                    std::string(kDiagnosticContext));
+                                return std::nullopt;
+                            }
+                            const VariableId target =
+                                builder.addVariable(sourceVariable.type, builder.undefInit());
+                            found = captureTargetBySource.emplace(source.value, target).first;
+                            commitOperandCaptures.push_back(CommitOperandCapture{
+                                .source = source,
+                                .target = target,
+                            });
+                        }
+                        builder.setInstructionOperand(instruction, position, found->second);
+                    }
+                    if (writerFrontierTargets[instruction.value] != kInvalidIndex) {
+                        writerFrontierGuards[instruction.value] =
+                            builder.view().operands(instruction).front();
+                    }
+                }
+                commitOperandCaptureOffsets.push_back(
+                    static_cast<uint32_t>(commitOperandCaptures.size()));
             }
 
             std::size_t edgeCursor = 0;
@@ -1278,7 +1646,27 @@ namespace wolvrix::lib::grhsim::am
                 if (block < semanticBlockOffsets.size() - 1) {
                     for (uint32_t offset = semanticBlockOffsets[block];
                          offset < semanticBlockOffsets[block + 1]; ++offset) {
-                        builder.appendBlockInstruction(InstructionId{semanticInstructions[offset]});
+                        const uint32_t instruction = semanticInstructions[offset];
+                        if (writerFrontierTargets[instruction] != kInvalidIndex) {
+                            const VariableId localGuard =
+                                builder.addVariable(eventType, builder.undefInit());
+                            const std::array<VariableId, 1> guardResults = {localGuard};
+                            const std::array<VariableId, 1> guardOperands = {
+                                writerFrontierGuards[instruction],
+                            };
+                            const InstructionId snapshot = builder.addInstruction(
+                                Opcode::ReduceOr, guardResults, guardOperands);
+                            builder.appendBlockInstruction(snapshot);
+                            const std::array<VariableId, 1> activateOperands = {localGuard};
+                            const InstructionId activate =
+                                builder.addInstruction(Opcode::ActForward, {}, activateOperands);
+                            const std::array<BlockId, 1> targets = {
+                                BlockId{writerFrontierTargets[instruction]},
+                            };
+                            builder.setActivationTargets(activate, targets);
+                            builder.appendBlockInstruction(activate);
+                        }
+                        builder.appendBlockInstruction(InstructionId{instruction});
                     }
                 }
                 if (!appendWatchGroups(builder, block, activationEdges, edgeCursor, eventType,
@@ -1296,6 +1684,13 @@ namespace wolvrix::lib::grhsim::am
             ExecutableModel model{
                 .program = builder.finish(),
                 .interface = std::move(interface),
+                .commitBlockBegin = commitBlockBegin,
+                .commitBlockEnd = commitBlockEnd,
+                .commitBlockOrder = commitPlan.order,
+                .commitGroupOffsets = commitPlan.groupOffsets,
+                .commitOperandCaptures = std::move(commitOperandCaptures),
+                .commitOperandCaptureOffsets =
+                    std::move(commitOperandCaptureOffsets),
             };
             if (!reportValidation(
                     validate(model, ValidationOptions{.level = ValidationLevel::Semantic}),
@@ -1316,10 +1711,17 @@ namespace wolvrix::lib::grhsim::am
                         std::to_string(blockCountsByClass[readyIndex(BlockClass::Compute)]) +
                         " commit_blocks=" +
                         std::to_string(blockCountsByClass[readyIndex(BlockClass::Commit)]) +
-                        " isolated_blocks=" +
-                        std::to_string(blockCountsByClass[readyIndex(BlockClass::Isolated)]) +
+                        " commit_groups=" +
+                        std::to_string(model.commitGroupOffsets.empty()
+                                           ? 0
+                                           : model.commitGroupOffsets.size() - 1) +
+                        " commit_operand_captures=" +
+                        std::to_string(model.commitOperandCaptures.size()) +
                         " detectors=" + std::to_string(materialization.detectors) +
-                        " activation_edges=" + std::to_string(materialization.targets) +
+                        " activation_edges=" +
+                        std::to_string(materialization.targets + writerFrontierActivations) +
+                        " writer_frontier_activations=" +
+                        std::to_string(writerFrontierActivations) +
                         " scheduled_instructions=" + std::to_string(stats.instructions) +
                         " storage_bytes=" + std::to_string(stats.estimatedBytes) +
                         " reserved_bytes=" + std::to_string(stats.reservedBytes),

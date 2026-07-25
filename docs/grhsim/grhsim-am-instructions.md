@@ -83,9 +83,11 @@ Variable 自身的结构化 metadata，不属于 Instruction Attribute。
 | `system.function` | `name` | non-empty String | 是 | 不带 `$` 的系统函数名。 |
 | `system.function` | `schedule` | `normal \| once \| final` | 是 | 普通、至多一次或 finalize 阶段调用。 |
 | `system.task` | `event_count` | Nat | 是 | Operand 尾部 event 的数量。 |
+| `system.task` | `event_mode` | `immediate \| pending` | 是 | event 仅限当前执行，或可在同一次 `eval()` 内保留。 |
 | `system.task` | `name` | non-empty String | 是 | 不带 `$` 的系统任务名。 |
 | `system.task` | `schedule` | `normal \| once \| final` | 是 | 普通、至多一次或 finalize 阶段调用。 |
 | `dpi.call` | `event_count` | Nat | 是 | Operand 尾部 event 的数量。 |
+| `dpi.call` | `event_mode` | `immediate \| pending` | 是 | event 仅限当前执行，或可在同一次 `eval()` 内保留。 |
 | `dpi.call` | `import` | non-empty String | 是 | Program 中唯一 `DpiImport.Symbol`。 |
 | `act.f/act.b` | `targets` | `non-empty set<BlockId>` | 是 | 激活目标；文本按 BlockId 升序排列。 |
 
@@ -117,8 +119,8 @@ Variable 自身的结构化 metadata，不属于 Instruction Attribute。
 | `mem.fill` | - | `%cond, %data, %target (rw), %event0, ..., %eventE-1` | - |
 | `latch.write` | - | `%cond, %mask, %nextValue, %target (rw)` | - |
 | `system.function` | `%res` | `%arg0, ..., %argA-1` | `has_side_effects: Bool, name: String, schedule: Enum` |
-| `system.task` | - | `%cond, %arg0, ..., %argA-1, %event0, ..., %eventE-1` | `event_count: Nat, name: String, schedule: Enum` |
-| `dpi.call` | `%return?, %out0, ..., %outO-1, %inout0, ..., %inoutQ-1` | `%cond, %in0, ..., %inI-1, %inout0, ..., %inoutQ-1, %event0, ..., %eventE-1` | `event_count: Nat, import: String` |
+| `system.task` | - | `%cond, %arg0, ..., %argA-1, %event0, ..., %eventE-1` | `event_count: Nat, event_mode: Enum, name: String, schedule: Enum` |
+| `dpi.call` | `%return?, %out0, ..., %outO-1, %inout0, ..., %inoutQ-1` | `%cond, %in0, ..., %inI-1, %inout0, ..., %inoutQ-1, %event0, ..., %eventE-1` | `event_count: Nat, event_mode: Enum, import: String` |
 | `act.f/act.b` | - | `%event` | `targets: set<BlockId>` |
 
 ### 2.2 执行与类型公共规则
@@ -166,9 +168,11 @@ opcode。
 | `kMul` | `width(L) + width(R)` | `commonS(L, R)` | `BV<W, C>` |
 | `kDiv/kMod` | `width(L)` | `commonS(L, R)` | `BV<W, C>` |
 | equality 与关系比较 | `max(width(L), width(R))` | `commonS(L, R)` | `BV<1, unsigned>` |
+| `kShl/kLShr/kAShr` | result 宽度 | `signedness(L)` | `BV<W, C>` |
 | `kMux` | result 宽度 | `commonS(True, False)` | `BV<W, C>` |
 
-表中二元 operand 都先执行 `resize(operand, W, C)`。此外：
+除 shift 外，表中二元 operand 都先执行 `resize(operand, W, C)`。Shift 只对
+lhs 执行该 resize；amount 保留原 Type，并按 `U(amount)` 解释。此外：
 
 - `kConstant` 的结果 Value 映射为 `Init = constant(value)` 的 Variable，不生成指令、
   Block 或 Block 激活；该规则同样适用于 Real 和 String constant；
@@ -787,7 +791,8 @@ GRH `kSystemTask` lower 为：
 
 ```text
 system.task %cond, %arg0, ..., %argA-1, %event0, ..., %eventE-1 {
-    event_count = E, name = "taskName", schedule = normal | once | final
+    event_count = E, event_mode = immediate | pending,
+    name = "taskName", schedule = normal | once | final
 }
 ```
 
@@ -811,17 +816,40 @@ BV、Real 和 String 参数都按 [HostValue](grhsim-host-environment.md#1-hostv
 非法，不能把未知任务静默解释为 no-op。`system.task` 是有副作用的显式调度边界，后端
 不能删除、合并、推测执行或跨越其他有副作用指令重排它。
 
-执行 Block 时先读取全部 Operand 的快照，并令：
+执行该指令时先读取本次执行的全部 Operand 快照，并令：
 
 ```text
-event_hit = (E = 0) || exists i in [0, E): U(event_i) = 1
-fire      = truth(cond) && event_hit
+raw_event_hit = exists i in [0, E): U(event_i) = 1
+fire_immediate = truth(cond) && ((E = 0) || raw_event_hit)
 ```
 
-多个 event 仍是 OR 关系。`fire = false` 时不调用 binding；`fire = true` 时，以参数快照
-按顺序调用 `host_system_task(name, args)`。binding 可以产生文本/文件 I/O、诊断、仿真
-结束请求等外部效果，具体任务的参数和效果由 binding 契约定义。效果按实际指令执行顺序
-可见；即使两次调用的名称和参数相同，也不得合并。
+`event_mode = immediate` 直接使用 `fire_immediate`，不保存 raw event。display、assert、
+difftest observer 等必须与当前 event 和当前参数快照绑定的调用使用这一模式；后续 epoch
+即使 `%cond` 变为 true，也不能重放已经消失的 event。
+
+`event_mode = pending` 且 `E > 0` 时，该指令独占一个初始化为 false 的内部
+`pending_event` bit，并改为：
+
+```text
+pending_event = pending_event || raw_event_hit
+fire_pending = truth(cond) && pending_event
+```
+
+多个 event 仍是 OR 关系；同一次执行中命中一个或多个 event 都只把同一个 bit 置为 true。
+`pending_event` 可以跨同一次顶层 `eval()` 内的 AM epoch 保留，raw event 在后续 epoch
+变为 0 不会清除它。每次顶层 `eval()` 开始前，Machine 清零所有此类 bit，因此 pending
+event 不能跨两个顶层 `eval()` 调用传播。`E = 0` 时两种 mode 等价，均不分配或读取
+`pending_event`。
+
+`pending_event` 只保存“至少发生过一个事件”，不保存事件发生时的 `%cond` 或参数。
+指令按 mode 选择 `fire = fire_immediate` 或 `fire = fire_pending`。`fire = false` 时不调用
+binding；pending mode 在后续 epoch 消费 event 时，重新读取该次
+指令执行时的 `%cond` 和参数快照。`fire = true` 时，以当前快照按顺序调用
+`host_system_task(name, args)`；pending mode 调用成功后把该指令的 `pending_event` 清为
+false。
+binding 可以产生文本/文件 I/O、诊断、仿真结束请求等外部效果，具体任务的参数和效果由
+binding 契约定义。效果按实际指令执行顺序可见；即使两次调用的名称和参数相同，也不得
+合并。
 
 `schedule` 决定调用阶段：
 
@@ -844,17 +872,21 @@ GRH lower 时：
 - `procKind = "final"` 映射为 `schedule = final`；`procKind = "initial"` 映射为
   `schedule = once`，无论 `hasTiming` 取值；其余过程种类映射为 `schedule = normal`；
 - `hasTiming` 本身不保留；时序触发已由显式 event 和 `once` 的 completed 状态表达；
-- `name` 去除且只去除一个源级前导 `$`，参数 Variable 保持源程序顺序。
+- `name` 去除且只去除一个源级前导 `$`，参数 Variable 保持源程序顺序；
+- 当前 GRH lowering 对 `system.task` 选择 `event_mode = immediate`，避免旧 event 使用
+  后续 epoch 的 task 参数重放副作用。
 
 例如：
 
 ```text
 system.task %true, %format, %data, %clkpos {
-    event_count = 1, name = "display", schedule = normal
+    event_count = 1, event_mode = immediate,
+    name = "display", schedule = normal
 }
 ```
 
-仅在 `%true = 1` 且 `%clkpos = 1` 时调用一次 `display(%format, %data)`。
+仅当 `%true = 1` 且 `%clkpos = 1` 的本次执行才调用 `display`；该 event 不会在后续
+epoch 重放。
 
 ## 15. DPI Call
 
@@ -867,7 +899,10 @@ GRH `kDpicCall` lower 为：
 ```text
 %return?, %out0, ..., %outO-1, %inoutOut0, ..., %inoutOutQ-1 =
     dpi.call %cond, %in0, ..., %inI-1, %inoutIn0, ..., %inoutInQ-1,
-             %event0, ..., %eventE-1 {event_count = E, import = "symbol"}
+             %event0, ..., %eventE-1 {
+                 event_count = E, event_mode = immediate | pending,
+                 import = "symbol"
+             }
 ```
 
 若没有 Result，省略左侧和 `=`。`import` 必须解析到唯一 DpiImport。参数严格按声明顺序
@@ -890,9 +925,11 @@ DPI 的 input、output、inout 和 return 都可以使用 Real 或 String；分�
 real64 保留 binary64，real32 在调用边界舍入/扩展，String 必须保留 AM 的完整 byte
 序列。无法满足某个 DpiImport ABI 的后端必须在 Machine 创建期间拒绝该 binding。
 
-执行时先读取 cond、全部 input/inout 输入侧以及 event 的快照，并计算与 `system.task`
-相同的 `event_hit` 和 `fire`。`fire = false` 时不调用外部函数，也不写任何 Result；Result
-保留执行前的值。`fire = true` 时：
+执行时使用与 `system.task` 相同的 `event_mode` 和 `fire` 计算。pending mode 同样只跨
+一次顶层 `eval()` 内的 epoch 保留，并在成功调用后清零；pending bit 不保存事件发生时
+的 cond 或参数，消费时读取当时的 cond、全部 input/inout 输入侧以及 event 快照。
+`fire = false` 时不调用外部函数，也不写任何 Result；Result 保留执行前的值。
+`fire = true` 时：
 
 1. 以所有 input 快照作为只读实参，并以所有 inout 输入侧快照初始化独立的本地
    read-write 实参；output 使用按对应 AM Type 零值初始化的独立本地输出槽；
@@ -912,19 +949,32 @@ Attribute。
 
 Lowering 使用 DpiImport 声明和 GRH `inArgName/outArgName/inoutArgName` 将各组重排为上述
 规范顺序，验证 `hasReturn` 后不再保留这些 name list 或 `hasReturn`。raw event 和
-`eventEdge` 按第 14.2 节规则 lower，`eventEdge` 不保留。
+`eventEdge` 按第 14.2 节规则 lower，`eventEdge` 不保留。当前 lowering 对产生 return、
+output 或 inout Result 的调用选择 `event_mode = pending`，使值生产调用可以等待同一次
+`eval()` 内的 guard 和参数收敛；无 Result 的 observer 调用选择
+`event_mode = immediate`，避免旧 event 使用后续 epoch 的参数重放副作用。
 
 例如声明 `add(input logic[31:0] a, input logic[31:0] b) -> logic[31:0]` 时：
 
 ```text
-%sum = dpi.call %true, %a, %b, %clkpos {event_count = 1, import = "add"}
+%sum = dpi.call %true, %a, %b, %clkpos {
+    event_count = 1, event_mode = pending, import = "add"
+}
 ```
 
 声明 `swap(inout int a, inout int b) -> none` 时：
 
 ```text
 %xout, %yout = dpi.call %true, %x, %y, %clkpos {
-    event_count = 1, import = "swap"
+    event_count = 1, event_mode = pending, import = "swap"
+}
+```
+
+无 Result 的 observer 使用 immediate mode，例如：
+
+```text
+dpi.call %valid, %pc, %clkpos {
+    event_count = 1, event_mode = immediate, import = "observe_commit"
 }
 ```
 
@@ -1001,12 +1051,12 @@ Backward 依赖。
 - `system.function` 恰有一个非 constant Result，参数和 Result 都是 BV、Real 或 String，
   三个必需 Attribute、binding 签名和 schedule 满足第 14.1 节；`schedule = final` 的
   Result 只供静态顺序更晚的 final 调用使用；
-- `system.task` 没有 Result，cond、参数、尾部 event、三个必需 Attribute 及
+- `system.task` 没有 Result，cond、参数、尾部 event、四个必需 Attribute 及
   `event_count` 分界满足第 14.2 节；`schedule = final` 时 event 数为 0；任务 binding
   唯一且签名匹配；
 - `dpi.call` 的 import 可唯一解析到满足 AM 基础设计第 2.3 节的 DpiImport，参数分组、
-  operand/result 数量、Type 和尾部 event 满足第 15 节，所有 Result 非 constant 且
-  VarId 两两不同；同一有序调用组完整且按 ordinal 顺序 lower；
+  operand/result 数量、Type、尾部 event 和三个必需 Attribute 满足第 15 节，所有
+  Result 非 constant 且 VarId 两两不同；同一有序调用组完整且按 ordinal 顺序 lower；
 - `act.f/act.b` 的 event 是 `BV<1, unsigned>`，并由同一 Block 中更早的指令写入；
 - `slice_static.lsb` 是满足第 10 节范围约束的 Nat，且该指令没有其他 Attribute；
 - `targets` 是静态非空 BlockId set Attribute，且 act 没有其他 Attribute；对所在 Block B，`act.f` 的每个 Target 满足

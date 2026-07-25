@@ -1396,6 +1396,227 @@ namespace
         return 0;
     }
 
+    ExecutableModel makeCommitPlanValidationModel(bool aliasedCaptures,
+                                                   bool emptyGroup,
+                                                   bool definedCaptureTarget)
+    {
+        LinearProgramBuilder linear;
+        const TypeId type = linear.addType(Type::bitVector(8));
+        const VariableId source =
+            linear.addVariable(type, linear.zeroInit());
+        const VariableId middle =
+            linear.addVariable(type, linear.zeroInit());
+        const VariableId target =
+            linear.addVariable(type, linear.zeroInit());
+        InstructionId definition = InstructionId::invalid();
+        if (definedCaptureTarget)
+        {
+            const std::array<VariableId, 1> results = {middle};
+            const std::array<VariableId, 1> operands = {source};
+            definition = linear.addInstruction(Opcode::Assign, results, operands);
+        }
+        ScheduledProgramBuilder scheduled(linear.finish());
+        scheduled.addBlock({});
+        if (definition.valid())
+        {
+            const std::array<InstructionId, 1> instructions = {definition};
+            scheduled.addBlock(instructions);
+        }
+        else
+        {
+            scheduled.addBlock({});
+        }
+        scheduled.addBlock({});
+
+        std::vector<CommitOperandCapture> captures = {
+            CommitOperandCapture{.source = source, .target = middle},
+        };
+        std::vector<uint32_t> captureOffsets = {0, 1, 1};
+        if (aliasedCaptures)
+        {
+            captures.push_back(
+                CommitOperandCapture{.source = middle, .target = target});
+            captureOffsets = {0, 1, 2};
+        }
+        return ExecutableModel{
+            .program = scheduled.finish(),
+            .interface = {},
+            .commitBlockBegin = 1,
+            .commitBlockEnd = 3,
+            .commitBlockOrder = {BlockId{1}, BlockId{2}},
+            .commitGroupOffsets = emptyGroup ? std::vector<uint32_t>{0, 0, 2}
+                                             : std::vector<uint32_t>{0, 1, 2},
+            .commitOperandCaptures = std::move(captures),
+            .commitOperandCaptureOffsets = std::move(captureOffsets),
+        };
+    }
+
+    int testCommitPlanValidationRejectsAmbiguousBatches()
+    {
+        {
+            ExecutableModel model =
+                makeCommitPlanValidationModel(false, false, false);
+            if (!validate(model,
+                          ValidationOptions{.level = ValidationLevel::Semantic})
+                     .success())
+            {
+                return fail("well-formed commit capture plan was rejected");
+            }
+        }
+        {
+            ExecutableModel model =
+                makeCommitPlanValidationModel(false, true, false);
+            const ValidationResult validation = validate(
+                model, ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(validation,
+                               "invalid commit Block execution plan"))
+            {
+                return fail("empty commit groups must be rejected");
+            }
+        }
+        {
+            ExecutableModel model =
+                makeCommitPlanValidationModel(true, false, false);
+            const ValidationResult validation = validate(
+                model, ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(
+                    validation,
+                    "commit operand capture sources and targets must not alias"))
+            {
+                return fail("capture source/target alias chains must be rejected");
+            }
+        }
+        {
+            ExecutableModel model =
+                makeCommitPlanValidationModel(false, false, true);
+            const ValidationResult validation = validate(
+                model, ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(
+                    validation,
+                    "capture target must not have an instruction definition"))
+            {
+                return fail("instruction-defined capture targets must be rejected");
+            }
+        }
+        return 0;
+    }
+
+    enum class CommitEventOwnershipViolation
+    {
+        None,
+        ResultWriter,
+        StateTarget,
+    };
+
+    ExecutableModel makeCommitEventOwnershipModel(
+        CommitEventOwnershipViolation violation)
+    {
+        LinearProgramBuilder linear;
+        const TypeId type = linear.addType(Type::bitVector(1));
+        const VariableId source =
+            linear.addVariable(type, linear.zeroInit());
+        const VariableId oldValue =
+            linear.addVariable(type, linear.undefInit());
+        const VariableId event =
+            linear.addVariable(type, linear.zeroInit());
+        const VariableId state =
+            linear.addVariable(type, linear.zeroInit());
+        const std::array<VariableId, 1> changedResults = {event};
+        const std::array<VariableId, 2> changedOperands = {source, oldValue};
+        const InstructionId changed = linear.addInstruction(
+            Opcode::ChangedAny, changedResults, changedOperands);
+        const std::array<VariableId, 5> writeOperands = {
+            source, source, source, state, event,
+        };
+        const InstructionId write =
+            linear.addInstruction(Opcode::RegisterWrite, {}, writeOperands);
+        InstructionId stateWriter = InstructionId::invalid();
+        if (violation == CommitEventOwnershipViolation::StateTarget)
+        {
+            const std::array<VariableId, 4> latchOperands = {
+                source, source, source, event,
+            };
+            stateWriter =
+                linear.addInstruction(Opcode::LatchWrite, {}, latchOperands);
+        }
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        InstructionId resultWriter = InstructionId::invalid();
+        if (violation == CommitEventOwnershipViolation::ResultWriter)
+        {
+            const std::array<VariableId, 1> results = {event};
+            const std::array<VariableId, 1> operands = {source};
+            resultWriter =
+                scheduled.addInstruction(Opcode::Assign, results, operands);
+        }
+        if (resultWriter.valid())
+        {
+            const std::array<InstructionId, 2> entry = {changed, resultWriter};
+            scheduled.addBlock(entry);
+        }
+        else
+        {
+            const std::array<InstructionId, 1> entry = {changed};
+            scheduled.addBlock(entry);
+        }
+        if (stateWriter.valid())
+        {
+            const std::array<InstructionId, 2> commit = {write, stateWriter};
+            scheduled.addBlock(commit);
+        }
+        else
+        {
+            const std::array<InstructionId, 1> commit = {write};
+            scheduled.addBlock(commit);
+        }
+        return ExecutableModel{
+            .program = scheduled.finish(),
+            .interface = {},
+            .commitBlockBegin = 1,
+            .commitBlockEnd = 2,
+            .commitBlockOrder = {BlockId{1}},
+            .commitGroupOffsets = {0, 1},
+        };
+    }
+
+    int testCommitEventOwnershipValidation()
+    {
+        if (!validate(
+                 makeCommitEventOwnershipModel(CommitEventOwnershipViolation::None),
+                 ValidationOptions{.level = ValidationLevel::Semantic})
+                 .success())
+        {
+            return fail("well-formed commit event ownership was rejected");
+        }
+        {
+            const ValidationResult validation = validate(
+                makeCommitEventOwnershipModel(
+                    CommitEventOwnershipViolation::ResultWriter),
+                ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(validation,
+                               "non-Changed instruction result writer"))
+            {
+                return fail("commit event result aliases must be rejected");
+            }
+        }
+        {
+            const ValidationResult validation = validate(
+                makeCommitEventOwnershipModel(
+                    CommitEventOwnershipViolation::StateTarget),
+                ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(validation, "commit event is a state write target"))
+            {
+                return fail("commit event state targets must be rejected");
+            }
+        }
+        return 0;
+    }
+
 } // namespace
 
 int main()
@@ -1469,6 +1690,14 @@ int main()
         return result;
     }
     if (const int result = testBaselineActivityScheduleMaterializesProgramSemantics(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testCommitPlanValidationRejectsAmbiguousBatches(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testCommitEventOwnershipValidation(); result != 0)
     {
         return result;
     }

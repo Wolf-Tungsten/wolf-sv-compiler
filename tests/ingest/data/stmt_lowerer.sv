@@ -489,6 +489,7 @@ endmodule
 import "DPI-C" function void dpi_capture(input logic [3:0] in_val,
                                          output logic [3:0] out_val);
 import "DPI-C" function int dpi_sum(input int a, input int b);
+import "DPI-C" function longint difftest_ram_read(input longint rIdx);
 
 module stmt_lowerer_display(
     input logic clk,
@@ -535,6 +536,19 @@ module stmt_lowerer_dpi_return(
 );
     always_ff @(posedge clk) begin
         dpi_sum(a, b);
+    end
+endmodule
+
+module stmt_lowerer_dpi_comb_return(
+    input logic r_enable,
+    input logic [63:0] r_index,
+    output logic [63:0] r_data
+);
+    always @(*) begin
+        r_data = 64'b0;
+        if (r_enable) begin
+            r_data = difftest_ram_read(r_index);
+        end
     end
 endmodule
 

@@ -39,15 +39,19 @@ normalized GRH
 > 独占/epoch 契约、B0 activation target 到实际 reader 的完整性、边沿分支的联合完备性和
 > ordered-effect 完整性证明。
 
-> 实现进展（2026-07-22）：完整 XiangShan `SimTop` 已通过 concrete lowering、production
-> scheduling 和一次历史 AM full emit。该历史测量的规模为 5,080,563 条 linear AM 指令、
-> 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 changed detector；当时
-> 生成的是 1,679,120,625-byte 的单一 C++ TU。此后 production scheduler 已采用 typed AM
-> compute/commit/isolated atom 策略，C++ emitter 已改为 staged multi-TU shard 输出，生成
-> runtime 已改为有序 packed activity bitset 和 dirty changed-result 清理。尚未用这版代码
-> 重新 full-emit SimTop，也尚未编译全部 shard、链接 AM XiangShan emu 或运行
-> 100/2k/20k/50k difftest。当前权威进度和剩余 gates 记录在
+> 实现进展（2026-07-25）：production scheduler 已删除 `Isolated` class，commit write
+> 已采用 consume-on-event，wide-result shift 已在执行前按 result 宽度扩展 lhs。
+> fresh XiangShan `SimTop` v8 产品包含 4,950,236 条 linear 指令、37,461 个 normal
+> Block 加 B0、8,992,117 条 scheduled 指令和 1,875,970 个 detector。CoreMark/NEMU
+> 已严格按 2k -> 20k -> 50k 运行，三档全部通过；50k 结果为
+> `instrCnt=73580, cycleCnt=49996, guestCycles=50001`。功能 gate 已关闭，但 host time
+> 为 4,178,703 ms，尚未达到旧基线的 355,000 ms 性能目标。
+> 当前权威进度和剩余 gates 记录在
 > `pdocs/grh_notepad/notes/00/000-099/NO00030_grhsim_am_pipeline_framework_20260722.md`。
+
+> 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
+> 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
+> 1,679,120,625-byte C++ TU。这些数字仅保留为旧 emitter/scheduler 证据，不是当前结果。
 
 当前 scaffold 已包含 `BaselineActivityScheduleStage`，用于尽早贯通强类型阶段 API 和
 ScheduledProgram validator。它采用受限的 smoke 桥接布局：
@@ -114,6 +118,14 @@ LinearProgramArtifact
 `dpi.call` 和 system instruction 在这一层已经使用 AM opcode、VarId、Type 和 Attribute
 表达。不得保留 GRH `Operation*`、`Value*`、symbol 字符串查找或“到 emitter 再解释”的
 GRH attribute。
+
+移位必须在 lowering 边界完成原生 Type 规整。对 `kShl`、`kLShr` 和 `kAShr`，
+原生 AM shift Type 为 `BV<width(GRH result), signedness(lhs)>`；先把 lhs resize/coerce 到
+该 Type，再执行 shift，使 AM result 与 lhs Type 完全一致。若映射后的 GRH
+result Signedness 不同，shift 先写入原生 temporary，再由 `assign` 写入 result。
+禁止先按 lhs 原宽执行 shift 再扩宽，因为扩宽无法恢复已经截掉的高位；
+`kAShr` 也不能采用 result Signedness，否则 signed lhs/unsigned result 会把算术右移
+退化成逻辑右移。
 
 LinearProgram 中可以已有表达 GRH raw event 的 `changed.any/pos/neg`；它们必须已经拥有
 类型正确且独占的 old/event Variable。`act.f/act.b` 因为引用尚不存在的 BlockId，在这一
@@ -251,10 +263,14 @@ Scheduler 按以下阶段工作，每一阶段只保留下一阶段需要的事�
 
 1. 校验并 freeze LinearProgram；在上述 single-result-writer normal form 上建立
    definition、uses、state/memory access、effect order 和 interface input reader 索引。
-2. 将必须一起执行的 instruction 收缩为 scheduling atom。event consumer、不可拆分的
-   memory intent、ordered DPI/system call 和多写 priority 在这里形成硬约束。
-3. 对依赖做 SCC/环检查，构造 condensation DAG；不能被 AM epoch 语义合法表达的组合环
-   必须诊断，不能靠原始 instruction 顺序碰运气。
+2. 将 event consumer、memory intent、DPI/system/effect 顺序和多写 priority 表示为有向
+   依赖/顺序边。它们是必须保持的约束，但不因而要求两端属于同一个 scheduling atom；合法时
+   可以跨 atom 和 Block。
+3. 对该依赖图做 SCC/环检查并构造 condensation DAG。condensation DAG 的顶点才是
+   indivisible scheduling atom；不能被 AM epoch 语义合法表达的组合环必须诊断，不能靠原始
+   instruction 顺序碰运气。当前 production scheduler 不使用任何 SCC 之外的 atom
+   contraction；未来若提出 typed contraction rule，必须另行定义和验证，不能改变这里记录的
+   当前事实。
 4. 按 cost、局部性和硬上限把 atom 划为普通 block；先形成稳定拓扑序，再连续编号为
    `B1...Bn`。
 5. 对跨 block 的可观察 value 变化创建或复用 watch。pure value 只有在 source Block、
@@ -274,16 +290,158 @@ Scheduler 按以下阶段工作，每一阶段只保留下一阶段需要的事�
 把 `changed.old = current` 的初始化偷偷加入 Program；规范要求 old 使用 `undef`，首次
 event 及其影响可能是 AM 层未定义行为。
 
-当前 production scheduler 的第一阶段采用保守的两类装桶策略。它把 AM atom 分为 compute、
-commit 和 isolated：纯计算与 state read 是 compute；带 state target 的 reg/latch/memory
-write 是 commit；host call 和 raw `changed` 暂为 isolated。Kahn ready 集合只在同类 atom
-之间连续装桶，因此不会违反已经建立的 def-use 或 ordered-effect 边。compute 使用
-`maxInstructionsPerBlock`，commit 使用独立的 `maxCommitInstructionsPerBlock`（默认 4096），
-并同时受 `maxStateWritesPerBlock` 限制；不可拆 atom 超限时保留为一个 oversized Block 并报告
-诊断。commit 的跨 target 合并只改变活动粒度，不改变 block 内的拓扑/effect 次序；同一 target
-的 watcher 仍只在 final write frontier 物化。这个阶段刻意不复制 legacy source，也不按
-Graph symbol/string 推断 guard。memory alias、宽值成本和更精细的 cone/chain coarsen 只能在
-AM typed facts 足够并经 differential gate 验证后加入。
+当前 production scheduler 只采用 compute 和 commit 两类装桶。Indivisible atom 严格等于
+instruction dependency graph 的一个 SCC；singleton SCC 就是一个 atom，不存在其他非 SCC
+收缩规则。纯计算、state read、raw `changed`、DPI/system call 和 `SystemFunction` 都属于
+compute；带 state target 的 reg/latch/memory write 属于 commit。DPI/system/effect 顺序和同
+target 多写 priority 只形成有向边，不会把有序序列或 writers 收缩为一个 atom。
+
+Kahn ready 集合只在同类 atom 之间连续装桶，因此不会违反已经建立的 def-use 或 ordered-effect
+边。compute 使用 `maxInstructionsPerBlock`，commit 使用独立的
+`maxCommitInstructionsPerBlock`（默认 4096），并同时受 `maxStateWritesPerBlock` 限制；真正的
+SCC atom 超限时保留为一个 oversized Block 并报告诊断。commit 跨 target 合并只改变活动粒度，
+不改变 Block 内拓扑/effect 次序。同一 target 多写只在 final scheduled writer frontier 物化一个
+watcher；若 earlier writer 与 final writer 跨 Block，earlier writer 在运行时先用
+`reduce.or` 把局部 guard snapshot 规范化为 unsigned one-bit event，再用 `act.f` 激活
+final frontier。
+
+`RegisterWrite`、`MemoryWrite` 和 `MemoryFill` 的 commit event 采用
+**consume-on-event**，不是 complete-on-write。某条 commit 指令在一次 `eval()` 中观察到
+任一触发 event 后，该 event 实例即对该指令消费；同一 event 的其他 consumer 仍可各自观察
+它。随后 guard 为 false、`MemoryWrite` address 越界或 write mask 为零，只表示这次不改变
+state/memory，不能把已观察到的旧 event 保留到新的 operand capture 后重放。只有新的 event
+实例才能提供下一次写入机会。这个规则与产生 Result 的 DPI 所使用的 Pending host-event
+生命周期不同。
+
+本轮对 XiangShan commit 路径的定位确认，block 36995 的 guard/address operands 在每个
+新 activation batch 都会重新 capture，不存在旧 operand capture 复用。真正跨批保留的是
+pending event；把该旧 event 恢复后再与新 operands 组合判断，正是 consume-on-event
+所禁止的重放。operand capture 的批次边界仍是独立的不变量。
+
+### 3.2.1 已实施（2026-07-23）：移除 `isolated` class
+
+`isolated` 是旧实现的保守策略，不是 AM 语义。当前 production scheduler 已删除
+`BlockClass::Isolated`、独立 ready queue、`isolated_blocks` 统计以及禁止合块分支。所有非
+commit host instruction，包括 `SystemFunction`，进入 compute phase，并可在正常 cap 下与其他
+compute instruction 共用 Block。
+
+host instruction 保留其指令内的 firing predicate 和生命周期：`event_mode = immediate`
+的 `system.task`/`dpi.call` 按 `condition && ((E = 0) || OR(本次 events))` 判断，
+`event_mode = pending` 则把命中的 event 保留到同一次 `eval()` 的后续 epoch，直到调用
+成功；`system.task` 另按 Normal/Once/Final 生命周期执行。GRH lower 后的 system task 和
+无 Result observer DPI 使用 Immediate，产生 Result 的 DPI 使用 Pending。host 的执行机会
+现在继承合并后 Block 的联合 activation domain，不再继承一个私有 Block 边界。带 event 的
+task/DPI 可按对应 mode 过滤无关激活；eventless task/DPI 和 `SystemFunction` 则可能因同
+Block 其他成员的 activation 而增加调用次数。这正是当前
+“host 作为 compute 合块”策略的明确运行语义：组合活动 Block 被重新激活时可重复
+执行 `display`、function 或其他 host instruction，不因此恢复 `isolated`。可观察顺序由
+DPI/system/effect 有向边保持；与 lowering 前调用次数是否等价，仍须通过逐次
+call-trace differential gate 验证，不能仅由 ScheduledProgram 内部语义推导。
+
+production scheduler tests 已覆盖 implicit/explicit host sequence 的跨 Block 顺序与 cap 内合块、
+posedge host 与其他 compute instruction 共 Block，以及 `SystemFunction` 与其普通 producer
+合块后随输入变化重新调用。同 target writers 回归覆盖跨 commit Block 但只有一个
+final watcher、signed one-bit writer guard 的 unsigned event 规范化，以及 `ActBackward`
+下一 epoch 唤醒 earlier writer 后的同 epoch frontier 传播。
+另一个 interpreter regression 构造 `A -> B -> C` runtime frontier chain，其中 B 同时是一个
+target 的 final writer 和另一个 target 的 earlier writer，确认逐层 `act.f` 可在同 epoch 到 C，
+且 scheduler 不物化 `A -> C` 静态传递闭包。
+
+### 3.2.2 2026-07-23 post-`Isolated` XiangShan 实测
+
+完整 `SimTop` 在上述 scheduler 上重新完成 emit、model build 和 difftest emu link：
+
+```text
+linear AM instructions                   5,080,563
+SCC atoms                                5,080,563
+oversized atoms                                  0
+
+compute Blocks                              37,423
+commit Blocks                                  515
+input sink Block                                  1
+normal Blocks                               37,939
+normal Blocks plus B0                       37,940
+
+changed detectors                        2,022,159
+activation targets                       3,556,634
+writer-frontier activations                      0
+scheduled instructions                   9,532,818
+emitted artifacts                              411
+```
+
+本输入的 `writer-frontier activations=0` 不表示该机制不存在；上节所述 focused regressions 已
+直接覆盖 split same-target frontier。Full emit 用时 47.22 秒，peak RSS 28,458,200 KiB；model
+build 用时 15:20.43，archive 为 843 MiB，model directory 为 3.1 GiB；emu link 用时 1.68 秒，
+peak RSS 971,808 KiB，生成的 emu 文件为 503 MiB。
+
+CoreMark/NEMU 的新模型边界为：
+
+```text
+-C 100      PASS
+-C 571      PASS
+-C 572      FAIL, SIGSEGV
+-C 2000     FAIL, SIGSEGV
+first bad model tick approximately cycleCnt 568
+-C 20000    NOT RUN
+-C 50000    NOT RUN
+```
+
+因此 2k gate 明确失败，并与更小的 `-C 572` 失败边界一致；之后没有继续运行 20k/50k。
+
+### 3.2.3 2026-07-24/25 wide-result shift 修复后的 XiangShan 实测
+
+consume-on-event v7 产品已通过 2k，但在必须的 20k gate 中于
+`cycleCnt=8250` 失败；观测到的五条 RefillBuffer cache line 全为 0，因此当时
+没有越级运行 50k。失败的 GRH 链为 1-bit `SliceStatic` -> result 为 514-bit 的
+`Shl` -> 514-bit `MemoryWritePort`。旧 AM lowering 先在 1-bit lhs 宽度上执行
+shift，再扩宽到 514 bit，因而不可逆地丢失 bit 1..513。该 checkpoint 共有 5,400 个
+`kShl`，其中 3,376 个 result 比 lhs 宽，并包含 2,048 个 1 -> 514 形态。
+
+lowering 现在对 `kShl` / `kLShr` / `kAShr` 选择
+`BV<result width, lhs signedness>` 作为原生 Type，先 coerce lhs 再 shift；若映射后的
+GRH result Signedness 不同，则保留现有的后续 `assign`。常量折叠也采用相同的
+先 resize 后 shift 次序。fresh XiangShan JSON 中的 3,376 个 wide `kShl` 没有任何
+直接或递归常量 lhs，`kLShr` / `kAShr` 也没有 wide 形态，因此该相邻修复不改变
+本次 v8 产品内容。focused regression 覆盖 wide `Shl`、signed wide `LShr`、signed wide
+`AShr` 和同形状常量折叠；全部 8 个 `grhsim-am-*` CTest 和新注册的
+`transform-const-fold` 均通过。
+
+fresh v8 从 SHA-256
+`a2f50b37834dbf97be15f336a6e05ccc59f87a499187f2d15edd78dc1fd727ea` 的 post-stats JSON
+重新 lower/schedule/emit，并使用全新 model archive 和 emu：
+
+```text
+linear AM instructions                   4,950,236
+compute Blocks                              36,963
+commit Blocks                                  497
+input sink Block                                  1
+normal Blocks                               37,461
+normal Blocks plus B0                       37,462
+changed detectors                        1,875,970
+activation targets                       3,218,269
+commit groups                                    1
+commit operand captures                    256,085
+scheduled instructions                   8,992,117
+emitted artifacts                              426
+```
+
+保存的 lower 日志记录 lower/schedule/emit 用时 40.26 秒，peak RSS 28,027,228 KiB；
+当次 `/usr/bin/time -v` 终端记录的 model + emu build 用时为 6:19.79，peak RSS
+6,126,112 KiB（未另存 build time 日志）。fresh emu 的 SHA-256 为
+`addf9dccfdae7cd2c21620782b99faa2d817d5b1749ea5bd5f3e10f11957d212`。
+
+CoreMark/NEMU 严格在前一档通过后才启动下一档：
+
+```text
+-C 2000     PASS, instrCnt=3,     cycleCnt=1996,  host=140574 ms
+-C 20000    PASS, instrCnt=14121, cycleCnt=19996, host=1542760 ms
+-C 50000    PASS, instrCnt=73580, cycleCnt=49996, host=4178703 ms
+             guestCycles=50001, IPC=1.471718, exit=0
+```
+
+三档都保持 difftest 开启，没有 mismatch、refill failure、assertion 或 crash。50k 的
+instruction/cycle 计数与旧功能基线完全一致；但 host time 为 4,178,703 ms，约为
+355,000 ms 旧性能目标的 11.77 倍，因而本轮关闭的是功能 gate，不是性能 gate。
 
 ### 3.3 临时 scheduling facts
 

@@ -85,17 +85,43 @@ namespace wolvrix::lib::grhsim::am
         void clearAndRelease();
     };
 
+    struct PreCommitSnapshot
+    {
+        VariableId source;
+        VariableId target;
+    };
+
+    struct CommitOperandCapture
+    {
+        VariableId source;
+        VariableId target;
+    };
+
     struct LinearProgramArtifact
     {
         LinearProgram program;
         ProgramInterface interface;
         SchedulingFacts schedulingFacts;
+        std::vector<PreCommitSnapshot> preCommitSnapshots;
     };
 
     struct ExecutableModel
     {
         ScheduledProgram program;
         ProgramInterface interface;
+        // Production schedules place state commits in one contiguous phase.
+        // Zero denotes an unphased schedule; otherwise this is a half-open Block range.
+        uint32_t commitBlockBegin = 0;
+        uint32_t commitBlockEnd = 0;
+        // Blocks in one group are mutually dependent and commit together. Groups are
+        // ordered by commit -> compute -> commit activation dependencies.
+        std::vector<BlockId> commitBlockOrder;
+        std::vector<uint32_t> commitGroupOffsets;
+        std::vector<PreCommitSnapshot> preCommitSnapshots;
+        // Captures are grouped by commit Block in BlockId order. A pending Block is
+        // captured once after compute settles and before any Block in that batch commits.
+        std::vector<CommitOperandCapture> commitOperandCaptures;
+        std::vector<uint32_t> commitOperandCaptureOffsets;
     };
 
     ValidationResult validate(const ProgramInterface &interface,

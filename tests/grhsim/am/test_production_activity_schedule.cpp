@@ -2,8 +2,10 @@
 #include "grhsim/am/interpreter.hpp"
 #include "grhsim/am/production_activity_schedule.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <iostream>
 #include <optional>
 #include <span>
@@ -27,6 +29,29 @@ namespace
     {
         ProductionActivityScheduleStage scheduler;
         return scheduler.schedule(std::move(linear), options, diagnostics);
+    }
+
+    InstructionId addInstruction(ScheduledProgramBuilder &builder, Opcode opcode,
+                                 std::initializer_list<VariableId> results,
+                                 std::initializer_list<VariableId> operands)
+    {
+        return builder.addInstruction(
+            opcode, std::span<const VariableId>(results.begin(), results.size()),
+            std::span<const VariableId>(operands.begin(), operands.size()));
+    }
+
+    void addBlock(ScheduledProgramBuilder &builder,
+                  std::initializer_list<InstructionId> instructions)
+    {
+        builder.addBlock(
+            std::span<const InstructionId>(instructions.begin(), instructions.size()));
+    }
+
+    void setTargets(ScheduledProgramBuilder &builder, InstructionId instruction,
+                    std::initializer_list<BlockId> targets)
+    {
+        builder.setActivationTargets(
+            instruction, std::span<const BlockId>(targets.begin(), targets.size()));
     }
 
     std::optional<BlockId> findInstructionBlock(const ExecutableModel &model,
@@ -61,6 +86,37 @@ namespace
                     return true;
                 }
             }
+        }
+        return false;
+    }
+
+    bool hasLocalGuardedForwardActivation(const ExecutableModel &model, BlockId block,
+                                          InstructionId writer, BlockId expectedTarget)
+    {
+        const ProgramView view = model.program.view();
+        for (std::size_t position = 2; position < model.program.blockSize(block); ++position) {
+            if (model.program.blockInstruction(block, position) != writer) {
+                continue;
+            }
+            const InstructionId snapshot =
+                model.program.blockInstruction(block, position - 2);
+            const InstructionId activation =
+                model.program.blockInstruction(block, position - 1);
+            if (view.opcode(snapshot) != Opcode::ReduceOr ||
+                view.opcode(activation) != Opcode::ActForward) {
+                return false;
+            }
+            const auto snapshotOperands = view.operands(snapshot);
+            const auto snapshotResults = view.results(snapshot);
+            const auto writerOperands = view.operands(writer);
+            const auto activationOperands = view.operands(activation);
+            const auto activationAttributes = view.activationAttributes(activation);
+            return snapshotOperands.size() == 1 && !writerOperands.empty() &&
+                   snapshotOperands.front() == writerOperands.front() &&
+                   snapshotResults.size() == 1 && activationOperands.size() == 1 &&
+                   activationOperands.front() == snapshotResults.front() &&
+                   activationAttributes && activationAttributes->targets.size() == 1 &&
+                   activationAttributes->targets.front() == expectedTarget;
         }
         return false;
     }
@@ -287,7 +343,7 @@ namespace
         }
         if (detectorBlockCount != 3 ||
             !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
-            return fail("independent changed detectors retained isolated one-instruction blocks");
+            return fail("independent changed detectors did not coarsen into cap-bounded Blocks");
         }
         return 0;
     }
@@ -351,25 +407,77 @@ namespace
                                                             .enableCoarsening = false,
                                                         },
                                                         diagnostics);
-        if (!model || diagnostics.hasError() || model->program.blockCount() != 3) {
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 4) {
             return fail("production scheduler rejected a valid host interaction");
         }
-        bool sawOrderedPair = false;
-        bool sawTask = false;
-        for (uint32_t block = 1; block < model->program.blockCount(); ++block) {
-            if (model->program.blockSize(BlockId{block}) >= 2 &&
-                model->program.blockInstruction(BlockId{block}, 0) == second &&
-                model->program.blockInstruction(BlockId{block}, 1) == first) {
-                sawOrderedPair = true;
-            }
-            if (model->program.blockSize(BlockId{block}) >= 1 &&
-                model->program.blockInstruction(BlockId{block}, 0) == task) {
-                sawTask = true;
+        const std::optional<BlockId> firstBlock = findInstructionBlock(*model, first);
+        const std::optional<BlockId> secondBlock = findInstructionBlock(*model, second);
+        const std::optional<BlockId> taskBlock = findInstructionBlock(*model, task);
+        if (!firstBlock || !secondBlock || !taskBlock || *secondBlock >= *firstBlock ||
+            *taskBlock == *firstBlock || *taskBlock == *secondBlock ||
+            !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
+            return fail("host ordered-effect edges did not preserve ordinal order across Blocks");
+        }
+        return 0;
+    }
+
+    int testInstructionCannotJoinMultipleExplicitOrderGroups()
+    {
+        LinearProgramBuilder builder;
+        const TypeId eventType = builder.addType(Type::bitVector(1));
+        const StringId taskName = builder.addString("multi_group_host_effect");
+        const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
+        const std::array<VariableId, 1> operands = {condition};
+        const InstructionId repeated =
+            builder.addInstruction(Opcode::SystemTask, {}, operands);
+        builder.setSystemTaskAttributes(repeated, SystemTaskAttributes{
+                                                       .name = taskName,
+                                                       .eventCount = 0,
+                                                       .schedule = CallSchedule::Normal,
+                                                   });
+        const InstructionId intervening =
+            builder.addInstruction(Opcode::SystemTask, {}, operands);
+        builder.setSystemTaskAttributes(intervening, SystemTaskAttributes{
+                                                          .name = taskName,
+                                                          .eventCount = 0,
+                                                          .schedule = CallSchedule::Normal,
+                                                      });
+
+        SchedulingFacts facts;
+        facts.variableRoles = {VariableRole::None};
+        facts.instructionEffects = {
+            InstructionEffect::HostEffect,
+            InstructionEffect::HostEffect,
+        };
+        facts.orderedEffects = {
+            OrderedEffect{.instruction = repeated, .group = 5, .ordinal = 0},
+            OrderedEffect{.instruction = intervening, .group = 6, .ordinal = 0},
+            OrderedEffect{.instruction = repeated, .group = 7, .ordinal = 0},
+        };
+        LinearProgramArtifact linear{
+            .program = builder.finish(),
+            .schedulingFacts = std::move(facts),
+        };
+
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        std::optional<ExecutableModel> model = schedule(
+            std::move(linear),
+            ActivityScheduleOptions{
+                .maxInstructionsPerBlock = 8,
+                .enableCoarsening = true,
+            },
+            diagnostics);
+        bool sawMultipleGroupError = false;
+        for (const wolvrix::lib::diag::Diagnostic &message : diagnostics.messages()) {
+            if (message.kind == wolvrix::lib::diag::DiagnosticKind::Error &&
+                message.message ==
+                    "AM instruction appears in multiple explicit ordered-effect groups: "
+                    "instruction=0 first_group=5 second_group=7") {
+                sawMultipleGroupError = true;
             }
         }
-        if (!sawOrderedPair || !sawTask ||
-            !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
-            return fail("host ordered-effect atoms did not preserve ordinal order");
+        if (model || !diagnostics.hasError() || !sawMultipleGroupError) {
+            return fail("one instruction was accepted in multiple explicit order groups");
         }
         return 0;
     }
@@ -411,26 +519,147 @@ namespace
                 .collectStats = true,
             },
             diagnostics);
-        if (!model || diagnostics.hasError() || model->program.blockCount() != hostCount + 1) {
-            return fail("implicit host order collapsed into an oversized scheduling atom");
+        constexpr uint32_t expectedHostBlocks = hostCount / 8;
+        if (!model || diagnostics.hasError() ||
+            model->program.blockCount() != expectedHostBlocks + 1) {
+            return fail("implicit host order did not coarsen into cap-bounded compute Blocks");
         }
 
-        BlockId previous = BlockId{0};
-        for (InstructionId task : tasks) {
-            const std::optional<BlockId> block = findInstructionBlock(*model, task);
-            if (!block || *block <= previous || model->program.blockSize(*block) != 1) {
-                return fail("implicit host execution order is not monotonic across blocks");
+        for (uint32_t index = 0; index < tasks.size(); ++index) {
+            const BlockId expectedBlock{index / 8 + 1};
+            const std::optional<BlockId> block = findInstructionBlock(*model, tasks[index]);
+            if (!block || *block != expectedBlock ||
+                model->program.blockInstruction(expectedBlock, index % 8) != tasks[index]) {
+                return fail("implicit host execution order was not preserved while coarsening");
             }
-            previous = *block;
         }
+        bool sawZeroOversizedAtoms = false;
         for (const wolvrix::lib::diag::Diagnostic &message : diagnostics.messages()) {
             if (message.kind == wolvrix::lib::diag::DiagnosticKind::Warning &&
                 message.message.find("indivisible AM scheduling atoms") != std::string::npos) {
                 return fail("implicit host chain was reported as an oversized atom");
             }
+            if (message.kind == wolvrix::lib::diag::DiagnosticKind::Info &&
+                message.message.find("oversized_atoms=0") != std::string::npos) {
+                sawZeroOversizedAtoms = true;
+            }
         }
-        if (!validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
+        if (!sawZeroOversizedAtoms ||
+            !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
             return fail("implicit host chain schedule is not semantically valid");
+        }
+        return 0;
+    }
+
+    class EchoSystemFunctionHost final : public HostEnvironment
+    {
+    public:
+        bool resolveSystemFunction(ProgramView, InstructionId, std::string &) override
+        {
+            return true;
+        }
+
+        bool invokeSystemFunction(ProgramView, InstructionId,
+                                  std::span<const InterpreterValue> arguments,
+                                  InterpreterValue &result, std::string &error) override
+        {
+            if (arguments.size() != 1) {
+                error = "expected one system-function argument";
+                return false;
+            }
+            ++calls;
+            lastArgument = arguments.front().lowWord();
+            const std::array<uint64_t, 1> words = {lastArgument};
+            result = InterpreterValue::bitVector(8, Signedness::Unsigned, words);
+            return true;
+        }
+
+        uint64_t calls = 0;
+        uint64_t lastArgument = 0;
+    };
+
+    int testSystemFunctionCoarsensWithProducerAndReschedules()
+    {
+        LinearProgramBuilder builder;
+        const TypeId valueType = builder.addType(Type::bitVector(8));
+        const StringId inputName = builder.addString("input");
+        const StringId functionName = builder.addString("echo");
+        const VariableId input = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId produced = builder.addVariable(valueType, builder.undefInit());
+        const VariableId result = builder.addVariable(valueType, builder.undefInit());
+
+        const std::array<VariableId, 1> producerResults = {produced};
+        const std::array<VariableId, 1> producerOperands = {input};
+        const InstructionId producer =
+            builder.addInstruction(Opcode::Assign, producerResults, producerOperands);
+        const std::array<VariableId, 1> functionResults = {result};
+        const std::array<VariableId, 1> functionOperands = {produced};
+        const InstructionId function =
+            builder.addInstruction(Opcode::SystemFunction, functionResults, functionOperands);
+        builder.setSystemFunctionAttributes(function, SystemFunctionAttributes{
+                                                          .name = functionName,
+                                                          .schedule = CallSchedule::Normal,
+                                                          .hasSideEffects = false,
+                                                      });
+
+        ProgramInterface interface;
+        interface.ports = {
+            PortBinding{
+                .name = inputName,
+                .direction = PortDirection::Input,
+                .input = input,
+            },
+        };
+        SchedulingFacts facts;
+        facts.variableRoles = {
+            VariableRole::ExternalInput,
+            VariableRole::None,
+            VariableRole::None,
+        };
+        facts.instructionEffects = {
+            InstructionEffect::Pure,
+            InstructionEffect::HostRead,
+        };
+        LinearProgramArtifact linear{
+            .program = builder.finish(),
+            .interface = std::move(interface),
+            .schedulingFacts = std::move(facts),
+        };
+
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        std::optional<ExecutableModel> model = schedule(
+            std::move(linear),
+            ActivityScheduleOptions{
+                .maxInstructionsPerBlock = 2,
+                .enableCoarsening = true,
+            },
+            diagnostics);
+        const std::optional<BlockId> producerBlock =
+            model ? findInstructionBlock(*model, producer) : std::nullopt;
+        const std::optional<BlockId> functionBlock =
+            model ? findInstructionBlock(*model, function) : std::nullopt;
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 2 ||
+            !producerBlock || !functionBlock || *producerBlock != *functionBlock ||
+            model->program.blockInstruction(*producerBlock, 0) != producer ||
+            model->program.blockInstruction(*producerBlock, 1) != function ||
+            !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
+            return fail("SystemFunction did not coarsen with its ordinary compute producer");
+        }
+
+        EchoSystemFunctionHost host;
+        Interpreter interpreter(*model, &host);
+        if (!interpreter.ready() || !interpreter.eval().success() || host.calls != 1 ||
+            host.lastArgument != 0 || interpreter.value(result).lowWord() != 0) {
+            return fail("coarsened SystemFunction did not run during the initial eval");
+        }
+        const std::array<uint64_t, 1> changedWords = {0x5a};
+        if (!interpreter
+                 .write(input,
+                        InterpreterValue::bitVector(8, Signedness::Unsigned, changedWords))
+                 .success() ||
+            !interpreter.eval().success() || host.calls != 2 || host.lastArgument != 0x5a ||
+            interpreter.value(result).lowWord() != 0x5a) {
+            return fail("reactivated compute Block did not rerun and update SystemFunction");
         }
         return 0;
     }
@@ -489,7 +718,8 @@ namespace
 
         const std::array<VariableId, 1> edgeResults = {posedge};
         const std::array<VariableId, 2> edgeOperands = {clock, clockOld};
-        builder.addInstruction(Opcode::ChangedPos, edgeResults, edgeOperands);
+        const InstructionId detector =
+            builder.addInstruction(Opcode::ChangedPos, edgeResults, edgeOperands);
         const std::array<VariableId, 5> writeOperands = {
             enabled, mask, data, state, posedge,
         };
@@ -537,11 +767,13 @@ namespace
         std::optional<ExecutableModel> model = schedule(
             std::move(linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 1,
+                .maxInstructionsPerBlock = 2,
                 .maxCommitInstructionsPerBlock = 1,
-                .enableCoarsening = false,
+                .enableCoarsening = true,
             },
             diagnostics);
+        const std::optional<BlockId> detectorBlock =
+            model ? findInstructionBlock(*model, detector) : std::nullopt;
         const std::optional<BlockId> writerBlock =
             model ? findInstructionBlock(*model, writer) : std::nullopt;
         const std::optional<BlockId> taskBlock =
@@ -549,10 +781,11 @@ namespace
         if (!model || diagnostics.hasError()) {
             return fail("posedge host-before-commit fixture was rejected by the scheduler");
         }
-        if (!writerBlock || !taskBlock || writer.value >= task.value ||
-            *taskBlock >= *writerBlock ||
+        if (!detectorBlock || !writerBlock || !taskBlock || *detectorBlock != *taskBlock ||
+            *taskBlock >= *writerBlock || model->commitBlockBegin != writerBlock->value ||
+            model->commitBlockEnd != writerBlock->value + 1U ||
             !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
-            return fail("posedge host effect was not scheduled before register commit");
+            return fail("posedge detector and host effect did not coarsen before register commit");
         }
 
         StateObservingHost host;
@@ -570,6 +803,159 @@ namespace
         if (!result.success() || host.calls != 1 || host.observedState != 1 ||
             interpreter.value(state).lowWord() != 0) {
             return fail("host effect did not observe old state before the posedge commit");
+        }
+        return 0;
+    }
+
+    int testCommitWaitsForBackwardComputeAndConsumesEdgeOnce()
+    {
+        LinearProgramBuilder linear;
+        const TypeId eventType = linear.addType(Type::bitVector(1));
+        const TypeId valueType = linear.addType(Type::bitVector(8));
+        const auto addConstant = [&linear](TypeId type, uint64_t value) {
+            const std::array<uint64_t, 1> words = {value};
+            return linear.addVariable(
+                type, linear.addConstantInit(linear.addBitLiteral(type, words)));
+        };
+
+        const VariableId clock = linear.addVariable(eventType, linear.zeroInit());
+        const VariableId entryOld = linear.addVariable(eventType, linear.undefInit());
+        const VariableId entryEvent = linear.addVariable(eventType, linear.zeroInit());
+        const VariableId clockOld = linear.addVariable(eventType, linear.undefInit());
+        const VariableId posedge = linear.addVariable(eventType, linear.zeroInit());
+        const VariableId payload = linear.addVariable(valueType, linear.zeroInit());
+        const VariableId capturedPayload = linear.addVariable(valueType, linear.zeroInit());
+        const VariableId capturedOld = linear.addVariable(valueType, linear.undefInit());
+        const VariableId capturedChanged = linear.addVariable(eventType, linear.zeroInit());
+        const VariableId lateData = linear.addVariable(valueType, linear.zeroInit());
+        const VariableId lateOld = linear.addVariable(valueType, linear.undefInit());
+        const VariableId lateChanged = linear.addVariable(eventType, linear.zeroInit());
+        const VariableId state = linear.addVariable(valueType, linear.zeroInit());
+        const VariableId nextState = linear.addVariable(valueType, linear.zeroInit());
+        const VariableId stateOld = linear.addVariable(valueType, linear.undefInit());
+        const VariableId stateChanged = linear.addVariable(eventType, linear.zeroInit());
+        const VariableId commitCount = linear.addVariable(valueType, linear.zeroInit());
+        const VariableId nextCommitCount = linear.addVariable(valueType, linear.zeroInit());
+        const VariableId captureCommitCount =
+            linear.addVariable(valueType, linear.zeroInit());
+        const VariableId nextCaptureCommitCount =
+            linear.addVariable(valueType, linear.zeroInit());
+        const VariableId one = addConstant(eventType, 1);
+        const VariableId oneValue = addConstant(valueType, 1);
+        const VariableId mask = addConstant(valueType, 0xff);
+
+        const InstructionId watchClock =
+            linear.addInstruction(Opcode::ChangedAny, std::array{entryEvent},
+                                  std::array{clock, entryOld});
+        const InstructionId detectPosedge =
+            linear.addInstruction(Opcode::ChangedPos, std::array{posedge},
+                                  std::array{clock, clockOld});
+        const InstructionId updateLateData =
+            linear.addInstruction(Opcode::Assign, std::array{lateData},
+                                  std::array{capturedPayload});
+        const InstructionId detectLateData =
+            linear.addInstruction(Opcode::ChangedAny, std::array{lateChanged},
+                                  std::array{lateData, lateOld});
+        const InstructionId addState =
+            linear.addInstruction(Opcode::Add, std::array{nextState},
+                                  std::array{state, lateData});
+        const InstructionId addCommitCount =
+            linear.addInstruction(Opcode::Add, std::array{nextCommitCount},
+                                  std::array{commitCount, oneValue});
+        const InstructionId addCaptureCommitCount =
+            linear.addInstruction(Opcode::Add, std::array{nextCaptureCommitCount},
+                                  std::array{captureCommitCount, oneValue});
+        const InstructionId commit =
+            linear.addInstruction(Opcode::RegisterWrite, {},
+                                  std::array{one, mask, nextState, state, posedge});
+        const InstructionId countCommit =
+            linear.addInstruction(Opcode::RegisterWrite, {},
+                                  std::array{one, mask, nextCommitCount, commitCount, posedge});
+        const InstructionId countCaptureCommit =
+            linear.addInstruction(
+                Opcode::RegisterWrite, {},
+                std::array{one, mask, nextCaptureCommitCount,
+                           captureCommitCount, posedge});
+        const InstructionId capturePayload =
+            linear.addInstruction(Opcode::RegisterWrite, {},
+                                  std::array{one, mask, payload, capturedPayload, posedge});
+        const InstructionId detectCaptured =
+            linear.addInstruction(Opcode::ChangedAny, std::array{capturedChanged},
+                                  std::array{capturedPayload, capturedOld});
+        const InstructionId detectState =
+            linear.addInstruction(Opcode::ChangedAny, std::array{stateChanged},
+                                  std::array{state, stateOld});
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        const InstructionId enterEdge =
+            addInstruction(scheduled, Opcode::ActForward, {}, {entryEvent});
+        const InstructionId activateCommit =
+            addInstruction(scheduled, Opcode::ActForward, {}, {posedge});
+        const InstructionId activateCapture =
+            addInstruction(scheduled, Opcode::ActForward, {}, {posedge});
+        const InstructionId activateLateData =
+            addInstruction(scheduled, Opcode::ActBackward, {}, {capturedChanged});
+        const InstructionId reactivateCommit =
+            addInstruction(scheduled, Opcode::ActForward, {}, {lateChanged});
+        const InstructionId reactivateCapture =
+            addInstruction(scheduled, Opcode::ActBackward, {}, {stateChanged});
+        setTargets(scheduled, enterEdge, {BlockId{1}});
+        setTargets(scheduled, activateCommit, {BlockId{3}});
+        setTargets(scheduled, activateCapture, {BlockId{4}});
+        setTargets(scheduled, activateLateData, {BlockId{2}});
+        setTargets(scheduled, reactivateCommit, {BlockId{3}});
+        setTargets(scheduled, reactivateCapture, {BlockId{4}});
+        addBlock(scheduled, {watchClock, enterEdge});
+        addBlock(scheduled, {detectPosedge, activateCommit, activateCapture});
+        addBlock(scheduled, {updateLateData, detectLateData, reactivateCommit});
+        addBlock(scheduled, {addState, addCommitCount, commit, countCommit,
+                             detectState, reactivateCapture});
+        addBlock(scheduled, {addCaptureCommitCount, capturePayload,
+                             countCaptureCommit, detectCaptured,
+                             activateLateData});
+
+        ExecutableModel model{
+            .program = scheduled.finish(),
+            .interface = {},
+            .commitBlockBegin = 3,
+            .commitBlockEnd = 5,
+            .commitBlockOrder = {BlockId{4}, BlockId{3}},
+            .commitGroupOffsets = {0, 1, 2},
+        };
+        if (!validate(model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
+            return fail("late-data commit regression model is invalid");
+        }
+
+        Interpreter interpreter(model);
+        const std::array<uint64_t, 1> high = {1};
+        const std::array<uint64_t, 1> payloadWords = {0x5a};
+        if (!interpreter.ready() || !interpreter.eval().success() ||
+            !interpreter
+                 .write(payload,
+                        InterpreterValue::bitVector(8, Signedness::Unsigned, payloadWords))
+                 .success() ||
+            !interpreter
+                 .write(clock,
+                        InterpreterValue::bitVector(1, Signedness::Unsigned, high))
+                 .success()) {
+            return fail("late-data commit regression could not enter its edge eval");
+        }
+
+        const InterpreterResult result = interpreter.eval();
+        if (!result.success() || result.epochsExecuted != 3 ||
+            interpreter.epochCounter() != 2 ||
+            interpreter.value(lateData).lowWord() != 0x5a ||
+            interpreter.value(state).lowWord() != 0x5a ||
+            interpreter.value(commitCount).lowWord() != 1 ||
+            interpreter.value(captureCommitCount).lowWord() != 1 ||
+            interpreter.value(posedge).lowWord() != 0) {
+            return fail("commit did not wait for backward compute or consumed its edge repeatedly");
+        }
+        const InterpreterResult stable = interpreter.eval();
+        if (!stable.success() || stable.epochsExecuted != 0 ||
+            interpreter.value(state).lowWord() != 0x5a ||
+            interpreter.value(commitCount).lowWord() != 1) {
+            return fail("deferred commit edge leaked into a later eval");
         }
         return 0;
     }
@@ -639,7 +1025,7 @@ namespace
         return 0;
     }
 
-    int testMemoryWritersShareOneOrderedAtom()
+    int testMemoryWritersRemainOrderedWithoutAtomContraction()
     {
         LinearProgramBuilder builder;
         const TypeId eventType = builder.addType(Type::bitVector(1));
@@ -684,11 +1070,16 @@ namespace
                                                             .enableCoarsening = false,
                                                         },
                                                         diagnostics);
-        if (!model || diagnostics.hasError() || model->program.blockCount() != 2 ||
-            model->program.blockSize(BlockId{1}) != 2 ||
-            model->program.blockInstruction(BlockId{1}, 0) != second ||
-            model->program.blockInstruction(BlockId{1}, 1) != first) {
-            return fail("same-memory writers were not kept at one ordered final frontier");
+        const std::optional<BlockId> secondBlock =
+            model ? findInstructionBlock(*model, second) : std::nullopt;
+        const std::optional<BlockId> firstBlock =
+            model ? findInstructionBlock(*model, first) : std::nullopt;
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 3 ||
+            !secondBlock || !firstBlock || *secondBlock != BlockId{1} ||
+            *firstBlock != BlockId{2} ||
+            !hasActivationTarget(*model, *secondBlock, Opcode::ActForward, *firstBlock) ||
+            !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
+            return fail("same-memory writer dependency did not remain ordered across Blocks");
         }
         return 0;
     }
@@ -752,7 +1143,7 @@ namespace
         };
     }
 
-    int testOrderedStateAndMemoryWritesShareOneCommitBucket()
+    int testOrderedStateAndMemoryWritesRemainSeparateWithoutCoarsening()
     {
         OrderedCommitFixture fixture = makeStateAndMemoryCommit(true);
         wolvrix::lib::diag::Diagnostics diagnostics;
@@ -765,12 +1156,11 @@ namespace
                 .enableCoarsening = false,
             },
             diagnostics);
-        if (!model || diagnostics.hasError() || model->program.blockCount() != 2 ||
-            model->program.blockSize(BlockId{1}) != 2 ||
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 3 ||
             model->program.blockInstruction(BlockId{1}, 0) != fixture.registerWrite ||
-            model->program.blockInstruction(BlockId{1}, 1) != fixture.memoryWrite ||
+            model->program.blockInstruction(BlockId{2}, 0) != fixture.memoryWrite ||
             !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
-            return fail("ordered state and memory writes did not remain in one commit bucket");
+            return fail("ordered state and memory writes did not remain separate ordered atoms");
         }
         return 0;
     }
@@ -988,7 +1378,7 @@ namespace
         return 0;
     }
 
-    int testOversizedOrderedCommitAtomSurvivesCommitCap()
+    int testOrderedCommitChainSplitsAtCommitCap()
     {
         OrderedCommitFixture fixture = makeStateAndMemoryCommit(true);
         wolvrix::lib::diag::Diagnostics diagnostics;
@@ -1002,34 +1392,34 @@ namespace
                 .collectStats = true,
             },
             diagnostics);
-        if (!model || diagnostics.hasError() || model->program.blockCount() != 2 ||
-            model->program.blockSize(BlockId{1}) != 2 ||
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 3 ||
+            model->program.blockSize(BlockId{1}) != 1 ||
+            model->program.blockSize(BlockId{2}) != 1 ||
             model->program.blockInstruction(BlockId{1}, 0) != fixture.registerWrite ||
-            model->program.blockInstruction(BlockId{1}, 1) != fixture.memoryWrite) {
-            return fail("an indivisible ordered commit atom was split at the commit cap");
+            model->program.blockInstruction(BlockId{2}, 0) != fixture.memoryWrite) {
+            return fail("ordered commit edges did not split cleanly at the commit cap");
         }
 
-        bool sawOversizedWarning = false;
-        bool sawOversizedStats = false;
+        bool sawZeroOversizedStats = false;
         for (const wolvrix::lib::diag::Diagnostic &message : diagnostics.messages()) {
             if (message.kind == wolvrix::lib::diag::DiagnosticKind::Warning &&
-                message.message.find("count=1") != std::string::npos &&
-                message.message.find("first_instructions=2") != std::string::npos) {
-                sawOversizedWarning = true;
+                message.message.find("indivisible AM scheduling atoms") != std::string::npos) {
+                return fail("ordered commit chain was still reported as one oversized atom");
             }
             if (message.kind == wolvrix::lib::diag::DiagnosticKind::Info &&
-                message.message.find("oversized_atoms=1") != std::string::npos) {
-                sawOversizedStats = true;
+                message.message.find("oversized_atoms=0") != std::string::npos &&
+                message.message.find("max_atom_instructions=1") != std::string::npos) {
+                sawZeroOversizedStats = true;
             }
         }
-        if (!sawOversizedWarning || !sawOversizedStats ||
+        if (!sawZeroOversizedStats ||
             !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
-            return fail("oversized commit-cap atom reporting or semantics are incomplete");
+            return fail("commit-cap split statistics or semantics are incomplete");
         }
         return 0;
     }
 
-    int testCommitBucketExceedsStateWriteCapWithoutSplitting()
+    int testOrderedCommitChainSplitsAtStateWriteCap()
     {
         OrderedCommitFixture fixture = makeStateAndMemoryCommit(true);
         wolvrix::lib::diag::Diagnostics diagnostics;
@@ -1043,31 +1433,29 @@ namespace
                 .collectStats = true,
             },
             diagnostics);
-        if (!model || diagnostics.hasError() || model->program.blockCount() != 2 ||
-            model->program.blockSize(BlockId{1}) != 2 ||
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 3 ||
+            model->program.blockSize(BlockId{1}) != 1 ||
+            model->program.blockSize(BlockId{2}) != 1 ||
             model->program.blockInstruction(BlockId{1}, 0) != fixture.registerWrite ||
-            model->program.blockInstruction(BlockId{1}, 1) != fixture.memoryWrite) {
-            return fail("an oversized ordered commit bucket was split or reordered");
+            model->program.blockInstruction(BlockId{2}, 0) != fixture.memoryWrite) {
+            return fail("ordered commit edges did not split cleanly at the state-write cap");
         }
 
-        bool sawOversizedWarning = false;
-        bool sawOversizedStats = false;
+        bool sawZeroOversizedStats = false;
         for (const wolvrix::lib::diag::Diagnostic &message : diagnostics.messages()) {
             if (message.kind == wolvrix::lib::diag::DiagnosticKind::Warning &&
-                message.message.find("count=1") != std::string::npos &&
-                message.message.find("first_state_writes=2") != std::string::npos &&
-                message.message.find("max_atom_state_writes=2") != std::string::npos) {
-                sawOversizedWarning = true;
+                message.message.find("indivisible AM scheduling atoms") != std::string::npos) {
+                return fail("ordered state-write chain was still reported as one oversized atom");
             }
             if (message.kind == wolvrix::lib::diag::DiagnosticKind::Info &&
-                message.message.find("oversized_atoms=1") != std::string::npos &&
-                message.message.find("max_atom_state_writes=2") != std::string::npos) {
-                sawOversizedStats = true;
+                message.message.find("oversized_atoms=0") != std::string::npos &&
+                message.message.find("max_atom_state_writes=1") != std::string::npos) {
+                sawZeroOversizedStats = true;
             }
         }
-        if (!sawOversizedWarning || !sawOversizedStats ||
+        if (!sawZeroOversizedStats ||
             !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
-            return fail("oversized commit bucket reporting or semantics are incomplete");
+            return fail("state-write-cap split statistics or semantics are incomplete");
         }
         return 0;
     }
@@ -1147,7 +1535,7 @@ namespace
                 .enableCoarsening = false,
             },
             diagnostics);
-        if (!model || diagnostics.hasError() || model->program.blockCount() != 3) {
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 4) {
             return fail("memory reader and writers did not form a deterministic schedule");
         }
         const std::optional<BlockId> readerBlock = findInstructionBlock(*model, fixture.reader);
@@ -1156,14 +1544,430 @@ namespace
         const std::optional<BlockId> finalWriterBlock =
             findInstructionBlock(*model, fixture.finalWrite);
         if (!readerBlock || !firstWriterBlock || !finalWriterBlock ||
-            *firstWriterBlock != *finalWriterBlock ||
-            model->program.blockInstruction(*firstWriterBlock, 0) != fixture.finalWrite ||
-            model->program.blockInstruction(*firstWriterBlock, 1) != fixture.firstWrite ||
+            *finalWriterBlock >= *firstWriterBlock ||
+            !hasActivationTarget(*model, *finalWriterBlock, Opcode::ActForward,
+                                 *firstWriterBlock) ||
             countChangedWatches(*model, fixture.memory) != 1 ||
             !watchActivatesTarget(*model, *firstWriterBlock, fixture.memory, Opcode::ActBackward,
                                   *readerBlock) ||
             !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
             return fail("only the final memory-write frontier must watch and reactivate readers");
+        }
+        return 0;
+    }
+
+    int testEarlierWriterActivityReachesFinalFrontier()
+    {
+        LinearProgramBuilder builder;
+        const TypeId eventType = builder.addType(Type::bitVector(1));
+        const TypeId signedConditionType =
+            builder.addType(Type::bitVector(1, Signedness::Signed));
+        const TypeId addressType = builder.addType(Type::bitVector(2));
+        const TypeId valueType = builder.addType(Type::bitVector(8));
+        const TypeId memoryType = builder.addType(Type::array(4, 8));
+        const auto addConstant = [&builder](TypeId type, uint64_t value) {
+            const std::array<uint64_t, 1> words = {value};
+            return builder.addVariable(
+                type, builder.addConstantInit(builder.addBitLiteral(type, words)));
+        };
+
+        const VariableId earlierEnabled =
+            builder.addVariable(signedConditionType, builder.zeroInit());
+        const VariableId disabled = addConstant(eventType, 0);
+        const VariableId companionTrigger =
+            builder.addVariable(eventType, builder.zeroInit());
+        const VariableId address = addConstant(addressType, 2);
+        const VariableId mask = addConstant(valueType, 0xff);
+        const VariableId data = addConstant(valueType, 0x5a);
+        const VariableId event = addConstant(eventType, 1);
+        const VariableId memory = builder.addVariable(memoryType, builder.zeroInit());
+        const VariableId companionMemory =
+            builder.addVariable(memoryType, builder.zeroInit());
+        const VariableId readData = builder.addVariable(valueType, builder.undefInit());
+
+        const std::array<VariableId, 1> readerResults = {readData};
+        const std::array<VariableId, 2> readerOperands = {memory, address};
+        const InstructionId reader =
+            builder.addInstruction(Opcode::MemoryRead, readerResults, readerOperands);
+        const std::array<VariableId, 6> companionOperands = {
+            companionTrigger, address, mask, data, companionMemory, event,
+        };
+        const InstructionId companionWrite =
+            builder.addInstruction(Opcode::MemoryWrite, {}, companionOperands);
+        const std::array<VariableId, 6> earlierOperands = {
+            earlierEnabled, address, mask, data, memory, event,
+        };
+        const InstructionId earlierWrite =
+            builder.addInstruction(Opcode::MemoryWrite, {}, earlierOperands);
+        const std::array<VariableId, 6> finalOperands = {
+            disabled, address, mask, data, memory, event,
+        };
+        const InstructionId finalWrite =
+            builder.addInstruction(Opcode::MemoryWrite, {}, finalOperands);
+
+        const StringId triggerName = builder.addString("companion_trigger");
+        const StringId outputName = builder.addString("read_data");
+        ProgramInterface interface;
+        interface.ports = {
+            PortBinding{
+                .name = triggerName,
+                .direction = PortDirection::Input,
+                .input = companionTrigger,
+            },
+            PortBinding{
+                .name = outputName,
+                .direction = PortDirection::Output,
+                .output = readData,
+            },
+        };
+        SchedulingFacts facts;
+        facts.variableRoles = {
+            VariableRole::None, VariableRole::None,          VariableRole::ExternalInput,
+            VariableRole::None, VariableRole::None,          VariableRole::None,
+            VariableRole::None, VariableRole::State,         VariableRole::State,
+            VariableRole::ExternalOutput,
+        };
+        facts.instructionEffects = {
+            InstructionEffect::StateRead,
+            InstructionEffect::StateReadWrite,
+            InstructionEffect::StateReadWrite,
+            InstructionEffect::StateReadWrite,
+        };
+        facts.orderedEffects = {
+            OrderedEffect{.instruction = earlierWrite, .group = 32, .ordinal = 0},
+            OrderedEffect{.instruction = finalWrite, .group = 32, .ordinal = 1},
+        };
+        LinearProgramArtifact linear{
+            .program = builder.finish(),
+            .interface = std::move(interface),
+            .schedulingFacts = std::move(facts),
+        };
+
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        std::optional<ExecutableModel> model = schedule(
+            std::move(linear),
+            ActivityScheduleOptions{
+                .maxInstructionsPerBlock = 1,
+                .maxCommitInstructionsPerBlock = 2,
+                .maxStateWritesPerBlock = 2,
+                .enableCoarsening = true,
+            },
+            diagnostics);
+        const std::optional<BlockId> readerBlock =
+            model ? findInstructionBlock(*model, reader) : std::nullopt;
+        const std::optional<BlockId> earlierBlock =
+            model ? findInstructionBlock(*model, earlierWrite) : std::nullopt;
+        const std::optional<BlockId> companionBlock =
+            model ? findInstructionBlock(*model, companionWrite) : std::nullopt;
+        const std::optional<BlockId> finalBlock =
+            model ? findInstructionBlock(*model, finalWrite) : std::nullopt;
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 4 ||
+            !readerBlock || !earlierBlock || !companionBlock || !finalBlock ||
+            *companionBlock != *earlierBlock || *earlierBlock >= *finalBlock ||
+            !hasActivationTarget(*model, BlockId{0}, Opcode::ActForward, *companionBlock) ||
+            !hasActivationTarget(*model, *earlierBlock, Opcode::ActForward, *finalBlock) ||
+            countChangedWatches(*model, memory) != 1 ||
+            !watchActivatesTarget(*model, *finalBlock, memory, Opcode::ActBackward,
+                                  *readerBlock) ||
+            !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
+            return fail("earlier writer activity did not reach the unique final-write frontier");
+        }
+
+        Interpreter interpreter(*model);
+        const std::array<uint64_t, 1> highWords = {1};
+        // Only the companion input supplies scheduled activity to their shared commit Block.
+        if (!interpreter.ready() || !interpreter.eval().success() ||
+            !interpreter
+                 .write(earlierEnabled,
+                        InterpreterValue::bitVector(1, Signedness::Signed, highWords))
+                 .success() ||
+            !interpreter
+                 .write(companionTrigger,
+                        InterpreterValue::bitVector(1, Signedness::Unsigned, highWords))
+                 .success()) {
+            return fail("earlier-writer frontier fixture could not enter its write epoch");
+        }
+        const InterpreterResult result = interpreter.eval();
+        if (!result.success() || result.epochsExecuted != 2 ||
+            interpreter.value(memory).arrayElementWords(2).front() != 0x5a ||
+            interpreter.value(readData).lowWord() != 0x5a) {
+            return fail("final writer frontier did not reactivate the reader after an earlier write");
+        }
+        return 0;
+    }
+
+    int testBackwardActivatedEarlierWriterReachesFinalFrontierInSameEpoch()
+    {
+        LinearProgramBuilder builder;
+        const TypeId eventType = builder.addType(Type::bitVector(1));
+        const TypeId valueType = builder.addType(Type::bitVector(8));
+        const auto addConstant = [&builder](TypeId type, uint64_t value) {
+            const std::array<uint64_t, 1> words = {value};
+            return builder.addVariable(
+                type, builder.addConstantInit(builder.addBitLiteral(type, words)));
+        };
+
+        const VariableId sourceTrigger = builder.addVariable(eventType, builder.zeroInit());
+        const VariableId disabled = addConstant(eventType, 0);
+        const VariableId one = addConstant(eventType, 1);
+        const VariableId mask = addConstant(valueType, 0xff);
+        const VariableId mainData = addConstant(valueType, 0x5a);
+        const VariableId mainState = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId triggerState = builder.addVariable(eventType, builder.zeroInit());
+        const VariableId readData = builder.addVariable(valueType, builder.undefInit());
+
+        const std::array<VariableId, 1> readerResults = {readData};
+        const std::array<VariableId, 1> readerOperands = {mainState};
+        const InstructionId reader =
+            builder.addInstruction(Opcode::Assign, readerResults, readerOperands);
+        const std::array<VariableId, 5> earlierOperands = {
+            triggerState, mask, mainData, mainState, one,
+        };
+        const InstructionId earlierWriter =
+            builder.addInstruction(Opcode::RegisterWrite, {}, earlierOperands);
+        const std::array<VariableId, 5> finalOperands = {
+            disabled, mask, mainData, mainState, one,
+        };
+        const InstructionId finalWriter =
+            builder.addInstruction(Opcode::RegisterWrite, {}, finalOperands);
+        const std::array<VariableId, 5> triggerOperands = {
+            sourceTrigger, one, one, triggerState, one,
+        };
+        const InstructionId triggerWriter =
+            builder.addInstruction(Opcode::RegisterWrite, {}, triggerOperands);
+
+        const StringId triggerName = builder.addString("source_trigger");
+        const StringId outputName = builder.addString("read_data");
+        ProgramInterface interface;
+        interface.ports = {
+            PortBinding{
+                .name = triggerName,
+                .direction = PortDirection::Input,
+                .input = sourceTrigger,
+            },
+            PortBinding{
+                .name = outputName,
+                .direction = PortDirection::Output,
+                .output = readData,
+            },
+        };
+        SchedulingFacts facts;
+        facts.variableRoles = {
+            VariableRole::ExternalInput, VariableRole::None, VariableRole::None,
+            VariableRole::None,          VariableRole::None, VariableRole::State,
+            VariableRole::State,         VariableRole::ExternalOutput,
+        };
+        facts.instructionEffects = {
+            InstructionEffect::Pure,
+            InstructionEffect::StateReadWrite,
+            InstructionEffect::StateReadWrite,
+            InstructionEffect::StateReadWrite,
+        };
+        facts.orderedEffects = {
+            OrderedEffect{.instruction = earlierWriter, .group = 90, .ordinal = 0},
+            OrderedEffect{.instruction = finalWriter, .group = 90, .ordinal = 1},
+            OrderedEffect{.instruction = triggerWriter, .group = 90, .ordinal = 2},
+        };
+        LinearProgramArtifact linear{
+            .program = builder.finish(),
+            .interface = std::move(interface),
+            .schedulingFacts = std::move(facts),
+        };
+
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        std::optional<ExecutableModel> model = schedule(
+            std::move(linear),
+            ActivityScheduleOptions{
+                .maxInstructionsPerBlock = 1,
+                .maxCommitInstructionsPerBlock = 1,
+                .maxStateWritesPerBlock = 1,
+                .enableCoarsening = true,
+            },
+            diagnostics);
+        const std::optional<BlockId> readerBlock =
+            model ? findInstructionBlock(*model, reader) : std::nullopt;
+        const std::optional<BlockId> earlierBlock =
+            model ? findInstructionBlock(*model, earlierWriter) : std::nullopt;
+        const std::optional<BlockId> finalBlock =
+            model ? findInstructionBlock(*model, finalWriter) : std::nullopt;
+        const std::optional<BlockId> triggerBlock =
+            model ? findInstructionBlock(*model, triggerWriter) : std::nullopt;
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 5 ||
+            !readerBlock || !earlierBlock || !finalBlock || !triggerBlock ||
+            !(*readerBlock < *earlierBlock && *earlierBlock < *finalBlock &&
+              *finalBlock < *triggerBlock) ||
+            !hasActivationTarget(*model, BlockId{0}, Opcode::ActForward, *triggerBlock) ||
+            !watchActivatesTarget(*model, *triggerBlock, triggerState, Opcode::ActBackward,
+                                  *earlierBlock) ||
+            !hasLocalGuardedForwardActivation(*model, *earlierBlock, earlierWriter,
+                                              *finalBlock) ||
+            countChangedWatches(*model, triggerState) != 1 ||
+            countChangedWatches(*model, mainState) != 1 ||
+            !watchActivatesTarget(*model, *finalBlock, mainState, Opcode::ActBackward,
+                                  *readerBlock) ||
+            !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
+            return fail("backward-activated earlier writer lost its same-epoch final frontier");
+        }
+
+        Interpreter interpreter(*model);
+        const std::array<uint64_t, 1> highWords = {1};
+        if (!interpreter.ready() || !interpreter.eval().success() ||
+            !interpreter
+                 .write(sourceTrigger,
+                        InterpreterValue::bitVector(1, Signedness::Unsigned, highWords))
+                 .success()) {
+            return fail("backward frontier fixture could not enter its trigger epoch");
+        }
+        const InterpreterResult result = interpreter.eval();
+        if (!result.success() || result.epochsExecuted != 3 ||
+            interpreter.value(triggerState).lowWord() != 1 ||
+            interpreter.value(mainState).lowWord() != 0x5a ||
+            interpreter.value(readData).lowWord() != 0x5a) {
+            return fail("backward activity did not reach the reader through the final frontier");
+        }
+        return 0;
+    }
+
+    int testRuntimeWriterFrontierChainPropagatesWithoutStaticClosure()
+    {
+        LinearProgramBuilder builder;
+        const TypeId eventType = builder.addType(Type::bitVector(1));
+        const TypeId valueType = builder.addType(Type::bitVector(8));
+        const auto addConstant = [&builder](TypeId type, uint64_t value) {
+            const std::array<uint64_t, 1> words = {value};
+            return builder.addVariable(
+                type, builder.addConstantInit(builder.addBitLiteral(type, words)));
+        };
+
+        const VariableId start = builder.addVariable(eventType, builder.zeroInit());
+        const VariableId disabled = addConstant(eventType, 0);
+        const VariableId one = addConstant(eventType, 1);
+        const VariableId eventA = addConstant(eventType, 1);
+        const VariableId eventB = addConstant(eventType, 1);
+        const VariableId eventC = addConstant(eventType, 1);
+        const VariableId mask = addConstant(valueType, 0xff);
+        const VariableId data = addConstant(valueType, 0x5a);
+        const VariableId stateX = builder.addVariable(eventType, builder.zeroInit());
+        const VariableId stateY = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId output = builder.addVariable(valueType, builder.undefInit());
+
+        const std::array<VariableId, 1> readerResults = {output};
+        const std::array<VariableId, 1> readerOperands = {stateY};
+        const InstructionId reader =
+            builder.addInstruction(Opcode::Assign, readerResults, readerOperands);
+        const std::array<VariableId, 5> earlierXOperands = {
+            start, one, one, stateX, eventA,
+        };
+        const InstructionId earlierX =
+            builder.addInstruction(Opcode::RegisterWrite, {}, earlierXOperands);
+        const std::array<VariableId, 5> finalXOperands = {
+            disabled, one, one, stateX, eventB,
+        };
+        const InstructionId finalX =
+            builder.addInstruction(Opcode::RegisterWrite, {}, finalXOperands);
+        const std::array<VariableId, 5> earlierYOperands = {
+            stateX, mask, data, stateY, eventB,
+        };
+        const InstructionId earlierY =
+            builder.addInstruction(Opcode::RegisterWrite, {}, earlierYOperands);
+        const std::array<VariableId, 5> finalYOperands = {
+            disabled, mask, data, stateY, eventC,
+        };
+        const InstructionId finalY =
+            builder.addInstruction(Opcode::RegisterWrite, {}, finalYOperands);
+
+        const StringId startName = builder.addString("start");
+        const StringId outputName = builder.addString("output");
+        ProgramInterface interface;
+        interface.ports = {
+            PortBinding{
+                .name = startName,
+                .direction = PortDirection::Input,
+                .input = start,
+            },
+            PortBinding{
+                .name = outputName,
+                .direction = PortDirection::Output,
+                .output = output,
+            },
+        };
+        SchedulingFacts facts;
+        facts.variableRoles = {
+            VariableRole::ExternalInput, VariableRole::None, VariableRole::None,
+            VariableRole::None,          VariableRole::None, VariableRole::None,
+            VariableRole::None,          VariableRole::None, VariableRole::State,
+            VariableRole::State,         VariableRole::ExternalOutput,
+        };
+        facts.instructionEffects = {
+            InstructionEffect::Pure,
+            InstructionEffect::StateReadWrite,
+            InstructionEffect::StateReadWrite,
+            InstructionEffect::StateReadWrite,
+            InstructionEffect::StateReadWrite,
+        };
+        facts.orderedEffects = {
+            OrderedEffect{.instruction = earlierX, .group = 91, .ordinal = 0},
+            OrderedEffect{.instruction = finalX, .group = 91, .ordinal = 1},
+            OrderedEffect{.instruction = earlierY, .group = 91, .ordinal = 2},
+            OrderedEffect{.instruction = finalY, .group = 91, .ordinal = 3},
+        };
+        LinearProgramArtifact linear{
+            .program = builder.finish(),
+            .interface = std::move(interface),
+            .schedulingFacts = std::move(facts),
+        };
+
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        std::optional<ExecutableModel> model = schedule(
+            std::move(linear),
+            ActivityScheduleOptions{
+                .maxInstructionsPerBlock = 1,
+                .maxCommitInstructionsPerBlock = 2,
+                .maxStateWritesPerBlock = 2,
+                .enableCoarsening = true,
+            },
+            diagnostics);
+        const std::optional<BlockId> readerBlock =
+            model ? findInstructionBlock(*model, reader) : std::nullopt;
+        const std::optional<BlockId> blockA =
+            model ? findInstructionBlock(*model, earlierX) : std::nullopt;
+        const std::optional<BlockId> finalXBlock =
+            model ? findInstructionBlock(*model, finalX) : std::nullopt;
+        const std::optional<BlockId> blockB =
+            model ? findInstructionBlock(*model, earlierY) : std::nullopt;
+        const std::optional<BlockId> blockC =
+            model ? findInstructionBlock(*model, finalY) : std::nullopt;
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 5 ||
+            !readerBlock || !blockA || !finalXBlock || !blockB || !blockC ||
+            *finalXBlock != *blockB ||
+            !(*readerBlock < *blockA && *blockA < *blockB && *blockB < *blockC) ||
+            !hasLocalGuardedForwardActivation(*model, *blockA, earlierX, *blockB) ||
+            !hasLocalGuardedForwardActivation(*model, *blockB, earlierY, *blockC) ||
+            hasActivationTarget(*model, *blockA, Opcode::ActForward, *blockC) ||
+            hasActivationTarget(*model, BlockId{0}, Opcode::ActForward, *blockB) ||
+            hasActivationTarget(*model, BlockId{0}, Opcode::ActForward, *blockC) ||
+            countChangedWatches(*model, stateY) != 1 ||
+            !watchActivatesTarget(*model, *blockC, stateY, Opcode::ActBackward,
+                                  *readerBlock) ||
+            !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
+            return fail("runtime writer-frontier chain was flattened or materialized incorrectly");
+        }
+
+        Interpreter interpreter(*model);
+        const std::array<uint64_t, 1> highWords = {1};
+        if (!interpreter.ready() || !interpreter.eval().success() ||
+            !interpreter
+                 .write(start, InterpreterValue::bitVector(
+                                   1, Signedness::Unsigned, highWords))
+                 .success()) {
+            return fail("runtime writer-frontier chain could not enter its start epoch");
+        }
+        const InterpreterResult result = interpreter.eval();
+        if (!result.success() || result.epochsExecuted != 2 ||
+            interpreter.value(stateX).lowWord() != 1 ||
+            interpreter.value(stateY).lowWord() != 0x5a ||
+            interpreter.value(output).lowWord() != 0x5a) {
+            return fail("runtime writer-frontier chain did not reach C in the source epoch");
         }
         return 0;
     }
@@ -1384,6 +2188,156 @@ namespace
             interpreter.value(memory).arrayElementWords(2).front() != 0x5a ||
             interpreter.value(readData).lowWord() != 0x5a) {
             return fail("separate commit event buckets did not reactivate the memory reader");
+        }
+        return 0;
+    }
+
+    struct CommitCycleFixture
+    {
+        LinearProgramArtifact linear;
+        VariableId start;
+        VariableId stateA;
+        VariableId stateB;
+        VariableId stateC;
+        InstructionId writerA;
+        InstructionId writerB;
+        InstructionId writerC;
+    };
+
+    CommitCycleFixture makeCommitCycleFixture()
+    {
+        LinearProgramBuilder builder;
+        const TypeId type = builder.addType(Type::bitVector(1));
+        const std::array<uint64_t, 1> oneWords = {1};
+        const auto oneInit =
+            builder.addConstantInit(builder.addBitLiteral(type, oneWords));
+        const VariableId start = builder.addVariable(type, builder.zeroInit());
+        const VariableId one = builder.addVariable(type, oneInit);
+        const VariableId stateA = builder.addVariable(type, builder.zeroInit());
+        const VariableId stateB = builder.addVariable(type, builder.zeroInit());
+        const VariableId stateC = builder.addVariable(type, builder.zeroInit());
+        const VariableId guardB = builder.addVariable(type, builder.undefInit());
+        const VariableId guardC = builder.addVariable(type, builder.undefInit());
+        const VariableId dataA = builder.addVariable(type, builder.undefInit());
+
+        builder.addInstruction(Opcode::Assign, std::array{guardB}, std::array{stateA});
+        const InstructionId writerB = builder.addInstruction(
+            Opcode::RegisterWrite, {}, std::array{guardB, one, one, stateB, one});
+        builder.addInstruction(Opcode::Assign, std::array{guardC}, std::array{stateB});
+        const InstructionId writerC = builder.addInstruction(
+            Opcode::RegisterWrite, {}, std::array{guardC, one, one, stateC, one});
+        builder.addInstruction(Opcode::LogicOr, std::array{dataA}, std::array{stateC, one});
+        const InstructionId writerA = builder.addInstruction(
+            Opcode::RegisterWrite, {}, std::array{start, one, dataA, stateA, one});
+
+        ProgramInterface interface;
+        interface.ports = {
+            PortBinding{
+                .name = builder.addString("start"),
+                .direction = PortDirection::Input,
+                .input = start,
+            },
+        };
+        SchedulingFacts facts;
+        facts.variableRoles = {
+            VariableRole::ExternalInput,
+            VariableRole::None,
+            VariableRole::State,
+            VariableRole::State,
+            VariableRole::State,
+            VariableRole::None,
+            VariableRole::None,
+            VariableRole::None,
+        };
+        facts.instructionEffects = {
+            InstructionEffect::Pure,
+            InstructionEffect::StateReadWrite,
+            InstructionEffect::Pure,
+            InstructionEffect::StateReadWrite,
+            InstructionEffect::Pure,
+            InstructionEffect::StateReadWrite,
+        };
+        return CommitCycleFixture{
+            .linear = LinearProgramArtifact{
+                .program = builder.finish(),
+                .interface = std::move(interface),
+                .schedulingFacts = std::move(facts),
+            },
+            .start = start,
+            .stateA = stateA,
+            .stateB = stateB,
+            .stateC = stateC,
+            .writerA = writerA,
+            .writerB = writerB,
+            .writerC = writerC,
+        };
+    }
+
+    int testCommitCycleUsesActivationOrderAndSccGroups()
+    {
+        const ActivityScheduleOptions options{
+            .maxInstructionsPerBlock = 1,
+            .maxCommitInstructionsPerBlock = 1,
+            .maxStateWritesPerBlock = 1,
+            .enableCoarsening = false,
+        };
+        CommitCycleFixture firstFixture = makeCommitCycleFixture();
+        wolvrix::lib::diag::Diagnostics firstDiagnostics;
+        std::optional<ExecutableModel> first =
+            schedule(std::move(firstFixture.linear), options, firstDiagnostics);
+        CommitCycleFixture secondFixture = makeCommitCycleFixture();
+        wolvrix::lib::diag::Diagnostics secondDiagnostics;
+        std::optional<ExecutableModel> second =
+            schedule(std::move(secondFixture.linear), options, secondDiagnostics);
+
+        const std::optional<BlockId> blockA =
+            first ? findInstructionBlock(*first, firstFixture.writerA) : std::nullopt;
+        const std::optional<BlockId> blockB =
+            first ? findInstructionBlock(*first, firstFixture.writerB) : std::nullopt;
+        const std::optional<BlockId> blockC =
+            first ? findInstructionBlock(*first, firstFixture.writerC) : std::nullopt;
+        const std::vector<uint32_t> expectedOffsets = {0, 3};
+        if (!first || !second || firstDiagnostics.hasError() || secondDiagnostics.hasError() ||
+            !blockA || !blockB || !blockC || !(*blockB < *blockC && *blockC < *blockA) ||
+            first->commitBlockOrder != std::vector<BlockId>{*blockA, *blockB, *blockC} ||
+            first->commitGroupOffsets != expectedOffsets ||
+            first->commitBlockOrder != second->commitBlockOrder ||
+            first->commitGroupOffsets != second->commitGroupOffsets ||
+            !validate(*first, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
+            std::cerr << "[commit-cycle] blocks="
+                      << (blockA ? std::to_string(blockA->value) : "missing") << ','
+                      << (blockB ? std::to_string(blockB->value) : "missing") << ','
+                      << (blockC ? std::to_string(blockC->value) : "missing") << " order=";
+            if (first) {
+                for (BlockId block : first->commitBlockOrder) {
+                    std::cerr << block.value << ',';
+                }
+                std::cerr << " offsets=";
+                for (uint32_t offset : first->commitGroupOffsets) {
+                    std::cerr << offset << ',';
+                }
+            }
+            std::cerr << '\n';
+            for (const wolvrix::lib::diag::Diagnostic &message : firstDiagnostics.messages()) {
+                std::cerr << "[commit-cycle] " << message.message << '\n';
+            }
+            return fail("cyclic commits did not use deterministic activation order and groups");
+        }
+
+        Interpreter interpreter(*first);
+        const std::array<uint64_t, 1> highWords = {1};
+        if (!interpreter.ready() || !interpreter.eval().success() ||
+            !interpreter
+                 .write(firstFixture.start,
+                        InterpreterValue::bitVector(1, Signedness::Unsigned, highWords))
+                 .success()) {
+            return fail("cyclic commit fixture could not enter its source eval");
+        }
+        const InterpreterResult result = interpreter.eval();
+        if (!result.success() || interpreter.value(firstFixture.stateA).lowWord() != 1 ||
+            interpreter.value(firstFixture.stateB).lowWord() != 1 ||
+            interpreter.value(firstFixture.stateC).lowWord() != 1) {
+            return fail("cyclic commit execution skipped an intervening compute frontier");
         }
         return 0;
     }
@@ -1705,19 +2659,29 @@ int main()
     if (const int result = testHostEffectsAreAcceptedAndOrdered(); result != 0) {
         return result;
     }
+    if (const int result = testInstructionCannotJoinMultipleExplicitOrderGroups(); result != 0) {
+        return result;
+    }
     if (const int result = testLongImplicitHostOrderDoesNotFormOneAtom(); result != 0) {
+        return result;
+    }
+    if (const int result = testSystemFunctionCoarsensWithProducerAndReschedules(); result != 0) {
         return result;
     }
     if (const int result = testPosedgeHostEffectPrecedesRegisterCommit(); result != 0) {
         return result;
     }
+    if (const int result = testCommitWaitsForBackwardComputeAndConsumesEdgeOnce(); result != 0) {
+        return result;
+    }
     if (const int result = testImplicitCommitBeforeHostDependencyIsRejected(); result != 0) {
         return result;
     }
-    if (const int result = testMemoryWritersShareOneOrderedAtom(); result != 0) {
+    if (const int result = testMemoryWritersRemainOrderedWithoutAtomContraction(); result != 0) {
         return result;
     }
-    if (const int result = testOrderedStateAndMemoryWritesShareOneCommitBucket(); result != 0) {
+    if (const int result = testOrderedStateAndMemoryWritesRemainSeparateWithoutCoarsening();
+        result != 0) {
         return result;
     }
     if (const int result = testIndependentCommitAtomsCoarsenWithinCommitCap(); result != 0) {
@@ -1732,19 +2696,33 @@ int main()
     if (const int result = testCommitGuardsGroupWithoutForcingBlockBoundary(); result != 0) {
         return result;
     }
-    if (const int result = testOversizedOrderedCommitAtomSurvivesCommitCap(); result != 0) {
+    if (const int result = testOrderedCommitChainSplitsAtCommitCap(); result != 0) {
         return result;
     }
-    if (const int result = testCommitBucketExceedsStateWriteCapWithoutSplitting(); result != 0) {
+    if (const int result = testOrderedCommitChainSplitsAtStateWriteCap(); result != 0) {
         return result;
     }
     if (const int result = testFinalMemoryWriteFrontierUsesOneWatcher(); result != 0) {
+        return result;
+    }
+    if (const int result = testEarlierWriterActivityReachesFinalFrontier(); result != 0) {
+        return result;
+    }
+    if (const int result = testBackwardActivatedEarlierWriterReachesFinalFrontierInSameEpoch();
+        result != 0) {
+        return result;
+    }
+    if (const int result = testRuntimeWriterFrontierChainPropagatesWithoutStaticClosure();
+        result != 0) {
         return result;
     }
     if (const int result = testStateChangeUsesBackwardReaderActivation(); result != 0) {
         return result;
     }
     if (const int result = testMergedCommitWritesReactivateMemoryReaderAcrossEpoch(); result != 0) {
+        return result;
+    }
+    if (const int result = testCommitCycleUsesActivationOrderAndSccGroups(); result != 0) {
         return result;
     }
     if (const int result = testPureComputeCoarseningHonorsInstructionCapDeterministically();

@@ -102,6 +102,9 @@ ExecutableModel makeHostModel() {
   const StringId signedReturnName = linear.addString("signed_return");
   const StringId signedOutputName = linear.addString("signed_output");
   const StringId unsignedOutputName = linear.addString("unsigned_output");
+  const StringId pendingClockName = linear.addString("pending_clock");
+  const StringId pendingEventName = linear.addString("pending_event");
+  const StringId pendingResultName = linear.addString("pending_result");
 
   const VariableId taskCondition =
       linear.addVariable(u1Type, linear.zeroInit());
@@ -126,6 +129,18 @@ ExecutableModel makeHostModel() {
       linear.addVariable(s32Type, linear.zeroInit());
   const VariableId unsignedOutput =
       linear.addVariable(u64Type, linear.zeroInit());
+  const VariableId pendingClock =
+      linear.addVariable(u1Type, linear.zeroInit());
+  const VariableId pendingClockOld =
+      linear.addVariable(u1Type, linear.undefInit());
+  const VariableId pendingEvent =
+      linear.addVariable(u1Type, linear.zeroInit());
+  const VariableId pendingEventVisible =
+      linear.addVariable(u1Type, linear.zeroInit());
+  const VariableId pendingGuard =
+      linear.addVariable(u1Type, linear.zeroInit());
+  const VariableId pendingResult =
+      linear.addVariable(u8Type, linear.zeroInit());
 
   const auto addInputWatch = [&](VariableId input) {
     const TypeId type = linear.view().variable(input).type;
@@ -145,6 +160,11 @@ ExecutableModel makeHostModel() {
       addInputWatch(finishCondition);
   const auto [inputBitChanged, inputBitEvent] = addInputWatch(inputBit);
   const auto [inputValueChanged, inputValueEvent] = addInputWatch(inputValue);
+  const auto [pendingClockInputChanged, pendingClockInputEvent] =
+      addInputWatch(pendingClock);
+  const InstructionId pendingClockChanged = addInstruction(
+      linear, Opcode::ChangedPos, {pendingEvent},
+      {pendingClock, pendingClockOld});
 
   const VariableId trueValue = addBitConstant(linear, u1Type, 1);
   const VariableId stderrHandle =
@@ -176,6 +196,7 @@ ExecutableModel makeHostModel() {
   const VariableId hexValue = addBitConstant(linear, u16Type, 0xbeef);
   const VariableId signedInput =
       addBitConstant(linear, s64Type, UINT64_C(0xfffffffffffffffb));
+  const VariableId pendingArgument = addBitConstant(linear, u8Type, 0x2a);
 
   const StringId fwriteName = linear.addString("fwrite");
   const InstructionId fwriteCall =
@@ -268,6 +289,7 @@ ExecutableModel makeHostModel() {
   linear.setDpiCallAttributes(dpiCall, DpiCallAttributes{
                                            .importSymbol = dpiSymbol,
                                            .eventCount = 1,
+                                           .eventMode = HostEventMode::Pending,
                                        });
 
   const StringId jtagSymbol = linear.addString("am_jtag_probe");
@@ -321,6 +343,7 @@ ExecutableModel makeHostModel() {
   linear.setDpiCallAttributes(jtagCall, DpiCallAttributes{
                                             .importSymbol = jtagSymbol,
                                             .eventCount = 1,
+                                            .eventMode = HostEventMode::Pending,
                                         });
 
   const StringId signedSymbol = linear.addString("am_signed_probe");
@@ -359,7 +382,38 @@ ExecutableModel makeHostModel() {
   linear.setDpiCallAttributes(signedCall, DpiCallAttributes{
                                               .importSymbol = signedSymbol,
                                               .eventCount = 1,
+                                              .eventMode = HostEventMode::Pending,
                                           });
+
+  const StringId pendingSymbol = linear.addString("am_pending_probe");
+  const StringId pendingArgumentName = linear.addString("argument");
+  const std::array<DpiParameter, 1> pendingParameters = {
+      DpiParameter{
+          .name = pendingArgumentName,
+          .type = u8Type,
+          .direction = DpiDirection::Input,
+          .abi = DpiAbiKind::Integral,
+      },
+  };
+  linear.addDpiImport(pendingSymbol, pendingParameters,
+                      DpiReturn{
+                          .type = u8Type,
+                          .abi = DpiAbiKind::Integral,
+                          .present = true,
+                      });
+  const InstructionId pendingCall = addInstruction(
+      linear, Opcode::DpiCall, {pendingResult},
+      {pendingGuard, pendingArgument, pendingEvent});
+  linear.setDpiCallAttributes(
+      pendingCall, DpiCallAttributes{
+                       .importSymbol = pendingSymbol,
+                       .eventCount = 1,
+                       .eventMode = HostEventMode::Pending,
+                   });
+  const InstructionId setPendingGuard = addInstruction(
+      linear, Opcode::Assign, {pendingGuard}, {pendingEvent});
+  const InstructionId copyPendingEvent = addInstruction(
+      linear, Opcode::Assign, {pendingEventVisible}, {pendingEvent});
 
   const StringId finishName = linear.addString("finish");
   const InstructionId finishCall =
@@ -397,14 +451,25 @@ ExecutableModel makeHostModel() {
       addHostActivation(finishConditionEvent);
   const InstructionId activateInputBit = addHostActivation(inputBitEvent);
   const InstructionId activateInputValue = addHostActivation(inputValueEvent);
+  const InstructionId activatePending =
+      addInstruction(scheduled, Opcode::ActForward, {}, {pendingClockInputEvent});
+  setTargets(scheduled, activatePending, {BlockId{2}});
+  const InstructionId reactivatePending =
+      addInstruction(scheduled, Opcode::ActBackward, {}, {pendingEvent});
+  setTargets(scheduled, reactivatePending, {BlockId{2}});
   addBlock(scheduled,
            {taskConditionChanged, activateTaskCondition, taskEventChanged,
             activateTaskEvent, dpiConditionChanged, activateDpiCondition,
             dpiEventChanged, activateDpiEvent, finishConditionChanged,
             activateFinishCondition, inputBitChanged, activateInputBit,
-            inputValueChanged, activateInputValue});
+            inputValueChanged, activateInputValue, pendingClockInputChanged,
+            activatePending});
   addBlock(scheduled, {fwriteCall, wideFwriteCall, stressFwriteCall, dpiCall,
                        jtagCall, signedCall, finishCall, finalWrite});
+  // Epoch 0 captures the edge and raises the guard; epoch 1 consumes it after
+  // ChangedPos has recomputed the raw event to zero.
+  addBlock(scheduled, {pendingClockChanged, pendingCall, setPendingGuard,
+                       copyPendingEvent, reactivatePending});
 
   ProgramInterface interface;
   interface.ports = {
@@ -442,6 +507,11 @@ ExecutableModel makeHostModel() {
           .name = inputValueName,
           .direction = PortDirection::Input,
           .input = inputValue,
+      },
+      PortBinding{
+          .name = pendingClockName,
+          .direction = PortDirection::Input,
+          .input = pendingClock,
       },
       PortBinding{
           .name = dpiReturnName,
@@ -498,6 +568,16 @@ ExecutableModel makeHostModel() {
           .direction = PortDirection::Output,
           .output = unsignedOutput,
       },
+      PortBinding{
+          .name = pendingEventName,
+          .direction = PortDirection::Output,
+          .output = pendingEventVisible,
+      },
+      PortBinding{
+          .name = pendingResultName,
+          .direction = PortDirection::Output,
+          .output = pendingResult,
+      },
   };
   return ExecutableModel{
       .program = scheduled.finish(),
@@ -520,6 +600,7 @@ namespace
     int dpi_calls = 0;
     int jtag_calls = 0;
     int signed_calls = 0;
+    int pending_calls = 0;
     bool dpi_throw_after_outputs = false;
     std::uint8_t seen_bit = 0;
     std::uint8_t seen_jtag_input = 0;
@@ -592,6 +673,12 @@ extern "C" std::int64_t am_signed_probe(std::int64_t input,
     return input - INT64_C(7);
 }
 
+extern "C" std::uint8_t am_pending_probe(std::uint8_t input)
+{
+    ++pending_calls;
+    return static_cast<std::uint8_t>(input + UINT8_C(1));
+}
+
 int main()
 {
     GrhSIM_HostTop model;
@@ -603,8 +690,18 @@ int main()
     std::streambuf *oldStderr = std::cerr.rdbuf(captured.rdbuf());
 
     model.eval();
-    if (dpi_calls != 0 || !captured.str().empty())
+    if (dpi_calls != 0 || pending_calls != 0 || !captured.str().empty())
         return 1;
+
+    model.pending_clock = 1;
+    model.eval();
+    if (pending_calls != 1 || model.pending_event ||
+        model.pending_result != UINT8_C(0x2b))
+        return 17;
+    model.eval();
+    if (pending_calls != 1 || model.pending_event ||
+        model.pending_result != UINT8_C(0x2b))
+        return 18;
 
     model.task_condition = 1;
     model.eval();
@@ -736,7 +833,7 @@ int main() {
                    },
                    diagnostics);
   if (!emitResult.success || diagnostics.hasError() ||
-      emitResult.artifacts.size() != 6) {
+      emitResult.artifacts.size() != 7) {
     for (const wolvrix::lib::diag::Diagnostic &diagnostic :
          diagnostics.messages()) {
       std::cerr << "[grhsim_am_cpp_emitter_host] " << diagnostic.message;

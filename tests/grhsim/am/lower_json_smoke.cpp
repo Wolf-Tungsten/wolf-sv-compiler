@@ -245,6 +245,8 @@ int main(int argc, char **argv)
         ProgramStorageStats scheduledStats;
         uint64_t blockCount = 0;
         uint64_t activationTargets = 0;
+        uint64_t commitGroups = 0;
+        uint64_t commitOperandCaptures = 0;
         uint64_t emitMs = 0;
         uint64_t emittedArtifacts = 0;
         if (runSchedule)
@@ -275,6 +277,10 @@ int main(int argc, char **argv)
             activationTargets = scheduledStats
                                     .arena(ProgramArena::ActivationTargets)
                                     .elements;
+            commitGroups = model->commitGroupOffsets.empty()
+                               ? 0
+                               : model->commitGroupOffsets.size() - 1;
+            commitOperandCaptures = model->commitOperandCaptures.size();
             if (!emitDirectory.empty())
             {
                 phaseStart = std::chrono::steady_clock::now();
@@ -326,6 +332,9 @@ int main(int argc, char **argv)
                   << "  \"scheduled_variables\": " << scheduledStats.variables << ",\n"
                   << "  \"blocks\": " << blockCount << ",\n"
                   << "  \"activation_targets\": " << activationTargets << ",\n"
+                  << "  \"commit_groups\": " << commitGroups << ",\n"
+                  << "  \"commit_operand_captures\": "
+                  << commitOperandCaptures << ",\n"
                   << "  \"scheduled_estimated_bytes\": "
                   << scheduledStats.estimatedBytes << ",\n"
                   << "  \"read_ms\": " << readMs << ",\n"

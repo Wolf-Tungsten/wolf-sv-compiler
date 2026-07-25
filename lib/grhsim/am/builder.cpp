@@ -885,6 +885,23 @@ namespace wolvrix::lib::grhsim::am
         return appendInstruction(requireStorage(storage_, finished_), opcode, results, operands);
     }
 
+    void ScheduledProgramBuilder::setInstructionOperand(InstructionId instruction,
+                                                        std::size_t position,
+                                                        VariableId operand)
+    {
+        auto &storage = requireStorage(storage_, finished_);
+        requireId(instruction, storage.opcodes, "AM InstructionId");
+        requireId(operand, storage.variables, "AM VariableId");
+        const std::size_t instructionIndex = instruction.value;
+        const uint32_t begin = storage.operandOffsets[instructionIndex];
+        const uint32_t end = storage.operandOffsets[instructionIndex + 1];
+        if (position >= end - begin)
+        {
+            throw std::out_of_range("AM instruction operand position is out of range");
+        }
+        storage.operands[begin + position] = operand;
+    }
+
     void ScheduledProgramBuilder::setSliceStaticAttributes(InstructionId instruction, uint32_t lsb)
     {
         appendSliceStaticAttributes(requireStorage(storage_, finished_), instruction, lsb);

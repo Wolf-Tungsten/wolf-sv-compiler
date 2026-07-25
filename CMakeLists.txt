@@ -635,6 +635,17 @@ target_link_libraries(transform-redundant-elim
 
 register_test_exe(transform-redundant-elim)
 
+add_executable(transform-const-fold
+    tests/transform/test_const_fold_pass.cpp
+)
+
+target_link_libraries(transform-const-fold
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-const-fold)
+
 add_executable(transform-simplify
     tests/transform/test_simplify_pass.cpp
 )
@@ -1032,6 +1043,7 @@ target_link_libraries(ingest-graph-assembly-dpi-display
 target_compile_definitions(ingest-graph-assembly-dpi-display
     PRIVATE
         WOLF_SV_INGEST_GRAPH_ASSEMBLY_DPI_DISPLAY_DATA_PATH="${WOLF_SV_INGEST_TEST_DATA_DIR}/graph_assembly_dpi_display.sv"
+        WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
 )
 register_test_exe(ingest-graph-assembly-dpi-display)
 

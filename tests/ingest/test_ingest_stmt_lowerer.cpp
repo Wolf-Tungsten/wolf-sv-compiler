@@ -1437,6 +1437,88 @@ int testDpiReturnLowering(const std::filesystem::path& sourcePath) {
     return 0;
 }
 
+int testDpiCombReturnLowering(const std::filesystem::path& sourcePath) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    if (!buildLoweringPlan(sourcePath, "stmt_lowerer_dpi_comb_return", diagnostics,
+                           plan, lowering)) {
+        return fail("Failed to build combinational DPI return lowering plan in " +
+                    sourcePath.string());
+    }
+
+    const wolvrix::lib::ingest::LoweredStmt* dpiStmt = nullptr;
+    for (const auto& stmt : lowering.loweredStmts) {
+        if (stmt.kind != wolvrix::lib::ingest::LoweredStmtKind::DpiCall) {
+            continue;
+        }
+        if (dpiStmt) {
+            return fail("Expected one combinational DPI call in " + sourcePath.string());
+        }
+        dpiStmt = &stmt;
+    }
+    if (!dpiStmt) {
+        return fail("Missing combinational DPI return call in " + sourcePath.string());
+    }
+    if (dpiStmt->dpiCall.targetImportSymbol != "difftest_ram_read" ||
+        !dpiStmt->dpiCall.hasReturn || dpiStmt->dpiCall.results.size() != 1) {
+        return fail("Unexpected combinational DPI return metadata in " +
+                    sourcePath.string());
+    }
+    if (dpiStmt->dpiCall.inArgNames.size() != 1 ||
+        dpiStmt->dpiCall.inArgNames.front() != "rIdx" ||
+        dpiStmt->dpiCall.inArgs.size() != 1) {
+        return fail("Unexpected combinational DPI input metadata in " +
+                    sourcePath.string());
+    }
+    if (!dpiStmt->eventEdges.empty() || !dpiStmt->eventOperands.empty()) {
+        return fail("Combinational DPI call should not have edge operands in " +
+                    sourcePath.string());
+    }
+
+    std::unordered_set<std::size_t> visited;
+    if (!exprTreeContainsSymbol(plan, lowering, dpiStmt->updateCond,
+                                "r_enable", visited)) {
+        return fail("Combinational DPI call lost its guard in " + sourcePath.string());
+    }
+    visited.clear();
+    if (!exprTreeContainsSymbol(plan, lowering, dpiStmt->dpiCall.inArgs.front(),
+                                "r_index", visited)) {
+        return fail("Combinational DPI call lost its input in " + sourcePath.string());
+    }
+
+    const std::string_view resultName =
+        plan.symbolTable.text(dpiStmt->dpiCall.results.front());
+    bool foundGuardedResultWrite = false;
+    for (const auto& write : lowering.writes) {
+        if (!write.target.valid() ||
+            plan.symbolTable.text(write.target) != std::string_view("r_data")) {
+            continue;
+        }
+        visited.clear();
+        if (!exprTreeContainsSymbol(plan, lowering, write.value, resultName, visited)) {
+            continue;
+        }
+        visited.clear();
+        if (exprTreeContainsSymbol(plan, lowering, write.guard, "r_enable", visited)) {
+            foundGuardedResultWrite = true;
+            break;
+        }
+    }
+    if (!foundGuardedResultWrite) {
+        return fail("Missing guarded write of the combinational DPI result in " +
+                    sourcePath.string());
+    }
+    if (hasWarningMessage(diagnostics, "dpi expression call")) {
+        return fail("Unexpected combinational DPI timing warning in " +
+                    sourcePath.string());
+    }
+    if (diagnostics.hasError()) {
+        return fail("Unexpected Convert diagnostics errors in " + sourcePath.string());
+    }
+    return 0;
+}
+
 int testProceduralLocalLowering(const std::filesystem::path& sourcePath) {
     wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
     wolvrix::lib::ingest::ModulePlan plan;
@@ -1602,6 +1684,9 @@ int main() {
         return status;
     }
     if (int status = testDpiReturnLowering(sourcePath); status != 0) {
+        return status;
+    }
+    if (int status = testDpiCombReturnLowering(sourcePath); status != 0) {
         return status;
     }
     return testProceduralLocalLowering(sourcePath);
