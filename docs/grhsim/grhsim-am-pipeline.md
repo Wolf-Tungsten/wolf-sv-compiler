@@ -27,8 +27,8 @@ normalized GRH
 采用的 C++ 实现类型名。规范层名称仍然只有 `Program`；当 `ScheduledProgram` 通过最终验证后，
 它在语义上就是规范中的 `Program`。
 
-> 状态：本文描述目标框架和迁移 gates。在 Phase 3/4 通过前，生产实现仍是文末链接的
-> legacy Graph + session 路径；存在框架类型和 smoke stage 不表示已经完成语义切换。
+> 状态：本文描述目标框架和迁移 gates。项目层保留文末链接的 legacy Graph + session
+> 路径，同时以独立 Make target 暴露 AM 路径；现有 legacy target 没有被静默切换。
 > 当前 `Structural`/`Semantic` validator 也只是部分 scaffold validator；即使
 > `ValidationLevel::Semantic` 通过，也不等于已完整验证
 > [指令集第 17 节](grhsim-am-instructions.md#17-合法性检查)的 AM 语义。当前已检查
@@ -48,6 +48,24 @@ normalized GRH
 > 为 4,178,703 ms，尚未达到旧基线的 355,000 ms 性能目标。
 > 当前权威进度和剩余 gates 记录在
 > `pdocs/grh_notepad/notes/00/000-099/NO00030_grhsim_am_pipeline_framework_20260722.md`。
+
+项目层两条 XiangShan 路径显式分离：
+
+```text
+make xs_wolf_grhsim_emu
+make run_xs_wolf_grhsim_emu
+    -> build/xs/grhsim           -> legacy activity-schedule + legacy C++ emitter
+
+make xs_wolf_grhsim_am_emu
+make run_xs_wolf_grhsim_am_emu
+    -> build/xs/grhsim-am        -> post-stats JSON -> AM lower/schedule/C++ emitter
+```
+
+AM 路径由 `scripts/wolvrix_xs_grhsim_am.py` 编排。前处理子进程只生成 normalized
+post-stats JSON 并退出，释放 GRH 内存后再启动 `grhsim-am-lower-json`。两条路径使用独立的
+normalize、emit、model build 和运行日志名称；difftest 侧继续复用相同的 `GRHSIM=1`
+模型 ABI。当前 AM emitter 不支持 waveform/runtime-profile，AM target 会显式拒绝对应选项，
+而不是回退到 legacy emitter。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
