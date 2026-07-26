@@ -108,7 +108,9 @@ int main(int argc, char **argv)
     {
         std::cerr << "usage: grhsim-am-lower-json <design.json> [top] [--schedule] "
                      "[--emit <output-directory>] [--blocks-per-source <count>] "
-                     "[--max-source-bytes <count>]\n";
+                     "[--max-source-bytes <count>] [--max-instructions-per-block <count>] "
+                     "[--block-formation greedy|coarsen-dp] [--dp-segment-penalty <value>] "
+                     "[--dp-coarsen-budget <count>]\n";
         return 2;
     }
     const std::string path = argv[1];
@@ -117,6 +119,10 @@ int main(int argc, char **argv)
     std::filesystem::path emitDirectory;
     std::optional<std::string> blocksPerSource;
     std::optional<std::string> maxSourceBytes;
+    std::size_t maxInstructionsPerBlock = 128;
+    AmBlockFormation blockFormation = AmBlockFormation::Greedy;
+    double dpSegmentPenalty = 64.0;
+    std::size_t dpCoarsenBudget = 0;
     for (int index = 2; index < argc; ++index)
     {
         const std::string_view argument(argv[index]);
@@ -154,6 +160,62 @@ int main(int argc, char **argv)
                 return 2;
             }
             maxSourceBytes = std::to_string(value);
+        }
+        else if (argument == "--max-instructions-per-block" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            std::size_t value = 0;
+            const auto [end, error] =
+                std::from_chars(text.data(), text.data() + text.size(), value);
+            if (error != std::errc{} || end != text.data() + text.size() || value == 0)
+            {
+                std::cerr << "invalid --max-instructions-per-block value: " << text << '\n';
+                return 2;
+            }
+            maxInstructionsPerBlock = value;
+        }
+        else if (argument == "--block-formation" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            if (text == "greedy")
+            {
+                blockFormation = AmBlockFormation::Greedy;
+            }
+            else if (text == "coarsen-dp")
+            {
+                blockFormation = AmBlockFormation::CoarsenDp;
+            }
+            else
+            {
+                std::cerr << "invalid --block-formation value: " << text << '\n';
+                return 2;
+            }
+        }
+        else if (argument == "--dp-segment-penalty" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            try
+            {
+                dpSegmentPenalty = std::stod(std::string(text));
+            }
+            catch (const std::exception &)
+            {
+                std::cerr << "invalid --dp-segment-penalty value: " << text << '\n';
+                return 2;
+            }
+        }
+        else if (argument == "--dp-coarsen-budget" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            std::size_t value = 0;
+            const auto [end, error] =
+                std::from_chars(text.data(), text.data() + text.size(), value);
+            if (error != std::errc{} || end != text.data() + text.size())
+            {
+                std::cerr << "invalid --dp-coarsen-budget value: " << text << '\n';
+                return 2;
+            }
+            dpCoarsenBudget = value;
         }
         else if (!argument.starts_with("--") && explicitTop.empty())
         {
@@ -256,10 +318,13 @@ int main(int argc, char **argv)
             model = scheduler.schedule(
                 std::move(*artifact),
                 ActivityScheduleOptions{
-                    .maxInstructionsPerBlock = 128,
+                    .maxInstructionsPerBlock = maxInstructionsPerBlock,
                     .maxStateWritesPerBlock = 4096,
                     .enableCoarsening = true,
                     .collectStats = true,
+                    .blockFormation = blockFormation,
+                    .dpSegmentPenalty = dpSegmentPenalty,
+                    .dpCoarsenBudget = dpCoarsenBudget,
                 },
                 diagnostics);
             scheduleMs = elapsedMilliseconds(phaseStart);

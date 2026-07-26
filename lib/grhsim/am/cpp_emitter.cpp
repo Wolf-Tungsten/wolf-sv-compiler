@@ -117,16 +117,6 @@ namespace wolvrix::lib::grhsim::am
             return result;
         }
 
-        std::string valueExpr(VariableId variable)
-        {
-            return "values_[" + std::to_string(variable.value) + "]";
-        }
-
-        std::string boolExpr(VariableId variable)
-        {
-            return "(" + valueExpr(variable) + " != 0)";
-        }
-
         std::string maskExpr(uint32_t width)
         {
             if (width >= 64)
@@ -160,7 +150,89 @@ namespace wolvrix::lib::grhsim::am
             std::unordered_map<uint32_t, DpiImportId> dpiImportBySymbol;
             std::vector<bool> referencedDpiImports;
             std::vector<InstructionId> finalSystemTasks;
+            // ST00009 block-local value localization: a narrow scalar value defined in
+            // exactly one block and only read later in the same block is emitted as a
+            // C++ local instead of a values_[] slot. variableEscapeFlags != 0 keeps the
+            // values_[] slot (kEscape* bits below).
+            std::vector<uint32_t> variableDefBlock;
+            std::vector<uint32_t> variableDefPosition;
+            std::vector<uint8_t> variableEscapeFlags;
+            std::vector<std::vector<uint32_t>> blockDefinedVariables;
+            mutable std::vector<uint32_t> localValueStamps;
+            mutable std::vector<uint32_t> localValueIndices;
+            mutable uint32_t activeLocalityBlock = std::numeric_limits<uint32_t>::max();
+            mutable std::vector<uint32_t> activeLocalityDeclarations;
         };
+
+        constexpr uint8_t kEscapeGlobal = 1U << 0U;
+        constexpr uint8_t kEscapeCrossBlockUse = 1U << 1U;
+        constexpr uint8_t kEscapeEarlyUse = 1U << 2U;
+        constexpr uint32_t kInvalidLocalityBlock = std::numeric_limits<uint32_t>::max();
+
+        bool isLocalValue(const EmitState &state, VariableId variable)
+        {
+            return state.activeLocalityBlock != kInvalidLocalityBlock &&
+                   state.localValueStamps[variable.value] == state.activeLocalityBlock + 1;
+        }
+
+        std::string valueExpr(const EmitState &state, VariableId variable)
+        {
+            if (isLocalValue(state, variable))
+            {
+                return "local_" + std::to_string(state.localValueIndices[variable.value]);
+            }
+            return "values_[" + std::to_string(variable.value) + "]";
+        }
+
+        std::string boolExpr(const EmitState &state, VariableId variable)
+        {
+            return "(" + valueExpr(state, variable) + " != 0)";
+        }
+
+        void beginLocalityBlock(const EmitState &state, uint32_t block)
+        {
+            state.activeLocalityBlock = block;
+            state.activeLocalityDeclarations.clear();
+            for (const uint32_t variable : state.blockDefinedVariables[block])
+            {
+                if (state.variableEscapeFlags[variable] != 0)
+                {
+                    continue;
+                }
+                state.localValueStamps[variable] = block + 1;
+                state.localValueIndices[variable] =
+                    static_cast<uint32_t>(state.activeLocalityDeclarations.size());
+                state.activeLocalityDeclarations.push_back(
+                    state.localValueIndices[variable]);
+            }
+        }
+
+        void endLocalityBlock(const EmitState &state)
+        {
+            state.activeLocalityBlock = kInvalidLocalityBlock;
+            state.activeLocalityDeclarations.clear();
+        }
+
+        std::string localValueDeclarations(const EmitState &state)
+        {
+            if (state.activeLocalityDeclarations.empty())
+            {
+                return {};
+            }
+            std::string code = "std::uint64_t ";
+            bool first = true;
+            for (const uint32_t index : state.activeLocalityDeclarations)
+            {
+                if (!first)
+                {
+                    code += ", ";
+                }
+                first = false;
+                code += "local_" + std::to_string(index);
+            }
+            code += ";\n";
+            return code;
+        }
 
         const Type &variableType(const EmitState &state, VariableId variable)
         {
@@ -200,7 +272,7 @@ namespace wolvrix::lib::grhsim::am
                                 Signedness signedness)
         {
             const Type &source = variableType(state, variable);
-            return "resize_value(" + valueExpr(variable) + ", " +
+            return "resize_value(" + valueExpr(state, variable) + ", " +
                    std::to_string(source.bitWidth) + ", " +
                    (signedness == Signedness::Signed ? "true" : "false") + ", " +
                    std::to_string(width) + ")";
@@ -211,7 +283,7 @@ namespace wolvrix::lib::grhsim::am
             const Type &type = variableType(state, variable);
             return (isWideBitVector(state, variable) || type.kind == TypeKind::Array)
                        ? wideDataExpr(state, variable)
-                       : "&" + valueExpr(variable);
+                       : "&" + valueExpr(state, variable);
         }
 
         uint64_t storedWordCount(const EmitState &state, VariableId variable)
@@ -233,17 +305,17 @@ namespace wolvrix::lib::grhsim::am
             {
                 if (sourceType.bitWidth <= 64)
                 {
-                    return valueExpr(target) + " = resize_value(" + valueExpr(source) + ", " +
+                    return valueExpr(state, target) + " = resize_value(" + valueExpr(state, source) + ", " +
                            std::to_string(sourceType.bitWidth) + ", " + sign + ", " +
                            std::to_string(targetType.bitWidth) + ");\n";
                 }
-                return valueExpr(target) + " = (" + wordDataExpr(state, source) + ")[0] & " +
+                return valueExpr(state, target) + " = (" + wordDataExpr(state, source) + ")[0] & " +
                        maskExpr(targetType.bitWidth) + ";\n";
             }
             if (sourceType.bitWidth <= 64)
             {
                 return "assign_words_from_scalar(" + wideDataExpr(state, target) + ", " +
-                       std::to_string(targetType.bitWidth) + ", " + valueExpr(source) + ", " +
+                       std::to_string(targetType.bitWidth) + ", " + valueExpr(state, source) + ", " +
                        std::to_string(sourceType.bitWidth) + ", " + sign + ");\n";
             }
             return "assign_words(" + wideDataExpr(state, target) + ", " +
@@ -319,7 +391,7 @@ namespace wolvrix::lib::grhsim::am
             const EmitState::Storage &storage = variableStorage(state, variable);
             if (type.kind == TypeKind::BitVector && type.bitWidth <= 64)
             {
-                return "TaskArgument::logic_scalar(" + valueExpr(variable) + ", " +
+                return "TaskArgument::logic_scalar(" + valueExpr(state, variable) + ", " +
                        std::to_string(type.bitWidth) + ", " +
                        (type.signedness == Signedness::Signed ? "true" : "false") + ")";
             }
@@ -353,7 +425,7 @@ namespace wolvrix::lib::grhsim::am
             {
                 case DpiAbiKind::Integral:
                     return "static_cast<" + std::string(cppType) + ">(" +
-                           valueExpr(variable) + " & " + maskExpr(type.bitWidth) + ")";
+                           valueExpr(state, variable) + " & " + maskExpr(type.bitWidth) + ")";
                 case DpiAbiKind::Real64:
                     return "std::bit_cast<double>(realValues_[" +
                            std::to_string(storage.offset) + "])";
@@ -376,7 +448,7 @@ namespace wolvrix::lib::grhsim::am
             switch (abi)
             {
                 case DpiAbiKind::Integral:
-                    return valueExpr(target) + " = static_cast<std::uint64_t>(" +
+                    return valueExpr(state, target) + " = static_cast<std::uint64_t>(" +
                            std::string(temporary) + ") & " + maskExpr(type.bitWidth) + ";\n";
                 case DpiAbiKind::Real64:
                     return "realValues_[" + std::to_string(storage.offset) +
@@ -399,7 +471,7 @@ namespace wolvrix::lib::grhsim::am
                                   uint32_t eventCount,
                                   bool finalPhase)
         {
-            std::string expression = boolExpr(operands.front());
+            std::string expression = boolExpr(state, operands.front());
             if (finalPhase || eventCount == 0)
             {
                 return expression;
@@ -412,7 +484,7 @@ namespace wolvrix::lib::grhsim::am
                 {
                     expression += " || ";
                 }
-                expression += boolExpr(operands[index]);
+                expression += boolExpr(state, operands[index]);
             }
             expression += ")";
             return expression;
@@ -434,7 +506,7 @@ namespace wolvrix::lib::grhsim::am
                 {
                     expression += " || ";
                 }
-                expression += boolExpr(operands[index]);
+                expression += boolExpr(state, operands[index]);
             }
             expression += ")";
             return expression;
@@ -488,7 +560,7 @@ namespace wolvrix::lib::grhsim::am
                     "pendingHostEvents_[" + std::to_string(*pendingEventSlot) + "]";
                 preamble = "if (" + eventHitExpr(state, operands, attributes->eventCount) +
                            ") " + pending + " = true;\n";
-                fire = boolExpr(operands.front()) + " && " + pending;
+                fire = boolExpr(state, operands.front()) + " && " + pending;
             }
             else
             {
@@ -526,7 +598,7 @@ namespace wolvrix::lib::grhsim::am
                 const std::string suffix = std::to_string(instruction.value);
                 const std::string handleName = "task_handle_" + suffix;
                 const std::string formatterName = "task_formatter_" + suffix;
-                code += "const std::uint64_t " + handleName + " = " + valueExpr(handle) +
+                code += "const std::uint64_t " + handleName + " = " + valueExpr(state, handle) +
                         " & " + maskExpr(handleType.bitWidth) + ";\n";
                 code += "TaskFormatter " + formatterName + "(stringValues_[" +
                         std::to_string(variableStorage(state, format).offset) + "]);\n";
@@ -556,7 +628,7 @@ namespace wolvrix::lib::grhsim::am
                         error = "finish system.task exit code must be scalar logic";
                         return std::nullopt;
                     }
-                    code += "systemExitCode_ = static_cast<int>(" + valueExpr(operands[1]) +
+                    code += "systemExitCode_ = static_cast<int>(" + valueExpr(state, operands[1]) +
                             " & " + maskExpr(exitType.bitWidth) + ");\n";
                 }
                 else
@@ -722,7 +794,7 @@ namespace wolvrix::lib::grhsim::am
                     "pendingHostEvents_[" + std::to_string(*pendingEventSlot) + "]";
                 preamble = "if (" + eventHitExpr(state, operands, attributes->eventCount) +
                            ") " + pending + " = true;\n";
-                fire = boolExpr(operands.front()) + " && " + pending;
+                fire = boolExpr(state, operands.front()) + " && " + pending;
             }
             else
             {
@@ -807,7 +879,7 @@ namespace wolvrix::lib::grhsim::am
                        std::to_string(operation) + ");\n";
             };
             const auto scalarResult = [&](std::string expression) {
-                return valueExpr(results.front()) + " = (" + expression + ") ? 1 : 0;\n";
+                return valueExpr(state, results.front()) + " = (" + expression + ") ? 1 : 0;\n";
             };
 
             switch (opcode)
@@ -925,7 +997,7 @@ namespace wolvrix::lib::grhsim::am
                                 falseType.signedness == Signedness::Signed
                             ? Signedness::Signed
                             : Signedness::Unsigned;
-                    return "if (" + boolExpr(operands[0]) + ") { " +
+                    return "if (" + boolExpr(state, operands[0]) + ") { " +
                            assignVariableStatement(state, results.front(), operands[1], common) +
                            "} else { " +
                            assignVariableStatement(state, results.front(), operands[2], common) +
@@ -1011,7 +1083,7 @@ namespace wolvrix::lib::grhsim::am
             const auto results = state.program.results(instruction);
             const auto resultAssign = [&](std::string expression) {
                 const Type &resultType = variableType(state, results.front());
-                return valueExpr(results.front()) + " = (" + expression + ") & " +
+                return valueExpr(state, results.front()) + " = (" + expression + ") & " +
                        maskExpr(resultType.bitWidth) + ";\n";
             };
             const auto binaryOperands = [&](const Type &resultType) {
@@ -1042,7 +1114,7 @@ namespace wolvrix::lib::grhsim::am
                            "if (" + event + " && !" + completed + ") {\n" +
                            completed + " = true;\n" +
                            "if (" + condition + ") { " + body + " }\n" +
-                           "}\n}\n";
+                           "}\n";
                 };
 
             if (opcode == Opcode::Assign &&
@@ -1067,7 +1139,7 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return "assign_words_from_scalar(" + wideDataExpr(state, results.front()) +
                            ", " + std::to_string(resultType.bitWidth) + ", " +
-                           valueExpr(operands.front()) + ", " +
+                           valueExpr(state, operands.front()) + ", " +
                            std::to_string(sourceType.bitWidth) + ", " + sign + ");\n";
                 }
                 return "assign_words(" + wideDataExpr(state, results.front()) + ", " +
@@ -1168,9 +1240,9 @@ namespace wolvrix::lib::grhsim::am
                     std::to_string(width) + ");";
                 if (opcode == Opcode::RegisterWrite)
                 {
-                    return emitEventfulStateWrite(4, boolExpr(operands[0]), body);
+                    return emitEventfulStateWrite(4, boolExpr(state, operands[0]), body);
                 }
-                return "if (" + boolExpr(operands[0]) + ") { " + body + " }\n";
+                return "if (" + boolExpr(state, operands[0]) + ") { " + body + " }\n";
             }
 
             const bool deferredUnsupported =
@@ -1237,7 +1309,7 @@ namespace wolvrix::lib::grhsim::am
                                         (resultType.signedness == Signedness::Signed ? "true" : "false") + ")");
                 }
                 case Opcode::Not:
-                    return resultAssign("~" + valueExpr(operands.front()));
+                    return resultAssign("~" + valueExpr(state, operands.front()));
                 case Opcode::Eq:
                 case Opcode::Ne:
                 case Opcode::Lt:
@@ -1276,16 +1348,16 @@ namespace wolvrix::lib::grhsim::am
                     return resultAssign(compare);
                 }
                 case Opcode::LogicAnd:
-                    return resultAssign(boolExpr(operands[0]) + " && " + boolExpr(operands[1]));
+                    return resultAssign(boolExpr(state, operands[0]) + " && " + boolExpr(state, operands[1]));
                 case Opcode::LogicOr:
-                    return resultAssign(boolExpr(operands[0]) + " || " + boolExpr(operands[1]));
+                    return resultAssign(boolExpr(state, operands[0]) + " || " + boolExpr(state, operands[1]));
                 case Opcode::LogicNot:
-                    return resultAssign("!" + boolExpr(operands[0]));
+                    return resultAssign("!" + boolExpr(state, operands[0]));
                 case Opcode::ReduceAnd:
                 case Opcode::ReduceNand:
                 {
                     const Type &sourceType = variableType(state, operands.front());
-                    const std::string reduced = "((" + valueExpr(operands.front()) + " & " +
+                    const std::string reduced = "((" + valueExpr(state, operands.front()) + " & " +
                                                 maskExpr(sourceType.bitWidth) + ") == " +
                                                 maskExpr(sourceType.bitWidth) + ")";
                     return resultAssign(opcode == Opcode::ReduceAnd ? reduced : "!(" + reduced + ")");
@@ -1293,13 +1365,13 @@ namespace wolvrix::lib::grhsim::am
                 case Opcode::ReduceOr:
                 case Opcode::ReduceNor:
                 {
-                    const std::string reduced = boolExpr(operands.front());
+                    const std::string reduced = boolExpr(state, operands.front());
                     return resultAssign(opcode == Opcode::ReduceOr ? reduced : "!(" + reduced + ")");
                 }
                 case Opcode::ReduceXor:
                 case Opcode::ReduceXnor:
                 {
-                    const std::string reduced = "(std::popcount(" + valueExpr(operands.front()) + ") & 1U)";
+                    const std::string reduced = "(std::popcount(" + valueExpr(state, operands.front()) + ") & 1U)";
                     return resultAssign(opcode == Opcode::ReduceXor ? reduced : "!(" + reduced + ")");
                 }
                 case Opcode::Shl:
@@ -1311,15 +1383,15 @@ namespace wolvrix::lib::grhsim::am
                                              ? "shift_left"
                                              : opcode == Opcode::LogicalShr ? "shift_right"
                                                                              : "arithmetic_shift_right";
-                    return resultAssign(std::string(helper) + "(" + valueExpr(operands[0]) + ", " +
-                                        valueExpr(operands[1]) + ", " +
+                    return resultAssign(std::string(helper) + "(" + valueExpr(state, operands[0]) + ", " +
+                                        valueExpr(state, operands[1]) + ", " +
                                         std::to_string(resultType.bitWidth) + ", " +
                                         (resultType.signedness == Signedness::Signed ? "true" : "false") + ")");
                 }
                 case Opcode::Mux:
                 {
                     const Type &resultType = variableType(state, results.front());
-                    return resultAssign(boolExpr(operands[0]) + " ? " +
+                    return resultAssign(boolExpr(state, operands[0]) + " ? " +
                                         resizedExpr(state, operands[1], resultType.bitWidth,
                                                     resultType.signedness) +
                                         " : " +
@@ -1335,7 +1407,7 @@ namespace wolvrix::lib::grhsim::am
                     {
                         const uint32_t width = variableType(state, operand).bitWidth;
                         code += "concat_" + suffix + " = concat_value(concat_" + suffix + ", " +
-                                std::to_string(accumulated) + ", " + valueExpr(operand) + ", " +
+                                std::to_string(accumulated) + ", " + valueExpr(state, operand) + ", " +
                                 std::to_string(width) + ");\n";
                         accumulated += width;
                     }
@@ -1354,7 +1426,7 @@ namespace wolvrix::lib::grhsim::am
                     {
                         code += "replicate_" + suffix + " = concat_value(replicate_" + suffix + ", " +
                                 std::to_string(index * sourceType.bitWidth) + ", " +
-                                valueExpr(operands.front()) + ", " +
+                                valueExpr(state, operands.front()) + ", " +
                                 std::to_string(sourceType.bitWidth) + ");\n";
                     }
                     code += resultAssign("replicate_" + suffix);
@@ -1364,17 +1436,17 @@ namespace wolvrix::lib::grhsim::am
                 case Opcode::SliceStatic:
                 {
                     const auto attributes = state.program.sliceStaticAttributes(instruction);
-                    return resultAssign("slice_value(" + valueExpr(operands.front()) + ", " +
+                    return resultAssign("slice_value(" + valueExpr(state, operands.front()) + ", " +
                                         std::to_string(attributes->lsb) + ", " +
                                         std::to_string(variableType(state, results.front()).bitWidth) + ")");
                 }
                 case Opcode::SliceDynamic:
-                    return resultAssign("slice_value(" + valueExpr(operands[0]) + ", " +
-                                        valueExpr(operands[1]) + ", " +
+                    return resultAssign("slice_value(" + valueExpr(state, operands[0]) + ", " +
+                                        valueExpr(state, operands[1]) + ", " +
                                         std::to_string(variableType(state, results.front()).bitWidth) + ")");
                 case Opcode::SliceArray:
-                    return resultAssign("slice_array_value(" + valueExpr(operands[0]) + ", " +
-                                        valueExpr(operands[1]) + ", " +
+                    return resultAssign("slice_array_value(" + valueExpr(state, operands[0]) + ", " +
+                                        valueExpr(state, operands[1]) + ", " +
                                         std::to_string(variableType(state, results.front()).bitWidth) + ", " +
                                         std::to_string(variableType(state, operands[0]).bitWidth) + ")");
                 case Opcode::ChangedAny:
@@ -1384,38 +1456,38 @@ namespace wolvrix::lib::grhsim::am
                     std::string event;
                     if (opcode == Opcode::ChangedAny)
                     {
-                        event = valueExpr(operands[0]) + " != " + valueExpr(operands[1]);
+                        event = valueExpr(state, operands[0]) + " != " + valueExpr(state, operands[1]);
                     }
                     else if (opcode == Opcode::ChangedPos)
                     {
-                        event = "(" + valueExpr(operands[1]) + " == 0 && " +
-                                valueExpr(operands[0]) + " != 0)";
+                        event = "(" + valueExpr(state, operands[1]) + " == 0 && " +
+                                valueExpr(state, operands[0]) + " != 0)";
                     }
                     else
                     {
-                        event = "(" + valueExpr(operands[1]) + " != 0 && " +
-                                valueExpr(operands[0]) + " == 0)";
+                        event = "(" + valueExpr(state, operands[1]) + " != 0 && " +
+                                valueExpr(state, operands[0]) + " == 0)";
                     }
                     return changedResultCallPrefix(state, results.front()) + event +
                            ");\n" +
-                           valueExpr(operands[1]) + " = " + valueExpr(operands[0]) + ";\n";
+                           valueExpr(state, operands[1]) + " = " + valueExpr(state, operands[0]) + ";\n";
                 }
                 case Opcode::RegisterWrite:
                 {
                     const VariableId target = operands[3];
                     const std::string body =
-                        valueExpr(target) + " = ((" + valueExpr(target) + " & ~" +
-                        valueExpr(operands[1]) + ") | (" + valueExpr(operands[2]) + " & " +
-                        valueExpr(operands[1]) + ")) & " +
+                        valueExpr(state, target) + " = ((" + valueExpr(state, target) + " & ~" +
+                        valueExpr(state, operands[1]) + ") | (" + valueExpr(state, operands[2]) + " & " +
+                        valueExpr(state, operands[1]) + ")) & " +
                         maskExpr(variableType(state, target).bitWidth) + ";";
-                    return emitEventfulStateWrite(4, boolExpr(operands[0]), body);
+                    return emitEventfulStateWrite(4, boolExpr(state, operands[0]), body);
                 }
                 case Opcode::LatchWrite:
                 {
                     const VariableId target = operands[3];
-                    return "if (" + boolExpr(operands[0]) + ") { " + valueExpr(target) + " = ((" +
-                           valueExpr(target) + " & ~" + valueExpr(operands[1]) + ") | (" +
-                           valueExpr(operands[2]) + " & " + valueExpr(operands[1]) + ")) & " +
+                    return "if (" + boolExpr(state, operands[0]) + ") { " + valueExpr(state, target) + " = ((" +
+                           valueExpr(state, target) + " & ~" + valueExpr(state, operands[1]) + ") | (" +
+                           valueExpr(state, operands[2]) + " & " + valueExpr(state, operands[1]) + ")) & " +
                            maskExpr(variableType(state, target).bitWidth) + "; }\n";
                 }
                 case Opcode::MemoryRead:
@@ -1436,8 +1508,8 @@ namespace wolvrix::lib::grhsim::am
                             std::to_string(memoryType.elementCount) + ") { ";
                     if (resultType.bitWidth <= 64)
                     {
-                        code += valueExpr(results.front()) + " = 0; } else { " +
-                                valueExpr(results.front()) + " = (" + row + ")[0] & " +
+                        code += valueExpr(state, results.front()) + " = 0; } else { " +
+                                valueExpr(state, results.front()) + " = (" + row + ")[0] & " +
                                 maskExpr(resultType.bitWidth) + "; }\n";
                     }
                     else
@@ -1463,7 +1535,7 @@ namespace wolvrix::lib::grhsim::am
                                        std::to_string(addressType.bitWidth) + ", " +
                                        std::to_string(memoryType.elementCount) + ");\n";
                     const std::string condition =
-                        boolExpr(operands[0]) + " && " + index + " != " +
+                        boolExpr(state, operands[0]) + " && " + index + " != " +
                         std::to_string(memoryType.elementCount);
                     const std::string body =
                         "masked_write_words(" + wordDataExpr(state, operands[4]) + " + " +
@@ -1502,13 +1574,13 @@ namespace wolvrix::lib::grhsim::am
                                 std::to_string(memoryType.bitWidth) + ");";
                     }
                     body += " }";
-                    return emitEventfulStateWrite(3, boolExpr(operands[0]), body);
+                    return emitEventfulStateWrite(3, boolExpr(state, operands[0]), body);
                 }
                 case Opcode::ActForward:
                 case Opcode::ActBackward:
                 {
                     const auto attributes = state.program.activationAttributes(instruction);
-                    std::string code = "if (" + boolExpr(operands.front()) + ") {\n";
+                    std::string code = "if (" + boolExpr(state, operands.front()) + ") {\n";
                     for (BlockId target : attributes->targets)
                     {
                         code += opcode == Opcode::ActForward ? "activate_forward(" :
@@ -1734,6 +1806,17 @@ namespace wolvrix::lib::grhsim::am
         {
             uint64_t byteCount = static_cast<uint64_t>(
                 ("    case " + std::to_string(blockIndex) + ": {\n").size());
+            beginLocalityBlock(state, static_cast<uint32_t>(blockIndex));
+            const std::optional<uint64_t> declarationBytes =
+                indentedLineByteCount(localValueDeclarations(state), "        ");
+            if (!declarationBytes || !addByteCount(byteCount, *declarationBytes))
+            {
+                endLocalityBlock(state);
+                diagnostics.error("AM C++ emitter source size overflow: block=" +
+                                      std::to_string(blockIndex),
+                                  std::string(kContext));
+                return std::nullopt;
+            }
             const BlockId block{static_cast<uint32_t>(blockIndex)};
             for (std::size_t index = 0; index < model.program.blockSize(block); ++index)
             {
@@ -1744,6 +1827,7 @@ namespace wolvrix::lib::grhsim::am
                     emitInstruction(state, instruction, error);
                 if (!code)
                 {
+                    endLocalityBlock(state);
                     diagnostics.error(error + ": instruction=" +
                                           std::to_string(instruction.value),
                                       std::string(kContext));
@@ -1753,12 +1837,14 @@ namespace wolvrix::lib::grhsim::am
                     indentedLineByteCount(*code, "        ");
                 if (!codeBytes || !addByteCount(byteCount, *codeBytes))
                 {
+                    endLocalityBlock(state);
                     diagnostics.error("AM C++ emitter source size overflow: block=" +
                                           std::to_string(blockIndex),
                                       std::string(kContext));
                     return std::nullopt;
                 }
             }
+            endLocalityBlock(state);
             constexpr std::string_view kBlockCaseEpilogue =
                 "        break;\n    }\n";
             if (!addByteCount(byteCount, kBlockCaseEpilogue.size()))
@@ -2366,6 +2452,182 @@ namespace wolvrix::lib::grhsim::am
             return result;
         }
         const std::size_t blockCount = model.program.blockCount();
+
+        // ST00009: escape analysis for block-local value localization. A value keeps
+        // its values_[] slot unless it is a narrow scalar defined by exactly one
+        // instruction and only read later in the same block. Anything the runtime,
+        // the host, another block, or a previous epoch can observe escapes.
+        const std::size_t variableCount = program.variableCount();
+        state.variableDefBlock.assign(variableCount, kInvalidLocalityBlock);
+        state.variableDefPosition.assign(variableCount, 0);
+        state.variableEscapeFlags.assign(variableCount, 0);
+        state.blockDefinedVariables.assign(blockCount, {});
+        state.localValueStamps.assign(variableCount, 0);
+        state.localValueIndices.assign(variableCount, 0);
+        std::vector<uint8_t> variableDefCounts(variableCount, 0);
+        for (uint32_t blockIndex = 0; blockIndex < blockCount; ++blockIndex)
+        {
+            const BlockId block{blockIndex};
+            for (std::size_t position = 0; position < model.program.blockSize(block); ++position)
+            {
+                const InstructionId instruction =
+                    model.program.blockInstruction(block, position);
+                const Opcode opcode = program.opcode(instruction);
+                const auto operands = program.operands(instruction);
+                const auto results = program.results(instruction);
+                const auto escapeOperands = [&] {
+                    for (const VariableId operand : operands)
+                    {
+                        state.variableEscapeFlags[operand.value] |= kEscapeGlobal;
+                    }
+                };
+                const auto escapeResults = [&] {
+                    for (const VariableId result : results)
+                    {
+                        state.variableEscapeFlags[result.value] |= kEscapeGlobal;
+                    }
+                };
+                switch (opcode)
+                {
+                    case Opcode::ChangedAny:
+                    case Opcode::ChangedPos:
+                    case Opcode::ChangedNeg:
+                        // Watched values persist across epochs; results are written by
+                        // index through set_changed_result.
+                        escapeOperands();
+                        escapeResults();
+                        break;
+                    case Opcode::RegisterWrite:
+                    case Opcode::LatchWrite:
+                    case Opcode::MemoryWrite:
+                    case Opcode::MemoryFill:
+                        // State writes keep persistent slots for every operand
+                        // (targets are state; the rest are commit capture slots).
+                        escapeOperands();
+                        break;
+                    case Opcode::MemoryRead:
+                        escapeOperands();
+                        break;
+                    case Opcode::SystemFunction:
+                    case Opcode::SystemTask:
+                    case Opcode::DpiCall:
+                        // Host-visible values; Final tasks are also read by finalize().
+                        escapeOperands();
+                        escapeResults();
+                        break;
+                    default:
+                        break;
+                }
+                // The emitter only assigns results.front(); keep any extra result
+                // conservatively in its values_[] slot.
+                for (std::size_t extra = 1; extra < results.size(); ++extra)
+                {
+                    state.variableEscapeFlags[results[extra].value] |= kEscapeGlobal;
+                }
+                for (const VariableId result : results)
+                {
+                    uint8_t &defCount = variableDefCounts[result.value];
+                    if (defCount != 0)
+                    {
+                        defCount = 2;
+                        state.variableDefBlock[result.value] = kInvalidLocalityBlock;
+                        state.variableEscapeFlags[result.value] |= kEscapeGlobal;
+                        continue;
+                    }
+                    defCount = 1;
+                    state.variableDefBlock[result.value] = blockIndex;
+                    state.variableDefPosition[result.value] = static_cast<uint32_t>(position);
+                    state.blockDefinedVariables[blockIndex].push_back(result.value);
+                }
+            }
+        }
+        for (uint32_t blockIndex = 0; blockIndex < blockCount; ++blockIndex)
+        {
+            const BlockId block{blockIndex};
+            for (std::size_t position = 0; position < model.program.blockSize(block); ++position)
+            {
+                const InstructionId instruction =
+                    model.program.blockInstruction(block, position);
+                for (const VariableId operand : program.operands(instruction))
+                {
+                    const uint32_t variable = operand.value;
+                    if (state.variableDefBlock[variable] != blockIndex)
+                    {
+                        state.variableEscapeFlags[variable] |= kEscapeCrossBlockUse;
+                    }
+                    else if (static_cast<uint32_t>(position) <=
+                             state.variableDefPosition[variable])
+                    {
+                        // A read at or before its definition observes a previous epoch.
+                        state.variableEscapeFlags[variable] |= kEscapeEarlyUse;
+                    }
+                }
+            }
+        }
+        for (uint32_t index = 0; index < variableCount; ++index)
+        {
+            const Type &type = state.variableTypes[index];
+            if (type.kind != TypeKind::BitVector || type.bitWidth > 64)
+            {
+                state.variableEscapeFlags[index] |= kEscapeGlobal;
+                continue;
+            }
+            const InitDescriptor &init = program.init(program.variable(VariableId{index}).init);
+            if (init.kind == InitKind::Constant || init.kind == InitKind::Actions)
+            {
+                // init() assigns values_[] slots by index.
+                state.variableEscapeFlags[index] |= kEscapeGlobal;
+            }
+        }
+        for (const PortBinding &port : model.interface.ports)
+        {
+            if (port.input.valid())
+            {
+                state.variableEscapeFlags[port.input.value] |= kEscapeGlobal;
+            }
+            if (port.output.valid())
+            {
+                state.variableEscapeFlags[port.output.value] |= kEscapeGlobal;
+            }
+            if (port.outputEnable.valid())
+            {
+                state.variableEscapeFlags[port.outputEnable.value] |= kEscapeGlobal;
+            }
+        }
+        for (const VariableLabel &declared : model.interface.declaredVariables)
+        {
+            state.variableEscapeFlags[declared.variable.value] |= kEscapeGlobal;
+        }
+        for (const PreCommitSnapshot &snapshot : model.preCommitSnapshots)
+        {
+            state.variableEscapeFlags[snapshot.source.value] |= kEscapeGlobal;
+            state.variableEscapeFlags[snapshot.target.value] |= kEscapeGlobal;
+        }
+        for (const CommitOperandCapture &capture : model.commitOperandCaptures)
+        {
+            state.variableEscapeFlags[capture.source.value] |= kEscapeGlobal;
+            state.variableEscapeFlags[capture.target.value] |= kEscapeGlobal;
+        }
+
+        if (statsAttribute != options.attributes.end() && statsAttribute->second == "true")
+        {
+            uint64_t localValues = 0;
+            for (const std::vector<uint32_t> &defined : state.blockDefinedVariables)
+            {
+                for (const uint32_t variable : defined)
+                {
+                    if (state.variableEscapeFlags[variable] == 0)
+                    {
+                        ++localValues;
+                    }
+                }
+            }
+            diagnostics.info("AM C++ emitter locality stats: local_values=" +
+                                 std::to_string(localValues) + " escaped_values=" +
+                                 std::to_string(variableCount - localValues),
+                             std::string(kContext));
+        }
+
         const std::size_t blockSourceCount =
             blockCount / *blocksPerSource + (blockCount % *blocksPerSource == 0 ? 0 : 1);
         const std::size_t activityWordCount = (blockCount + 63U) / 64U;
@@ -4207,6 +4469,8 @@ namespace
                      ++blockIndex)
                 {
                     blockSource << "    case " << blockIndex << ": {\n";
+                    beginLocalityBlock(state, static_cast<uint32_t>(blockIndex));
+                    writeIndentedLines(blockSource, localValueDeclarations(state), "        ");
                     const BlockId block{static_cast<uint32_t>(blockIndex)};
                     for (std::size_t index = 0;
                          index < model.program.blockSize(block);
@@ -4227,6 +4491,7 @@ namespace
                         }
                         writeIndentedLines(blockSource, *code, "        ");
                     }
+                    endLocalityBlock(state);
                     if (!blocksGenerated)
                     {
                         break;

@@ -1,6 +1,7 @@
 #include "grhsim/am/production_activity_schedule.hpp"
 
 #include "grhsim/am/builder.hpp"
+#include "grhsim/am/grhsim_am_activity_schedule.hpp"
 #include "grhsim/am/opcode_traits.hpp"
 
 #include <algorithm>
@@ -1239,12 +1240,76 @@ namespace wolvrix::lib::grhsim::am
         std::vector<uint32_t> atomTopo;
         atomTopo.reserve(atomCount);
         uint32_t normalBlockCount = 0;
+        std::array<uint32_t, 2> blockCountsByClass{};
+        if (options.blockFormation == AmBlockFormation::CoarsenDp) {
+            std::vector<uint32_t> atomInstructions(atomCount, 0);
+            std::vector<uint32_t> atomStateWrites(atomCount, 0);
+            std::vector<uint8_t> atomIsCommit(atomCount, 0);
+            for (uint32_t atom = 0; atom < atomCount; ++atom) {
+                atomInstructions[atom] = static_cast<uint32_t>(atomCosts[atom].instructions);
+                atomStateWrites[atom] = static_cast<uint32_t>(atomCosts[atom].stateWrites);
+                atomIsCommit[atom] = atomCosts[atom].blockClass == BlockClass::Commit ? 1 : 0;
+            }
+            const GrhSimAmActivityScheduleInput blockInput{
+                .atomCount = atomCount,
+                .atomOffsets = atomGraph.offsets,
+                .atomTargets = atomGraph.targets,
+                .atomInstructions = atomInstructions,
+                .atomStateWrites = atomStateWrites,
+                .atomIsCommit = atomIsCommit,
+                .atomMinInstruction = atomMinInstruction,
+                .commitEventRank = commitEventRank,
+                .commitGuardRank = commitGuardRank,
+                .variableCount = variableCount,
+                .definitions = defUse.definitions,
+                .useOffsets = defUse.useOffsets,
+                .uses = defUse.uses,
+                .instructionAtom = instructionAtom,
+                .maxInstructionsPerBlock = options.maxInstructionsPerBlock,
+                .maxCommitInstructionsPerBlock = options.maxCommitInstructionsPerBlock,
+                .maxStateWritesPerBlock = options.maxStateWritesPerBlock,
+                .coarsenBudget = options.dpCoarsenBudget != 0
+                                     ? options.dpCoarsenBudget
+                                     : std::max<std::size_t>(
+                                           options.maxInstructionsPerBlock / 8, std::size_t{16}),
+                .segmentPenalty = options.dpSegmentPenalty,
+            };
+            std::string blockError;
+            std::optional<GrhSimAmActivityScheduleResult> scheduled =
+                scheduleGrhSimAmActivityBlocks(blockInput, blockError);
+            if (!scheduled) {
+                diagnostics.error(std::move(blockError), std::string(kDiagnosticContext));
+                return std::nullopt;
+            }
+            atomBlock = std::move(scheduled->atomBlock);
+            atomTopo = std::move(scheduled->atomTopo);
+            normalBlockCount = scheduled->normalBlockCount;
+            blockCountsByClass[readyIndex(BlockClass::Compute)] = scheduled->computeBlockCount;
+            blockCountsByClass[readyIndex(BlockClass::Commit)] = scheduled->commitBlockCount;
+            if (options.collectStats) {
+                diagnostics.info("coarsen-dp block formation stats: clusters_after_coarsen=" +
+                                     std::to_string(scheduled->clustersAfterCoarsen) +
+                                     " dp_segments=" + std::to_string(scheduled->dpSegments) +
+                                     " coarsen_ms=" + std::to_string(scheduled->coarsenMs) +
+                                     " dp_ms=" + std::to_string(scheduled->dpMs) +
+                                     " rounds=" + std::to_string(scheduled->coarsenRounds) +
+                                     " out1_merges=" +
+                                     std::to_string(scheduled->coarsenOut1Merges) +
+                                     " in1_merges=" +
+                                     std::to_string(scheduled->coarsenIn1Merges) +
+                                     " sibling_merges=" +
+                                     std::to_string(scheduled->coarsenSiblingMerges),
+                                 std::string(kDiagnosticContext));
+                diagnostics.info("coarsen-dp initial degree histogram: " +
+                                     scheduled->initialDegreeHistogram,
+                                 std::string(kDiagnosticContext));
+            }
+        } else {
         std::size_t currentInstructions = 0;
         std::size_t currentStateWrites = 0;
         BlockClass currentClass = BlockClass::Compute;
         uint32_t currentBucketAtom = kInvalidIndex;
         bool haveCurrent = false;
-        std::array<uint32_t, 2> blockCountsByClass{};
         while (atomTopo.size() != atomCount) {
             uint32_t atom = kInvalidIndex;
             if (!haveCurrent) {
@@ -1312,6 +1377,7 @@ namespace wolvrix::lib::grhsim::am
             if (!options.enableCoarsening) {
                 haveCurrent = false;
             }
+        }
         }
 
         const uint32_t commitBlockCount =

@@ -135,6 +135,12 @@ namespace wolvrix::lib::grhsim::am
     ValidationResult validate(const ExecutableModel &model,
                               const ValidationOptions &options = {});
 
+    enum class AmBlockFormation : uint8_t
+    {
+        Greedy = 0,
+        CoarsenDp = 1,
+    };
+
     struct ActivityScheduleOptions
     {
         std::size_t maxInstructionsPerBlock = 128;
@@ -144,6 +150,10 @@ namespace wolvrix::lib::grhsim::am
         std::size_t maxStateWritesPerBlock = 4096;
         bool enableCoarsening = true;
         bool collectStats = false;
+        AmBlockFormation blockFormation = AmBlockFormation::Greedy;
+        double dpSegmentPenalty = 64.0;
+        // 0 = automatic (maxInstructionsPerBlock / 8, at least 16).
+        std::size_t dpCoarsenBudget = 0;
     };
 
     struct GrhSimAmCppOptions
