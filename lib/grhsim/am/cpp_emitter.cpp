@@ -1114,7 +1114,7 @@ namespace wolvrix::lib::grhsim::am
                            "if (" + event + " && !" + completed + ") {\n" +
                            completed + " = true;\n" +
                            "if (" + condition + ") { " + body + " }\n" +
-                           "}\n";
+                           "}\n}\n";
                 };
 
             if (opcode == Opcode::Assign &&
