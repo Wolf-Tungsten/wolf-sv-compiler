@@ -155,6 +155,11 @@ namespace wolvrix::lib::grhsim::am
             uint64_t wideWords = 0;
             uint64_t realValues = 0;
             uint64_t stringValues = 0;
+            // Compile-time runtime-profile switch (GrhSimAmCppOptions attribute
+            // "runtimeProfile", default off). When false the generated model
+            // carries no profile counters or hot-path profile branches, and the
+            // host-facing profile API degrades to no-op stubs.
+            bool runtimeProfile = false;
             std::unordered_map<uint32_t, uint32_t> onceSlotByInstruction;
             uint32_t onceSlotCount = 0;
             std::unordered_map<uint32_t, uint32_t> pendingEventSlotByInstruction;
@@ -1662,7 +1667,7 @@ namespace wolvrix::lib::grhsim::am
                     const std::size_t maskedCount =
                         (maskCompute ? computeTargets.size() : 0) +
                         (maskCommit ? commitTargets.size() : 0);
-                    if (maskedCount != 0)
+                    if (state.runtimeProfile && maskedCount != 0)
                     {
                         code += "if (runtimeProfileEnabled_) ";
                         code += forward ? "profileActivateForward_ += " :
@@ -2282,6 +2287,9 @@ namespace wolvrix::lib::grhsim::am
         state.blockCount = static_cast<uint32_t>(model.program.blockCount());
         state.commitBlockBegin = model.commitBlockBegin;
         state.commitBlockEnd = model.commitBlockEnd;
+        const auto runtimeProfileAttribute = options.attributes.find("runtimeProfile");
+        state.runtimeProfile = runtimeProfileAttribute != options.attributes.end() &&
+                               runtimeProfileAttribute->second == "true";
         state.commitEventSlotByVariable.assign(
             program.variableCount(), std::numeric_limits<uint32_t>::max());
         for (uint32_t slot = 0; slot < commitEventVariables.size(); ++slot)
@@ -2807,7 +2815,8 @@ namespace wolvrix::lib::grhsim::am
                << "    void set_runtime_profile_enabled(bool enabled);\n"
                << "    [[nodiscard]] bool runtime_profile_enabled() const;\n"
                << "    void dump_runtime_profile() const;\n"
-               << "    static constexpr bool kRuntimeProfileCompiled = false;\n"
+               << "    static constexpr bool kRuntimeProfileCompiled = "
+               << (state.runtimeProfile ? "true" : "false") << ";\n"
                << "    [[nodiscard]] bool finish_requested() const;\n"
                << "    [[nodiscard]] bool stop_requested() const;\n"
                << "    [[nodiscard]] bool fatal_requested() const;\n"
@@ -2954,25 +2963,28 @@ namespace wolvrix::lib::grhsim::am
                << "> pendingHostEvents_{};\n"
                << "    bool firstEval_ = true;\n"
                << "    std::uint64_t epochCounter_ = 0;\n"
-               << "    std::uint64_t randomSeed_ = 0;\n"
-               << "    bool runtimeProfileEnabled_ = false;\n"
-               << "    std::uint64_t profileEvalCalls_ = 0;\n"
-               << "    std::uint64_t profileEpochs_ = 0;\n"
-               << "    std::uint64_t profileBlockExecs_ = 0;\n"
-               << "    std::uint64_t profileCommitBlockExecs_ = 0;\n"
-               << "    std::uint64_t profileCommitGroups_ = 0;\n"
-               << "    std::uint64_t profileActivateForward_ = 0;\n"
-               << "    std::uint64_t profileActivateBackward_ = 0;\n"
-               << "    std::uint64_t profileChangedMarks_ = 0;\n"
-               << "    std::uint64_t profileCommitChangedMarks_ = 0;\n"
-               << "    std::uint64_t profileChangedClears_ = 0;\n"
-               << "    std::uint64_t profileCaptureBlocks_ = 0;\n"
-               << "    std::uint64_t profileCaptureWords_ = 0;\n"
-               << "    std::uint64_t profileComputeNs_ = 0;\n"
-               << "    std::uint64_t profileCommitNs_ = 0;\n"
-               << "    std::uint64_t profileEvalNs_ = 0;\n"
-               << "    std::array<std::uint64_t, kBlockCount> profilePerBlockExecs_{};\n"
-               << "    bool finalized_ = false;\n"
+               << "    std::uint64_t randomSeed_ = 0;\n";
+        if (state.runtimeProfile)
+        {
+            header << "    bool runtimeProfileEnabled_ = false;\n"
+                   << "    std::uint64_t profileEvalCalls_ = 0;\n"
+                   << "    std::uint64_t profileEpochs_ = 0;\n"
+                   << "    std::uint64_t profileBlockExecs_ = 0;\n"
+                   << "    std::uint64_t profileCommitBlockExecs_ = 0;\n"
+                   << "    std::uint64_t profileCommitGroups_ = 0;\n"
+                   << "    std::uint64_t profileActivateForward_ = 0;\n"
+                   << "    std::uint64_t profileActivateBackward_ = 0;\n"
+                   << "    std::uint64_t profileChangedMarks_ = 0;\n"
+                   << "    std::uint64_t profileCommitChangedMarks_ = 0;\n"
+                   << "    std::uint64_t profileChangedClears_ = 0;\n"
+                   << "    std::uint64_t profileCaptureBlocks_ = 0;\n"
+                   << "    std::uint64_t profileCaptureWords_ = 0;\n"
+                   << "    std::uint64_t profileComputeNs_ = 0;\n"
+                   << "    std::uint64_t profileCommitNs_ = 0;\n"
+                   << "    std::uint64_t profileEvalNs_ = 0;\n"
+                   << "    std::array<std::uint64_t, kBlockCount> profilePerBlockExecs_{};\n";
+        }
+        header << "    bool finalized_ = false;\n"
                << "    bool finishRequested_ = false;\n"
                << "    bool stopRequested_ = false;\n"
                << "    bool fatalRequested_ = false;\n"
@@ -4038,7 +4050,9 @@ namespace
                 << "    return kCommitBlockBegin != 0 && block >= kCommitBlockBegin && block < kCommitBlockEnd;\n"
                 << "}\n\nvoid " << className
                 << "::activate_forward(std::size_t block) {\n"
-                << "    if (runtimeProfileEnabled_) ++profileActivateForward_;\n"
+                << (state.runtimeProfile
+                        ? "    if (runtimeProfileEnabled_) ++profileActivateForward_;\n"
+                        : "")
                 << "    if (block >= kBlockCount) throw std::runtime_error(\"invalid AM BlockId\");\n"
                 << "    const std::size_t word = block / 64U;\n"
                 << "    if (is_commit_block(block)) {\n"
@@ -4052,7 +4066,9 @@ namespace
                 << "    activeSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
                 << "}\n\nvoid " << className
                 << "::activate_backward(std::size_t block) {\n"
-                << "    if (runtimeProfileEnabled_) ++profileActivateBackward_;\n"
+                << (state.runtimeProfile
+                        ? "    if (runtimeProfileEnabled_) ++profileActivateBackward_;\n"
+                        : "")
                 << "    if (block >= kBlockCount) throw std::runtime_error(\"invalid AM BlockId\");\n"
                 << "    const std::size_t word = block / 64U;\n"
                 << "    if (is_commit_block(block)) {\n"
@@ -4129,11 +4145,15 @@ namespace
                 << "            uncaptured &= ~(UINT64_C(1) << bit);\n"
                 << "            const std::size_t block = word * 64U + bit;\n"
                 << "            if (block < kCommitBlockBegin || block >= kCommitBlockEnd) continue;\n"
-                << "            if (runtimeProfileEnabled_) ++profileCaptureBlocks_;\n"
+                << (state.runtimeProfile
+                        ? "            if (runtimeProfileEnabled_) ++profileCaptureBlocks_;\n"
+                        : "")
                 << "            const std::size_t local = block - kCommitBlockBegin;\n"
                 << "            for (std::uint32_t index = kCommitOperandCaptureOffsets_[local]; index < kCommitOperandCaptureOffsets_[local + 1]; ++index) {\n"
                 << "                const std::uint32_t words = kCommitOperandCaptureWords_[index];\n"
-                << "                if (runtimeProfileEnabled_) profileCaptureWords_ += words == 0 ? 1 : words;\n"
+                << (state.runtimeProfile
+                        ? "                if (runtimeProfileEnabled_) profileCaptureWords_ += words == 0 ? 1 : words;\n"
+                        : "")
                 << "                if (words == 0) values_[kCommitOperandCaptureTargets_[index]] = values_[kCommitOperandCaptureSources_[index]];\n"
                 << "                else std::copy_n(wideValues_.data() + kCommitOperandCaptureSources_[index], words, wideValues_.data() + kCommitOperandCaptureTargets_[index]);\n"
                 << "            }\n"
@@ -4191,8 +4211,11 @@ namespace
                 runtime << "        if (selectedCommitBlock" << block
                         << ") execute_block(" << block << ");\n";
             }
-            runtime << "        if (runtimeProfileEnabled_) ++profileCommitGroups_;\n"
-                    << "        return true;\n"
+            if (state.runtimeProfile)
+            {
+                runtime << "        if (runtimeProfileEnabled_) ++profileCommitGroups_;\n";
+            }
+            runtime << "        return true;\n"
                     << "    }\n";
         }
         runtime << "    return false;\n"
@@ -4221,7 +4244,9 @@ namespace
                 << "    pendingCommitEventSlots_.clear();\n"
                 << "}\n\nvoid " << className
                 << "::mark_commit_changed_result(std::size_t variable, std::uint32_t commitEventSlot) {\n"
-                << "    if (runtimeProfileEnabled_) ++profileCommitChangedMarks_;\n"
+                << (state.runtimeProfile
+                        ? "    if (runtimeProfileEnabled_) ++profileCommitChangedMarks_;\n"
+                        : "")
                 << "    const std::size_t word = variable / 64U;\n"
                 << "    const std::uint64_t bit = UINT64_C(1) << (variable % 64U);\n"
                 << "    if ((dirtyChangedBits_[word] & bit) == 0) {\n"
@@ -4231,7 +4256,9 @@ namespace
                 << "    }\n"
                 << "}\n\nvoid " << className
                 << "::mark_changed_result(std::size_t variable) {\n"
-                << "    if (runtimeProfileEnabled_) ++profileChangedMarks_;\n"
+                << (state.runtimeProfile
+                        ? "    if (runtimeProfileEnabled_) ++profileChangedMarks_;\n"
+                        : "")
                 << "    const std::size_t word = variable / 64U;\n"
                 << "    const std::uint64_t bit = UINT64_C(1) << (variable % 64U);\n"
                 << "    if ((dirtyChangedBits_[word] & bit) == 0) {\n"
@@ -4240,7 +4267,9 @@ namespace
                 << "    }\n"
                 << "}\n\nvoid " << className
                 << "::clear_changed_results() {\n"
-                << "    if (runtimeProfileEnabled_) profileChangedClears_ += dirtyChangedResults_.size();\n"
+                << (state.runtimeProfile
+                        ? "    if (runtimeProfileEnabled_) profileChangedClears_ += dirtyChangedResults_.size();\n"
+                        : "")
                 << "    for (const std::uint32_t variable : dirtyChangedResults_) {\n"
                 << "        values_[variable] = 0;\n"
                 << "        dirtyChangedBits_[variable / 64U] &= ~(UINT64_C(1) << (variable % 64U));\n"
@@ -4249,10 +4278,12 @@ namespace
                 << "    dirtyCommitEventSlots_.clear();\n"
                 << "}\n\nvoid " << className << "::execute_block(std::size_t block) {\n"
                 << "    if (block >= kBlockCount) throw std::runtime_error(\"invalid AM BlockId\");\n"
-                << "    if (runtimeProfileEnabled_) {\n"
-                << "        profilePerBlockExecs_[block] += 1;\n"
-                << "        if (is_commit_block(block)) ++profileCommitBlockExecs_; else ++profileBlockExecs_;\n"
-                << "    }\n"
+                << (state.runtimeProfile
+                        ? "    if (runtimeProfileEnabled_) {\n"
+                          "        profilePerBlockExecs_[block] += 1;\n"
+                          "        if (is_commit_block(block)) ++profileCommitBlockExecs_; else ++profileBlockExecs_;\n"
+                          "    }\n"
+                        : "")
                 << "    switch (block / " << *blocksPerSource << "U) {\n";
         for (std::size_t sourceIndex = 0;
              sourceIndex < blockSourcePlan->size();
@@ -4307,8 +4338,10 @@ namespace
                 << "}\n\n"
                 << "void " << className << "::eval() {\n"
                 << "    if (finalized_) throw std::runtime_error(\"cannot eval a finalized AM model\");\n"
-                << "    if (runtimeProfileEnabled_) ++profileEvalCalls_;\n"
-                << "    const auto profileEvalStart = std::chrono::steady_clock::now();\n";
+                << (state.runtimeProfile
+                        ? "    if (runtimeProfileEnabled_) ++profileEvalCalls_;\n"
+                          "    const auto profileEvalStart = std::chrono::steady_clock::now();\n"
+                        : "");
         for (const PortBinding &port : model.interface.ports)
         {
             if (port.direction != PortDirection::Input)
@@ -4358,9 +4391,13 @@ namespace
                 << "    execute_block(0);\n"
                 << "    if (initial) activate_all_blocks();\n"
                 << "    while (true) {\n"
-                << "        const auto profileComputeStart = runtimeProfileEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};\n"
+                << (state.runtimeProfile
+                        ? "        const auto profileComputeStart = runtimeProfileEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};\n"
+                        : "")
                 << "        execute_active_blocks();\n"
-                << "        if (runtimeProfileEnabled_) profileComputeNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profileComputeStart).count());\n"
+                << (state.runtimeProfile
+                        ? "        if (runtimeProfileEnabled_) profileComputeNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profileComputeStart).count());\n"
+                        : "")
                 << "        if (has_next_active_blocks()) {\n"
                 << "            activeWords_ = nextActiveWords_;\n"
                 << "            activeSummary_ = nextActiveSummary_;\n"
@@ -4375,12 +4412,16 @@ namespace
                 << "            continue;\n"
                 << "        }\n"
                 << "        if (has_pending_commit_blocks()) {\n"
-                << "            const auto profileCommitStart = runtimeProfileEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};\n"
+                << (state.runtimeProfile
+                        ? "            const auto profileCommitStart = runtimeProfileEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};\n"
+                        : "")
                 << "            capture_pending_commit_operands();\n"
                 << "            capture_commit_events();\n"
                 << "            restore_commit_events();\n"
                 << "            if (!execute_next_commit_group()) throw std::runtime_error(\"pending commit Block is absent from its execution plan\");\n"
-                << "            if (runtimeProfileEnabled_) profileCommitNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profileCommitStart).count());\n"
+                << (state.runtimeProfile
+                        ? "            if (runtimeProfileEnabled_) profileCommitNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profileCommitStart).count());\n"
+                        : "")
                 << "            if (has_next_active_blocks()) {\n"
                 << "                for (std::size_t word = 0; word < kActivityWordCount; ++word) {\n"
                 << "                    activeWords_[word] |= nextActiveWords_[word];\n"
@@ -4405,10 +4446,12 @@ namespace
                 << "        break;\n"
                 << "    }\n"
                 << "    if (initial) firstEval_ = false;\n"
-                << "    if (runtimeProfileEnabled_) {\n"
-                << "        profileEpochs_ += epochCounter_;\n"
-                << "        profileEvalNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profileEvalStart).count());\n"
-                << "    }\n";
+                << (state.runtimeProfile
+                        ? "    if (runtimeProfileEnabled_) {\n"
+                          "        profileEpochs_ += epochCounter_;\n"
+                          "        profileEvalNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profileEvalStart).count());\n"
+                          "    }\n"
+                        : "");
         for (const PortBinding &port : model.interface.ports)
         {
             if (port.direction != PortDirection::Output)
@@ -4436,40 +4479,51 @@ namespace
                 << "void " << className
                 << "::set_random_seed(std::uint64_t seed) { randomSeed_ = seed; }\n"
                 << "bool " << className
-                << "::had_register_write_conflict() const { return false; }\n"
-                << "void " << className
-                << "::set_runtime_profile_enabled(bool enabled) { runtimeProfileEnabled_ = enabled; }\n"
-                << "bool " << className
-                << "::runtime_profile_enabled() const { return runtimeProfileEnabled_; }\n"
-                << "void " << className << "::dump_runtime_profile() const {\n"
-                << "    const std::uint64_t totalBlockExecs = profileBlockExecs_ + profileCommitBlockExecs_;\n"
-                << "    const double evalMs = static_cast<double>(profileEvalNs_) / 1.0e6;\n"
-                << "    const double computeMs = static_cast<double>(profileComputeNs_) / 1.0e6;\n"
-                << "    const double commitMs = static_cast<double>(profileCommitNs_) / 1.0e6;\n"
-                << "    std::cerr << \"[am-profile] eval calls: \" << profileEvalCalls_ << \", epochs: \" << profileEpochs_\n"
-                << "              << \" (\" << (profileEvalCalls_ != 0 ? static_cast<double>(profileEpochs_) / static_cast<double>(profileEvalCalls_) : 0.0) << \" per eval)\\n\";\n"
-                << "    std::cerr << \"[am-profile] block execs: \" << totalBlockExecs << \" (compute \" << profileBlockExecs_\n"
-                << "              << \", commit \" << profileCommitBlockExecs_ << \", commit groups \" << profileCommitGroups_ << \")\\n\";\n"
-                << "    std::cerr << \"[am-profile] activations: forward \" << profileActivateForward_ << \", backward \" << profileActivateBackward_ << \"\\n\";\n"
-                << "    std::cerr << \"[am-profile] changed marks: \" << profileChangedMarks_ << \" (commit events \" << profileCommitChangedMarks_\n"
-                << "              << \"), clears \" << profileChangedClears_ << \"\\n\";\n"
-                << "    std::cerr << \"[am-profile] commit captures: blocks \" << profileCaptureBlocks_ << \", words \" << profileCaptureWords_ << \"\\n\";\n"
-                << "    std::cerr << \"[am-profile] time ms: eval \" << evalMs << \", compute \" << computeMs << \" (\"\n"
-                << "              << (evalMs > 0.0 ? 100.0 * computeMs / evalMs : 0.0) << \"%), commit \" << commitMs << \" (\"\n"
-                << "              << (evalMs > 0.0 ? 100.0 * commitMs / evalMs : 0.0) << \"%), other \" << (evalMs - computeMs - commitMs) << \"\\n\";\n"
-                << "    std::vector<std::size_t> order(kBlockCount);\n"
-                << "    for (std::size_t index = 0; index < kBlockCount; ++index) order[index] = index;\n"
-                << "    std::sort(order.begin(), order.end(), [&](std::size_t lhs, std::size_t rhs) { return profilePerBlockExecs_[lhs] > profilePerBlockExecs_[rhs]; });\n"
-                << "    const std::size_t topCount = kBlockCount < 32 ? kBlockCount : 32;\n"
-                << "    std::cerr << \"[am-profile] top blocks by exec count:\\n\";\n"
-                << "    for (std::size_t rank = 0; rank < topCount; ++rank) {\n"
-                << "        const std::size_t block = order[rank];\n"
-                << "        if (profilePerBlockExecs_[block] == 0) break;\n"
-                << "        std::cerr << \"  block \" << block << (is_commit_block(block) ? \" (commit)\" : \"\") << \": \" << profilePerBlockExecs_[block]\n"
-                << "                  << \" (\" << (totalBlockExecs != 0 ? 100.0 * static_cast<double>(profilePerBlockExecs_[block]) / static_cast<double>(totalBlockExecs) : 0.0) << \"%)\\n\";\n"
-                << "    }\n"
-                << "}\n"
-                << "bool " << className
+                << "::had_register_write_conflict() const { return false; }\n";
+        if (state.runtimeProfile)
+        {
+            runtime << "void " << className
+                    << "::set_runtime_profile_enabled(bool enabled) { runtimeProfileEnabled_ = enabled; }\n"
+                    << "bool " << className
+                    << "::runtime_profile_enabled() const { return runtimeProfileEnabled_; }\n"
+                    << "void " << className << "::dump_runtime_profile() const {\n"
+                    << "    const std::uint64_t totalBlockExecs = profileBlockExecs_ + profileCommitBlockExecs_;\n"
+                    << "    const double evalMs = static_cast<double>(profileEvalNs_) / 1.0e6;\n"
+                    << "    const double computeMs = static_cast<double>(profileComputeNs_) / 1.0e6;\n"
+                    << "    const double commitMs = static_cast<double>(profileCommitNs_) / 1.0e6;\n"
+                    << "    std::cerr << \"[am-profile] eval calls: \" << profileEvalCalls_ << \", epochs: \" << profileEpochs_\n"
+                    << "              << \" (\" << (profileEvalCalls_ != 0 ? static_cast<double>(profileEpochs_) / static_cast<double>(profileEvalCalls_) : 0.0) << \" per eval)\\n\";\n"
+                    << "    std::cerr << \"[am-profile] block execs: \" << totalBlockExecs << \" (compute \" << profileBlockExecs_\n"
+                    << "              << \", commit \" << profileCommitBlockExecs_ << \", commit groups \" << profileCommitGroups_ << \")\\n\";\n"
+                    << "    std::cerr << \"[am-profile] activations: forward \" << profileActivateForward_ << \", backward \" << profileActivateBackward_ << \"\\n\";\n"
+                    << "    std::cerr << \"[am-profile] changed marks: \" << profileChangedMarks_ << \" (commit events \" << profileCommitChangedMarks_\n"
+                    << "              << \"), clears \" << profileChangedClears_ << \"\\n\";\n"
+                    << "    std::cerr << \"[am-profile] commit captures: blocks \" << profileCaptureBlocks_ << \", words \" << profileCaptureWords_ << \"\\n\";\n"
+                    << "    std::cerr << \"[am-profile] time ms: eval \" << evalMs << \", compute \" << computeMs << \" (\"\n"
+                    << "              << (evalMs > 0.0 ? 100.0 * computeMs / evalMs : 0.0) << \"%), commit \" << commitMs << \" (\"\n"
+                    << "              << (evalMs > 0.0 ? 100.0 * commitMs / evalMs : 0.0) << \"%), other \" << (evalMs - computeMs - commitMs) << \"\\n\";\n"
+                    << "    std::vector<std::size_t> order(kBlockCount);\n"
+                    << "    for (std::size_t index = 0; index < kBlockCount; ++index) order[index] = index;\n"
+                    << "    std::sort(order.begin(), order.end(), [&](std::size_t lhs, std::size_t rhs) { return profilePerBlockExecs_[lhs] > profilePerBlockExecs_[rhs]; });\n"
+                    << "    const std::size_t topCount = kBlockCount < 32 ? kBlockCount : 32;\n"
+                    << "    std::cerr << \"[am-profile] top blocks by exec count:\\n\";\n"
+                    << "    for (std::size_t rank = 0; rank < topCount; ++rank) {\n"
+                    << "        const std::size_t block = order[rank];\n"
+                    << "        if (profilePerBlockExecs_[block] == 0) break;\n"
+                    << "        std::cerr << \"  block \" << block << (is_commit_block(block) ? \" (commit)\" : \"\") << \": \" << profilePerBlockExecs_[block]\n"
+                    << "                  << \" (\" << (totalBlockExecs != 0 ? 100.0 * static_cast<double>(profilePerBlockExecs_[block]) / static_cast<double>(totalBlockExecs) : 0.0) << \"%)\\n\";\n"
+                    << "    }\n"
+                    << "}\n";
+        }
+        else
+        {
+            runtime << "void " << className
+                    << "::set_runtime_profile_enabled(bool enabled) { (void)enabled; }\n"
+                    << "bool " << className
+                    << "::runtime_profile_enabled() const { return false; }\n"
+                    << "void " << className << "::dump_runtime_profile() const {}\n";
+        }
+        runtime << "bool " << className
                 << "::finish_requested() const { return finishRequested_; }\n"
                 << "bool " << className
                 << "::stop_requested() const { return stopRequested_; }\n"

@@ -110,7 +110,7 @@ int main(int argc, char **argv)
                      "[--emit <output-directory>] [--blocks-per-source <count>] "
                      "[--max-source-bytes <count>] [--max-instructions-per-block <count>] "
                      "[--block-formation greedy|coarsen-dp] [--dp-segment-penalty <value>] "
-                     "[--dp-coarsen-budget <count>]\n";
+                     "[--dp-coarsen-budget <count>] [--runtime-profile]\n";
         return 2;
     }
     const std::string path = argv[1];
@@ -123,6 +123,7 @@ int main(int argc, char **argv)
     AmBlockFormation blockFormation = AmBlockFormation::Greedy;
     double dpSegmentPenalty = 64.0;
     std::size_t dpCoarsenBudget = 0;
+    bool runtimeProfile = false;
     for (int index = 2; index < argc; ++index)
     {
         const std::string_view argument(argv[index]);
@@ -216,6 +217,10 @@ int main(int argc, char **argv)
                 return 2;
             }
             dpCoarsenBudget = value;
+        }
+        else if (argument == "--runtime-profile")
+        {
+            runtimeProfile = true;
         }
         else if (!argument.starts_with("--") && explicitTop.empty())
         {
@@ -362,6 +367,10 @@ int main(int argc, char **argv)
                 if (maxSourceBytes)
                 {
                     emitOptions.attributes.emplace("maxSourceBytes", *maxSourceBytes);
+                }
+                if (runtimeProfile)
+                {
+                    emitOptions.attributes.emplace("runtimeProfile", "true");
                 }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,

@@ -1222,7 +1222,7 @@ namespace
                 .outputDirectory = outputDirectory,
                 .modelName = "PackedActivityTop",
                 .maxOutputFileBytes = 1024 * 1024,
-                .attributes = {{"blocksPerSource", "17"}},
+                .attributes = {{"blocksPerSource", "17"}, {"runtimeProfile", "true"}},
             },
             diagnostics);
         if (!emitResult.success || diagnostics.hasError())
@@ -1338,7 +1338,12 @@ namespace
         }
         // Low-fanout acts keep the compact per-target call form; the eight-target
         // act is emitted as constant-mask writes (see the fixture's manyTargets).
-        if (generatedSourceText.find("activate_forward(17);") == std::string::npos ||
+        // This fixture opts into the compile-time runtime profile, so the mask
+        // path also carries its counted profile statement.
+        if (headerText->find("static constexpr bool kRuntimeProfileCompiled = true;") ==
+                std::string::npos ||
+            headerText->find("profilePerBlockExecs_") == std::string::npos ||
+            generatedSourceText.find("activate_forward(17);") == std::string::npos ||
             generatedSourceText.find("activate_forward(64);") == std::string::npos ||
             generatedSourceText.find("activate_backward(65);") == std::string::npos ||
             generatedSourceText.find("activeWords_[1] |= UINT64_C(0x3fc);") ==
@@ -1375,7 +1380,11 @@ namespace
         harness << R"CPP(#include "grhsim_PackedActivityTop.hpp"
 int main()
 {
+    static_assert(GrhSIM_PackedActivityTop::kRuntimeProfileCompiled);
     GrhSIM_PackedActivityTop model;
+    model.set_runtime_profile_enabled(true);
+    if (!model.runtime_profile_enabled())
+        return 5;
     model.init();
     model.activity_input = 0;
     model.eval();
@@ -1392,6 +1401,7 @@ int main()
     model.eval();
     if (model.forward_output != 1 || model.backward_output != 1)
         return 4;
+    model.dump_runtime_profile();
     return 0;
 }
 )CPP";
@@ -1759,12 +1769,37 @@ int main()
             return fail("AM C++ emitter did not generate sparse commit-event tracking");
         }
 
+        // The runtime profile is a compile-time switch and defaults to off: no
+        // counters, no hot-path profile branches, and the host profile API
+        // degrades to no-op stubs (see testPackedActivityRuntime for the on state).
+        if (headerText->find("static constexpr bool kRuntimeProfileCompiled = false;") ==
+                std::string::npos ||
+            headerText->find("runtimeProfileEnabled_") != std::string::npos ||
+            headerText->find("profilePerBlockExecs_") != std::string::npos ||
+            runtimeText->find("runtimeProfileEnabled_") != std::string::npos ||
+            blockText->find("runtimeProfileEnabled_") != std::string::npos ||
+            runtimeText->find(
+                "::set_runtime_profile_enabled(bool enabled) { (void)enabled; }") ==
+                std::string::npos ||
+            runtimeText->find("::runtime_profile_enabled() const { return false; }") ==
+                std::string::npos ||
+            runtimeText->find("::dump_runtime_profile() const {}") ==
+                std::string::npos)
+        {
+            return fail("AM C++ emitter kept runtime profile code with the switch off");
+        }
+
         const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
         std::ofstream harness(harnessPath);
         harness << R"CPP(#include "grhsim_PhasedCommitTop.hpp"
 int main()
 {
+    static_assert(!GrhSIM_PhasedCommitTop::kRuntimeProfileCompiled);
     GrhSIM_PhasedCommitTop model;
+    model.set_runtime_profile_enabled(true);
+    if (model.runtime_profile_enabled())
+        return 4;
+    model.dump_runtime_profile();
     model.init();
     model.clock = 0;
     model.payload = 0x5a;
