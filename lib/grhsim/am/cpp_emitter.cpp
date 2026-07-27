@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -126,6 +127,17 @@ namespace wolvrix::lib::grhsim::am
             return "((UINT64_C(1) << " + std::to_string(width) + ") - UINT64_C(1))";
         }
 
+        std::string wordMaskLiteral(uint64_t mask)
+        {
+            char buffer[16];
+            const auto [end, error] = std::to_chars(buffer, buffer + sizeof(buffer), mask, 16);
+            if (error != std::errc{})
+            {
+                return "UINT64_C(" + std::to_string(mask) + ")";
+            }
+            return "UINT64_C(0x" + std::string(buffer, end) + ")";
+        }
+
         struct EmitState
         {
             struct Storage
@@ -135,6 +147,9 @@ namespace wolvrix::lib::grhsim::am
             };
 
             ProgramView program;
+            uint32_t blockCount = 0;
+            uint32_t commitBlockBegin = 0;
+            uint32_t commitBlockEnd = 0;
             std::vector<Type> variableTypes;
             std::vector<Storage> variableStorage;
             uint64_t wideWords = 0;
@@ -1580,12 +1595,129 @@ namespace wolvrix::lib::grhsim::am
                 case Opcode::ActBackward:
                 {
                     const auto attributes = state.program.activationAttributes(instruction);
-                    std::string code = "if (" + boolExpr(state, operands.front()) + ") {\n";
+                    const bool forward = opcode == Opcode::ActForward;
+                    // Two emission forms per act instruction, chosen per destination
+                    // class by estimated site footprint. XiangShan-scale generated
+                    // models are front-end bound (IPC ~0.2), so the winning form is
+                    // the smaller one, not the one retiring fewer instructions:
+                    //   call: one activate_* call per target (~10 bytes/site), with
+                    //         word/bit and summary logic in two shared helpers;
+                    //   mask: constant-mask OR per touched 64-block word (~11 bytes)
+                    //         + one per summary word (~11); commit words cost ~45
+                    //         (they also invalidate the captured bit). Removes the
+                    //         call and its branches, but a low-fanout act pays more
+                    //         site bytes than the call chain it replaces.
+                    // The mask form mirrors activate_forward/activate_backward
+                    // exactly: compute targets OR into active/nextActive words;
+                    // commit targets OR into pending/nextCommit words and clear the
+                    // captured bit of every target that was not already pending
+                    // (per-bit checks on one word commute, so the batched
+                    // newlyPending mask clears the same bit set as the per-target
+                    // loop). Summary bits are set unconditionally, which is safe
+                    // (a spurious summary bit only costs an empty scan).
+                    std::vector<BlockId> computeTargets;
+                    std::vector<BlockId> commitTargets;
+                    std::map<uint32_t, uint64_t> computeMasks;
+                    std::map<uint32_t, uint64_t> commitMasks;
                     for (BlockId target : attributes->targets)
                     {
-                        code += opcode == Opcode::ActForward ? "activate_forward(" :
-                                                              "activate_backward(";
-                        code += std::to_string(target.value) + ");\n";
+                        if (target.value >= state.blockCount)
+                        {
+                            error = "AM activation target BlockId out of range";
+                            return std::nullopt;
+                        }
+                        const bool isCommit = state.commitBlockBegin != 0 &&
+                                              target.value >= state.commitBlockBegin &&
+                                              target.value < state.commitBlockEnd;
+                        (isCommit ? commitTargets : computeTargets).push_back(target);
+                        (isCommit ? commitMasks : computeMasks)[target.value / 64U] |=
+                            UINT64_C(1) << (target.value % 64U);
+                    }
+                    const auto summaryMasks = [](const std::map<uint32_t, uint64_t> &masks) {
+                        std::map<uint32_t, uint64_t> summaries;
+                        for (const auto &[word, mask] : masks)
+                        {
+                            summaries[word / 64U] |= UINT64_C(1) << (word % 64U);
+                        }
+                        return summaries;
+                    };
+                    const std::map<uint32_t, uint64_t> computeSummaryMasks =
+                        summaryMasks(computeMasks);
+                    const std::map<uint32_t, uint64_t> commitSummaryMasks =
+                        summaryMasks(commitMasks);
+                    const auto inlineCost = [](std::size_t words, std::size_t summaries,
+                                               std::size_t perWord) {
+                        return 10 + perWord * words + 11 * summaries;
+                    };
+                    const auto callCost = [](std::size_t targets) { return 10 * targets; };
+                    const bool maskCompute =
+                        !computeTargets.empty() &&
+                        inlineCost(computeMasks.size(), computeSummaryMasks.size(), 11) <
+                            callCost(computeTargets.size());
+                    const bool maskCommit =
+                        !commitTargets.empty() &&
+                        inlineCost(commitMasks.size(), commitSummaryMasks.size(), 45) <
+                            callCost(commitTargets.size());
+                    std::string code = "if (" + boolExpr(state, operands.front()) + ") {\n";
+                    const std::size_t maskedCount =
+                        (maskCompute ? computeTargets.size() : 0) +
+                        (maskCommit ? commitTargets.size() : 0);
+                    if (maskedCount != 0)
+                    {
+                        code += "if (runtimeProfileEnabled_) ";
+                        code += forward ? "profileActivateForward_ += " :
+                                          "profileActivateBackward_ += ";
+                        code += std::to_string(maskedCount) + ";\n";
+                    }
+                    const auto emitCalls = [&](const std::vector<BlockId> &targets) {
+                        for (BlockId target : targets)
+                        {
+                            code += forward ? "activate_forward(" : "activate_backward(";
+                            code += std::to_string(target.value) + ");\n";
+                        }
+                    };
+                    if (maskCompute)
+                    {
+                        for (const auto &[word, mask] : computeMasks)
+                        {
+                            code += forward ? "activeWords_[" : "nextActiveWords_[";
+                            code += std::to_string(word) + "] |= " + wordMaskLiteral(mask) +
+                                    ";\n";
+                        }
+                        for (const auto &[word, mask] : computeSummaryMasks)
+                        {
+                            code += forward ? "activeSummary_[" : "nextActiveSummary_[";
+                            code += std::to_string(word) + "] |= " + wordMaskLiteral(mask) +
+                                    ";\n";
+                        }
+                    }
+                    else
+                    {
+                        emitCalls(computeTargets);
+                    }
+                    if (maskCommit)
+                    {
+                        for (const auto &[word, mask] : commitMasks)
+                        {
+                            code += "{ const std::uint64_t newlyPending = " +
+                                    wordMaskLiteral(mask) + " & ~pendingCommitWords_[" +
+                                    std::to_string(word) + "]; capturedCommitWords_[" +
+                                    std::to_string(word) + "] &= ~newlyPending; ";
+                            code += forward ? "pendingCommitWords_[" : "nextCommitWords_[";
+                            code += std::to_string(word) + "] |= " + wordMaskLiteral(mask) +
+                                    "; }\n";
+                        }
+                        for (const auto &[word, mask] : commitSummaryMasks)
+                        {
+                            code += forward ? "pendingCommitSummary_[" :
+                                              "nextCommitSummary_[";
+                            code += std::to_string(word) + "] |= " + wordMaskLiteral(mask) +
+                                    ";\n";
+                        }
+                    }
+                    else
+                    {
+                        emitCalls(commitTargets);
                     }
                     code += "}\n";
                     return code;
@@ -2147,6 +2279,9 @@ namespace wolvrix::lib::grhsim::am
                 commitWriteInstructions.end());
         }
         EmitState state{.program = program};
+        state.blockCount = static_cast<uint32_t>(model.program.blockCount());
+        state.commitBlockBegin = model.commitBlockBegin;
+        state.commitBlockEnd = model.commitBlockEnd;
         state.commitEventSlotByVariable.assign(
             program.variableCount(), std::numeric_limits<uint32_t>::max());
         for (uint32_t slot = 0; slot < commitEventVariables.size(); ++slot)

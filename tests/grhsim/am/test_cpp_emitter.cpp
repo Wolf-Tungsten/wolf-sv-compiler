@@ -1095,15 +1095,24 @@ namespace
             addScheduledInstruction(Opcode::ActForward, {}, {forwardStage});
         const InstructionId activateBackward =
             addScheduledInstruction(Opcode::ActBackward, {}, {backwardChanged});
+        const InstructionId activateMany =
+            addScheduledInstruction(Opcode::ActForward, {}, {forwardStage});
         const std::array<BlockId, 2> entryTargets = {
             BlockId{kBoundaryBlock},
             BlockId{kForwardBlock},
         };
         const std::array<BlockId, 1> finalTargets = {BlockId{kFinalBlock}};
         const std::array<BlockId, 1> backwardTargets = {BlockId{kBackwardBlock}};
+        // Eight empty Blocks in one activity word: high enough fanout to select
+        // the constant-mask emission form, and executing them is a no-op.
+        const std::array<BlockId, 8> manyTargets = {
+            BlockId{66}, BlockId{67}, BlockId{68}, BlockId{69},
+            BlockId{70}, BlockId{71}, BlockId{72}, BlockId{73},
+        };
         scheduled.setActivationTargets(activateForward, entryTargets);
         scheduled.setActivationTargets(activateFinal, finalTargets);
         scheduled.setActivationTargets(activateBackward, backwardTargets);
+        scheduled.setActivationTargets(activateMany, manyTargets);
 
         for (uint32_t block = 0; block <= kFinalBlock; ++block)
         {
@@ -1117,9 +1126,10 @@ namespace
             }
             else if (block == kForwardBlock)
             {
-                const std::array<InstructionId, 2> forward = {
+                const std::array<InstructionId, 3> forward = {
                     assignForwardStage,
                     activateFinal,
+                    activateMany,
                 };
                 scheduled.addBlock(forward);
             }
@@ -1325,6 +1335,20 @@ namespace
                 std::string::npos)
         {
             return fail("generated activity runtime retained dense activation or changed-result paths");
+        }
+        // Low-fanout acts keep the compact per-target call form; the eight-target
+        // act is emitted as constant-mask writes (see the fixture's manyTargets).
+        if (generatedSourceText.find("activate_forward(17);") == std::string::npos ||
+            generatedSourceText.find("activate_forward(64);") == std::string::npos ||
+            generatedSourceText.find("activate_backward(65);") == std::string::npos ||
+            generatedSourceText.find("activeWords_[1] |= UINT64_C(0x3fc);") ==
+                std::string::npos ||
+            generatedSourceText.find("activeSummary_[0] |= UINT64_C(0x2);") ==
+                std::string::npos ||
+            generatedSourceText.find("profileActivateForward_ += 8;") ==
+                std::string::npos)
+        {
+            return fail("generated activity runtime did not pick activation forms by site footprint");
         }
         for (std::size_t source = 0; source < 8; ++source)
         {
