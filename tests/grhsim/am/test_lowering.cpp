@@ -256,10 +256,46 @@ namespace
             countOpcode(program, Opcode::SystemFunction) != 2 ||
             countOpcode(program, Opcode::SystemTask) != 1 ||
             countOpcode(program, Opcode::DpiCall) != 1 ||
-            countOpcode(program, Opcode::ChangedPos) != 4 ||
+            countOpcode(program, Opcode::ChangedPos) != 1 ||
             countOpcode(program, Opcode::ChangedNeg) != 1)
         {
             return fail("lowered opcode inventory is incomplete");
+        }
+
+        // All posedge(clk) consumers share one lowered detector instance.
+        VariableId sharedPosedge;
+        bool checkedSharedPosedge = false;
+        for (uint32_t index = 0; index < program.instructionCount(); ++index)
+        {
+            const InstructionId instruction{index};
+            const Opcode opcode = program.opcode(instruction);
+            if (opcode == Opcode::ChangedPos)
+            {
+                sharedPosedge = program.results(instruction).front();
+                continue;
+            }
+            std::size_t eventIndex = 0;
+            if (opcode == Opcode::RegisterWrite)
+            {
+                eventIndex = 4;
+            }
+            else if (opcode == Opcode::MemoryWrite)
+            {
+                eventIndex = 5;
+            }
+            else
+            {
+                continue;
+            }
+            if (program.operands(instruction)[eventIndex] != sharedPosedge)
+            {
+                return fail("posedge(clk) writes did not share one lowered detector");
+            }
+            checkedSharedPosedge = true;
+        }
+        if (!checkedSharedPosedge || !sharedPosedge.valid())
+        {
+            return fail("missing shared posedge detector");
         }
         if (artifact->interface.ports.size() != 8 ||
             artifact->schedulingFacts.orderedEffects.size() != 4)

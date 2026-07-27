@@ -438,7 +438,10 @@ target'[i] = mask[i] ? nextValue[i] : target[i]
 `changed.any %target, %targetOld` 检测实际状态变化，再通过 `act.f/act.b` 传播。
 
 GRH `eventEdge[i]` 与 `events[i]` 在 lower 时先转换成 event：`posedge` 使用
-`changed.pos`，`negedge` 使用 `changed.neg`。多个 event 采用 OR 触发，即任一 event
+`changed.pos`，`negedge` 使用 `changed.neg`。同一 (边沿种类, 被观测 Variable) 的
+event 在一次 Graph lowering 内共享一条 `changed.pos/changed.neg` 指令及其独占
+old/event Variable，不为每个写口分别创建 detector；各消费方读到的是同一 detector 的
+观测历史。多个 event 采用 OR 触发，即任一 event
 为 1 即满足 `fire` 的事件部分。event 列表只决定是否触发，不表示事件优先级，也不根据
 触发来源选择 nextValue；同步/异步 reset、enable 等优先级必须由 `%cond/%nextValue`
 上游的 mux 显式编码。例如：

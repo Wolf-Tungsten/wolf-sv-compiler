@@ -1916,17 +1916,28 @@ namespace wolvrix::lib::grhsim::am
                               opContext(op));
                         return std::nullopt;
                     }
+                    const VariableId rawVariable = mappedValue(raw, op);
+                    if (!rawVariable.valid())
+                    {
+                        return std::nullopt;
+                    }
+                    // Share one detector per (edge kind, watched variable): every
+                    // consumer observes the same raw transitions, so a single
+                    // Changed instruction with its private old baseline is enough.
+                    const auto memoKey = std::make_pair(opcode, rawVariable.value);
+                    const auto found = eventDetectorMemo_.find(memoKey);
+                    if (found != eventDetectorMemo_.end())
+                    {
+                        events.push_back(found->second);
+                        continue;
+                    }
                     const Type rawType = typeForValue(raw);
                     const VariableId old = addVariable(rawType, builder_.undefInit());
                     const VariableId event = addVariable(eventType, builder_.zeroInit());
                     const std::array<VariableId, 1> results{event};
-                    const std::array<VariableId, 2> eventOperands{
-                        mappedValue(raw, op), old};
-                    if (!eventOperands[0].valid())
-                    {
-                        return std::nullopt;
-                    }
+                    const std::array<VariableId, 2> eventOperands{rawVariable, old};
                     addInstruction(opcode, results, eventOperands);
+                    eventDetectorMemo_.emplace(memoKey, event);
                     events.push_back(event);
                 }
                 return events;
@@ -2734,6 +2745,7 @@ namespace wolvrix::lib::grhsim::am
             std::unordered_map<uint32_t, uint32_t> stateOrderGroups_;
             std::unordered_map<uint32_t, VariableId> preCommitSnapshots_;
             std::vector<PreCommitSnapshot> preCommitSnapshotBindings_;
+            std::map<std::pair<Opcode, uint32_t>, VariableId> eventDetectorMemo_;
             uint64_t freshTemporaryCount_ = 0;
             std::size_t flattenedUnknownLiterals_ = 0;
         };
