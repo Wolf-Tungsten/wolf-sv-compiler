@@ -1,4 +1,3 @@
-#include "grhsim/am/activity_schedule.hpp"
 #include "grhsim/am/builder.hpp"
 #include "grhsim/am/cpp_emitter.hpp"
 #include "grhsim/am/interpreter.hpp"
@@ -438,7 +437,7 @@ namespace
     {
         std::filesystem::remove_all(outputDirectory);
         WidePureFixture fixture = makeWidePureProgram();
-        BaselineActivityScheduleStage scheduler;
+        ProductionActivityScheduleStage scheduler;
         wolvrix::lib::diag::Diagnostics diagnostics;
         std::optional<ExecutableModel> model = scheduler.schedule(
             std::move(fixture.artifact), ActivityScheduleOptions{}, diagnostics);
@@ -600,6 +599,10 @@ namespace
         const VariableId memory = linear.addVariable(memoryType, linear.zeroInit());
         const VariableId memoryOld = linear.addVariable(memoryType, linear.undefInit());
         const VariableId changedEvent = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId commitMemoryOld =
+            linear.addVariable(memoryType, linear.undefInit());
+        const VariableId commitChangedEvent =
+            linear.addVariable(u1Type, linear.zeroInit());
 
         const InstructionId fill = addInstruction(
             Opcode::MemoryFill, {}, {fillEnable, fillData, memory, event});
@@ -613,6 +616,8 @@ namespace
             Opcode::ChangedAny, {changedEvent}, {memory, memoryOld});
         const InstructionId exposeChanged = addInstruction(
             Opcode::Assign, {memoryChanged}, {changedEvent});
+        const InstructionId detectCommitChanged = addInstruction(
+            Opcode::ChangedAny, {commitChangedEvent}, {memory, commitMemoryOld});
 
         ScheduledProgramBuilder scheduled(linear.finish());
         std::vector<InstructionId> entry;
@@ -638,15 +643,28 @@ namespace
             entry.push_back(activate);
         }
         scheduled.addBlock(entry);
-        const std::array<InstructionId, 5> body = {
-            fill, write, read, changed, exposeChanged,
+        // Compute Block: state readers. The commit Block reactivates it via
+        // act.b whenever a write actually changes the memory.
+        const std::array<InstructionId, 3> readers = {
+            read, changed, exposeChanged,
         };
-        scheduled.addBlock(body);
+        scheduled.addBlock(readers);
+        // Commit Block: the state writes plus the same-Block change detector
+        // feeding act.b; it executes unconditionally every round.
+        const InstructionId activateReaders = scheduled.addInstruction(
+            Opcode::ActBackward, {}, std::array{commitChangedEvent});
+        scheduled.setActivationTargets(activateReaders, std::array{BlockId{1}});
+        const std::array<InstructionId, 4> commit = {
+            fill, write, detectCommitChanged, activateReaders,
+        };
+        scheduled.addBlock(commit);
 
         return MemoryEmitterFixture{
             .model = ExecutableModel{
                 .program = scheduled.finish(),
                 .interface = std::move(interface),
+                .commitBlockBegin = 2,
+                .commitBlockEnd = 3,
             },
             .fillEnable = fillEnable,
             .writeEnable = writeEnable,
@@ -889,13 +907,15 @@ namespace
         LinearProgram program = builder.finish();
         SchedulingFacts facts;
         facts.variableRoles.assign(program.view().variableCount(), VariableRole::None);
+        facts.variableRoles[memory.value] = VariableRole::State;
+        facts.variableRoles[narrowMemory.value] = VariableRole::State;
         for (VariableId output : outputs)
         {
             facts.variableRoles[output.value] = VariableRole::ExternalOutput;
         }
         facts.variableRoles[narrowOutput.value] = VariableRole::ExternalOutput;
         facts.instructionEffects.assign(program.view().instructionCount(),
-                                        InstructionEffect::Pure);
+                                        InstructionEffect::StateRead);
         return ArrayInitFixture{
             .artifact = LinearProgramArtifact{
                 .program = std::move(program),
@@ -911,7 +931,7 @@ namespace
     {
         std::filesystem::remove_all(outputDirectory);
         ArrayInitFixture fixture = makeArrayInitFixture();
-        BaselineActivityScheduleStage scheduler;
+        ProductionActivityScheduleStage scheduler;
         wolvrix::lib::diag::Diagnostics diagnostics;
         std::optional<ExecutableModel> model = scheduler.schedule(
             std::move(fixture.artifact), ActivityScheduleOptions{}, diagnostics);
@@ -1045,7 +1065,8 @@ namespace
         constexpr uint32_t kBoundaryBlock = 17;
         constexpr uint32_t kForwardBlock = 64;
         constexpr uint32_t kBackwardBlock = 65;
-        constexpr uint32_t kFinalBlock = 130;
+        constexpr uint32_t kFinalBlock = 129;
+        constexpr uint32_t kCommitBlock = 130;
 
         LinearProgramBuilder linear;
         const TypeId u1Type = linear.addType(Type::bitVector(1));
@@ -1057,9 +1078,18 @@ namespace
         const VariableId inputChanged = linear.addVariable(u1Type, linear.zeroInit());
         const VariableId forwardStage = linear.addVariable(u1Type, linear.zeroInit());
         const VariableId forwardOld = linear.addVariable(u1Type, linear.undefInit());
-        const VariableId backwardChanged = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId forwardChanged =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId backwardState = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId backwardStateOld =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId backwardChanged =
+            linear.addVariable(u1Type, linear.zeroInit());
         const VariableId forwardOutput = linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId backwardOutput = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId backwardOutput =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const std::array<uint64_t, 1> oneWords = {1};
+        const VariableId one = addBitConstant(linear, u1Type, oneWords);
 
         const auto addInstruction = [&](Opcode opcode,
                                         std::initializer_list<VariableId> results,
@@ -1073,12 +1103,18 @@ namespace
             addInstruction(Opcode::ChangedAny, {inputChanged}, {input, inputOld});
         const InstructionId assignForwardStage =
             addInstruction(Opcode::Assign, {forwardStage}, {input});
+        const InstructionId detectForward = addInstruction(
+            Opcode::ChangedAny, {forwardChanged}, {forwardStage, forwardOld});
         const InstructionId assignForwardOutput =
             addInstruction(Opcode::Assign, {forwardOutput}, {forwardStage});
-        const InstructionId detectBackward = addInstruction(
-            Opcode::ChangedAny, {backwardChanged}, {forwardStage, forwardOld});
         const InstructionId assignBackwardOutput =
-            addInstruction(Opcode::Assign, {backwardOutput}, {forwardStage});
+            addInstruction(Opcode::Assign, {backwardOutput}, {backwardState});
+        const InstructionId writeBackward =
+            addInstruction(Opcode::RegisterWrite,
+                           {},
+                           {forwardChanged, one, one, backwardState, one});
+        const InstructionId detectBackward = addInstruction(
+            Opcode::ChangedAny, {backwardChanged}, {backwardState, backwardStateOld});
 
         ScheduledProgramBuilder scheduled(linear.finish());
         const auto addScheduledInstruction = [&](Opcode opcode,
@@ -1093,10 +1129,10 @@ namespace
             addScheduledInstruction(Opcode::ActForward, {}, {inputChanged});
         const InstructionId activateFinal =
             addScheduledInstruction(Opcode::ActForward, {}, {forwardStage});
-        const InstructionId activateBackward =
-            addScheduledInstruction(Opcode::ActBackward, {}, {backwardChanged});
         const InstructionId activateMany =
             addScheduledInstruction(Opcode::ActForward, {}, {forwardStage});
+        const InstructionId activateBackward =
+            addScheduledInstruction(Opcode::ActBackward, {}, {backwardChanged});
         const std::array<BlockId, 2> entryTargets = {
             BlockId{kBoundaryBlock},
             BlockId{kForwardBlock},
@@ -1111,10 +1147,10 @@ namespace
         };
         scheduled.setActivationTargets(activateForward, entryTargets);
         scheduled.setActivationTargets(activateFinal, finalTargets);
-        scheduled.setActivationTargets(activateBackward, backwardTargets);
         scheduled.setActivationTargets(activateMany, manyTargets);
+        scheduled.setActivationTargets(activateBackward, backwardTargets);
 
-        for (uint32_t block = 0; block <= kFinalBlock; ++block)
+        for (uint32_t block = 0; block <= kCommitBlock; ++block)
         {
             if (block == 0)
             {
@@ -1126,8 +1162,9 @@ namespace
             }
             else if (block == kForwardBlock)
             {
-                const std::array<InstructionId, 3> forward = {
+                const std::array<InstructionId, 4> forward = {
                     assignForwardStage,
+                    detectForward,
                     activateFinal,
                     activateMany,
                 };
@@ -1142,12 +1179,22 @@ namespace
             }
             else if (block == kFinalBlock)
             {
-                const std::array<InstructionId, 3> final = {
+                const std::array<InstructionId, 1> final = {
                     assignForwardOutput,
+                };
+                scheduled.addBlock(final);
+            }
+            else if (block == kCommitBlock)
+            {
+                // The commit Block always executes; the forwardChanged event
+                // (round-local, cross-Block) gates the write, and the same-Block
+                // detector drives act.b back to the reader compute Block.
+                const std::array<InstructionId, 3> commit = {
+                    writeBackward,
                     detectBackward,
                     activateBackward,
                 };
-                scheduled.addBlock(final);
+                scheduled.addBlock(commit);
             }
             else
             {
@@ -1177,6 +1224,8 @@ namespace
             .model = ExecutableModel{
                 .program = scheduled.finish(),
                 .interface = std::move(interface),
+                .commitBlockBegin = kCommitBlock,
+                .commitBlockEnd = kCommitBlock + 1,
             },
             .input = input,
             .forwardOutput = forwardOutput,
@@ -1294,42 +1343,30 @@ namespace
 
         const std::size_t blockCount = fixture.model.program.blockCount();
         const std::size_t activityWordCount = (blockCount + 63U) / 64U;
-        const std::size_t activitySummaryWordCount = (activityWordCount + 63U) / 64U;
-        const std::string oldActiveArray =
-            "std::array<bool, " + std::to_string(blockCount) + "> active_{};";
-        const std::string oldNextActiveArray =
-            "std::array<bool, " + std::to_string(blockCount) + "> nextActive_{};";
-        if (headerText->find(oldActiveArray) != std::string::npos ||
-            headerText->find(oldNextActiveArray) != std::string::npos ||
-            headerText->find("kActivityWordCount = " +
+        if (headerText->find("kActivityWordCount = " +
                              std::to_string(activityWordCount)) == std::string::npos ||
-            headerText->find("kActivitySummaryWordCount = " +
-                             std::to_string(activitySummaryWordCount)) == std::string::npos ||
-            headerText->find(
-                "std::array<std::uint64_t, kActivityWordCount> activeWordBuffers_[2]{};") ==
+            headerText->find("kCommitBlockBegin = " +
+                             std::to_string(blockCount - 1) + ";") ==
                 std::string::npos ||
-            headerText->find("std::uint64_t *activeWords_ = activeWordBuffers_[0].data();") ==
+            headerText->find("kCommitBlockEnd = " + std::to_string(blockCount) + ";") ==
                 std::string::npos ||
             headerText->find(
-                "std::uint64_t *nextActiveWords_ = activeWordBuffers_[1].data();") ==
+                "std::array<std::uint64_t, kActivityWordCount> activeWords_{};") ==
                 std::string::npos ||
-            headerText->find(
-                "std::array<std::uint64_t, kActivitySummaryWordCount> activeSummaryBuffers_[2]{};") ==
-                std::string::npos ||
-            headerText->find(
-                "std::uint64_t *activeSummary_ = activeSummaryBuffers_[0].data();") ==
-                std::string::npos ||
-            headerText->find(
-                "std::uint64_t *nextActiveSummary_ = activeSummaryBuffers_[1].data();") ==
-                std::string::npos ||
+            headerText->find("bool backwardFired_ = false;") == std::string::npos ||
+            headerText->find("std::uint64_t roundCounter_ = 0;") == std::string::npos ||
             headerText->find("dirtyChangedResults_") == std::string::npos ||
-            headerText->find("dirtyChangedBits_") == std::string::npos)
+            headerText->find("dirtyChangedBits_") == std::string::npos ||
+            headerText->find("nextActiveWords_") != std::string::npos ||
+            headerText->find("activeSummary_") != std::string::npos ||
+            headerText->find("SummaryWordCount") != std::string::npos ||
+            headerText->find("activeWordBuffers_") != std::string::npos)
         {
-            return fail("generated activity runtime did not use packed activity and dirty-change tracking");
+            return fail("generated activity runtime did not use the single-bitmap round activity state");
         }
-        if (runtimeText->find("activate_forward(") == std::string::npos ||
-            runtimeText->find("activate_backward(") == std::string::npos ||
-            countOccurrences(generatedSourceText, "set_changed_result(") < 2 ||
+        if (runtimeText->find("activate_forward(") != std::string::npos ||
+            runtimeText->find("activate_backward(") != std::string::npos ||
+            countOccurrences(generatedSourceText, "set_changed_result(") < 1 ||
             runtimeText->find("dirtyChangedResults_") == std::string::npos ||
             runtimeText->find("dirtyChangedBits_") == std::string::npos ||
             runtimeText->find("if (block >= kBlockCount)") == std::string::npos ||
@@ -1343,39 +1380,49 @@ namespace
         {
             return fail("generated activity runtime retained dense activation or changed-result paths");
         }
-        // The epoch advance swaps the double-buffered compute activity pointers
-        // and sparse-drains the next commit side; the old whole-array
-        // copy/merge/fill sequence must not come back.
-        if (runtimeText->find("std::swap(activeWords_, nextActiveWords_);") == std::string::npos ||
-            runtimeText->find("std::swap(activeSummary_, nextActiveSummary_);") ==
+        // The eval loop is one active bitmap scanned to a fixed point plus an
+        // unconditional commit scan per round; the double-buffered epoch
+        // advance and the commit activity channels must not come back.
+        if (runtimeText->find("activeWords_.fill(0);") == std::string::npos ||
+            runtimeText->find("backwardFired_ = false;") == std::string::npos ||
+            runtimeText->find(
+                "for (std::size_t block = kCommitBlockBegin; block < kCommitBlockEnd; ++block) execute_block(block);") ==
                 std::string::npos ||
-            runtimeText->find("drain_next_active_activity();") == std::string::npos ||
-            runtimeText->find("drain_next_commit_activity();") == std::string::npos ||
-            runtimeText->find("activeWords_ = nextActiveWords_;") != std::string::npos ||
-            runtimeText->find("nextActiveWords_.fill(0);") != std::string::npos ||
-            runtimeText->find("nextCommitWords_.fill(0); nextCommitSummary_.fill(0);\n            if (has_pending_commit_blocks())") !=
-                std::string::npos)
+            runtimeText->find("++roundCounter_;") == std::string::npos ||
+            runtimeText->find("if (!backwardFired_) break;") == std::string::npos ||
+            runtimeText->find("std::swap(activeWords_") != std::string::npos ||
+            runtimeText->find("nextActiveWords_") != std::string::npos ||
+            runtimeText->find("drain_next_active_activity") != std::string::npos ||
+            runtimeText->find("drain_next_commit_activity") != std::string::npos ||
+            runtimeText->find("nextCommitWords_") != std::string::npos ||
+            runtimeText->find("execute_next_commit_group") != std::string::npos)
         {
-            return fail("generated activity runtime did not use the swap-based epoch advance");
+            return fail("generated activity runtime did not use the two-phase round loop");
         }
-        // Low-fanout acts keep the compact per-target call form; the eight-target
-        // act is emitted as constant-mask writes (see the fixture's manyTargets).
-        // This fixture opts into the compile-time runtime profile, so the mask
-        // path also carries its counted profile statement.
+        // Every act is emitted as constant-mask writes into the single active
+        // bitmap (see the fixture's manyTargets); an act.b also raises
+        // backwardFired_. This fixture opts into the compile-time runtime
+        // profile, so the mask path also carries its counted profile statement.
         if (headerText->find("static constexpr bool kRuntimeProfileCompiled = true;") ==
                 std::string::npos ||
             headerText->find("profilePerBlockExecs_") == std::string::npos ||
-            generatedSourceText.find("activate_forward(17);") == std::string::npos ||
-            generatedSourceText.find("activate_forward(64);") == std::string::npos ||
-            generatedSourceText.find("activate_backward(65);") == std::string::npos ||
+            generatedSourceText.find("activeWords_[0] |= UINT64_C(0x20000);") ==
+                std::string::npos ||
+            generatedSourceText.find("activeWords_[1] |= UINT64_C(0x1);") ==
+                std::string::npos ||
+            generatedSourceText.find("activeWords_[2] |= UINT64_C(0x2);") ==
+                std::string::npos ||
             generatedSourceText.find("activeWords_[1] |= UINT64_C(0x3fc);") ==
                 std::string::npos ||
-            generatedSourceText.find("activeSummary_[0] |= UINT64_C(0x2);") ==
+            generatedSourceText.find("activeWords_[1] |= UINT64_C(0x2);") ==
                 std::string::npos ||
+            generatedSourceText.find("backwardFired_ = true;") == std::string::npos ||
             generatedSourceText.find("profileActivateForward_ += 8;") ==
+                std::string::npos ||
+            generatedSourceText.find("profileActivateBackward_ += 1;") ==
                 std::string::npos)
         {
-            return fail("generated activity runtime did not pick activation forms by site footprint");
+            return fail("generated activity runtime did not use constant-mask activation writes");
         }
         for (std::size_t source = 0; source < 8; ++source)
         {
@@ -1463,7 +1510,6 @@ int main()
         LinearProgramBuilder linear;
         const TypeId u1Type = linear.addType(Type::bitVector(1));
         const TypeId u8Type = linear.addType(Type::bitVector(8));
-        const TypeId memoryType = linear.addType(Type::array(1, 8));
 
         ProgramInterface interface;
         const auto addInput = [&](TypeId type, std::string_view name) {
@@ -1498,95 +1544,38 @@ int main()
         const VariableId state = addOutput(u8Type, "state");
         const VariableId sampledState = addOutput(u8Type, "sampled_state");
         const VariableId commitCount = addOutput(u8Type, "commit_count");
-        const VariableId captureCommitCount =
-            addOutput(u8Type, "capture_commit_count");
-        const VariableId memoryWriteValue =
-            addOutput(u8Type, "memory_write_value");
-        const VariableId memoryFillValue =
-            addOutput(u8Type, "memory_fill_value");
         const VariableId commitEvent = addOutput(u1Type, "commit_event");
-        const VariableId entryOld = linear.addVariable(u1Type, linear.undefInit());
-        const VariableId entryEvent = linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId payloadOld = linear.addVariable(u8Type, linear.undefInit());
-        const VariableId payloadEvent = linear.addVariable(u1Type, linear.zeroInit());
         const VariableId clockOld = linear.addVariable(u1Type, linear.undefInit());
+        const VariableId entryEvent = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId posedgeOld = linear.addVariable(u1Type, linear.undefInit());
         const VariableId posedge = linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId capturedPayload =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId capturedOld = linear.addVariable(u8Type, linear.undefInit());
-        const VariableId capturedChanged =
-            linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId lateData = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId lateOld = linear.addVariable(u8Type, linear.undefInit());
-        const VariableId lateChanged = linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId nextState = linear.addVariable(u8Type, linear.zeroInit());
         const VariableId nextCommitCount =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId nextCaptureCommitCount =
             linear.addVariable(u8Type, linear.zeroInit());
         const VariableId stateOld = linear.addVariable(u8Type, linear.undefInit());
         const VariableId stateChanged = linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId writtenMemory =
-            linear.addVariable(memoryType, linear.zeroInit());
-        const VariableId filledMemory =
-            linear.addVariable(memoryType, linear.zeroInit());
 
         const std::array<uint64_t, 1> oneWords = {1};
-        const std::array<uint64_t, 1> zeroWords = {0};
         const std::array<uint64_t, 1> maskWords = {0xff};
         const VariableId one = addBitConstant(linear, u1Type, oneWords);
-        const VariableId zero = addBitConstant(linear, u8Type, zeroWords);
         const VariableId oneValue = addBitConstant(linear, u8Type, oneWords);
         const VariableId mask = addBitConstant(linear, u8Type, maskWords);
 
-        const InstructionId sampleCommitEvent =
-            addInstruction(Opcode::Assign, {commitEvent}, {posedge});
         const InstructionId watchClock =
-            addInstruction(Opcode::ChangedAny, {entryEvent}, {clock, entryOld});
-        const InstructionId watchPayload =
-            addInstruction(Opcode::ChangedAny, {payloadEvent}, {payload, payloadOld});
+            addInstruction(Opcode::ChangedAny, {entryEvent}, {clock, clockOld});
         const InstructionId detectPosedge =
-            addInstruction(Opcode::ChangedPos, {posedge}, {clock, clockOld});
-        const InstructionId updateLateData =
-            addInstruction(Opcode::Assign, {lateData}, {capturedPayload});
-        const InstructionId detectLateData =
-            addInstruction(Opcode::ChangedAny, {lateChanged}, {lateData, lateOld});
-        const InstructionId addState =
-            addInstruction(Opcode::Add, {nextState}, {state, lateData});
+            addInstruction(Opcode::ChangedPos, {posedge}, {clock, posedgeOld});
         const InstructionId addCommitCount =
             addInstruction(Opcode::Add, {nextCommitCount}, {commitCount, oneValue});
-        const InstructionId addCaptureCommitCount = addInstruction(
-            Opcode::Add,
-            {nextCaptureCommitCount},
-            {captureCommitCount, oneValue});
-        const InstructionId commit = addInstruction(
-            Opcode::RegisterWrite, {}, {one, mask, nextState, state, posedge});
-        const InstructionId countCommit = addInstruction(
+        const InstructionId sampleState =
+            addInstruction(Opcode::Assign, {sampledState}, {state});
+        const InstructionId sampleCommitEvent =
+            addInstruction(Opcode::Assign, {commitEvent}, {posedge});
+        const InstructionId writeState = addInstruction(
+            Opcode::RegisterWrite, {}, {one, mask, payload, state, posedge});
+        const InstructionId writeCount = addInstruction(
             Opcode::RegisterWrite,
             {},
             {one, mask, nextCommitCount, commitCount, posedge});
-        const InstructionId capturePayload = addInstruction(
-            Opcode::RegisterWrite,
-            {},
-            {one, mask, payload, capturedPayload, posedge});
-        const InstructionId countCaptureCommit = addInstruction(
-            Opcode::RegisterWrite,
-            {},
-            {one, mask, nextCaptureCommitCount, captureCommitCount, posedge});
-        const InstructionId writeMemory = addInstruction(
-            Opcode::MemoryWrite,
-            {},
-            {one, zero, mask, nextCaptureCommitCount, writtenMemory, posedge});
-        const InstructionId fillMemory = addInstruction(
-            Opcode::MemoryFill,
-            {},
-            {one, nextCaptureCommitCount, filledMemory, posedge});
-        const InstructionId readWrittenMemory = addInstruction(
-            Opcode::MemoryRead, {memoryWriteValue}, {writtenMemory, zero});
-        const InstructionId readFilledMemory = addInstruction(
-            Opcode::MemoryRead, {memoryFillValue}, {filledMemory, zero});
-        const InstructionId detectCaptured = addInstruction(
-            Opcode::ChangedAny, {capturedChanged}, {capturedPayload, capturedOld});
         const InstructionId detectState =
             addInstruction(Opcode::ChangedAny, {stateChanged}, {state, stateOld});
 
@@ -1598,57 +1587,30 @@ int main()
                     {},
                     std::span<const VariableId>(operands.begin(), operands.size()));
             };
-        const auto setTargets = [&](InstructionId instruction,
-                                    std::initializer_list<BlockId> targets) {
-            scheduled.setActivationTargets(
-                instruction,
-                std::span<const BlockId>(targets.begin(), targets.size()));
-        };
         const auto addBlock = [&](std::initializer_list<InstructionId> instructions) {
             scheduled.addBlock(std::span<const InstructionId>(instructions.begin(),
                                                                instructions.size()));
         };
 
-        const InstructionId enterEdge =
+        const InstructionId enterClock =
             addScheduledInstruction(Opcode::ActForward, {entryEvent});
-        const InstructionId enterPayload =
-            addScheduledInstruction(Opcode::ActForward, {payloadEvent});
-        const InstructionId activateCommit =
-            addScheduledInstruction(Opcode::ActBackward, {posedge});
-        const InstructionId activateCapture =
-            addScheduledInstruction(Opcode::ActBackward, {posedge});
-        const InstructionId activateLateData =
-            addScheduledInstruction(Opcode::ActBackward, {capturedChanged});
-        const InstructionId reactivateCommit =
-            addScheduledInstruction(Opcode::ActForward, {lateChanged});
-        const InstructionId reactivateCapture =
+        const InstructionId activateReaders =
             addScheduledInstruction(Opcode::ActBackward, {stateChanged});
-        setTargets(enterEdge, {BlockId{1}});
-        setTargets(enterPayload, {BlockId{1}});
-        setTargets(activateCommit, {BlockId{3}});
-        setTargets(activateCapture, {BlockId{4}});
-        setTargets(activateLateData, {BlockId{2}});
-        setTargets(reactivateCommit, {BlockId{3}});
-        setTargets(reactivateCapture, {BlockId{4}});
-        addBlock({sampleCommitEvent, watchClock, enterEdge, watchPayload, enterPayload});
-        addBlock({detectPosedge, activateCommit, activateCapture});
-        addBlock({updateLateData, detectLateData, reactivateCommit});
-        addBlock({addState, addCommitCount, commit, countCommit, detectState,
-                  reactivateCapture});
-        addBlock({addCaptureCommitCount, capturePayload, countCaptureCommit,
-                  writeMemory, fillMemory, readWrittenMemory, readFilledMemory,
-                  detectCaptured, activateLateData});
+        scheduled.setActivationTargets(enterClock, std::array{BlockId{1}});
+        scheduled.setActivationTargets(activateReaders, std::array{BlockId{2}});
+        addBlock({watchClock, enterClock});
+        addBlock({detectPosedge, addCommitCount});
+        addBlock({sampleState, sampleCommitEvent});
+        // Commit Block: scanned unconditionally every round; the round-local
+        // posedge event gates the writes, and the same-Block detector
+        // reactivates the reader compute Block through act.b.
+        addBlock({writeState, writeCount, detectState, activateReaders});
 
         return ExecutableModel{
             .program = scheduled.finish(),
             .interface = std::move(interface),
             .commitBlockBegin = 3,
-            .commitBlockEnd = 5,
-            .commitBlockOrder = {BlockId{4}, BlockId{3}},
-            .commitGroupOffsets = {0, 1, 2},
-            .preCommitSnapshots = {
-                PreCommitSnapshot{.source = state, .target = sampledState},
-            },
+            .commitBlockEnd = 4,
         };
     }
 
@@ -1701,37 +1663,24 @@ int main()
         const std::string_view evalText(*runtimeText);
         const std::string_view evalBody =
             evalText.substr(evalBegin, evalEnd - evalBegin);
-        if (headerText->find("static constexpr std::size_t kCommitEventCount = 1;") ==
+        if (headerText->find("static constexpr std::size_t kCommitBlockBegin = 3;") ==
                 std::string::npos ||
-            headerText->find("static constexpr std::size_t kCommitEventWordCount = 1;") ==
+            headerText->find("static constexpr std::size_t kCommitBlockEnd = 4;") ==
                 std::string::npos ||
             headerText->find(
-                "static const std::array<std::uint32_t, kCommitEventCount> "
-                "kCommitEventVariables_;") == std::string::npos ||
-            headerText->find("std::vector<std::uint32_t> dirtyCommitEventSlots_;") ==
+                "std::array<std::uint64_t, kActivityWordCount> activeWords_{};") ==
                 std::string::npos ||
-            headerText->find("std::vector<std::uint32_t> pendingCommitEventSlots_;") ==
-                std::string::npos ||
+            headerText->find("bool backwardFired_ = false;") == std::string::npos ||
             headerText->find(
                 "void set_changed_result(std::size_t variable, bool event) {\n"
                 "        values_[variable] = event ? 1 : 0;\n"
                 "        if (event) mark_changed_result(variable);\n"
                 "    }") == std::string::npos ||
             headerText->find(
-                "void set_commit_changed_result(std::uint32_t commitEventSlot, "
-                "bool event) {\n"
-                "        const std::size_t variable = "
-                "kCommitEventVariables_[commitEventSlot];\n"
-                "        values_[variable] = event ? 1 : 0;\n"
-                "        if (event) mark_commit_changed_result(variable, "
-                "commitEventSlot);\n"
-                "    }") == std::string::npos ||
-            headerText->find(
                 "void mark_changed_result(std::size_t variable);") ==
                 std::string::npos ||
-            headerText->find(
-                "void mark_commit_changed_result(std::size_t variable, "
-                "std::uint32_t commitEventSlot);") == std::string::npos ||
+            headerText->find("void clear_changed_results();") ==
+                std::string::npos ||
             headerText->find(
                 "static constexpr std::uint64_t bit_mask(std::uint32_t width) {") ==
                 std::string::npos ||
@@ -1741,54 +1690,38 @@ int main()
             headerText->find(
                 "static constexpr std::uint64_t concat_value(") ==
                 std::string::npos ||
-            headerText->find(
-                "std::array<std::uint64_t, kCommitEventWordCount> "
-                "pendingCommitEventBits_{};") == std::string::npos ||
-            headerText->find("std::array<bool, kCommitEventCount>") !=
-                std::string::npos ||
-            runtimeText->find(
-                "const std::array<std::uint32_t, 1> "
-                "GrhSIM_PhasedCommitTop::kCommitEventVariables_ = {") ==
-                std::string::npos ||
-            runtimeText->find(
-                "for (const std::uint32_t slot : dirtyCommitEventSlots_)") ==
-                std::string::npos ||
-            runtimeText->find("pendingCommitEventBits_[word] |= bit;") ==
-                std::string::npos ||
-            runtimeText->find(
-                "for (const std::uint32_t slot : pendingCommitEventSlots_)") ==
-                std::string::npos ||
-            runtimeText->find(
-                "set_commit_changed_result(slot, true);") ==
-                std::string::npos ||
-            runtimeText->find(
-                "pendingCommitEventBits_[slot / 64U] &= "
-                "~(UINT64_C(1) << (slot % 64U));") == std::string::npos ||
+            headerText->find("CommitEvent") != std::string::npos ||
+            headerText->find("commitGroup") != std::string::npos ||
+            headerText->find("commitBlockOrder") != std::string::npos ||
+            headerText->find("preCommitSnapshot") != std::string::npos ||
             runtimeText->find(
                 "::mark_changed_result(std::size_t variable) {") ==
                 std::string::npos ||
-            runtimeText->find(
-                "::mark_commit_changed_result(std::size_t variable, "
-                "std::uint32_t commitEventSlot) {") == std::string::npos ||
+            runtimeText->find("::clear_changed_results() {") ==
+                std::string::npos ||
             runtimeText->find("::set_changed_result(") != std::string::npos ||
-            runtimeText->find("::set_commit_changed_result(") != std::string::npos ||
             runtimeText->find("::bit_mask(") != std::string::npos ||
             runtimeText->find("::resize_value(") != std::string::npos ||
             runtimeText->find("::concat_value(") != std::string::npos ||
-            runtimeText->find(
-                "for (std::size_t index = 0; index < kCommitEventCount; ++index)") !=
-                std::string::npos ||
-            blockText->find("set_changed_result(") == std::string::npos ||
-            blockText->find("set_commit_changed_result(0, ") == std::string::npos ||
-            blockText->find("kNoCommitEventSlot") != std::string::npos ||
-            evalBody.find("pendingCommitEventBits_.fill") != std::string_view::npos ||
-            evalBody.find("kCommitEventCount") != std::string_view::npos ||
-            runtimeText->find("pendingCommitEvents_") !=
-                std::string::npos ||
-            runtimeText->find("dirtyCommitEventSlots_.clear();") ==
-                std::string::npos)
+            evalBody.find("execute_block(0);") == std::string_view::npos ||
+            evalBody.find(
+                "if (block >= 1U && block < kComputeBlockEnd) execute_block(block);") ==
+                std::string_view::npos ||
+            evalBody.find(
+                "for (std::size_t block = kCommitBlockBegin; block < kCommitBlockEnd; ++block) execute_block(block);") ==
+                std::string_view::npos ||
+            evalBody.find("++roundCounter_;") == std::string_view::npos ||
+            evalBody.find("if (!backwardFired_) break;") ==
+                std::string_view::npos ||
+            evalBody.find("execute_next_commit_group") != std::string_view::npos ||
+            evalBody.find("capture_pending_commit_operands") !=
+                std::string_view::npos ||
+            runtimeText->find("pendingCommitWords_") != std::string::npos ||
+            runtimeText->find("forcedCommitWords_") != std::string::npos ||
+            runtimeText->find("set_commit_changed_result") != std::string::npos ||
+            blockText->find("set_changed_result(") == std::string::npos)
         {
-            return fail("AM C++ emitter did not generate sparse commit-event tracking");
+            return fail("AM C++ emitter did not generate the two-phase round commit runtime");
         }
 
         // The runtime profile is a compile-time switch and defaults to off: no
@@ -1820,27 +1753,38 @@ int main()
     GrhSIM_PhasedCommitTop model;
     model.set_runtime_profile_enabled(true);
     if (model.runtime_profile_enabled())
-        return 4;
+        return 6;
     model.dump_runtime_profile();
     model.init();
     model.clock = 0;
     model.payload = 0x5a;
     model.eval();
     if (model.state != 0 || model.sampled_state != 0 || model.commit_count != 0 ||
-        model.capture_commit_count != 0 || model.memory_write_value != 0 ||
-        model.memory_fill_value != 0 || model.commit_event != 0)
+        model.commit_event != 0)
         return 1;
     model.clock = 1;
     model.eval();
-    if (model.state != 0x5a || model.sampled_state != 0 || model.commit_count != 1 ||
-        model.capture_commit_count != 1 || model.memory_write_value != 1 ||
-        model.memory_fill_value != 1 || model.commit_event != 0)
+    // The posedge gates both writes in the same round; the reader Block
+    // re-samples through act.b in the following round.
+    if (model.state != 0x5a || model.sampled_state != 0x5a ||
+        model.commit_count != 1 || model.commit_event != 0)
         return 2;
     model.eval();
-    if (model.state != 0x5a || model.sampled_state != 0x5a || model.commit_count != 1 ||
-        model.capture_commit_count != 1 || model.memory_write_value != 1 ||
-        model.memory_fill_value != 1 || model.commit_event != 0)
+    // No fresh edge: the round-local event was cleared, nothing re-fires.
+    if (model.state != 0x5a || model.sampled_state != 0x5a ||
+        model.commit_count != 1 || model.commit_event != 0)
         return 3;
+    model.clock = 0;
+    model.eval();
+    if (model.state != 0x5a || model.sampled_state != 0x5a ||
+        model.commit_count != 1 || model.commit_event != 0)
+        return 4;
+    model.payload = 0x33;
+    model.clock = 1;
+    model.eval();
+    if (model.state != 0x33 || model.sampled_state != 0x33 ||
+        model.commit_count != 2 || model.commit_event != 0)
+        return 5;
     return 0;
 }
 )CPP";
@@ -1871,484 +1815,6 @@ int main()
         if (std::system(runCommand.c_str()) != 0)
         {
             return fail("generated phased commit AM model lost or reused its edge");
-        }
-        return 0;
-    }
-
-    ExecutableModel makeDisabledCommitWriteConsumptionModel()
-    {
-        LinearProgramBuilder linear;
-        const TypeId u1Type = linear.addType(Type::bitVector(1));
-        const TypeId u8Type = linear.addType(Type::bitVector(8));
-        const TypeId memoryType = linear.addType(Type::array(1, 8));
-        const VariableId guard = linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId data = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId nextData = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId pass = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId nextPass = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId reactivate = linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId firstPass = linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId address = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId selectedMask = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId registerValue = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId latchValue = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId writtenMemory =
-            linear.addVariable(memoryType, linear.zeroInit());
-        const VariableId filledMemory =
-            linear.addVariable(memoryType, linear.zeroInit());
-        const VariableId addressedMemory =
-            linear.addVariable(memoryType, linear.zeroInit());
-        const VariableId zeroMaskMemory =
-            linear.addVariable(memoryType, linear.zeroInit());
-        const VariableId writtenValue = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId filledValue = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId addressedValue = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId zeroMaskValue = linear.addVariable(u8Type, linear.zeroInit());
-        const std::array<uint64_t, 1> oneWords = {1};
-        const std::array<uint64_t, 1> threeWords = {3};
-        const std::array<uint64_t, 1> zeroWords = {0};
-        const std::array<uint64_t, 1> maskWords = {0xff};
-        const VariableId one = addBitConstant(linear, u1Type, oneWords);
-        const VariableId zeroBit = addBitConstant(linear, u1Type, zeroWords);
-        const VariableId oneValue = addBitConstant(linear, u8Type, oneWords);
-        const VariableId three = addBitConstant(linear, u8Type, threeWords);
-        const VariableId zero = addBitConstant(linear, u8Type, zeroWords);
-        const VariableId mask = addBitConstant(linear, u8Type, maskWords);
-
-        const auto addInstruction = [&](Opcode opcode,
-                                        std::initializer_list<VariableId> results,
-                                        std::initializer_list<VariableId> operands) {
-            return linear.addInstruction(
-                opcode,
-                std::span<const VariableId>(results.begin(), results.size()),
-                std::span<const VariableId>(operands.begin(), operands.size()));
-        };
-        const InstructionId detectFirstPass =
-            addInstruction(Opcode::Eq, {firstPass}, {pass, zero});
-        const InstructionId selectAddress = addInstruction(
-            Opcode::Mux, {address}, {firstPass, oneValue, zero});
-        const InstructionId selectMask = addInstruction(
-            Opcode::Mux, {selectedMask}, {firstPass, zero, mask});
-        const InstructionId writeRegister = addInstruction(
-            Opcode::RegisterWrite, {}, {guard, mask, data, registerValue, one});
-        const InstructionId writeLatch = addInstruction(
-            Opcode::LatchWrite, {}, {guard, mask, data, latchValue});
-        const InstructionId writeMemory = addInstruction(
-            Opcode::MemoryWrite, {},
-            {guard, zero, mask, data, writtenMemory, one});
-        const InstructionId fillMemory = addInstruction(
-            Opcode::MemoryFill, {}, {guard, data, filledMemory, one});
-        const InstructionId writeAfterInvalidAddress = addInstruction(
-            Opcode::MemoryWrite, {},
-            {one, address, mask, data, addressedMemory, zeroBit, one});
-        const InstructionId writeWithZeroMask = addInstruction(
-            Opcode::MemoryWrite, {},
-            {one, zero, selectedMask, data, zeroMaskMemory, zeroBit, one});
-        const InstructionId readWritten = addInstruction(
-            Opcode::MemoryRead, {writtenValue}, {writtenMemory, zero});
-        const InstructionId readFilled = addInstruction(
-            Opcode::MemoryRead, {filledValue}, {filledMemory, zero});
-        const InstructionId readAddressed = addInstruction(
-            Opcode::MemoryRead, {addressedValue}, {addressedMemory, zero});
-        const InstructionId readZeroMask = addInstruction(
-            Opcode::MemoryRead, {zeroMaskValue}, {zeroMaskMemory, zero});
-        const InstructionId incrementData =
-            addInstruction(Opcode::Add, {nextData}, {data, oneValue});
-        const InstructionId storeData =
-            addInstruction(Opcode::Assign, {data}, {nextData});
-        const InstructionId incrementPass =
-            addInstruction(Opcode::Add, {nextPass}, {pass, oneValue});
-        const InstructionId storePass =
-            addInstruction(Opcode::Assign, {pass}, {nextPass});
-        const InstructionId enableWrites =
-            addInstruction(Opcode::Assign, {guard}, {one});
-        const InstructionId testPass =
-            addInstruction(Opcode::Lt, {reactivate}, {pass, three});
-
-        ScheduledProgramBuilder scheduled(linear.finish());
-        const InstructionId activateSelf = scheduled.addInstruction(
-            Opcode::ActBackward, {}, std::array{reactivate});
-        scheduled.setActivationTargets(activateSelf, std::array{BlockId{1}});
-        scheduled.addBlock({});
-        const std::array commitInstructions = {
-            detectFirstPass, selectAddress, selectMask, writeRegister,
-            writeLatch, writeMemory, fillMemory, writeAfterInvalidAddress,
-            writeWithZeroMask, readWritten, readFilled, readAddressed,
-            readZeroMask, incrementData, storeData, incrementPass, storePass,
-            enableWrites, testPass, activateSelf,
-        };
-        scheduled.addBlock(commitInstructions);
-
-        ProgramInterface interface;
-        interface.ports = {
-            PortBinding{
-                .name = scheduled.addString("pass_count"),
-                .direction = PortDirection::Output,
-                .output = pass,
-            },
-            PortBinding{
-                .name = scheduled.addString("data_value"),
-                .direction = PortDirection::Output,
-                .output = data,
-            },
-            PortBinding{
-                .name = scheduled.addString("register_value"),
-                .direction = PortDirection::Output,
-                .output = registerValue,
-            },
-            PortBinding{
-                .name = scheduled.addString("latch_value"),
-                .direction = PortDirection::Output,
-                .output = latchValue,
-            },
-            PortBinding{
-                .name = scheduled.addString("memory_write_value"),
-                .direction = PortDirection::Output,
-                .output = writtenValue,
-            },
-            PortBinding{
-                .name = scheduled.addString("memory_fill_value"),
-                .direction = PortDirection::Output,
-                .output = filledValue,
-            },
-            PortBinding{
-                .name = scheduled.addString("addressed_memory_value"),
-                .direction = PortDirection::Output,
-                .output = addressedValue,
-            },
-            PortBinding{
-                .name = scheduled.addString("zero_mask_memory_value"),
-                .direction = PortDirection::Output,
-                .output = zeroMaskValue,
-            },
-        };
-        return ExecutableModel{
-            .program = scheduled.finish(),
-            .interface = std::move(interface),
-            .commitBlockBegin = 1,
-            .commitBlockEnd = 2,
-            .commitBlockOrder = {BlockId{1}},
-            .commitGroupOffsets = {0, 1},
-        };
-    }
-
-    int testDisabledCommitWriteConsumptionRuntime(
-        const std::filesystem::path &outputDirectory)
-    {
-        std::filesystem::remove_all(outputDirectory);
-        const ExecutableModel model = makeDisabledCommitWriteConsumptionModel();
-        if (!validate(model, ValidationOptions{.level = ValidationLevel::Semantic})
-                 .success())
-        {
-            return fail("disabled commit-write reactivation fixture is invalid");
-        }
-
-        wolvrix::lib::diag::Diagnostics diagnostics;
-        GrhSimAmCppEmitter emitter;
-        const GrhSimAmCppResult emitResult = emitter.emit(
-            model,
-            GrhSimAmCppOptions{
-                .outputDirectory = outputDirectory,
-                .modelName = "GuardReactivationTop",
-                .maxOutputFileBytes = 1024 * 1024,
-            },
-            diagnostics);
-        if (!emitResult.success || diagnostics.hasError())
-        {
-            return fail(
-                "AM C++ emitter failed to generate the disabled commit-write fixture");
-        }
-
-        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
-        std::ofstream harness(harnessPath);
-        harness << R"CPP(#include "grhsim_GuardReactivationTop.hpp"
-int main()
-{
-    GrhSIM_GuardReactivationTop model;
-    model.init();
-    model.eval();
-    if (model.pass_count != 3 || model.data_value != 3 ||
-        model.register_value != 0 || model.latch_value != 2 ||
-        model.memory_write_value != 0 || model.memory_fill_value != 0 ||
-        model.addressed_memory_value != 0 || model.zero_mask_memory_value != 0)
-        return 1;
-    model.eval();
-    if (model.pass_count != 3 || model.data_value != 3 ||
-        model.register_value != 0 || model.latch_value != 2 ||
-        model.memory_write_value != 0 || model.memory_fill_value != 0 ||
-        model.addressed_memory_value != 0 || model.zero_mask_memory_value != 0)
-        return 2;
-    return 0;
-}
-)CPP";
-        harness.close();
-        if (!harness)
-        {
-            return fail("failed to write the disabled commit-write fixture harness");
-        }
-
-        const std::string buildCommand =
-            "make -C '" + outputDirectory.string() +
-            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
-        if (std::system(buildCommand.c_str()) != 0)
-        {
-            return fail("generated disabled commit-write fixture failed to compile");
-        }
-        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
-        const std::string harnessCompileCommand =
-            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
-            harnessPath.string() + "' '" +
-            (outputDirectory / "libgrhsim_GuardReactivationTop.a").string() +
-            "' -o '" + harnessExecutable.string() + "'";
-        if (std::system(harnessCompileCommand.c_str()) != 0)
-        {
-            return fail(
-                "generated disabled commit-write fixture harness failed to compile");
-        }
-        const std::string runCommand = "'" + harnessExecutable.string() + "'";
-        if (std::system(runCommand.c_str()) != 0)
-        {
-            return fail(
-                "commit event was reused after a disabled or invalid write");
-        }
-        return 0;
-    }
-
-    ExecutableModel makeSameGroupForwardCaptureModel()
-    {
-        LinearProgramBuilder linear;
-        const TypeId u1Type = linear.addType(Type::bitVector(1));
-        const TypeId u8Type = linear.addType(Type::bitVector(8));
-        const VariableId trigger = linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId triggerOld = linear.addVariable(u1Type, linear.undefInit());
-        const VariableId triggerChanged =
-            linear.addVariable(u1Type, linear.zeroInit());
-        const std::array<uint64_t, 1> oneWords = {1};
-        const std::array<uint64_t, 1> maskWords = {0xff};
-        const std::array<uint64_t, 1> nextAWords = {0x34};
-        const VariableId one = addBitConstant(linear, u1Type, oneWords);
-        const VariableId mask = addBitConstant(linear, u8Type, maskWords);
-        const VariableId nextA = addBitConstant(linear, u8Type, nextAWords);
-        const VariableId stateA = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId stateB = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId capturedA =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId activateBEvent =
-            linear.addVariable(u1Type, linear.zeroInit());
-
-        const auto addInstruction = [&](Opcode opcode,
-                                        std::initializer_list<VariableId> results,
-                                        std::initializer_list<VariableId> operands) {
-            return linear.addInstruction(
-                opcode,
-                std::span<const VariableId>(results.begin(), results.size()),
-                std::span<const VariableId>(operands.begin(), operands.size()));
-        };
-        const InstructionId detect = addInstruction(
-            Opcode::ChangedAny, {triggerChanged}, {trigger, triggerOld});
-        const InstructionId writeA = addInstruction(
-            Opcode::RegisterWrite, {}, {one, mask, nextA, stateA, one});
-        const InstructionId enableB =
-            addInstruction(Opcode::Assign, {activateBEvent}, {trigger});
-        const InstructionId writeB = addInstruction(
-            Opcode::RegisterWrite, {}, {one, mask, capturedA, stateB, one});
-
-        ScheduledProgramBuilder scheduled(linear.finish());
-        const auto addScheduledInstruction =
-            [&](Opcode opcode, std::initializer_list<VariableId> operands) {
-                return scheduled.addInstruction(
-                    opcode,
-                    {},
-                    std::span<const VariableId>(operands.begin(), operands.size()));
-            };
-        const InstructionId activateA =
-            addScheduledInstruction(Opcode::ActForward, {triggerChanged});
-        const InstructionId activateB =
-            addScheduledInstruction(Opcode::ActForward, {activateBEvent});
-        scheduled.setActivationTargets(activateA, std::array{BlockId{1}});
-        scheduled.setActivationTargets(activateB, std::array{BlockId{2}});
-        scheduled.addBlock(std::array{detect, activateA});
-        scheduled.addBlock(std::array{writeA, enableB, activateB});
-        scheduled.addBlock(std::array{writeB});
-
-        ProgramInterface interface;
-        interface.ports = {
-            PortBinding{
-                .name = scheduled.addString("trigger"),
-                .direction = PortDirection::Input,
-                .input = trigger,
-            },
-            PortBinding{
-                .name = scheduled.addString("state_a"),
-                .direction = PortDirection::Output,
-                .output = stateA,
-            },
-            PortBinding{
-                .name = scheduled.addString("state_b"),
-                .direction = PortDirection::Output,
-                .output = stateB,
-            },
-        };
-        return ExecutableModel{
-            .program = scheduled.finish(),
-            .interface = std::move(interface),
-            .commitBlockBegin = 1,
-            .commitBlockEnd = 3,
-            .commitBlockOrder = {BlockId{1}, BlockId{2}},
-            .commitGroupOffsets = {0, 2},
-            .commitOperandCaptures = {
-                CommitOperandCapture{.source = stateA, .target = capturedA},
-            },
-            .commitOperandCaptureOffsets = {0, 0, 1},
-        };
-    }
-
-    int testSameGroupForwardCaptureRuntime(
-        const std::filesystem::path &outputDirectory)
-    {
-        std::filesystem::remove_all(outputDirectory);
-        const ExecutableModel model = makeSameGroupForwardCaptureModel();
-        if (!validate(model, ValidationOptions{.level = ValidationLevel::Semantic})
-                 .success())
-        {
-            return fail("same-group forward capture fixture is invalid");
-        }
-
-        wolvrix::lib::diag::Diagnostics diagnostics;
-        GrhSimAmCppEmitter emitter;
-        const GrhSimAmCppResult emitResult = emitter.emit(
-            model,
-            GrhSimAmCppOptions{
-                .outputDirectory = outputDirectory,
-                .modelName = "SameGroupForwardCaptureTop",
-                .maxOutputFileBytes = 1024 * 1024,
-            },
-            diagnostics);
-        if (!emitResult.success || diagnostics.hasError())
-        {
-            return fail("AM C++ emitter failed to generate the same-group capture fixture");
-        }
-
-        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
-        std::ofstream harness(harnessPath);
-        harness << R"CPP(#include "grhsim_SameGroupForwardCaptureTop.hpp"
-int main()
-{
-    GrhSIM_SameGroupForwardCaptureTop model;
-    model.init();
-    model.trigger = 0;
-    model.eval();
-    if (model.state_a != 0x34 || model.state_b != 0)
-        return 1;
-    model.trigger = 1;
-    model.eval();
-    if (model.state_a != 0x34 || model.state_b != 0x34)
-        return 2;
-    return 0;
-}
-)CPP";
-        harness.close();
-        if (!harness)
-        {
-            return fail("failed to write the same-group capture fixture harness");
-        }
-
-        const std::string buildCommand =
-            "make -C '" + outputDirectory.string() +
-            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
-        if (std::system(buildCommand.c_str()) != 0)
-        {
-            return fail("generated same-group capture fixture failed to compile");
-        }
-        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
-        const std::string harnessCompileCommand =
-            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
-            harnessPath.string() + "' '" +
-            (outputDirectory / "libgrhsim_SameGroupForwardCaptureTop.a").string() +
-            "' -o '" + harnessExecutable.string() + "'";
-        if (std::system(harnessCompileCommand.c_str()) != 0)
-        {
-            return fail("generated same-group capture fixture harness failed to compile");
-        }
-        const std::string runCommand = "'" + harnessExecutable.string() + "'";
-        if (std::system(runCommand.c_str()) != 0)
-        {
-            return fail("same-group forward activation reused a stale operand capture");
-        }
-        return 0;
-    }
-
-    int testCrossGroupFirstEvalCaptureRuntime(
-        const std::filesystem::path &outputDirectory)
-    {
-        std::filesystem::remove_all(outputDirectory);
-        ExecutableModel model = makeSameGroupForwardCaptureModel();
-        model.commitGroupOffsets = {0, 1, 2};
-        if (!validate(model, ValidationOptions{.level = ValidationLevel::Semantic})
-                 .success())
-        {
-            return fail("cross-group first-eval capture fixture is invalid");
-        }
-
-        wolvrix::lib::diag::Diagnostics diagnostics;
-        GrhSimAmCppEmitter emitter;
-        const GrhSimAmCppResult emitResult = emitter.emit(
-            model,
-            GrhSimAmCppOptions{
-                .outputDirectory = outputDirectory,
-                .modelName = "CrossGroupFirstEvalCaptureTop",
-                .maxOutputFileBytes = 1024 * 1024,
-            },
-            diagnostics);
-        if (!emitResult.success || diagnostics.hasError())
-        {
-            return fail(
-                "AM C++ emitter failed to generate the cross-group first-eval capture fixture");
-        }
-
-        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
-        std::ofstream harness(harnessPath);
-        harness << R"CPP(#include "grhsim_CrossGroupFirstEvalCaptureTop.hpp"
-int main()
-{
-    GrhSIM_CrossGroupFirstEvalCaptureTop model;
-    model.init();
-    model.trigger = 1;
-    model.eval();
-    if (model.state_a != 0x34 || model.state_b != 0x34)
-        return 1;
-    return 0;
-}
-)CPP";
-        harness.close();
-        if (!harness)
-        {
-            return fail("failed to write the cross-group first-eval capture harness");
-        }
-
-        const std::string buildCommand =
-            "make -C '" + outputDirectory.string() +
-            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
-        if (std::system(buildCommand.c_str()) != 0)
-        {
-            return fail("generated cross-group first-eval capture fixture failed to compile");
-        }
-        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
-        const std::string harnessCompileCommand =
-            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
-            harnessPath.string() + "' '" +
-            (outputDirectory / "libgrhsim_CrossGroupFirstEvalCaptureTop.a").string() +
-            "' -o '" + harnessExecutable.string() + "'";
-        if (std::system(harnessCompileCommand.c_str()) != 0)
-        {
-            return fail(
-                "generated cross-group first-eval capture fixture harness failed to compile");
-        }
-        const std::string runCommand = "'" + harnessExecutable.string() + "'";
-        if (std::system(runCommand.c_str()) != 0)
-        {
-            return fail(
-                "cross-group first-eval activation reused the forced operand capture");
         }
         return 0;
     }
@@ -2465,13 +1931,12 @@ int main()
             ActivityScheduleOptions{
                 .maxInstructionsPerBlock = 1,
                 .maxCommitInstructionsPerBlock = 1,
-                .maxStateWritesPerBlock = 1,
                 .enableCoarsening = false,
             },
             diagnostics);
-        if (!model || diagnostics.hasError() || model->commitBlockOrder.size() != 4 ||
-            model->commitGroupOffsets != std::vector<uint32_t>{0, 3, 4} ||
-            model->commitOperandCaptures.empty())
+        if (!model || diagnostics.hasError() || model->commitBlockBegin == 0 ||
+            model->commitBlockEnd != model->program.blockCount() ||
+            model->commitBlockEnd - model->commitBlockBegin != 4)
         {
             return fail("failed to schedule the generated cyclic commit fixture");
         }
@@ -2504,11 +1969,14 @@ int main()
         return 1;
     model.start = 1;
     model.eval();
+    // The guard chain propagates through act.b reactivation until the eval
+    // reaches a fixed point, so state_d settles within this eval.
     if (model.state_a != 1 || model.state_b != 1 || model.state_c != 1 ||
-        model.state_d != 0)
+        model.state_d != 1)
         return 2;
     model.eval();
-    if (model.state_a != 1 || model.state_b != 1 || model.state_c != 1)
+    if (model.state_a != 1 || model.state_b != 1 || model.state_c != 1 ||
+        model.state_d != 1)
         return 3;
     return 0;
 }
@@ -2539,7 +2007,7 @@ int main()
         const std::string runCommand = "'" + harnessExecutable.string() + "'";
         if (std::system(runCommand.c_str()) != 0)
         {
-            return fail("generated cyclic commit fixture skipped a compute frontier");
+            return fail("generated cyclic commit fixture did not reach the chained fixed point");
         }
         return 0;
     }
@@ -2552,7 +2020,7 @@ int main()
         std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) / "cpp-emitter";
     std::filesystem::remove_all(outputDirectory);
 
-    BaselineActivityScheduleStage scheduler;
+    ProductionActivityScheduleStage scheduler;
     wolvrix::lib::diag::Diagnostics diagnostics;
     std::optional<ExecutableModel> model =
         scheduler.schedule(makeAddProgram(), ActivityScheduleOptions{}, diagnostics);
@@ -2813,27 +2281,6 @@ int main()
     if (const int result = testPhasedCommitRuntime(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-phased-commit");
-        result != 0)
-    {
-        return result;
-    }
-    if (const int result = testDisabledCommitWriteConsumptionRuntime(
-            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
-            "cpp-emitter-guard-reactivation");
-        result != 0)
-    {
-        return result;
-    }
-    if (const int result = testSameGroupForwardCaptureRuntime(
-            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
-            "cpp-emitter-same-group-forward-capture");
-        result != 0)
-    {
-        return result;
-    }
-    if (const int result = testCrossGroupFirstEvalCaptureRuntime(
-            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
-            "cpp-emitter-cross-group-first-eval-capture");
         result != 0)
     {
         return result;

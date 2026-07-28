@@ -238,241 +238,6 @@ namespace wolvrix::lib::grhsim::am
                    lhsType->bitWidth == rhsType->bitWidth;
         }
 
-        void validatePreCommitSnapshots(ValidationResult &result,
-                                        ProgramView program,
-                                        std::span<const PreCommitSnapshot> snapshots,
-                                        const ValidationOptions &options)
-        {
-            std::vector<uint32_t> targets;
-            targets.reserve(snapshots.size());
-            for (const PreCommitSnapshot &snapshot : snapshots)
-            {
-                const Type *sourceType = variableType(program, snapshot.source);
-                const Type *targetType = variableType(program, snapshot.target);
-                if (!sourceType || !targetType ||
-                    sourceType->kind != TypeKind::BitVector ||
-                    snapshot.source == snapshot.target ||
-                    *sourceType != *targetType)
-                {
-                    addError(result, options,
-                             "AM pre-commit snapshot has invalid or mismatched variables");
-                    continue;
-                }
-                if (program.init(program.variable(snapshot.target).init).kind ==
-                    InitKind::Constant)
-                {
-                    addError(result, options,
-                             "AM pre-commit snapshot target must be writable");
-                }
-                targets.push_back(snapshot.target.value);
-            }
-            std::sort(targets.begin(), targets.end());
-            if (std::adjacent_find(targets.begin(), targets.end()) != targets.end())
-            {
-                addError(result, options,
-                         "AM pre-commit snapshot targets must be unique");
-            }
-        }
-
-        void validateCommitOperandCaptures(
-            ValidationResult &result, ProgramView program,
-            std::span<const CommitOperandCapture> captures,
-            const ValidationOptions &options)
-        {
-            std::vector<uint32_t> sources;
-            std::vector<uint32_t> targets;
-            sources.reserve(captures.size());
-            targets.reserve(captures.size());
-            for (const CommitOperandCapture &capture : captures)
-            {
-                const Type *sourceType = variableType(program, capture.source);
-                const Type *targetType = variableType(program, capture.target);
-                if (!sourceType || !targetType ||
-                    sourceType->kind != TypeKind::BitVector ||
-                    capture.source == capture.target || *sourceType != *targetType)
-                {
-                    addError(result, options,
-                             "AM commit operand capture has invalid or mismatched variables");
-                    continue;
-                }
-                if (program.init(program.variable(capture.target).init).kind ==
-                    InitKind::Constant)
-                {
-                    addError(result, options,
-                             "AM commit operand capture target must be writable");
-                }
-                sources.push_back(capture.source.value);
-                targets.push_back(capture.target.value);
-            }
-            std::sort(sources.begin(), sources.end());
-            std::sort(targets.begin(), targets.end());
-            if (std::adjacent_find(targets.begin(), targets.end()) != targets.end())
-            {
-                addError(result, options,
-                         "AM commit operand capture targets must be unique");
-            }
-            if (std::any_of(targets.begin(), targets.end(),
-                            [&](uint32_t target) {
-                                return std::binary_search(sources.begin(), sources.end(),
-                                                          target);
-                            }))
-            {
-                addError(result, options,
-                         "AM commit operand capture sources and targets must not alias");
-            }
-            bool targetDefinedByInstruction = false;
-            for (uint32_t instruction = 0;
-                 instruction < program.instructionCount() &&
-                 !targetDefinedByInstruction;
-                 ++instruction)
-            {
-                for (VariableId result : program.results(InstructionId{instruction}))
-                {
-                    if (std::binary_search(targets.begin(), targets.end(),
-                                           result.value))
-                    {
-                        targetDefinedByInstruction = true;
-                        break;
-                    }
-                }
-            }
-            if (targetDefinedByInstruction)
-            {
-                addError(result, options,
-                         "AM commit operand capture target must not have an instruction definition");
-            }
-        }
-
-        void validateCommitEventOwnership(ValidationResult &result,
-                                          const ExecutableModel &model,
-                                          const ValidationOptions &options)
-        {
-            const ProgramView program = model.program.view();
-            std::vector<bool> changedVariables(program.variableCount(), false);
-            for (uint32_t index = 0; index < program.instructionCount(); ++index)
-            {
-                const InstructionId instruction{index};
-                if (!isChangedOpcode(program.opcode(instruction)))
-                {
-                    continue;
-                }
-                const auto results = program.results(instruction);
-                if (results.size() == 1 && results.front().valid() &&
-                    results.front().value < changedVariables.size())
-                {
-                    changedVariables[results.front().value] = true;
-                }
-            }
-
-            std::vector<bool> commitEvents(program.variableCount(), false);
-            for (uint32_t blockIndex = model.commitBlockBegin;
-                 blockIndex < model.commitBlockEnd; ++blockIndex)
-            {
-                const BlockId block{blockIndex};
-                for (std::size_t position = 0;
-                     position < model.program.blockSize(block); ++position)
-                {
-                    const InstructionId instruction =
-                        model.program.blockInstruction(block, position);
-                    const Opcode opcode = program.opcode(instruction);
-                    const auto operands = program.operands(instruction);
-                    std::size_t eventBegin = operands.size();
-                    if (opcode == Opcode::RegisterWrite)
-                    {
-                        eventBegin = 4;
-                    }
-                    else if (opcode == Opcode::MemoryWrite)
-                    {
-                        eventBegin = 5;
-                    }
-                    else if (opcode == Opcode::MemoryFill)
-                    {
-                        eventBegin = 3;
-                    }
-                    for (std::size_t index = eventBegin; index < operands.size(); ++index)
-                    {
-                        const VariableId event = operands[index];
-                        if (event.valid() && event.value < changedVariables.size() &&
-                            changedVariables[event.value])
-                        {
-                            commitEvents[event.value] = true;
-                        }
-                    }
-                }
-            }
-            const auto isCommitEvent = [&](VariableId variable) {
-                return variable.valid() && variable.value < commitEvents.size() &&
-                       commitEvents[variable.value];
-            };
-
-            for (uint32_t index = 0; index < program.instructionCount(); ++index)
-            {
-                const InstructionId instruction{index};
-                const Opcode opcode = program.opcode(instruction);
-                if (!isChangedOpcode(opcode))
-                {
-                    for (VariableId variable : program.results(instruction))
-                    {
-                        if (isCommitEvent(variable))
-                        {
-                            addError(
-                                result, options,
-                                "AM commit event has a non-Changed instruction result writer: variable=" +
-                                    std::to_string(variable.value) + " instruction=" +
-                                    std::to_string(index));
-                        }
-                    }
-                }
-
-                const bool writesState =
-                    opcode == Opcode::RegisterWrite || opcode == Opcode::LatchWrite ||
-                    opcode == Opcode::MemoryWrite || opcode == Opcode::MemoryFill;
-                if (writesState)
-                {
-                    const std::optional<VariableId> target =
-                        stateTarget(program, instruction);
-                    if (target && isCommitEvent(*target))
-                    {
-                        addError(result, options,
-                                 "AM commit event is a state write target: variable=" +
-                                     std::to_string(target->value) + " instruction=" +
-                                     std::to_string(index));
-                    }
-                }
-
-                if (isChangedOpcode(opcode))
-                {
-                    const auto operands = program.operands(instruction);
-                    if (operands.size() == 2 && isCommitEvent(operands[1]))
-                    {
-                        addError(result, options,
-                                 "AM commit event is a Changed old operand: variable=" +
-                                     std::to_string(operands[1].value) + " instruction=" +
-                                     std::to_string(index));
-                    }
-                }
-            }
-
-            for (const PreCommitSnapshot &snapshot : model.preCommitSnapshots)
-            {
-                if (isCommitEvent(snapshot.target))
-                {
-                    addError(result, options,
-                             "AM commit event is a pre-commit snapshot target: variable=" +
-                                 std::to_string(snapshot.target.value));
-                }
-            }
-            for (const CommitOperandCapture &capture : model.commitOperandCaptures)
-            {
-                if (isCommitEvent(capture.target))
-                {
-                    addError(result, options,
-                             "AM commit event is a commit operand capture target: variable=" +
-                                 std::to_string(capture.target.value));
-                }
-            }
-        }
-
         struct EntryDefinition
         {
             uint32_t variable = 0;
@@ -826,8 +591,6 @@ namespace wolvrix::lib::grhsim::am
         const ProgramView program = artifact.program.view();
         if (program.valid())
         {
-            validatePreCommitSnapshots(result, program, artifact.preCommitSnapshots,
-                                       options);
             const std::vector<uint32_t> interfaceInputs = interfaceInputVariables(artifact.interface);
             if (!interfaceInputs.empty())
             {
@@ -901,85 +664,152 @@ namespace wolvrix::lib::grhsim::am
             return result;
         }
 
-        validatePreCommitSnapshots(result, model.program.view(),
-                                   model.preCommitSnapshots, options);
-        validateCommitOperandCaptures(result, model.program.view(),
-                                      model.commitOperandCaptures, options);
+        const ProgramView program = model.program.view();
+        const std::size_t blockCount = model.program.blockCount();
 
-        const bool hasCommitRange = model.commitBlockBegin != 0 || model.commitBlockEnd != 0;
-        if (hasCommitRange &&
-            (model.commitBlockBegin == 0 || model.commitBlockBegin >= model.commitBlockEnd ||
-             model.commitBlockEnd > model.program.blockCount()))
+        // Commit Blocks, when present, form one contiguous suffix of the Block
+        // space; without them every Block is a compute Block.
+        std::size_t commitBegin = blockCount;
+        bool validCommitRange = true;
+        if (model.commitBlockBegin == 0)
+        {
+            validCommitRange = model.commitBlockEnd == 0;
+        }
+        else if (model.commitBlockBegin < model.commitBlockEnd &&
+                 model.commitBlockEnd == blockCount)
+        {
+            commitBegin = model.commitBlockBegin;
+        }
+        else
+        {
+            validCommitRange = false;
+        }
+        if (!validCommitRange)
         {
             addError(result, options,
-                     "ExecutableModel has an invalid commit Block range");
+                     "AM ExecutableModel commit Blocks must form a contiguous suffix of the Block space");
         }
-        if (hasCommitRange && model.commitBlockBegin < model.commitBlockEnd)
+
+        if (validCommitRange)
         {
-            const std::size_t commitCount = model.commitBlockEnd - model.commitBlockBegin;
-            bool validPlan = model.commitBlockOrder.size() == commitCount &&
-                             model.commitGroupOffsets.size() >= 2 &&
-                             model.commitGroupOffsets.front() == 0 &&
-                             model.commitGroupOffsets.back() == commitCount;
-            const bool hasCapturePlan =
-                !model.commitOperandCaptures.empty() ||
-                !model.commitOperandCaptureOffsets.empty();
-            bool validCaptures =
-                !hasCapturePlan ||
-                (model.commitOperandCaptureOffsets.size() == commitCount + 1 &&
-                 model.commitOperandCaptureOffsets.front() == 0 &&
-                 model.commitOperandCaptureOffsets.back() ==
-                     model.commitOperandCaptures.size());
-            std::vector<bool> seen(commitCount, false);
-            for (std::size_t index = 1; index < model.commitGroupOffsets.size(); ++index)
+            const auto isStateWrite = [](Opcode opcode) {
+                return opcode == Opcode::RegisterWrite || opcode == Opcode::LatchWrite ||
+                       opcode == Opcode::MemoryWrite || opcode == Opcode::MemoryFill;
+            };
+            std::vector<uint32_t> changedBlocks(program.variableCount(), UINT32_MAX);
+            for (uint32_t block = 0; block < blockCount; ++block)
             {
-                validPlan = validPlan &&
-                            model.commitGroupOffsets[index] >
-                                model.commitGroupOffsets[index - 1] &&
-                            model.commitGroupOffsets[index] <= commitCount;
-            }
-            for (BlockId block : model.commitBlockOrder)
-            {
-                if (!block.valid() || block.value < model.commitBlockBegin ||
-                    block.value >= model.commitBlockEnd)
+                const BlockId blockId{block};
+                const bool isCommitBlock = block >= commitBegin;
+                for (std::size_t position = 0;
+                     position < model.program.blockSize(blockId); ++position)
                 {
-                    validPlan = false;
-                    continue;
+                    const InstructionId instruction =
+                        model.program.blockInstruction(blockId, position);
+                    if (!instruction.valid() || instruction.value >= program.instructionCount())
+                    {
+                        continue;
+                    }
+                    const Opcode opcode = program.opcode(instruction);
+                    if (isStateWrite(opcode) && !isCommitBlock)
+                    {
+                        addError(result, options,
+                                 "AM state write instruction outside a commit Block: instruction=" +
+                                     std::to_string(instruction.value) +
+                                     " block=" + std::to_string(block));
+                    }
+                    if (opcode == Opcode::ActForward)
+                    {
+                        if (isCommitBlock)
+                        {
+                            addError(result, options,
+                                     "AM ActForward instruction inside a commit Block: instruction=" +
+                                         std::to_string(instruction.value) +
+                                         " block=" + std::to_string(block));
+                        }
+                        if (const auto attributes = program.activationAttributes(instruction))
+                        {
+                            for (const BlockId target : attributes->targets)
+                            {
+                                if (!target.valid() || target.value <= block ||
+                                    target.value >= commitBegin)
+                                {
+                                    addError(result, options,
+                                             "AM ActForward target is not a later compute Block: instruction=" +
+                                                 std::to_string(instruction.value) +
+                                                 " target=" + std::to_string(target.value));
+                                }
+                            }
+                        }
+                    }
+                    if (opcode == Opcode::ActBackward)
+                    {
+                        if (!isCommitBlock)
+                        {
+                            addError(result, options,
+                                     "AM ActBackward instruction outside a commit Block: instruction=" +
+                                         std::to_string(instruction.value) +
+                                         " block=" + std::to_string(block));
+                        }
+                        if (const auto attributes = program.activationAttributes(instruction))
+                        {
+                            for (const BlockId target : attributes->targets)
+                            {
+                                if (!target.valid() || target.value < 1 ||
+                                    target.value >= commitBegin)
+                                {
+                                    addError(result, options,
+                                             "AM ActBackward target is not a compute Block: instruction=" +
+                                                 std::to_string(instruction.value) +
+                                                 " target=" + std::to_string(target.value));
+                                }
+                            }
+                        }
+                    }
+                    if (isChangedOpcode(opcode))
+                    {
+                        const auto results = program.results(instruction);
+                        if (results.size() == 1 && results.front().valid() &&
+                            results.front().value < changedBlocks.size())
+                        {
+                            changedBlocks[results.front().value] = block;
+                        }
+                    }
                 }
-                const std::size_t index = block.value - model.commitBlockBegin;
-                validPlan = validPlan && !seen[index];
-                seen[index] = true;
             }
-            uint32_t previousCaptureOffset = 0;
-            for (uint32_t offset : model.commitOperandCaptureOffsets)
+
+            // A Changed result consumed across Blocks must flow strictly forward.
+            for (uint32_t block = 0; block < blockCount; ++block)
             {
-                validCaptures = validCaptures &&
-                                offset >= previousCaptureOffset &&
-                                offset <= model.commitOperandCaptures.size();
-                previousCaptureOffset = offset;
+                const BlockId blockId{block};
+                for (std::size_t position = 0;
+                     position < model.program.blockSize(blockId); ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(blockId, position);
+                    if (!instruction.valid() || instruction.value >= program.instructionCount())
+                    {
+                        continue;
+                    }
+                    for (const VariableId operand : program.operands(instruction))
+                    {
+                        if (!operand.valid() || operand.value >= changedBlocks.size())
+                        {
+                            continue;
+                        }
+                        const uint32_t producerBlock = changedBlocks[operand.value];
+                        if (producerBlock == UINT32_MAX || producerBlock <= block)
+                        {
+                            continue;
+                        }
+                        addError(result, options,
+                                 "AM Changed result is consumed by an earlier Block: variable=" +
+                                     std::to_string(operand.value) +
+                                     " producerBlock=" + std::to_string(producerBlock) +
+                                     " consumerBlock=" + std::to_string(block));
+                    }
+                }
             }
-            if (!validPlan)
-            {
-                addError(result, options,
-                         "ExecutableModel has an invalid commit Block execution plan");
-            }
-            if (!validCaptures)
-            {
-                addError(result, options,
-                         "ExecutableModel has an invalid commit operand capture plan");
-            }
-            if (model.commitBlockBegin != 0 &&
-                model.commitBlockEnd <= model.program.blockCount())
-            {
-                validateCommitEventOwnership(result, model, options);
-            }
-        }
-        else if (!model.commitBlockOrder.empty() || !model.commitGroupOffsets.empty() ||
-                 !model.commitOperandCaptures.empty() ||
-                 !model.commitOperandCaptureOffsets.empty())
-        {
-            addError(result, options,
-                     "ExecutableModel has a commit execution plan without a commit Block range");
         }
 
         const std::vector<uint32_t> interfaceInputs = interfaceInputVariables(model.interface);
@@ -987,7 +817,6 @@ namespace wolvrix::lib::grhsim::am
         {
             return result;
         }
-        const ProgramView program = model.program.view();
         for (uint32_t index = 0; index < program.instructionCount(); ++index)
         {
             if (writesInterfaceInput(program, InstructionId{index}, interfaceInputs))
@@ -1000,8 +829,38 @@ namespace wolvrix::lib::grhsim::am
         }
         const std::vector<uint32_t> watchedInputs =
             entryWatchedInputs(model.program, interfaceInputs);
+        // Commit Blocks scan every round, so an input only needs EntryBlock
+        // activation when some Block outside the commit range reads it.
+        std::vector<uint32_t> activationInputs;
+        for (uint32_t block = 0; block < commitBegin; ++block)
+        {
+            const BlockId blockId{block};
+            for (std::size_t position = 0;
+                 position < model.program.blockSize(blockId); ++position)
+            {
+                const InstructionId instruction =
+                    model.program.blockInstruction(blockId, position);
+                if (!instruction.valid() || instruction.value >= program.instructionCount())
+                {
+                    continue;
+                }
+                for (const VariableId operand : program.operands(instruction))
+                {
+                    if (operand.valid() &&
+                        std::binary_search(interfaceInputs.begin(), interfaceInputs.end(),
+                                           operand.value))
+                    {
+                        activationInputs.push_back(operand.value);
+                    }
+                }
+            }
+        }
+        std::sort(activationInputs.begin(), activationInputs.end());
+        activationInputs.erase(
+            std::unique(activationInputs.begin(), activationInputs.end()),
+            activationInputs.end());
         if (!std::includes(watchedInputs.begin(), watchedInputs.end(),
-                           interfaceInputs.begin(), interfaceInputs.end()))
+                           activationInputs.begin(), activationInputs.end()))
         {
             addError(result,
                      options,

@@ -34,13 +34,42 @@ normalized GRH
 > [指令集第 17 节](grhsim-am-instructions.md#17-合法性检查)的 AM 语义。当前已检查
 > opcode/BV signature、state/memory target、activation event、`changed` old 独占性、
 > interface input 写隔离、外部 input/output role 对齐、B0 的保守 net-change provenance、
-> slice、system/DPI signature、非法 enum 和 Linear-only normal form。尚待最终 gate
-> 覆盖的包括 host binding 唯一性、final-call 数据依赖顺序、`changed` result 的完整
-> 独占/epoch 契约、B0 activation target 到实际 reader 的完整性、边沿分支的联合完备性和
+> slice、system/DPI signature、非法 enum、Linear-only normal form，以及 ExecutableModel
+> 级的 commit Block 连续后缀、state write/`act.f`/`act.b` 放置与 target 范围、跨块
+> `changed` result 的严格前向流。尚待最终 gate 覆盖的包括 host binding 唯一性、
+> final-call 数据依赖顺序、`changed` result 的完整独占/round 生命周期契约、
+> B0 activation target 到实际 reader 的完整性、边沿分支的联合完备性和
 > ordered-effect 完整性证明。
 
-> 实现进展（2026-07-25）：production scheduler 已删除 `Isolated` class，commit write
-> 已采用 consume-on-event，wide-result shift 已在执行前按 result 宽度扩展 lhs。
+> 实现进展（2026-07-28）：运行时调度模型已从“epoch + `act.f`/`act.b` 双缓冲 +
+> commit 双通道”整体替换为与 legacy 对齐的两阶段 round 模型：compute Block 按
+> BlockId 升序、以单一 active 位图过滤执行；commit Block 构成连续后缀，每轮总是
+> 扫描；任一 `act.b` 激发即要求下一轮，一趟完整遍历无激发即收敛。
+> `BaselineActivityScheduleStage`、`AmBlockFormation::Greedy`、
+> `maxStateWritesPerBlock`、commit group 执行计划、commit operand capture、
+> consume-on-event、writer-frontier 和 `preCommitSnapshots`（eval 首快照绑定）已全部
+> 删除，全仓只剩一份 activity schedule 实现（legacy 移植的 coarsen + segment DP）。
+> 改造计划见 `pdocs/draft/grhsim-am-legacy-round-model-plan-20260728.md`。
+>
+> 同日的 XS difftest 裁决出一处语义修正：commit 写指令的操作数若**直接引用寄存器
+> state**，就地读取会把 commit 段内/段间的先写后读变成 read-new，破坏启动路径
+> （XiangShan BPU 预测 PC 管线 16954→17116，首取指地址多推进一个 64B 块，NEMU
+> 重放崩溃于 cycle ~568）。legacy 的正确语义是 read-old（sink 数据来自 compute
+> 已收敛值）。修复在 lowering：这类操作数改经快照变量 + 一条普通 compute
+> `assign`（在 compute 阶段求值、随 state 变化经 `act.b` 重激活）读取，恒等于本轮
+> commit 前的值；不恢复任何运行时捕获/快照机制，RMW target 旧值与 event 操作数
+> 保持就地读取（与 legacy/旧模型一致）。Gate 状态：AM 单测 8/8、xs-components
+> 053/044/100 与 legacy 20,000 向量 bit-exact；XiangShan CoreMark/NEMU 已严格按
+> 2k -> 20k -> 50k 升档，**三档全部通过**（50k 时双方退休指令数 73,580、IPC 1.471718
+> 完全一致）。50k host time：AM 2,682,743 ms，同窗口 legacy 169,387 ms（15.8x）；
+> 对比旧 AM 模型的 4,178,703 ms（历史记录）提升 1.56x，但仍未回到 legacy 基线
+> （355,000 ms 历史记录）附近的同一数量级，性能阈值需另行评审。性能差距的代码层
+> 来源仍是逐 Block 动态 dispatch、detector 密度与 commit 段常扫描（见
+> `grhsim-am-vs-legacy-analysis-20260727.md` §3.4/§3.5）。
+>
+> 历史记录（2026-07-25，对应上述重构前的旧模型）：production scheduler 已删除
+> `Isolated` class，commit write 曾采用 consume-on-event（该机制已删除），wide-result
+> shift 已在执行前按 result 宽度扩展 lhs。
 > fresh XiangShan `SimTop` v8 产品包含 4,950,236 条 linear 指令、37,461 个 normal
 > Block 加 B0、8,992,117 条 scheduled 指令和 1,875,970 个 detector。CoreMark/NEMU
 > 已严格按 2k -> 20k -> 50k 运行，三档全部通过；50k 结果为
@@ -71,31 +100,17 @@ normalize、emit、model build 和运行日志名称；difftest 侧继续复用�
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
 > 1,679,120,625-byte C++ TU。这些数字仅保留为旧 emitter/scheduler 证据，不是当前结果。
 
-当前 scaffold 已包含 `BaselineActivityScheduleStage`，用于尽早贯通强类型阶段 API 和
-ScheduledProgram validator。它采用受限的 smoke 桥接布局：
-
-```text
-B0: changed.any(external input) -> act.f B1
-B1: 原 LinearProgram 语义 instruction 流
-    changed.any(each state, shared final value) -> act.b B1
-```
-
-这使外部输入变化进入一个普通 Block，state 实际变化时再进入下一 epoch。由于它不做
-topological scheduling，只接受每个 Result producer 已经位于全部 use 之前的 LinearProgram
-子集；forward def-use、`HostRead`、`HostEffect`，以及 ordinal 顺序与线性 instruction
-顺序冲突的 ordered-effect group 都会被拒绝。它不做 def-use partition、memory-aware cost、
-reader 精确激活或 coarsening，既不是生产 scheduler，也尚不是 differential oracle；`B1`
-的全块重跑只是一条可删除的迁移桥。存在该 stage 不表示 Phase 1 的完整 GRH lowering 或
-Phase 2 的 AM activity scheduler 已完成。
-
 ## 1. 为什么单线性块不能叫 Program
 
 规范中的 `Program` 不是“若干 AM 指令的容器”。它至少已经满足以下可执行契约：
 
 - `B0` 是每次 `eval()` 无条件执行的 EntryBlock；
-- `B1` 及之后只在 active 时执行，首次求值额外激活全部普通 Block；
+- 普通 Block 分为 compute 段和构成连续后缀的 commit 段：compute Block 只在 active
+  时执行，首次求值额外激活全部 compute Block，commit Block 每轮（round）总是扫描；
 - `changed` 有独占的 `old` Variable，并在比较后更新基线；
-- `act.f` 只指向更大的 BlockId，`act.b` 明确跨到下一 epoch；
+- `act.f` 只出现在 B0 和 compute Block，只指向更大的 compute BlockId，并在同一趟
+  compute 扫描内被消费；`act.b` 只出现在 commit Block，target 为 compute Block，
+  其激发是要求下一 round 的唯一信号；
 - Block 顺序、event 清零点和 state write 的可见时点共同决定 `eval()` 行为。
 
 GRH 刚完成 opcode lowering 时还没有这些信息。把所有指令临时塞进一个“B0”或“B1”
@@ -223,8 +238,13 @@ API 以组合产物传递所有权，避免 interface 与错误版本的 Program
 
 ```text
 LinearProgramArtifact = (LinearProgram, ProgramInterface, SchedulingFacts)
-ExecutableModel       = (ScheduledProgram, ProgramInterface)
+ExecutableModel       = (ScheduledProgram, ProgramInterface, commitBlockBegin, commitBlockEnd)
 ```
+
+`commitBlockBegin`/`commitBlockEnd` 是一个半开 Block 区间：commit Block 构成 Block
+空间的连续后缀，区间终点恒为 Program 的 Block 总数；两者均为 0 表示没有 commit
+Block。state write 只允许位于 commit Block；commit Block 每轮总是被扫描，不占用
+激活状态。
 
 两种 artifact 都要校验 port name 唯一、方向对应的 VarId 有效、input/output 逻辑 Type
 兼容、input/inout 的可写性和 input 写隔离。`LinearProgramArtifact` 还要求
@@ -285,56 +305,59 @@ Scheduler 按以下阶段工作，每一阶段只保留下一阶段需要的事�
    依赖/顺序边。它们是必须保持的约束，但不因而要求两端属于同一个 scheduling atom；合法时
    可以跨 atom 和 Block。
 3. 对该依赖图做 SCC/环检查并构造 condensation DAG。condensation DAG 的顶点才是
-   indivisible scheduling atom；不能被 AM epoch 语义合法表达的组合环必须诊断，不能靠原始
-   instruction 顺序碰运气。当前 production scheduler 不使用任何 SCC 之外的 atom
-   contraction；未来若提出 typed contraction rule，必须另行定义和验证，不能改变这里记录的
-   当前事实。
-4. 按 cost、局部性和硬上限把 atom 划为普通 block；先形成稳定拓扑序，再连续编号为
-   `B1...Bn`。
-5. 对跨 block 的可观察 value 变化创建或复用 watch。pure value 只有在 source Block、
-   VarId、change kind 和执行 frontier 全部相同时才能共用 detector。每个 materialized
-   `changed` 创建独占、`Init = undef` 的 old Variable 和一个 event Variable，并放在 value
-   更新后、act 之前。
-6. 同一 register/memory/latch target 存在多个候选 write 时，先按 priority/effect order
-   完成所有实际写回，再在最终 write frontier 放一个共享 `changed.any target,targetOld`；
-   不能按 writer 或 activation edge 各放 detector，否则会把中间瞬态错误地暴露给 reader。
+   indivisible scheduling atom；不能被 AM round 语义合法表达的组合环必须诊断，不能靠原始
+   instruction 顺序碰运气。SCC 之后允许以确定性、可解释的合并规则收缩 atom（当前为
+   legacy 移植的 out1/in1/sibling coarsen，见本节末的分块实现）；未来若提出新的
+   typed contraction rule，必须另行定义和验证。
+4. 按 cost、局部性和硬上限把 atom 划为 block：compute Block 先形成稳定拓扑序并连续
+   编号，commit Block 在 Block 空间中构成连续后缀。
+5. 对跨 block 的可观察 value 变化创建或复用 watch。同一 (Block, VarId, change kind)
+   的 activation edge 组共用一个 detector。每个 materialized `changed` 创建独占、
+   `Init = undef` 的 old Variable 和一个 event Variable，并放在所在 Block 尾部、act 之前。
+6. state write 只进入 commit Block。同一 register/memory/latch target 存在多个候选
+   write 时，由块内文本顺序和 commit 段静态 BlockId 顺序兑现 priority/effect order；
+   每个 commit Block 对自身写入的每个 state target 在块尾物化一个共享
+   `changed.any target,targetOld`，实际变化经 `act.b` 激活 reader compute Block。
+   reader 一律在下一 round 才执行、只看到本轮最终值，因此不存在轮内瞬态暴露。
 7. 对外部可写 port 的 watch 在 `B0` 物化；B0 只含 `changed`、派生 event 所需的组合指令
-   和 `act.f`。内部 watch 放在其 producer/writer 所在普通 block。
-8. target BlockId 大于 source 时生成 `act.f`；其余依赖，包括自激活和必须跨 epoch 的
-   feedback，生成 `act.b`。同一 event/target 去重，但不合并语义不同的 old 基线。
+   和 `act.f`。内部 watch 放在其 producer 所在 compute Block 或 writer 所在 commit
+   Block。
+8. B0/compute Block 内指向更大 compute BlockId 的依赖生成 `act.f`；commit Block 的判变
+   event 指向 reader compute Block 生成 `act.b`。commit Block 每轮常扫描，不接收任何
+   激活边。同一 event/target 去重，但不合并语义不同的 old 基线。
 9. 按 BlockId 顺序写出 ScheduledProgram，丢弃 derived facts，运行最终 validator。
 
-第一次 `eval()` 激活所有 `B1...Bn` 是 Machine 语义，不需要额外伪指令。Scheduler 也不能
-把 `changed.old = current` 的初始化偷偷加入 Program；规范要求 old 使用 `undef`，首次
-event 及其影响可能是 AM 层未定义行为。
+第一次 `eval()` 激活所有 compute Block 是 Machine 语义，不需要额外伪指令。Scheduler
+也不能把 `changed.old = current` 的初始化偷偷加入 Program；规范要求 old 使用
+`undef`，首次 event 及其影响可能是 AM 层未定义行为。
 
-当前 production scheduler 只采用 compute 和 commit 两类装桶。Indivisible atom 严格等于
-instruction dependency graph 的一个 SCC；singleton SCC 就是一个 atom，不存在其他非 SCC
-收缩规则。纯计算、state read、raw `changed`、DPI/system call 和 `SystemFunction` 都属于
-compute；带 state target 的 reg/latch/memory write 属于 commit。DPI/system/effect 顺序和同
-target 多写 priority 只形成有向边，不会把有序序列或 writers 收缩为一个 atom。
+当前 production scheduler 只采用 compute 和 commit 两类 Block。Scheduling atom 严格等于
+instruction dependency graph 的一个 SCC；singleton SCC 就是一个 atom。纯计算、state read、
+raw `changed`、DPI/system call 和 `SystemFunction` 都属于 compute；带 state target 的
+reg/latch/memory write 属于 commit。DPI/system/effect 顺序和同 target 多写 priority 只形成
+有向边，不会把有序序列或 writers 收缩为一个 atom。
 
-Kahn ready 集合只在同类 atom 之间连续装桶，因此不会违反已经建立的 def-use 或 ordered-effect
-边。compute 使用 `maxInstructionsPerBlock`，commit 使用独立的
-`maxCommitInstructionsPerBlock`（默认 4096），并同时受 `maxStateWritesPerBlock` 限制；真正的
-SCC atom 超限时保留为一个 oversized Block 并报告诊断。commit 跨 target 合并只改变活动粒度，
-不改变 Block 内拓扑/effect 次序。同一 target 多写只在 final scheduled writer frontier 物化一个
-watcher；若 earlier writer 与 final writer 跨 Block，earlier writer 在运行时先用
-`reduce.or` 把局部 guard snapshot 规范化为 unsigned one-bit event，再用 `act.f` 激活
-final frontier。
+分块实现全仓唯一（`lib/grhsim/am/activity_schedule.cpp`，从 legacy 逐行移植）：先对
+atom DAG 做 out1/in1/sibling 三路迭代 coarsen（`enableCoarsening` 控制，cluster 指令上限
+为 `dpCoarsenBudget`，0 表示自动取 32 × `maxInstructionsPerBlock`），再在确定性拓扑
+序列上做 segment DP，以“跨段 incoming 激活 value 数加每段 `dpSegmentPenalty`（默认
+1.0）”为代价切成 compute Block。compute Block 受 `maxInstructionsPerBlock`（默认 128）
+限制；commit 侧按 normalized event + update guard 聚合分块（对齐 legacy
+`commitGuardEventBuckets` 的默认行为），受 `maxCommitInstructionsPerBlock`（默认 4096）
+限制；真正的 SCC atom 超限时保留为一个 oversized Block 并报告诊断。commit 跨 target
+合并只改变活动粒度，不改变 Block 内拓扑/effect 次序。
 
-`RegisterWrite`、`MemoryWrite` 和 `MemoryFill` 的 commit event 采用
-**consume-on-event**，不是 complete-on-write。某条 commit 指令在一次 `eval()` 中观察到
-任一触发 event 后，该 event 实例即对该指令消费；同一 event 的其他 consumer 仍可各自观察
-它。随后 guard 为 false、`MemoryWrite` address 越界或 write mask 为零，只表示这次不改变
-state/memory，不能把已观察到的旧 event 保留到新的 operand capture 后重放。只有新的 event
-实例才能提供下一次写入机会。这个规则与产生 Result 的 DPI 所使用的 Pending host-event
-生命周期不同。
+commit Block 没有独立的运行时激活通道：每轮 compute 阶段结束后，全部 commit Block 按
+BlockId 升序执行一次。写指令按文本顺序读取执行点可见的 operand 和 event，由块内
+guard/event 决定是否真正写入；使 visible state 实际变化且存在 reader 时，同块判变 event
+激发 `act.b`，激活该 state 的 reader compute Block 进入下一 round。没有 operand 快照、
+没有 pending event、没有跨轮保留。
 
-本轮对 XiangShan commit 路径的定位确认，block 36995 的 guard/address operands 在每个
-新 activation batch 都会重新 capture，不存在旧 operand capture 复用。真正跨批保留的是
-pending event；把该旧 event 恢复后再与新 operands 组合判断，正是 consume-on-event
-所禁止的重放。operand capture 的批次边界仍是独立的不变量。
+> 历史记录（旧模型，机制已删除）：旧模型曾对 XiangShan commit 路径定位确认，block
+> 36995 的 guard/address operands 在每个新 activation batch 都会重新 capture，不存在旧
+> operand capture 复用；真正跨批保留的是 pending event，把该旧 event 恢复后再与新
+> operands 组合判断，正是 consume-on-event 所禁止的重放。上述 capture/pending event
+> 机制已随 2026-07-28 重构整体删除。
 
 ### 3.2.1 已实施（2026-07-23）：移除 `isolated` class
 
@@ -345,7 +368,7 @@ compute instruction 共用 Block。
 
 host instruction 保留其指令内的 firing predicate 和生命周期：`event_mode = immediate`
 的 `system.task`/`dpi.call` 按 `condition && ((E = 0) || OR(本次 events))` 判断，
-`event_mode = pending` 则把命中的 event 保留到同一次 `eval()` 的后续 epoch，直到调用
+`event_mode = pending` 则把命中的 event 保留到同一次 `eval()` 的后续 round，直到调用
 成功；`system.task` 另按 Normal/Once/Final 生命周期执行。GRH lower 后的 system task 和
 无 Result observer DPI 使用 Immediate，产生 Result 的 DPI 使用 Pending。host 的执行机会
 现在继承合并后 Block 的联合 activation domain，不再继承一个私有 Block 边界。带 event 的
@@ -358,14 +381,20 @@ call-trace differential gate 验证，不能仅由 ScheduledProgram 内部语义
 
 production scheduler tests 已覆盖 implicit/explicit host sequence 的跨 Block 顺序与 cap 内合块、
 posedge host 与其他 compute instruction 共 Block，以及 `SystemFunction` 与其普通 producer
-合块后随输入变化重新调用。同 target writers 回归覆盖跨 commit Block 但只有一个
-final watcher、signed one-bit writer guard 的 unsigned event 规范化，以及 `ActBackward`
-下一 epoch 唤醒 earlier writer 后的同 epoch frontier 传播。
-另一个 interpreter regression 构造 `A -> B -> C` runtime frontier chain，其中 B 同时是一个
-target 的 final writer 和另一个 target 的 earlier writer，确认逐层 `act.f` 可在同 epoch 到 C，
-且 scheduler 不物化 `A -> C` 静态传递闭包。
+合块后随输入变化重新调用。
+
+> 历史记录（旧模型，机制已删除）：同 target writers 回归曾覆盖跨 commit Block 但只有一个
+> final watcher、signed one-bit writer guard 的 unsigned event 规范化，以及 `ActBackward`
+> 下一 epoch 唤醒 earlier writer 后的同 epoch frontier 传播。另一个 interpreter regression
+> 曾构造 `A -> B -> C` runtime frontier chain，其中 B 同时是一个 target 的 final writer 和
+> 另一个 target 的 earlier writer，确认逐层 `act.f` 可在同 epoch 到 C，且 scheduler 不物化
+> `A -> C` 静态传递闭包。writer-frontier 机制与这些回归已随 2026-07-28 重构删除；新模型下
+> 同一 target 多写仅由 commit 段静态顺序表达。
 
 ### 3.2.2 2026-07-23 post-`Isolated` XiangShan 实测
+
+> 本节为 2026-07-28 运行时模型重构前的旧模型实测，仅作历史证据保留；其中
+> “writer-frontier activations”等统计项对应的机制已删除，不代表当前 scheduler 输出。
 
 完整 `SimTop` 在上述 scheduler 上重新完成 emit、model build 和 difftest emu link：
 
@@ -407,6 +436,10 @@ first bad model tick approximately cycleCnt 568
 因此 2k gate 明确失败，并与更小的 `-C 572` 失败边界一致；之后没有继续运行 20k/50k。
 
 ### 3.2.3 2026-07-24/25 wide-result shift 修复后的 XiangShan 实测
+
+> 本节为 2026-07-28 运行时模型重构前的旧模型实测，仅作历史证据保留；其中
+> “commit groups”、“commit operand captures”等统计项对应的机制已删除，三档
+> CoreMark 结果与 host time 属于旧模型功能/性能基线，新模型的 XS gate 重跑后再更新。
 
 consume-on-event v7 产品已通过 2k，但在必须的 20k gate 中于
 `cycleCnt=8250` 失败；观测到的五条 RefillBuffer cache line 全为 0，因此当时
@@ -605,11 +638,17 @@ GRH 风格 def-use 图。跨 shard 需要的静态信息应来自一次紧凑索
 只在当前 shard 写入，生成在 staging directory 完成后才发布，因此 rejected emit 不会留下
 半套 artifact。
 
-生成 runtime 将 current/next activity 表示为每 64 个 Block 一个 word，并为 non-empty
-activity word 再维护一层 summary bitset。`act.f` 设置 current 位图，`act.b` 设置 next
-位图；消费时按递增 BlockId 取位，因此符合合法 Program 的严格 forward target 规则。首次
-`eval()` 仍激活所有普通 Block。`changed` 使用 `set_changed_result` 将实际为真的结果加入
-dirty list，epoch/eval 边界只清理这些结果，而不是生成每个 detector 的静态 clear store。
+生成 runtime 把 compute Block 的激活状态表示为每 64 个 Block 一个 word 的单一
+active 位图（不分 current/next，没有 summary 层；commit Block 每轮总是执行，不占用
+激活状态）。`eval()` 主循环是两阶段 round：compute 阶段按 BlockId 升序扫描位图，
+取位即清并执行对应 Block，`act.f` 置位更大的 compute Block，因严格前向而在同一趟
+扫描内被消费；commit 阶段按 BlockId 升序总是执行全部 commit Block，`act.b` 置位
+reader compute Block 并置 `backwardFired_`，作为“需要下一轮”的唯一信号。一轮完整
+遍历没有任何 `act.b` 激发即收敛；round 计数超过上限（1,000,000）报 did not converge。
+首次 `eval()` 仍激活所有 compute Block。跨块消费的 `changed` 结果使用
+`set_changed_result` 将实际为真的结果加入 dirty list，每轮结束只清理这些结果，而不是
+生成每个 detector 的静态 clear store；同块消费的 result 每次执行都被重写，不进
+dirty list。
 
 ## 5. 与旧 Graph + session emitter 的并轨边界
 
@@ -625,7 +664,7 @@ normalized GRH
 新路径完成后，AM C++ emitter 的完整输入只能是：
 
 ```text
-const ExecutableModel&   // (am::ScheduledProgram, ProgramInterface)
+const ExecutableModel&   // (am::ScheduledProgram, ProgramInterface, commitBlockBegin, commitBlockEnd)
 ```
 
 这是唯一并轨边界。可以复用旧 emitter 在边界之后的成熟基础设施：
@@ -652,7 +691,8 @@ no-double-copy gate 的证据。
 
 迁移期间可以让现有 `emit_grhsim_cpp(...)` 外部 API 保持不变，并在内部调用新 lowering、
 scheduler 和 AM emitter；这只是 API 兼容。禁止把旧 session schedule 翻译成“看起来像”
-ScheduledProgram 作为长期实现，因为旧 compute/commit round 与 AM epoch 并不天然同构。
+ScheduledProgram 作为长期实现：旧 session key 只是 emitter side table，不带 AM Program
+的 validator 契约与所有权边界。
 
 ## 6. 分阶段实现和验收 gates
 
@@ -665,7 +705,7 @@ ScheduledProgram 作为长期实现，因为旧 compute/commit round 与 AM epoc
 | linear/scheduled validator | `include/grhsim/am/validate.hpp`、`lib/grhsim/am/validate.cpp` |
 | ProgramInterface、SchedulingFacts、stage/pipeline API | `include/grhsim/am/pipeline.hpp`、`lib/grhsim/am/pipeline.cpp` |
 | opcode 分类 helper | `include/grhsim/am/opcode_traits.hpp` |
-| 受限的 baseline smoke scheduler | `include/grhsim/am/activity_schedule.hpp`、`lib/grhsim/am/activity_schedule.cpp` |
+| coarsen + segment DP 分块实现（全仓唯一） | `include/grhsim/am/activity_schedule.hpp`、`lib/grhsim/am/activity_schedule.cpp` |
 | concrete lowering/scheduler/emitter 私有实现 | `lib/grhsim/am/` 下按职责拆分的 `.cpp` |
 | 单元与 contract tests | `tests/grhsim/am/` |
 
@@ -681,8 +721,8 @@ artifact。具体实现增长后可拆私有 `.cpp`，但公共所有权方向�
 ### Phase 0：冻结契约与测量基线
 
 - 把本文的数据契约转成 header skeleton、validator 接口和 size `static_assert`；
-- 以 `BaselineActivityScheduleStage` 打通
-  `LinearProgramArtifact -> ExecutableModel`，只把它作为 API/validator smoke bridge；
+- 以 `ProductionActivityScheduleStage` 打通
+  `LinearProgramArtifact -> ExecutableModel`；
 - 增加 artifact/interface validator，并补全 Program validator；Program validator 分别执行
   linear-only normal form 与最终规范规则，不能混用；
 - 用 scheduled-growth reserve 和 per-arena size/capacity telemetry 验证 synthetic
@@ -691,9 +731,8 @@ artifact。具体实现增长后可拆私有 `.cpp`，但公共所有权方向�
 - 建立覆盖 first eval、edge、反馈、多个 state writer、memory、DPI/system effect 的小型
   differential corpus。
 
-Gate：术语中不存在可执行“single-block Program”；baseline 的限制有测试且未被当成
-memory-aware scheduler；所有预算字段可测；每个已知风险至少有一个预定 test oracle；
-notepad 包含 baseline 证据和 Phase 1 待办。
+Gate：术语中不存在可执行“single-block Program”；所有预算字段可测；每个已知风险
+至少有一个预定 test oracle；notepad 包含 Phase 1 待办。
 
 ### Phase 1：compact LinearProgram 与 lowering
 
@@ -707,17 +746,14 @@ notepad 包含 baseline 证据和 Phase 1 待办。
 
 Gate：opcode 覆盖与指令集文档逐项对齐；非法 hierarchy/blackbox/X/Z 输入在 lowering
 失败；端口 ABI round-trip；100M synthetic case 满足主表和峰值预算、GRH 已在 schedule
-前释放，且无 per-op heap allocation。Baseline 能消费该 artifact 只证明阶段接线正确，
-不等于 Phase 2 完成。
+前释放，且无 per-op heap allocation。
 
 ### Phase 2：AM activity scheduler
 
 - 实现紧凑 facts、block partition、B0、watch、`changed` 和 `act.f/act.b` materialize；
 - 实现 ScheduledProgram validator 和确定性摘要 hash；
 - 在小设计上用规范解释器或直接参考执行器比较全量执行与 activity 执行。
-- 先用规范解释器和 differential corpus 证明 `BaselineActivityScheduleStage` 的适用子集，
-  再决定是否将它保留为小设计 oracle；当前拒绝 host interaction 的 smoke bridge
-  不得当作 differential oracle。正式 scheduler 必须产生多 Block reader 精确激活并通过
+- 正式 scheduler 必须产生多 Block reader 精确激活并通过
   memory-aware cost/alias tests，不能回退为永久 B1。
 
 Gate：所有规范 Program 不变量通过；不同线程数产生相同 Program hash；feedback/event/
@@ -757,16 +793,16 @@ Gate：仓库没有第二套 runtime schedule 真相；所有生产入口都经�
 
 | 风险 | 当前旧路径与 AM 契约的差异点 | 必须验证的结果 |
 | --- | --- | --- |
-| 首次求值 | 旧路径 seed compute/activity；AM 先执行 B0，再额外激活全部 B1+，old 为 `undef` | 不把旧 baseline 强加给 AM；reset 后行为与首次未定义边界分开测 |
-| round/epoch | 旧 compute bit + 每 round 扫 commit；AM 每个普通 Block 都由 activity 驱动，`act.b` 明确进入下一 epoch | feedback 收敛、写回可见时点和执行次数符合 AM |
-| forward 激活 | 旧代码依赖 topo active id 和 batch 内局部传播；AM `act.f` 只能指向更大 BlockId | 每条 forward edge 经 validator 证明，其他边必须是 `act.b` |
-| event 生命周期 | 旧 event edge slot 通常按 fixed-point round 清零；AM changed result 在 epoch 边界清零，B0 每次 eval 执行 | pos/neg、同 epoch 多消费者和跨 epoch event 不丢失或重复 |
-| state write | 旧 commit supernode 可能每 round 扫描；AM reg/latch/mem write 位于被激活 Block 并读取执行点 operand | 多写 priority、mask/fill、read-during-write 和 reader reactivation 一致 |
+| 首次求值 | 旧路径 seed compute/activity；AM 先执行 B0，首次求值额外激活全部 compute Block（commit Block 每轮常扫），old 为 `undef` | 不把旧 baseline 强加给 AM；reset 后行为与首次未定义边界分开测 |
+| round 结构 | 旧路径按 batch 调 compute、每 round 扫 commit；AM 对齐同一两阶段 round：compute 按 active 过滤升序执行，commit 常扫描，任一 `act.b` 激发即要求下一轮 | feedback 收敛、写回可见时点和执行次数符合 AM |
+| 激活边 | 旧代码依赖 topo active id 和 batch 内局部传播；AM `act.f` 只指向更大的 compute BlockId 且不出现在 commit Block，`act.b` 只在 commit Block、target 为 compute Block | 每条激活边的放置与 target 范围经 validator 证明 |
+| event 生命周期 | 旧 event edge slot 通常按 fixed-point round 清零；AM 跨块消费的 changed result 在 round 末清零（同块消费不清），B0 每次 eval 执行 | pos/neg、同轮多消费者和跨轮 event 不丢失或重复 |
+| state write | 旧 commit supernode 每 round 扫描；AM reg/latch/mem write 同样位于每轮常扫的 commit Block，读取执行点 operand，由块内 guard/event 决定写入 | 多写 priority、mask/fill、read-during-write 和 reader reactivation 一致 |
 | memory 划分 | 旧 `kMemoryReadPort` 是 source-class 且可能 clone；新层看到显式 `mem.read` 和 Array | address 依赖保留；有副作用/可能 alias 的访问不被非法复制或重排 |
 | 外部输入 | 两条路径都应只观察两次 eval 间的最终值，但 seed 机制不同 | 0->1->0 后再 eval 不产生虚假变化 |
 | DPI/system | 旧 supernode/batch 和 full-pass fast path 可能改变调用次数；AM 要保持 Block、schedule、once/final 顺序 | 逐次调用 trace、参数/返回 ABI 和 finalize 顺序一致 |
 | value equality | 旧 emitter 有宽值/packed-array 专用优化；AM `sameValue` 对 BV、Real bit pattern、String、Array 有统一定义 | NaN bit pattern、宽值最高字 mask、Array 更新的 changed 判断一致 |
-| 非收敛 | 两条路径的循环单位和可选保护不同 | 不把未收敛静默当成功；诊断能定位 Block/epoch |
+| 非收敛 | 旧路径无收敛上限；AM 保留 round 上限作为实现保护（解释器 `maxRounds`、生成代码固定 1,000,000） | 不把未收敛静默当成功；诊断能定位 Block/round |
 | 特化路径 | 旧 full-pass specialization 可绕过 generic fixed point | 只有证明等价的特化才能留在 AM emitter，不能以性能为由豁免 |
 
 此外，hierarchy/XMR/blackbox 和含 X/Z Logic 必须按 AM lowering 规范拒绝或在更早阶段处理；

@@ -141,6 +141,14 @@ ExecutableModel makeHostModel() {
       linear.addVariable(u1Type, linear.zeroInit());
   const VariableId pendingResult =
       linear.addVariable(u8Type, linear.zeroInit());
+  const VariableId pendingStateNext =
+      linear.addVariable(u1Type, linear.zeroInit());
+  const VariableId pendingState =
+      linear.addVariable(u1Type, linear.zeroInit());
+  const VariableId pendingStateOld =
+      linear.addVariable(u1Type, linear.undefInit());
+  const VariableId pendingStateEvent =
+      linear.addVariable(u1Type, linear.zeroInit());
 
   const auto addInputWatch = [&](VariableId input) {
     const TypeId type = linear.view().variable(input).type;
@@ -414,6 +422,14 @@ ExecutableModel makeHostModel() {
       linear, Opcode::Assign, {pendingGuard}, {pendingEvent});
   const InstructionId copyPendingEvent = addInstruction(
       linear, Opcode::Assign, {pendingEventVisible}, {pendingEvent});
+  const InstructionId assignPendingStateNext = addInstruction(
+      linear, Opcode::Assign, {pendingStateNext}, {pendingEvent});
+  const InstructionId pendingStateWrite =
+      addInstruction(linear, Opcode::LatchWrite, {},
+                     {pendingStateNext, trueValue, trueValue, pendingState});
+  const InstructionId pendingStateChanged =
+      addInstruction(linear, Opcode::ChangedAny, {pendingStateEvent},
+                     {pendingState, pendingStateOld});
 
   const StringId finishName = linear.addString("finish");
   const InstructionId finishCall =
@@ -455,7 +471,7 @@ ExecutableModel makeHostModel() {
       addInstruction(scheduled, Opcode::ActForward, {}, {pendingClockInputEvent});
   setTargets(scheduled, activatePending, {BlockId{2}});
   const InstructionId reactivatePending =
-      addInstruction(scheduled, Opcode::ActBackward, {}, {pendingEvent});
+      addInstruction(scheduled, Opcode::ActBackward, {}, {pendingStateEvent});
   setTargets(scheduled, reactivatePending, {BlockId{2}});
   addBlock(scheduled,
            {taskConditionChanged, activateTaskCondition, taskEventChanged,
@@ -466,10 +482,13 @@ ExecutableModel makeHostModel() {
             activatePending});
   addBlock(scheduled, {fwriteCall, wideFwriteCall, stressFwriteCall, dpiCall,
                        jtagCall, signedCall, finishCall, finalWrite});
-  // Epoch 0 captures the edge and raises the guard; epoch 1 consumes it after
-  // ChangedPos has recomputed the raw event to zero.
+  // Round 1 captures the edge and raises the guard; the commit Block's
+  // tracked state write re-fires the pending Block so that round 2 consumes
+  // the call after ChangedPos has recomputed the raw event to zero.
   addBlock(scheduled, {pendingClockChanged, pendingCall, setPendingGuard,
-                       copyPendingEvent, reactivatePending});
+                       copyPendingEvent, assignPendingStateNext});
+  addBlock(scheduled,
+           {pendingStateWrite, pendingStateChanged, reactivatePending});
 
   ProgramInterface interface;
   interface.ports = {
@@ -582,6 +601,8 @@ ExecutableModel makeHostModel() {
   return ExecutableModel{
       .program = scheduled.finish(),
       .interface = std::move(interface),
+      .commitBlockBegin = 3,
+      .commitBlockEnd = 4,
   };
 }
 
@@ -833,7 +854,7 @@ int main() {
                    },
                    diagnostics);
   if (!emitResult.success || diagnostics.hasError() ||
-      emitResult.artifacts.size() != 7) {
+      emitResult.artifacts.size() != 8) {
     for (const wolvrix::lib::diag::Diagnostic &diagnostic :
          diagnostics.messages()) {
       std::cerr << "[grhsim_am_cpp_emitter_host] " << diagnostic.message;

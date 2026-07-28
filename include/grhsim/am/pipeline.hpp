@@ -85,43 +85,23 @@ namespace wolvrix::lib::grhsim::am
         void clearAndRelease();
     };
 
-    struct PreCommitSnapshot
-    {
-        VariableId source;
-        VariableId target;
-    };
-
-    struct CommitOperandCapture
-    {
-        VariableId source;
-        VariableId target;
-    };
-
     struct LinearProgramArtifact
     {
         LinearProgram program;
         ProgramInterface interface;
         SchedulingFacts schedulingFacts;
-        std::vector<PreCommitSnapshot> preCommitSnapshots;
     };
 
     struct ExecutableModel
     {
         ScheduledProgram program;
         ProgramInterface interface;
-        // Production schedules place state commits in one contiguous phase.
-        // Zero denotes an unphased schedule; otherwise this is a half-open Block range.
+        // Commit Blocks form one contiguous suffix of the Block space and are
+        // scanned unconditionally on every round. Zero denotes a schedule
+        // without commit Blocks; otherwise this is a half-open Block range
+        // that ends at the Program's Block count.
         uint32_t commitBlockBegin = 0;
         uint32_t commitBlockEnd = 0;
-        // Blocks in one group are mutually dependent and commit together. Groups are
-        // ordered by commit -> compute -> commit activation dependencies.
-        std::vector<BlockId> commitBlockOrder;
-        std::vector<uint32_t> commitGroupOffsets;
-        std::vector<PreCommitSnapshot> preCommitSnapshots;
-        // Captures are grouped by commit Block in BlockId order. A pending Block is
-        // captured once after compute settles and before any Block in that batch commits.
-        std::vector<CommitOperandCapture> commitOperandCaptures;
-        std::vector<uint32_t> commitOperandCaptureOffsets;
     };
 
     ValidationResult validate(const ProgramInterface &interface,
@@ -135,24 +115,22 @@ namespace wolvrix::lib::grhsim::am
     ValidationResult validate(const ExecutableModel &model,
                               const ValidationOptions &options = {});
 
-    enum class AmBlockFormation : uint8_t
-    {
-        Greedy = 0,
-        CoarsenDp = 1,
-    };
-
     struct ActivityScheduleOptions
     {
+        // Aligns with the legacy maxOpInComputeSupernode limit.
         std::size_t maxInstructionsPerBlock = 128;
         // Commit blocks may carry a longer ordered state-write chain than a
         // compute block, but never split an indivisible effect atom.
+        // Aligns with the legacy maxOpInCommitSupernode limit.
         std::size_t maxCommitInstructionsPerBlock = 4096;
-        std::size_t maxStateWritesPerBlock = 4096;
+        // Aligns with the legacy enableCoarsen/enableChainMerge switches; the
+        // out1/in1 and sibling merge stages are both built in.
         bool enableCoarsening = true;
         bool collectStats = false;
-        AmBlockFormation blockFormation = AmBlockFormation::Greedy;
-        double dpSegmentPenalty = 64.0;
-        // 0 = automatic (maxInstructionsPerBlock / 8, at least 16).
+        // DP fixed cost per segment boundary; legacy hard-codes +1 per segment.
+        double dpSegmentPenalty = 1.0;
+        // 0 = automatic (32 * maxInstructionsPerBlock), matching the legacy
+        // coarsen cluster instruction cap.
         std::size_t dpCoarsenBudget = 0;
     };
 

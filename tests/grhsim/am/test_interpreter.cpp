@@ -76,10 +76,13 @@ namespace {
         ExecutableModel model;
         VariableId input;
         VariableId entryEvent;
-        VariableId midEvent;
+        VariableId stateEvent;
         VariableId output;
     };
 
+    // input -> (B1) middle -> commit write -> state -> (B2) output.  The
+    // commit Block's change detector fires act.b to re-activate the reader
+    // compute Block on the next round.
     FeedbackFixture makeFeedbackModel() {
         LinearProgramBuilder linear;
         const TypeId u1Type = linear.addType(Type::bitVector(1));
@@ -90,46 +93,55 @@ namespace {
         const VariableId entryEvent =
             linear.addVariable(u1Type, linear.zeroInit());
         const VariableId middle = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId middleOld =
+        const VariableId state = linear.addVariable(u8Type, linear.zeroInit());
+        const VariableId stateOld =
             linear.addVariable(u8Type, linear.undefInit());
-        const VariableId middleEvent =
+        const VariableId stateEvent =
             linear.addVariable(u1Type, linear.zeroInit());
         const VariableId output = linear.addVariable(u8Type, linear.zeroInit());
+        const VariableId one = addConstant(linear, u1Type, 1);
+        const VariableId mask = addConstant(linear, u8Type, 0xff);
 
         const InstructionId inputChanged = addInstruction(
             linear, Opcode::ChangedAny, {entryEvent}, {input, inputOld});
         const InstructionId assignMiddle =
             addInstruction(linear, Opcode::Assign, {middle}, {input});
-        const InstructionId middleChanged = addInstruction(
-            linear, Opcode::ChangedAny, {middleEvent}, {middle, middleOld});
         const InstructionId assignOutput =
-            addInstruction(linear, Opcode::Assign, {output}, {middle});
+            addInstruction(linear, Opcode::Assign, {output}, {state});
+        const InstructionId writeState =
+            addInstruction(linear, Opcode::RegisterWrite, {},
+                           {one, mask, middle, state, one});
+        const InstructionId detectState = addInstruction(
+            linear, Opcode::ChangedAny, {stateEvent}, {state, stateOld});
 
         ScheduledProgramBuilder scheduled(linear.finish());
         const InstructionId activateMiddle =
             addInstruction(scheduled, Opcode::ActForward, {}, {entryEvent});
         const InstructionId activateOutput =
-            addInstruction(scheduled, Opcode::ActBackward, {}, {middleEvent});
+            addInstruction(scheduled, Opcode::ActBackward, {}, {stateEvent});
         setTargets(scheduled, activateMiddle, {BlockId{1}});
         setTargets(scheduled, activateOutput, {BlockId{2}});
         addBlock(scheduled, {inputChanged, activateMiddle});
-        addBlock(scheduled, {assignMiddle, middleChanged, activateOutput});
+        addBlock(scheduled, {assignMiddle});
         addBlock(scheduled, {assignOutput});
+        addBlock(scheduled, {writeState, detectState, activateOutput});
 
         return FeedbackFixture{
             .model =
                 ExecutableModel{
                     .program = scheduled.finish(),
                     .interface = {},
+                    .commitBlockBegin = 3,
+                    .commitBlockEnd = 4,
                 },
             .input = input,
             .entryEvent = entryEvent,
-            .midEvent = middleEvent,
+            .stateEvent = stateEvent,
             .output = output,
         };
     }
 
-    int testFeedbackAndEpochLifecycle() {
+    int testFeedbackAndRoundLifecycle() {
         FeedbackFixture fixture = makeFeedbackModel();
         Interpreter interpreter(fixture.model);
         if (!interpreter.ready()) {
@@ -138,27 +150,31 @@ namespace {
         const InterpreterResult initial = interpreter.eval();
         if (!initial.success() || interpreter.firstEval() ||
             interpreter.value(fixture.output).lowWord() != 0) {
-            return fail("first eval did not execute every normal Block");
+            return fail("first eval did not execute every compute Block");
         }
 
         if (!interpreter.write(fixture.input, u8(0x35)).success()) {
             return fail("external input write failed");
         }
         const InterpreterResult changed = interpreter.eval();
-        if (!changed.success() || changed.epochsExecuted != 2 ||
-            interpreter.epochCounter() != 1 ||
+        if (!changed.success() || changed.roundsExecuted != 2 ||
+            interpreter.roundCounter() != 2 ||
             interpreter.value(fixture.output).lowWord() != 0x35) {
-            return fail("act.b feedback did not execute in the next epoch");
+            return fail("act.b feedback did not execute in the next round");
         }
-        if (interpreter.value(fixture.entryEvent).lowWord() != 0 ||
-            interpreter.value(fixture.midEvent).lowWord() != 0) {
-            return fail("changed results were not cleared on next-epoch entry");
+        // The commit detector rewrites its event on every round; the B0 event
+        // is only consumed inside B0, so it persists until the next eval
+        // re-runs B0.
+        if (interpreter.value(fixture.entryEvent).lowWord() != 1 ||
+            interpreter.value(fixture.stateEvent).lowWord() != 0) {
+            return fail("round-local changed results have the wrong lifetime");
         }
 
         const InterpreterResult stable = interpreter.eval();
-        if (!stable.success() || stable.epochsExecuted != 0 ||
-            interpreter.value(fixture.output).lowWord() != 0x35) {
-            return fail("stable input unexpectedly activated a normal Block");
+        if (!stable.success() || stable.roundsExecuted != 1 ||
+            interpreter.value(fixture.output).lowWord() != 0x35 ||
+            interpreter.value(fixture.entryEvent).lowWord() != 0) {
+            return fail("stable input unexpectedly activated a compute Block");
         }
         if (interpreter.write(fixture.entryEvent, u1(1)).success()) {
             return fail("external write to a changed-owned event was accepted");
@@ -194,16 +210,15 @@ namespace {
                            {enabled, mask, data, state, posedge});
 
         ScheduledProgramBuilder scheduled(linear.finish());
-        const InstructionId activate =
-            addInstruction(scheduled, Opcode::ActForward, {}, {posedge});
-        setTargets(scheduled, activate, {BlockId{1}});
-        addBlock(scheduled, {detect, activate});
+        addBlock(scheduled, {detect});
         addBlock(scheduled, {write});
         return RegisterFixture{
             .model =
                 ExecutableModel{
                     .program = scheduled.finish(),
                     .interface = {},
+                    .commitBlockBegin = 1,
+                    .commitBlockEnd = 2,
                 },
             .clock = clock,
             .data = data,
@@ -277,16 +292,15 @@ namespace {
             linear, Opcode::MemoryRead, {readData}, {memory, address});
 
         ScheduledProgramBuilder scheduled(linear.finish());
-        const InstructionId activate =
-            addInstruction(scheduled, Opcode::ActForward, {}, {posedge});
-        setTargets(scheduled, activate, {BlockId{1}});
-        addBlock(scheduled, {detect, activate});
+        addBlock(scheduled, {detect});
         addBlock(scheduled, {write, read});
         return MemoryFixture{
             .model =
                 ExecutableModel{
                     .program = scheduled.finish(),
                     .interface = {},
+                    .commitBlockBegin = 1,
+                    .commitBlockEnd = 2,
                 },
             .clock = clock,
             .address = address,
@@ -495,8 +509,10 @@ namespace {
         VariableId guard;
     };
 
-    EventfulTaskFixture makeEventfulTaskModel(bool guardChangesInEpoch,
-                                               HostEventMode eventMode) {
+    // The commit Block raises the guard state one round after the edge and
+    // its change detector re-activates the compute Block carrying the task.
+    EventfulTaskFixture makeEventfulTaskModel(bool guardStartsLow,
+                                              HostEventMode eventMode) {
         LinearProgramBuilder linear;
         const TypeId u1Type = linear.addType(Type::bitVector(1));
         const StringId taskName = linear.addString("eventful_task");
@@ -505,9 +521,13 @@ namespace {
             linear.addVariable(u1Type, linear.undefInit());
         const VariableId event = linear.addVariable(u1Type, linear.zeroInit());
         const VariableId one = addConstant(linear, u1Type, 1);
-        const VariableId guard =
-            guardChangesInEpoch ? linear.addVariable(u1Type, linear.zeroInit())
-                                : one;
+        const VariableId guardState =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId guardStateOld =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId guardEvent =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId guard = guardStartsLow ? guardState : one;
 
         const InstructionId changed = addInstruction(
             linear, Opcode::ChangedPos, {event}, {clock, clockOld});
@@ -520,26 +540,27 @@ namespace {
                      .schedule = CallSchedule::Normal,
                      .eventMode = eventMode,
                  });
-        const InstructionId setGuard =
-            guardChangesInEpoch
-                ? addInstruction(linear, Opcode::Assign, {guard}, {one})
-                : InstructionId::invalid();
+        const InstructionId writeGuard =
+            addInstruction(linear, Opcode::RegisterWrite, {},
+                           {one, one, one, guardState, one});
+        const InstructionId detectGuard =
+            addInstruction(linear, Opcode::ChangedAny, {guardEvent},
+                           {guardState, guardStateOld});
 
         ScheduledProgramBuilder scheduled(linear.finish());
         const InstructionId reactivate =
-            addInstruction(scheduled, Opcode::ActBackward, {}, {event});
+            addInstruction(scheduled, Opcode::ActBackward, {}, {guardEvent});
         setTargets(scheduled, reactivate, {BlockId{1}});
         addBlock(scheduled, {});
-        if (guardChangesInEpoch) {
-            addBlock(scheduled, {changed, task, setGuard, reactivate});
-        } else {
-            addBlock(scheduled, {changed, task, reactivate});
-        }
+        addBlock(scheduled, {changed, task});
+        addBlock(scheduled, {writeGuard, detectGuard, reactivate});
 
         return EventfulTaskFixture{
             .model = ExecutableModel{
                 .program = scheduled.finish(),
                 .interface = {},
+                .commitBlockBegin = 2,
+                .commitBlockEnd = 3,
             },
             .clock = clock,
             .event = event,
@@ -547,9 +568,9 @@ namespace {
         };
     }
 
-    int testEventfulHostPendingAcrossEpochs() {
+    int testEventfulHostPendingAcrossRounds() {
         // The first case raises the guard only after the eventful task has
-        // observed the edge.  The task must retain the event into epoch 1.
+        // observed the edge.  The task must retain the event into round 1.
         {
             EventfulTaskFixture fixture =
                 makeEventfulTaskModel(true, HostEventMode::Pending);
@@ -565,15 +586,15 @@ namespace {
                 return fail("eventful task fixture clock write failed");
             }
             const InterpreterResult result = interpreter.eval();
-            if (!result.success() || result.epochsExecuted != 2 ||
-                interpreter.epochCounter() != 1 || host.calls != 1 ||
+            if (!result.success() || result.roundsExecuted != 2 ||
+                interpreter.roundCounter() != 2 || host.calls != 1 ||
                 interpreter.value(fixture.event).lowWord() != 0 ||
                 interpreter.value(fixture.guard).lowWord() != 1) {
-                return fail("eventful task did not carry an edge across epochs");
+                return fail("eventful task did not carry an edge across rounds");
             }
         }
 
-        // If the guard is already true, the epoch-0 invocation must consume
+        // If the guard is already true, the round-0 invocation must consume
         // the pending event and not fire again when the block is reactivated.
         {
             EventfulTaskFixture fixture =
@@ -590,7 +611,7 @@ namespace {
                 return fail("eventful task repeat fixture clock write failed");
             }
             const InterpreterResult result = interpreter.eval();
-            if (!result.success() || result.epochsExecuted != 2 ||
+            if (!result.success() || result.roundsExecuted != 2 ||
                 host.calls != 1 || interpreter.value(fixture.event).lowWord() != 0) {
                 return fail("eventful task repeated after consuming its edge");
             }
@@ -608,10 +629,10 @@ namespace {
             return fail("immediate event fixture initialization failed");
         }
         const InterpreterResult result = interpreter.eval();
-        if (!result.success() || result.epochsExecuted != 2 ||
+        if (!result.success() || result.roundsExecuted != 2 ||
             host.calls != 0 || interpreter.value(fixture.event).lowWord() != 0 ||
             interpreter.value(fixture.guard).lowWord() != 1) {
-            return fail("immediate host event was replayed after its epoch");
+            return fail("immediate host event was replayed after its round");
         }
         return 0;
     }
@@ -736,6 +757,8 @@ namespace {
         VariableId result;
     };
 
+    // The commit Block publishes the argument and raises the guard one round
+    // after the edge; its change detector re-activates the compute Block.
     EventfulDpiFixture makeEventfulDpiModel() {
         LinearProgramBuilder linear;
         const TypeId u1Type = linear.addType(Type::bitVector(1));
@@ -762,10 +785,15 @@ namespace {
             linear.addVariable(u1Type, linear.undefInit());
         const VariableId event = linear.addVariable(u1Type, linear.zeroInit());
         const VariableId guard = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId guardOld =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId guardEvent =
+            linear.addVariable(u1Type, linear.zeroInit());
         const VariableId argument =
             linear.addVariable(u8Type, linear.zeroInit());
         const VariableId result = linear.addVariable(u8Type, linear.zeroInit());
         const VariableId one = addConstant(linear, u1Type, 1);
+        const VariableId mask = addConstant(linear, u8Type, 0xff);
         const VariableId nextArgument = addConstant(linear, u8Type, 0x2a);
 
         const InstructionId changed = addInstruction(
@@ -778,22 +806,28 @@ namespace {
                       .eventCount = 1,
                       .eventMode = HostEventMode::Pending,
                   });
-        const InstructionId setArgument = addInstruction(
-            linear, Opcode::Assign, {argument}, {nextArgument});
+        const InstructionId setArgument =
+            addInstruction(linear, Opcode::RegisterWrite, {},
+                           {one, mask, nextArgument, argument, one});
         const InstructionId setGuard =
-            addInstruction(linear, Opcode::Assign, {guard}, {one});
+            addInstruction(linear, Opcode::RegisterWrite, {},
+                           {one, one, one, guard, one});
+        const InstructionId detectGuard = addInstruction(
+            linear, Opcode::ChangedAny, {guardEvent}, {guard, guardOld});
 
         ScheduledProgramBuilder scheduled(linear.finish());
         const InstructionId reactivate =
-            addInstruction(scheduled, Opcode::ActBackward, {}, {event});
+            addInstruction(scheduled, Opcode::ActBackward, {}, {guardEvent});
         setTargets(scheduled, reactivate, {BlockId{1}});
         addBlock(scheduled, {});
-        addBlock(scheduled,
-                 {changed, call, setArgument, setGuard, reactivate});
+        addBlock(scheduled, {changed, call});
+        addBlock(scheduled, {setArgument, setGuard, detectGuard, reactivate});
         return EventfulDpiFixture{
             .model = ExecutableModel{
                 .program = scheduled.finish(),
                 .interface = {},
+                .commitBlockBegin = 2,
+                .commitBlockEnd = 3,
             },
             .clock = clock,
             .event = event,
@@ -812,14 +846,14 @@ namespace {
             return fail("eventful DPI fixture initialization failed");
         }
         const InterpreterResult eval = interpreter.eval();
-        if (!eval.success() || eval.epochsExecuted != 2 || host.calls != 1 ||
+        if (!eval.success() || eval.roundsExecuted != 2 || host.calls != 1 ||
             host.lastArgument != 0x2a ||
             interpreter.value(fixture.event).lowWord() != 0 ||
             interpreter.value(fixture.guard).lowWord() != 1 ||
             interpreter.value(fixture.argument).lowWord() != 0x2a ||
             interpreter.value(fixture.result).lowWord() != 0x2b) {
             return fail(
-                "eventful DPI call did not consume current-epoch operands");
+                "eventful DPI call did not consume current-round operands");
         }
         return 0;
     }
@@ -895,8 +929,10 @@ namespace {
             return fail("eval-boundary task fixture initialization failed");
         }
         const InterpreterResult first = interpreter.eval();
+        // The cross-Block event is cleared at round end; the pending host
+        // event is retained internally and not observable after the eval.
         if (!first.success() || host.calls != 0 ||
-            interpreter.value(fixture.event).lowWord() != 1) {
+            interpreter.value(fixture.event).lowWord() != 0) {
             return fail("guard-false eval did not retain its pending event");
         }
         if (!interpreter.write(fixture.guard, u1(1)).success() ||
@@ -904,7 +940,7 @@ namespace {
             return fail("eval-boundary task fixture wake write failed");
         }
         const InterpreterResult second = interpreter.eval();
-        if (!second.success() || second.epochsExecuted != 1 ||
+        if (!second.success() || second.roundsExecuted != 1 ||
             host.calls != 0 ||
             interpreter.value(fixture.event).lowWord() != 0 ||
             interpreter.value(fixture.wakeEvent).lowWord() != 1) {
@@ -992,337 +1028,10 @@ namespace {
         return 0;
     }
 
-    int testSparseCommitEventsAcrossEpochsAndGroups() {
-        LinearProgramBuilder linear;
-        const TypeId u1Type = linear.addType(Type::bitVector(1));
-        const TypeId u8Type = linear.addType(Type::bitVector(8));
-        const VariableId clock =
-            linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId clockOld =
-            linear.addVariable(u1Type, linear.undefInit());
-        const VariableId edge =
-            linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId one = addConstant(linear, u1Type, 1);
-        const VariableId mask = addConstant(linear, u8Type, 0xff);
-        const VariableId nextA = addConstant(linear, u8Type, 0x34);
-        const VariableId nextB = addConstant(linear, u8Type, 0x56);
-        const VariableId stateA =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId stateB =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId activateComputeEvent =
-            linear.addVariable(u1Type, linear.zeroInit());
-
-        const InstructionId detect = addInstruction(
-            linear, Opcode::ChangedPos, {edge}, {clock, clockOld});
-        const InstructionId writeA = addInstruction(
-            linear, Opcode::RegisterWrite, {},
-            {one, mask, nextA, stateA, edge});
-        const InstructionId writeB = addInstruction(
-            linear, Opcode::RegisterWrite, {},
-            {one, mask, nextB, stateB, edge});
-        const InstructionId copyEdge = addInstruction(
-            linear, Opcode::Assign, {activateComputeEvent}, {edge});
-
-        ScheduledProgramBuilder scheduled(linear.finish());
-        const InstructionId activateCommits =
-            addInstruction(scheduled, Opcode::ActForward, {}, {edge});
-        const InstructionId activateCompute =
-            addInstruction(scheduled, Opcode::ActBackward, {},
-                           {activateComputeEvent});
-        setTargets(scheduled, activateCommits, {BlockId{2}, BlockId{3}});
-        setTargets(scheduled, activateCompute, {BlockId{1}});
-        addBlock(scheduled, {detect, activateCommits});
-        addBlock(scheduled, {});
-        addBlock(scheduled, {writeA, copyEdge, activateCompute});
-        addBlock(scheduled, {writeB});
-
-        ExecutableModel model{
-            .program = scheduled.finish(),
-            .interface = {},
-            .commitBlockBegin = 2,
-            .commitBlockEnd = 4,
-            .commitBlockOrder = {BlockId{2}, BlockId{3}},
-            .commitGroupOffsets = {0, 1, 2},
-        };
-        Interpreter interpreter(model);
-        if (!interpreter.ready()) {
-            return fail(
-                "sparse commit-event fixture failed interpreter initialization: " +
-                (interpreter.initializationDiagnostic()
-                     ? interpreter.initializationDiagnostic()->message
-                     : std::string("unknown error")));
-        }
-
-        const InterpreterResult initial = interpreter.eval();
-        if (!initial.success() || interpreter.value(stateA).lowWord() != 0 ||
-            interpreter.value(stateB).lowWord() != 0 ||
-            interpreter.value(edge).lowWord() != 0) {
-            return fail("false event fired during forced first-eval commit groups");
-        }
-
-        if (!interpreter.write(clock, u1(1)).success()) {
-            return fail("sparse commit-event fixture clock write failed");
-        }
-        const InterpreterResult edgeEval = interpreter.eval();
-        if (!edgeEval.success() || edgeEval.epochsExecuted != 2 ||
-            interpreter.value(stateA).lowWord() != 0x34 ||
-            interpreter.value(stateB).lowWord() != 0x56) {
-            return fail("pending commit event did not survive an epoch between groups");
-        }
-        if (interpreter.value(edge).lowWord() != 0) {
-            return fail("restored commit event was not cleared after the final group");
-        }
-
-        const InterpreterResult quiet = interpreter.eval();
-        if (!quiet.success() || interpreter.value(stateA).lowWord() != 0x34 ||
-            interpreter.value(stateB).lowWord() != 0x56 ||
-            interpreter.value(edge).lowWord() != 0) {
-            return fail("commit event leaked into a later top-level eval");
-        }
-        return 0;
-    }
-
-    int testDisabledCommitWritesConsumeEventBeforeSelfReactivation() {
-        LinearProgramBuilder linear;
-        const TypeId u1Type = linear.addType(Type::bitVector(1));
-        const TypeId u8Type = linear.addType(Type::bitVector(8));
-        const TypeId memoryType = linear.addType(Type::array(1, 8));
-        const VariableId guard = linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId data = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId nextData =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId pass = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId nextPass =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId reactivate =
-            linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId firstPass =
-            linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId address =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId selectedMask =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId registerValue =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId latchValue =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId writtenMemory =
-            linear.addVariable(memoryType, linear.zeroInit());
-        const VariableId filledMemory =
-            linear.addVariable(memoryType, linear.zeroInit());
-        const VariableId addressedMemory =
-            linear.addVariable(memoryType, linear.zeroInit());
-        const VariableId zeroMaskMemory =
-            linear.addVariable(memoryType, linear.zeroInit());
-        const VariableId writtenValue =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId filledValue =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId addressedValue =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId zeroMaskValue =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId one = addConstant(linear, u1Type, 1);
-        const VariableId zeroBit = addConstant(linear, u1Type, 0);
-        const VariableId oneValue = addConstant(linear, u8Type, 1);
-        const VariableId three = addConstant(linear, u8Type, 3);
-        const VariableId zero = addConstant(linear, u8Type, 0);
-        const VariableId mask = addConstant(linear, u8Type, 0xff);
-
-        const InstructionId detectFirstPass = addInstruction(
-            linear, Opcode::Eq, {firstPass}, {pass, zero});
-        const InstructionId selectAddress = addInstruction(
-            linear, Opcode::Mux, {address}, {firstPass, oneValue, zero});
-        const InstructionId selectMask = addInstruction(
-            linear, Opcode::Mux, {selectedMask}, {firstPass, zero, mask});
-        const InstructionId writeRegister = addInstruction(
-            linear, Opcode::RegisterWrite, {},
-            {guard, mask, data, registerValue, one});
-        const InstructionId writeLatch = addInstruction(
-            linear, Opcode::LatchWrite, {},
-            {guard, mask, data, latchValue});
-        const InstructionId writeMemory = addInstruction(
-            linear, Opcode::MemoryWrite, {},
-            {guard, zero, mask, data, writtenMemory, one});
-        const InstructionId fillMemory = addInstruction(
-            linear, Opcode::MemoryFill, {},
-            {guard, data, filledMemory, one});
-        const InstructionId writeAfterInvalidAddress = addInstruction(
-            linear, Opcode::MemoryWrite, {},
-            {one, address, mask, data, addressedMemory, zeroBit, one});
-        const InstructionId writeWithZeroMask = addInstruction(
-            linear, Opcode::MemoryWrite, {},
-            {one, zero, selectedMask, data, zeroMaskMemory, zeroBit, one});
-        const InstructionId readWritten = addInstruction(
-            linear, Opcode::MemoryRead, {writtenValue}, {writtenMemory, zero});
-        const InstructionId readFilled = addInstruction(
-            linear, Opcode::MemoryRead, {filledValue}, {filledMemory, zero});
-        const InstructionId readAddressed = addInstruction(
-            linear, Opcode::MemoryRead, {addressedValue},
-            {addressedMemory, zero});
-        const InstructionId readZeroMask = addInstruction(
-            linear, Opcode::MemoryRead, {zeroMaskValue},
-            {zeroMaskMemory, zero});
-        const InstructionId incrementData = addInstruction(
-            linear, Opcode::Add, {nextData}, {data, oneValue});
-        const InstructionId storeData =
-            addInstruction(linear, Opcode::Assign, {data}, {nextData});
-        const InstructionId incrementPass = addInstruction(
-            linear, Opcode::Add, {nextPass}, {pass, oneValue});
-        const InstructionId storePass =
-            addInstruction(linear, Opcode::Assign, {pass}, {nextPass});
-        const InstructionId enableWrites =
-            addInstruction(linear, Opcode::Assign, {guard}, {one});
-        const InstructionId testPass = addInstruction(
-            linear, Opcode::Lt, {reactivate}, {pass, three});
-
-        ScheduledProgramBuilder scheduled(linear.finish());
-        const InstructionId activateSelf = addInstruction(
-            scheduled, Opcode::ActBackward, {}, {reactivate});
-        setTargets(scheduled, activateSelf, {BlockId{1}});
-        addBlock(scheduled, {});
-        addBlock(scheduled,
-                 {detectFirstPass, selectAddress, selectMask, writeRegister,
-                  writeLatch, writeMemory, fillMemory,
-                  writeAfterInvalidAddress, writeWithZeroMask, readWritten,
-                  readFilled, readAddressed, readZeroMask, incrementData,
-                  storeData, incrementPass, storePass, enableWrites, testPass,
-                  activateSelf});
-
-        ExecutableModel model{
-            .program = scheduled.finish(),
-            .interface = {},
-            .commitBlockBegin = 1,
-            .commitBlockEnd = 2,
-            .commitBlockOrder = {BlockId{1}},
-            .commitGroupOffsets = {0, 1},
-        };
-        Interpreter interpreter(model);
-        if (!interpreter.ready()) {
-            return fail(
-                "disabled commit-write fixture failed interpreter initialization: " +
-                (interpreter.initializationDiagnostic()
-                     ? interpreter.initializationDiagnostic()->message
-                     : std::string("unknown error")));
-        }
-
-        const InterpreterResult result = interpreter.eval();
-        if (!result.success() || result.epochsExecuted != 3) {
-            return fail("disabled commit-write fixture failed evaluation");
-        }
-        if (interpreter.value(pass).lowWord() != 3 ||
-            interpreter.value(data).lowWord() != 3 ||
-            interpreter.value(registerValue).lowWord() != 0 ||
-            interpreter.value(latchValue).lowWord() != 2 ||
-            interpreter.value(writtenValue).lowWord() != 0 ||
-            interpreter.value(filledValue).lowWord() != 0 ||
-            interpreter.value(addressedValue).lowWord() != 0 ||
-            interpreter.value(zeroMaskValue).lowWord() != 0 ||
-            interpreter.value(writtenMemory).arrayElementWords(0).front() != 0 ||
-            interpreter.value(filledMemory).arrayElementWords(0).front() != 0 ||
-            interpreter.value(addressedMemory).arrayElementWords(0).front() != 0 ||
-            interpreter.value(zeroMaskMemory).arrayElementWords(0).front() != 0) {
-            return fail(
-                "commit event was reused after a disabled or invalid write");
-        }
-        return 0;
-    }
-
-    int testSameGroupForwardActivationStartsANewCaptureBatch() {
-        LinearProgramBuilder linear;
-        const TypeId u1Type = linear.addType(Type::bitVector(1));
-        const TypeId u8Type = linear.addType(Type::bitVector(8));
-        const VariableId trigger =
-            linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId triggerOld =
-            linear.addVariable(u1Type, linear.undefInit());
-        const VariableId triggerChanged =
-            linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId one = addConstant(linear, u1Type, 1);
-        const VariableId mask = addConstant(linear, u8Type, 0xff);
-        const VariableId nextA = addConstant(linear, u8Type, 0x34);
-        const VariableId stateA =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId stateB =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId capturedA =
-            linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId activateBEvent =
-            linear.addVariable(u1Type, linear.zeroInit());
-
-        const InstructionId detect = addInstruction(
-            linear, Opcode::ChangedAny, {triggerChanged}, {trigger, triggerOld});
-        const InstructionId writeA = addInstruction(
-            linear, Opcode::RegisterWrite, {},
-            {one, mask, nextA, stateA, one});
-        const InstructionId writeB = addInstruction(
-            linear, Opcode::RegisterWrite, {},
-            {one, mask, capturedA, stateB, one});
-        const InstructionId enableB = addInstruction(
-            linear, Opcode::Assign, {activateBEvent}, {one});
-
-        ScheduledProgramBuilder scheduled(linear.finish());
-        const InstructionId activateA = addInstruction(
-            scheduled, Opcode::ActForward, {}, {triggerChanged});
-        const InstructionId activateB =
-            addInstruction(scheduled, Opcode::ActForward, {}, {activateBEvent});
-        setTargets(scheduled, activateA, {BlockId{1}});
-        setTargets(scheduled, activateB, {BlockId{2}});
-        addBlock(scheduled, {detect, activateA});
-        addBlock(scheduled, {writeA, enableB, activateB});
-        addBlock(scheduled, {writeB});
-
-        ExecutableModel model{
-            .program = scheduled.finish(),
-            .interface = {},
-            .commitBlockBegin = 1,
-            .commitBlockEnd = 3,
-            .commitBlockOrder = {BlockId{1}, BlockId{2}},
-            .commitGroupOffsets = {0, 2},
-            .commitOperandCaptures = {
-                CommitOperandCapture{.source = stateA, .target = capturedA},
-            },
-            .commitOperandCaptureOffsets = {0, 0, 1},
-        };
-        {
-            Interpreter interpreter(model);
-            if (!interpreter.ready()) {
-                return fail(
-                    "same-group capture fixture failed interpreter initialization: " +
-                    (interpreter.initializationDiagnostic()
-                         ? interpreter.initializationDiagnostic()->message
-                         : std::string("unknown error")));
-            }
-            const InterpreterResult initial = interpreter.eval();
-            if (!initial.success() ||
-                interpreter.value(stateA).lowWord() != 0x34 ||
-                interpreter.value(stateB).lowWord() != 0) {
-                return fail("same-group capture fixture failed its warm-up batch");
-            }
-            if (!interpreter.write(trigger, u1(1)).success() ||
-                !interpreter.eval().success() ||
-                interpreter.value(stateB).lowWord() != 0x34) {
-                return fail(
-                    "same-group forward activation reused an earlier capture batch");
-            }
-        }
-
-        model.commitGroupOffsets = {0, 1, 2};
-        Interpreter crossGroup(model);
-        if (!crossGroup.ready() || !crossGroup.eval().success() ||
-            crossGroup.value(stateA).lowWord() != 0x34 ||
-            crossGroup.value(stateB).lowWord() != 0x34) {
-            return fail(
-                "cross-group first-eval activation reused the forced operand capture");
-        }
-        return 0;
-    }
-
 } // namespace
 
 int main() {
-    if (testFeedbackAndEpochLifecycle() != 0)
+    if (testFeedbackAndRoundLifecycle() != 0)
         return 1;
     if (testEventDrivenRegister() != 0)
         return 1;
@@ -1332,7 +1041,7 @@ int main() {
         return 1;
     if (testWideAndSignedArithmetic() != 0)
         return 1;
-    if (testEventfulHostPendingAcrossEpochs() != 0)
+    if (testEventfulHostPendingAcrossRounds() != 0)
         return 1;
     if (testImmediateHostEventIsNotReplayed() != 0)
         return 1;
@@ -1345,12 +1054,6 @@ int main() {
     if (testInjectedHostAndOnceSchedule() != 0)
         return 1;
     if (testMissingHostBindingDiagnostic() != 0)
-        return 1;
-    if (testSparseCommitEventsAcrossEpochsAndGroups() != 0)
-        return 1;
-    if (testDisabledCommitWritesConsumeEventBeforeSelfReactivation() != 0)
-        return 1;
-    if (testSameGroupForwardActivationStartsANewCaptureBatch() != 0)
         return 1;
     return 0;
 }

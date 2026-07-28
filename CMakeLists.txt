@@ -117,7 +117,6 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/am/lowering.cpp
     lib/grhsim/am/activity_schedule.cpp
     lib/grhsim/am/production_activity_schedule.cpp
-    lib/grhsim/am/grhsim_am_activity_schedule.cpp
     lib/grhsim/am/interpreter.cpp
     lib/grhsim/am/cpp_emitter.cpp
     lib/emit/grhsim_cpp.cpp

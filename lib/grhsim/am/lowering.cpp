@@ -185,8 +185,6 @@ namespace wolvrix::lib::grhsim::am
                             .instructionEffects = std::move(instructionEffects_),
                             .orderedEffects = std::move(orderedEffects_),
                         },
-                        .preCommitSnapshots =
-                            std::move(preCommitSnapshotBindings_),
                     };
                     const ValidationResult validation =
                         validate(artifact, ValidationOptions{.level = ValidationLevel::Semantic,
@@ -500,7 +498,6 @@ namespace wolvrix::lib::grhsim::am
             {
                 std::size_t stateCount = 0;
                 std::size_t eventCount = 0;
-                std::size_t preCommitSnapshotUpperBound = 0;
                 std::size_t instructionCount = 0;
                 std::size_t operandCount = 0;
                 std::size_t resultCount = 0;
@@ -538,28 +535,6 @@ namespace wolvrix::lib::grhsim::am
                             eventCount += typed->size();
                         }
                     }
-                    std::size_t sampledOperandCount = 0;
-                    switch (op.kind())
-                    {
-                    case OperationKind::kRegisterWritePort:
-                        sampledOperandCount = std::min<std::size_t>(3, op.operands().size());
-                        break;
-                    case OperationKind::kMemoryWritePort:
-                        sampledOperandCount = std::min<std::size_t>(4, op.operands().size());
-                        break;
-                    case OperationKind::kMemoryFillPort:
-                        sampledOperandCount = std::min<std::size_t>(2, op.operands().size());
-                        break;
-                    default:
-                        break;
-                    }
-                    for (std::size_t index = 0; index < sampledOperandCount; ++index)
-                    {
-                        const OperationId definition = graph_.valueDef(op.operands()[index]);
-                        preCommitSnapshotUpperBound +=
-                            definition.valid() &&
-                            graph_.opKind(definition) == OperationKind::kRegisterReadPort;
-                    }
                 }
                 instructionCount += eventCount;
                 operandCount += 2 * eventCount;
@@ -573,8 +548,7 @@ namespace wolvrix::lib::grhsim::am
                 reserve.initActions = graph_.operations().size() / 16;
                 reserve.literals = graph_.operations().size() / 16;
                 reserve.literalWords = graph_.operations().size() / 8;
-                reserve.variables = graph_.values().size() + stateCount + 2 * eventCount +
-                                    preCommitSnapshotUpperBound;
+                reserve.variables = graph_.values().size() + stateCount + 2 * eventCount;
                 reserve.variableLabels = exposedValues_.size() + stateCount;
                 reserve.instructions = instructionCount;
                 reserve.operands = operandCount;
@@ -1357,6 +1331,13 @@ namespace wolvrix::lib::grhsim::am
                 return valueMap_[value.index];
             }
 
+            // Commit Blocks read their operands at the execution point, but a
+            // state operand read there must observe the value from before this
+            // round's commit phase (read-old), not a state written earlier in
+            // the same commit sweep. Route such operands through a snapshot fed
+            // by a plain compute Assign: it settles in the compute phase and is
+            // reactivated by the scheduler's normal reader activation whenever
+            // the source state changes.
             VariableId preCommitValue(ValueId value, VariableId source,
                                       const Operation &user)
             {
@@ -1379,10 +1360,9 @@ namespace wolvrix::lib::grhsim::am
                 const TypeId type = builder_.view().variable(source).type;
                 const VariableId snapshot = addVariable(type, builder_.undefInit());
                 preCommitSnapshots_.emplace(source.value, snapshot);
-                preCommitSnapshotBindings_.push_back(PreCommitSnapshot{
-                    .source = source,
-                    .target = snapshot,
-                });
+                const std::array<VariableId, 1> results{snapshot};
+                const std::array<VariableId, 1> operands{source};
+                addInstruction(Opcode::Assign, results, operands);
                 return snapshot;
             }
 
@@ -2743,9 +2723,8 @@ namespace wolvrix::lib::grhsim::am
             std::vector<PendingStateOrderedEffect> pendingStateOrderedEffects_;
             uint32_t nextOrderedGroup_ = 0;
             std::unordered_map<uint32_t, uint32_t> stateOrderGroups_;
-            std::unordered_map<uint32_t, VariableId> preCommitSnapshots_;
-            std::vector<PreCommitSnapshot> preCommitSnapshotBindings_;
             std::map<std::pair<Opcode, uint32_t>, VariableId> eventDetectorMemo_;
+            std::unordered_map<uint32_t, VariableId> preCommitSnapshots_;
             uint64_t freshTemporaryCount_ = 0;
             std::size_t flattenedUnknownLiterals_ = 0;
         };

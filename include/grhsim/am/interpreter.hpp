@@ -104,13 +104,13 @@ namespace wolvrix::lib::grhsim::am {
 
     struct InterpreterResult {
         std::optional<InterpreterDiagnostic> diagnostic;
-        uint64_t epochsExecuted = 0;
+        uint64_t roundsExecuted = 0;
 
         bool success() const noexcept { return !diagnostic.has_value(); }
     };
 
     struct InterpreterOptions {
-        uint64_t maxEpochs = 1000000;
+        uint64_t maxRounds = 1000000;
         uint64_t randomSeed = 0;
         ValidationLevel validationLevel = ValidationLevel::Semantic;
     };
@@ -140,7 +140,7 @@ namespace wolvrix::lib::grhsim::am {
 
         bool firstEval() const noexcept;
         bool finalized() const noexcept;
-        uint64_t epochCounter() const noexcept;
+        uint64_t roundCounter() const noexcept;
 
     private:
         struct Impl;

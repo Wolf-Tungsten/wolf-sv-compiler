@@ -6,6 +6,7 @@
 #include <cctype>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace wolvrix::lib::grhsim::am {
@@ -416,34 +417,22 @@ namespace wolvrix::lib::grhsim::am {
         std::vector<bool> constants;
         std::vector<bool> protectedVariables;
         std::vector<VariableId> changedResults;
-        std::vector<VariableId> commitEventVariables;
-        std::vector<uint32_t> commitEventSlotByVariable;
         std::vector<uint64_t> dirtyChangedBits;
         std::vector<VariableId> dirtyChangedResults;
-        std::vector<uint32_t> dirtyCommitEventSlots;
         std::vector<bool> active;
-        std::vector<bool> nextActive;
-        std::vector<bool> pendingCommitBlocks;
-        std::vector<bool> forcedCommitBlocks;
-        std::vector<bool> nextCommitBlocks;
-        std::vector<bool> capturedCommitBlocks;
-        std::vector<uint64_t> pendingCommitEventBits;
-        std::vector<uint32_t> pendingCommitEventSlots;
-        std::vector<bool> completedCommitWrites;
         std::vector<bool> callCompleted;
         std::vector<bool> pendingHostEvents;
         std::vector<BlockId> instructionBlocks;
+        std::unordered_set<uint32_t> crossBlockChangedResults;
         std::optional<InterpreterDiagnostic> initializationDiagnostic;
         bool firstEval = true;
         bool finalized = false;
         bool failed = false;
         bool successfulEval = false;
         bool dirtySinceEval = false;
-        uint64_t epochCounter = 0;
+        bool backwardFired = false;
+        uint64_t roundCounter = 0;
         uint64_t randomState = 0;
-
-        static constexpr uint32_t kNoCommitEventSlot =
-            std::numeric_limits<uint32_t>::max();
 
         Impl(const ExecutableModel &model, HostEnvironment *host,
              const InterpreterOptions &options)
@@ -475,7 +464,7 @@ namespace wolvrix::lib::grhsim::am {
             return InterpreterResult{
                 .diagnostic = diagnostic(code, std::move(message), block,
                                          instruction, variable),
-                .epochsExecuted = epochCounter + 1U,
+                .roundsExecuted = roundCounter + 1U,
             };
         }
 
@@ -597,10 +586,10 @@ namespace wolvrix::lib::grhsim::am {
         }
 
         void initialize() {
-            if (options.maxEpochs == 0) {
+            if (options.maxRounds == 0) {
                 initializationDiagnostic =
                     diagnostic(InterpreterErrorCode::InvalidModel,
-                               "AM interpreter maxEpochs must be positive");
+                               "AM interpreter maxRounds must be positive");
                 return;
             }
             const ValidationResult validation = validate(
@@ -642,6 +631,8 @@ namespace wolvrix::lib::grhsim::am {
                 }
             }
 
+            std::vector<BlockId> changedProducerBlocks(program.variableCount(),
+                                                       BlockId::invalid());
             for (uint32_t index = 0; index < program.instructionCount();
                  ++index) {
                 const InstructionId instruction{index};
@@ -654,6 +645,8 @@ namespace wolvrix::lib::grhsim::am {
                     protectedVariables[operands[1].value] = true;
                     protectedVariables[results[0].value] = true;
                     changedResults.push_back(results[0]);
+                    changedProducerBlocks[results[0].value] =
+                        instructionBlocks[index];
                 }
 
                 std::string error;
@@ -682,64 +675,29 @@ namespace wolvrix::lib::grhsim::am {
                 }
             }
 
-            active.assign(model.program.blockCount(), false);
-            nextActive.assign(model.program.blockCount(), false);
-            pendingCommitBlocks.assign(model.program.blockCount(), false);
-            forcedCommitBlocks.assign(model.program.blockCount(), false);
-            nextCommitBlocks.assign(model.program.blockCount(), false);
-            capturedCommitBlocks.assign(model.program.blockCount(), false);
-            if (model.commitBlockBegin != 0) {
-                std::vector<bool> changedVariable(program.variableCount(), false);
-                for (VariableId result : changedResults) {
-                    changedVariable[result.value] = true;
-                }
-                for (uint32_t blockIndex = model.commitBlockBegin;
-                     blockIndex < model.commitBlockEnd; ++blockIndex) {
-                    const BlockId block{blockIndex};
-                    for (std::size_t position = 0;
-                         position < model.program.blockSize(block); ++position) {
-                        const InstructionId instruction =
-                            model.program.blockInstruction(block, position);
-                        const Opcode opcode = program.opcode(instruction);
-                        std::size_t eventBegin = program.operands(instruction).size();
-                        if (opcode == Opcode::RegisterWrite) {
-                            eventBegin = 4;
-                        } else if (opcode == Opcode::MemoryWrite) {
-                            eventBegin = 5;
-                        } else if (opcode == Opcode::MemoryFill) {
-                            eventBegin = 3;
-                        }
-                        const auto operands = program.operands(instruction);
-                        for (std::size_t index = eventBegin; index < operands.size(); ++index) {
-                            if (changedVariable[operands[index].value]) {
-                                commitEventVariables.push_back(operands[index]);
-                            }
-                        }
+            // A changed result consumed by at least one instruction in a
+            // different Block is round-local state and must be cleared at the
+            // end of every round; same-Block results are rewritten before
+            // every read and need no clearing.
+            for (uint32_t index = 0; index < program.instructionCount();
+                 ++index) {
+                const InstructionId instruction{index};
+                const BlockId consumerBlock = instructionBlocks[index];
+                for (VariableId operand : program.operands(instruction)) {
+                    const BlockId producerBlock =
+                        changedProducerBlocks[operand.value];
+                    if (producerBlock.valid() &&
+                        consumerBlock != producerBlock) {
+                        crossBlockChangedResults.insert(operand.value);
                     }
                 }
-                std::sort(commitEventVariables.begin(), commitEventVariables.end(),
-                          [](VariableId lhs, VariableId rhs) {
-                              return lhs.value < rhs.value;
-                          });
-                commitEventVariables.erase(
-                    std::unique(commitEventVariables.begin(), commitEventVariables.end()),
-                    commitEventVariables.end());
             }
-            commitEventSlotByVariable.assign(program.variableCount(),
-                                             kNoCommitEventSlot);
-            for (std::size_t index = 0; index < commitEventVariables.size(); ++index) {
-                commitEventSlotByVariable[commitEventVariables[index].value] =
-                    static_cast<uint32_t>(index);
-            }
+
+            active.assign(model.program.blockCount(), false);
             dirtyChangedBits.assign(
                 (static_cast<std::size_t>(program.variableCount()) + 63U) / 64U,
                 0);
             dirtyChangedResults.reserve(changedResults.size());
-            dirtyCommitEventSlots.reserve(commitEventVariables.size());
-            pendingCommitEventBits.assign(
-                (commitEventVariables.size() + 63U) / 64U, 0);
-            pendingCommitEventSlots.reserve(commitEventVariables.size());
-            completedCommitWrites.assign(program.instructionCount(), false);
             callCompleted.assign(program.instructionCount(), false);
             pendingHostEvents.assign(program.instructionCount(), false);
             for (VariableId result : changedResults) {
@@ -753,12 +711,10 @@ namespace wolvrix::lib::grhsim::am {
                 1, Signedness::Unsigned,
                 std::array<uint64_t, 1>{event ? 1U : 0U});
 
-            if (!event) {
+            if (!event || !crossBlockChangedResults.contains(result.value)) {
                 return;
             }
 
-            const uint32_t commitEventSlot =
-                commitEventSlotByVariable[result.value];
             const std::size_t word = result.value / 64U;
             const uint64_t bit = UINT64_C(1) << (result.value % 64U);
             if ((dirtyChangedBits[word] & bit) != 0) {
@@ -766,9 +722,6 @@ namespace wolvrix::lib::grhsim::am {
             }
             dirtyChangedBits[word] |= bit;
             dirtyChangedResults.push_back(result);
-            if (commitEventSlot != kNoCommitEventSlot) {
-                dirtyCommitEventSlots.push_back(commitEventSlot);
-            }
         }
 
         void clearChangedResults() {
@@ -779,92 +732,6 @@ namespace wolvrix::lib::grhsim::am {
                     ~(UINT64_C(1) << (result.value % 64U));
             }
             dirtyChangedResults.clear();
-            dirtyCommitEventSlots.clear();
-        }
-
-        bool isCommitBlock(BlockId block) const {
-            return model.commitBlockBegin != 0 &&
-                   block.value >= model.commitBlockBegin &&
-                   block.value < model.commitBlockEnd;
-        }
-
-        static bool hasActiveBlocks(const std::vector<bool> &blocks) {
-            return std::any_of(blocks.begin() + 1, blocks.end(),
-                               [](bool value) { return value; });
-        }
-
-        bool hasPendingCommitBlocks() const {
-            for (std::size_t block = 1; block < pendingCommitBlocks.size(); ++block) {
-                if (pendingCommitBlocks[block] || forcedCommitBlocks[block]) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        void captureCommitEvents() {
-            if (!hasPendingCommitBlocks() &&
-                !hasActiveBlocks(nextCommitBlocks)) {
-                return;
-            }
-            for (uint32_t slot : dirtyCommitEventSlots) {
-                if (!truth(values[commitEventVariables[slot].value])) {
-                    continue;
-                }
-                const std::size_t word = slot / 64U;
-                const uint64_t bit = UINT64_C(1) << (slot % 64U);
-                if ((pendingCommitEventBits[word] & bit) != 0) {
-                    continue;
-                }
-                pendingCommitEventBits[word] |= bit;
-                pendingCommitEventSlots.push_back(slot);
-            }
-        }
-
-        void restoreCommitEvents() {
-            for (uint32_t slot : pendingCommitEventSlots) {
-                setChangedResult(commitEventVariables[slot], true);
-            }
-        }
-
-        void clearPendingCommitEvents() {
-            for (uint32_t slot : pendingCommitEventSlots) {
-                pendingCommitEventBits[slot / 64U] &=
-                    ~(UINT64_C(1) << (slot % 64U));
-            }
-            pendingCommitEventSlots.clear();
-        }
-
-        void capturePendingCommitOperands() {
-            for (uint32_t block = model.commitBlockBegin;
-                 block < model.commitBlockEnd; ++block) {
-                if ((!pendingCommitBlocks[block] && !forcedCommitBlocks[block]) ||
-                    capturedCommitBlocks[block]) {
-                    continue;
-                }
-                if (!model.commitOperandCaptureOffsets.empty()) {
-                    const uint32_t local = block - model.commitBlockBegin;
-                    const uint32_t begin = model.commitOperandCaptureOffsets[local];
-                    const uint32_t end = model.commitOperandCaptureOffsets[local + 1];
-                    for (uint32_t index = begin; index < end; ++index) {
-                        const CommitOperandCapture &capture =
-                            model.commitOperandCaptures[index];
-                        values[capture.target.value] = values[capture.source.value];
-                    }
-                }
-                capturedCommitBlocks[block] = true;
-            }
-        }
-
-        bool alreadyCompletedCommitWrite(BlockId block,
-                                         InstructionId instruction,
-                                         bool eventHit) {
-            if (!eventHit || !isCommitBlock(block)) {
-                return false;
-            }
-            const bool completed = completedCommitWrites[instruction.value];
-            completedCommitWrites[instruction.value] = true;
-            return completed;
         }
 
         static bool truth(const InterpreterValue &value) {
@@ -1329,10 +1196,6 @@ namespace wolvrix::lib::grhsim::am {
                          ++index) {
                         eventHit = eventHit || truth(operands[index]);
                     }
-                    if (alreadyCompletedCommitWrite(block, instruction,
-                                                    eventHit)) {
-                        return {};
-                    }
                     fire = fire && eventHit;
                 }
                 if (fire) {
@@ -1373,10 +1236,6 @@ namespace wolvrix::lib::grhsim::am {
                 }
                 const bool fire = truth(operands[0]) && eventHit &&
                                   address < memoryType.elementCount;
-                if (alreadyCompletedCommitWrite(block, instruction,
-                                                eventHit)) {
-                    return {};
-                }
                 if (fire) {
                     InterpreterValue next = operands[targetIndex];
                     const std::size_t stride = wordCount(memoryType.bitWidth);
@@ -1401,10 +1260,6 @@ namespace wolvrix::lib::grhsim::am {
                     eventHit = eventHit || truth(operands[index]);
                 }
                 const bool fire = truth(operands[0]) && eventHit;
-                if (alreadyCompletedCommitWrite(block, instruction,
-                                                eventHit)) {
-                    return {};
-                }
                 if (fire) {
                     InterpreterValue next = operands[targetIndex];
                     const std::size_t stride = wordCount(memoryType.bitWidth);
@@ -1438,20 +1293,10 @@ namespace wolvrix::lib::grhsim::am {
                     const auto attributes =
                         *program.activationAttributes(instruction);
                     for (BlockId target : attributes.targets) {
-                        if (isCommitBlock(target)) {
-                            if (!pendingCommitBlocks[target.value]) {
-                                capturedCommitBlocks[target.value] = false;
-                            }
-                            std::vector<bool> &targets =
-                                opcode == Opcode::ActForward
-                                    ? pendingCommitBlocks
-                                    : nextCommitBlocks;
-                            targets[target.value] = true;
-                        } else {
-                            std::vector<bool> &targets =
-                                opcode == Opcode::ActForward ? active : nextActive;
-                            targets[target.value] = true;
-                        }
+                        active[target.value] = true;
+                    }
+                    if (opcode == Opcode::ActBackward) {
+                        backwardFired = true;
                     }
                 }
                 return {};
@@ -1492,145 +1337,62 @@ namespace wolvrix::lib::grhsim::am {
             }
 
             const bool initial = firstEval;
-            epochCounter = 0;
+            roundCounter = 0;
             std::fill(active.begin(), active.end(), false);
-            std::fill(nextActive.begin(), nextActive.end(), false);
-            std::fill(pendingCommitBlocks.begin(), pendingCommitBlocks.end(), false);
-            std::fill(forcedCommitBlocks.begin(), forcedCommitBlocks.end(), false);
-            std::fill(nextCommitBlocks.begin(), nextCommitBlocks.end(), false);
-            std::fill(capturedCommitBlocks.begin(), capturedCommitBlocks.end(), false);
-            clearPendingCommitEvents();
-            std::fill(completedCommitWrites.begin(), completedCommitWrites.end(), false);
-            std::fill(pendingHostEvents.begin(), pendingHostEvents.end(), false);
+            std::fill(pendingHostEvents.begin(), pendingHostEvents.end(),
+                      false);
             clearChangedResults();
-
-            for (const PreCommitSnapshot &snapshot : model.preCommitSnapshots) {
-                values[snapshot.target.value] = values[snapshot.source.value];
-            }
 
             InterpreterResult result = executeBlock(BlockId{0});
             if (!result.success()) {
                 return result;
             }
+
+            const uint32_t blockCount = model.program.blockCount();
+            const uint32_t computeEnd = model.commitBlockBegin != 0
+                                            ? model.commitBlockBegin
+                                            : blockCount;
             if (initial) {
-                for (std::size_t block = 1; block < active.size(); ++block) {
-                    if (isCommitBlock(BlockId{static_cast<uint32_t>(block)})) {
-                        forcedCommitBlocks[block] = true;
-                    } else {
-                        active[block] = true;
-                    }
+                for (uint32_t block = 1; block < computeEnd; ++block) {
+                    active[block] = true;
                 }
             }
 
-            uint64_t epochsExecuted = 0;
-            while (hasActiveBlocks(active) || hasPendingCommitBlocks()) {
-                epochsExecuted = std::max(epochsExecuted, epochCounter + 1U);
-                for (uint32_t blockIndex = 1; blockIndex < active.size();
-                     ++blockIndex) {
-                    if (!active[blockIndex]) {
+            while (true) {
+                backwardFired = false;
+                // Compute phase: ascending, active-filtered, cleared as scanned.
+                for (uint32_t block = 1; block < computeEnd; ++block) {
+                    if (!active[block]) {
                         continue;
                     }
-                    active[blockIndex] = false;
-                    result = executeBlock(BlockId{blockIndex});
+                    active[block] = false;
+                    result = executeBlock(BlockId{block});
                     if (!result.success()) {
-                        result.epochsExecuted = epochsExecuted;
+                        result.roundsExecuted = roundCounter + 1U;
                         return result;
                     }
                 }
-
-                captureCommitEvents();
-                if (hasActiveBlocks(nextActive) || hasActiveBlocks(nextCommitBlocks)) {
-                    if (epochsExecuted >= options.maxEpochs) {
-                        result =
-                            fail(InterpreterErrorCode::NonConvergent,
-                                 "AM eval exceeded the configured epoch limit");
-                        result.epochsExecuted = epochsExecuted;
+                // Commit phase: ascending, always executed.
+                for (uint32_t block = model.commitBlockBegin;
+                     block < model.commitBlockEnd; ++block) {
+                    result = executeBlock(BlockId{block});
+                    if (!result.success()) {
+                        result.roundsExecuted = roundCounter + 1U;
                         return result;
                     }
-                    active = nextActive;
-                    std::fill(nextActive.begin(), nextActive.end(), false);
-                    for (std::size_t block = 1; block < pendingCommitBlocks.size(); ++block) {
-                        pendingCommitBlocks[block] =
-                            pendingCommitBlocks[block] || nextCommitBlocks[block];
-                    }
-                    std::fill(nextCommitBlocks.begin(), nextCommitBlocks.end(), false);
-                    ++epochCounter;
-                    clearChangedResults();
-                    continue;
                 }
-
-                if (hasPendingCommitBlocks()) {
-                    capturePendingCommitOperands();
-                    restoreCommitEvents();
-                    bool executedGroup = false;
-                    for (std::size_t group = 0;
-                         group + 1 < model.commitGroupOffsets.size(); ++group) {
-                        const uint32_t begin = model.commitGroupOffsets[group];
-                        const uint32_t end = model.commitGroupOffsets[group + 1];
-                        std::vector<BlockId> selectedBlocks;
-                        selectedBlocks.reserve(end - begin);
-                        for (uint32_t index = begin; index < end; ++index) {
-                            const BlockId block = model.commitBlockOrder[index];
-                            if ((pendingCommitBlocks[block.value] ||
-                                 forcedCommitBlocks[block.value]) &&
-                                capturedCommitBlocks[block.value]) {
-                                selectedBlocks.push_back(block);
-                            }
-                        }
-                        if (selectedBlocks.empty()) {
-                            continue;
-                        }
-                        executedGroup = true;
-                        for (BlockId block : selectedBlocks) {
-                            pendingCommitBlocks[block.value] = false;
-                            forcedCommitBlocks[block.value] = false;
-                            capturedCommitBlocks[block.value] = false;
-                        }
-                        for (BlockId block : selectedBlocks) {
-                            result = executeBlock(block);
-                            if (!result.success()) {
-                                result.epochsExecuted = epochsExecuted;
-                                return result;
-                            }
-                        }
-                        break;
-                    }
-                    if (!executedGroup) {
-                        return fail(InterpreterErrorCode::InvalidModel,
-                                    "pending commit Block is absent from its execution plan");
-                    }
-                    if (hasActiveBlocks(nextActive) || hasActiveBlocks(nextCommitBlocks)) {
-                        if (epochsExecuted >= options.maxEpochs) {
-                            result =
-                                fail(InterpreterErrorCode::NonConvergent,
-                                     "AM eval exceeded the configured epoch limit");
-                            result.epochsExecuted = epochsExecuted;
-                            return result;
-                        }
-                        for (std::size_t block = 1; block < active.size(); ++block) {
-                            active[block] = active[block] || nextActive[block];
-                            pendingCommitBlocks[block] =
-                                pendingCommitBlocks[block] || nextCommitBlocks[block];
-                        }
-                        std::fill(nextActive.begin(), nextActive.end(), false);
-                        std::fill(nextCommitBlocks.begin(), nextCommitBlocks.end(), false);
-                        captureCommitEvents();
-                        ++epochCounter;
-                        clearChangedResults();
-                        continue;
-                    }
-                    if (hasActiveBlocks(active)) {
-                        clearChangedResults();
-                        continue;
-                    }
-                    if (!hasPendingCommitBlocks()) {
-                        clearPendingCommitEvents();
-                        clearChangedResults();
-                    }
-                    continue;
+                clearChangedResults();
+                ++roundCounter;
+                if (roundCounter > options.maxRounds) {
+                    result = fail(
+                        InterpreterErrorCode::NonConvergent,
+                        "AM eval exceeded the configured round limit");
+                    result.roundsExecuted = roundCounter;
+                    return result;
                 }
-
-                break;
+                if (!backwardFired) {
+                    break;
+                }
             }
 
             if (initial) {
@@ -1640,7 +1402,7 @@ namespace wolvrix::lib::grhsim::am {
             dirtySinceEval = false;
             return InterpreterResult{
                 .diagnostic = std::nullopt,
-                .epochsExecuted = epochsExecuted,
+                .roundsExecuted = roundCounter,
             };
         }
 
@@ -1776,8 +1538,8 @@ namespace wolvrix::lib::grhsim::am {
         return impl_ && impl_->finalized;
     }
 
-    uint64_t Interpreter::epochCounter() const noexcept {
-        return impl_ ? impl_->epochCounter : 0;
+    uint64_t Interpreter::roundCounter() const noexcept {
+        return impl_ ? impl_->roundCounter : 0;
     }
 
 } // namespace wolvrix::lib::grhsim::am

@@ -587,7 +587,6 @@ namespace
             ActivityScheduleOptions{
                 .maxInstructionsPerBlock = 8,
                 .maxCommitInstructionsPerBlock = 1,
-                .maxStateWritesPerBlock = 1,
                 .enableCoarsening = true,
             },
             diagnostics);
@@ -705,9 +704,9 @@ namespace
         const VariableId firstVariable = findPort("first", PortDirection::Output);
         const VariableId secondVariable = findPort("second", PortDirection::Output);
         if (!clockVariable.valid() || !nextVariable.valid() || !firstVariable.valid() ||
-            !secondVariable.valid() || !artifact->preCommitSnapshots.empty())
+            !secondVariable.valid())
         {
-            return fail("register-chain lowering produced invalid interface or entry snapshots");
+            return fail("register-chain lowering produced an invalid interface");
         }
 
         ProductionActivityScheduleStage scheduler;
@@ -716,13 +715,10 @@ namespace
             ActivityScheduleOptions{
                 .maxInstructionsPerBlock = 8,
                 .maxCommitInstructionsPerBlock = 1,
-                .maxStateWritesPerBlock = 1,
                 .enableCoarsening = true,
             },
             diagnostics);
-        if (!model || diagnostics.hasError() || !model->preCommitSnapshots.empty() ||
-            model->commitOperandCaptures.size() < 2 ||
-            model->commitOperandCaptureOffsets.empty())
+        if (!model || diagnostics.hasError())
         {
             return fail("register-chain AM program did not schedule");
         }
@@ -773,7 +769,7 @@ namespace
             interpreter.value(firstVariable).lowWord() != 0x56 ||
             interpreter.value(secondVariable).lowWord() != 0x34)
         {
-            return fail("pre-commit snapshot conversion was stale on a later edge");
+            return fail("register chain observed a stale pre-commit value on a later edge");
         }
         return 0;
     }

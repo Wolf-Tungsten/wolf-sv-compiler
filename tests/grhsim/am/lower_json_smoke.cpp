@@ -109,7 +109,7 @@ int main(int argc, char **argv)
         std::cerr << "usage: grhsim-am-lower-json <design.json> [top] [--schedule] "
                      "[--emit <output-directory>] [--blocks-per-source <count>] "
                      "[--max-source-bytes <count>] [--max-instructions-per-block <count>] "
-                     "[--block-formation greedy|coarsen-dp] [--dp-segment-penalty <value>] "
+                     "[--dp-segment-penalty <value>] "
                      "[--dp-coarsen-budget <count>] [--runtime-profile]\n";
         return 2;
     }
@@ -120,8 +120,7 @@ int main(int argc, char **argv)
     std::optional<std::string> blocksPerSource;
     std::optional<std::string> maxSourceBytes;
     std::size_t maxInstructionsPerBlock = 128;
-    AmBlockFormation blockFormation = AmBlockFormation::Greedy;
-    double dpSegmentPenalty = 64.0;
+    double dpSegmentPenalty = 1.0;
     std::size_t dpCoarsenBudget = 0;
     bool runtimeProfile = false;
     for (int index = 2; index < argc; ++index)
@@ -174,23 +173,6 @@ int main(int argc, char **argv)
                 return 2;
             }
             maxInstructionsPerBlock = value;
-        }
-        else if (argument == "--block-formation" && index + 1 < argc)
-        {
-            const std::string_view text(argv[++index]);
-            if (text == "greedy")
-            {
-                blockFormation = AmBlockFormation::Greedy;
-            }
-            else if (text == "coarsen-dp")
-            {
-                blockFormation = AmBlockFormation::CoarsenDp;
-            }
-            else
-            {
-                std::cerr << "invalid --block-formation value: " << text << '\n';
-                return 2;
-            }
         }
         else if (argument == "--dp-segment-penalty" && index + 1 < argc)
         {
@@ -312,8 +294,7 @@ int main(int argc, char **argv)
         ProgramStorageStats scheduledStats;
         uint64_t blockCount = 0;
         uint64_t activationTargets = 0;
-        uint64_t commitGroups = 0;
-        uint64_t commitOperandCaptures = 0;
+        uint64_t commitBlocks = 0;
         uint64_t emitMs = 0;
         uint64_t emittedArtifacts = 0;
         if (runSchedule)
@@ -324,10 +305,8 @@ int main(int argc, char **argv)
                 std::move(*artifact),
                 ActivityScheduleOptions{
                     .maxInstructionsPerBlock = maxInstructionsPerBlock,
-                    .maxStateWritesPerBlock = 4096,
                     .enableCoarsening = true,
                     .collectStats = true,
-                    .blockFormation = blockFormation,
                     .dpSegmentPenalty = dpSegmentPenalty,
                     .dpCoarsenBudget = dpCoarsenBudget,
                 },
@@ -347,10 +326,9 @@ int main(int argc, char **argv)
             activationTargets = scheduledStats
                                     .arena(ProgramArena::ActivationTargets)
                                     .elements;
-            commitGroups = model->commitGroupOffsets.empty()
+            commitBlocks = model->commitBlockBegin == 0
                                ? 0
-                               : model->commitGroupOffsets.size() - 1;
-            commitOperandCaptures = model->commitOperandCaptures.size();
+                               : model->commitBlockEnd - model->commitBlockBegin;
             if (!emitDirectory.empty())
             {
                 phaseStart = std::chrono::steady_clock::now();
@@ -406,9 +384,7 @@ int main(int argc, char **argv)
                   << "  \"scheduled_variables\": " << scheduledStats.variables << ",\n"
                   << "  \"blocks\": " << blockCount << ",\n"
                   << "  \"activation_targets\": " << activationTargets << ",\n"
-                  << "  \"commit_groups\": " << commitGroups << ",\n"
-                  << "  \"commit_operand_captures\": "
-                  << commitOperandCaptures << ",\n"
+                  << "  \"commit_blocks\": " << commitBlocks << ",\n"
                   << "  \"scheduled_estimated_bytes\": "
                   << scheduledStats.estimatedBytes << ",\n"
                   << "  \"read_ms\": " << readMs << ",\n"

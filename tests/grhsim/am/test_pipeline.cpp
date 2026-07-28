@@ -1,7 +1,7 @@
 #include "grhsim/am/builder.hpp"
-#include "grhsim/am/activity_schedule.hpp"
 #include "grhsim/am/opcode_traits.hpp"
 #include "grhsim/am/pipeline.hpp"
+#include "grhsim/am/production_activity_schedule.hpp"
 
 #include <array>
 #include <cstddef>
@@ -169,7 +169,7 @@ namespace
                 linear.schedulingFacts.orderedEffects.empty();
             state_.schedulerSawOptions =
                 options.maxInstructionsPerBlock == 17 &&
-                options.maxStateWritesPerBlock == 23 && !options.enableCoarsening &&
+                options.maxCommitInstructionsPerBlock == 23 && !options.enableCoarsening &&
                 options.collectStats;
 
             if (behavior_ == ScheduleBehavior::ReturnFailure)
@@ -280,7 +280,7 @@ namespace
         wolvrix::lib::diag::Diagnostics diagnostics;
         const ActivityScheduleOptions scheduleOptions{
             .maxInstructionsPerBlock = 17,
-            .maxStateWritesPerBlock = 23,
+            .maxCommitInstructionsPerBlock = 23,
             .enableCoarsening = false,
             .collectStats = true,
         };
@@ -358,7 +358,7 @@ namespace
 
         const ActivityScheduleOptions scheduleOptions{
             .maxInstructionsPerBlock = 17,
-            .maxStateWritesPerBlock = 23,
+            .maxCommitInstructionsPerBlock = 23,
             .enableCoarsening = false,
             .collectStats = true,
         };
@@ -659,9 +659,19 @@ namespace
             const StringId inputName = linearBuilder.addString("input");
             const VariableId input =
                 linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
+            const VariableId output =
+                linearBuilder.addVariable(eventType, linearBuilder.zeroInit());
             ScheduledProgramBuilder scheduledBuilder(linearBuilder.finish());
+            const std::array<VariableId, 1> assignResults = {output};
+            const std::array<VariableId, 1> assignOperands = {input};
+            const InstructionId assign = scheduledBuilder.addInstruction(
+                Opcode::Assign,
+                assignResults,
+                assignOperands);
             const std::array<InstructionId, 0> noInstructions = {};
+            const std::array<InstructionId, 1> computeInstructions = {assign};
             scheduledBuilder.addBlock(noInstructions);
+            scheduledBuilder.addBlock(computeInstructions);
             ExecutableModel model{
                 .program = scheduledBuilder.finish(),
                 .interface = ProgramInterface{
@@ -1057,184 +1067,10 @@ namespace
         return 0;
     }
 
-    int testBaselineRejectsReversedOrderedEffects()
-    {
-        LinearProgramBuilder builder;
-        const TypeId eventType = builder.addType(Type::bitVector(1));
-        const TypeId valueType = builder.addType(Type::bitVector(8));
-        const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
-        const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
-        const VariableId nextValue = builder.addVariable(valueType, builder.zeroInit());
-        const VariableId target = builder.addVariable(valueType, builder.zeroInit());
-        const VariableId event = builder.addVariable(eventType, builder.zeroInit());
-        const std::array<VariableId, 5> operands = {
-            condition,
-            mask,
-            nextValue,
-            target,
-            event,
-        };
-        const InstructionId first = builder.addInstruction(Opcode::RegisterWrite, {}, operands);
-        const InstructionId second = builder.addInstruction(Opcode::RegisterWrite, {}, operands);
-
-        SchedulingFacts facts;
-        facts.variableRoles = {
-            VariableRole::None,
-            VariableRole::None,
-            VariableRole::None,
-            VariableRole::State,
-            VariableRole::None,
-        };
-        facts.instructionEffects = {
-            InstructionEffect::StateReadWrite,
-            InstructionEffect::StateReadWrite,
-        };
-        facts.orderedEffects = {
-            OrderedEffect{.instruction = second, .group = 3, .ordinal = 0},
-            OrderedEffect{.instruction = first, .group = 3, .ordinal = 1},
-        };
-        LinearProgramArtifact linear{
-            .program = builder.finish(),
-            .schedulingFacts = std::move(facts),
-        };
-        if (!validate(linear, ValidationOptions{.level = ValidationLevel::Semantic}).success())
-        {
-            return fail("reversed linear instruction order is a valid ordered-effect fact input");
-        }
-
-        BaselineActivityScheduleStage scheduler;
-        wolvrix::lib::diag::Diagnostics diagnostics;
-        const std::optional<ExecutableModel> model =
-            scheduler.schedule(std::move(linear), ActivityScheduleOptions{}, diagnostics);
-        if (model || !diagnostics.hasError())
-        {
-            return fail("baseline scheduler must reject ordered effects it cannot preserve");
-        }
-        return 0;
-    }
-
-    int testBaselineRejectsForwardDefUseOrder()
-    {
-        LinearProgramBuilder builder;
-        const TypeId type = builder.addType(Type::bitVector(8));
-        const VariableId input = builder.addVariable(type, builder.zeroInit());
-        const VariableId temporary = builder.addVariable(type, builder.undefInit());
-        const VariableId output = builder.addVariable(type, builder.undefInit());
-        const std::array<VariableId, 1> firstResults = {output};
-        const std::array<VariableId, 1> firstOperands = {temporary};
-        builder.addInstruction(Opcode::Assign, firstResults, firstOperands);
-        const std::array<VariableId, 1> secondResults = {temporary};
-        const std::array<VariableId, 1> secondOperands = {input};
-        builder.addInstruction(Opcode::Assign, secondResults, secondOperands);
-        SchedulingFacts facts;
-        facts.variableRoles.assign(3, VariableRole::None);
-        facts.instructionEffects.assign(2, InstructionEffect::Pure);
-        LinearProgramArtifact linear{
-            .program = builder.finish(),
-            .schedulingFacts = std::move(facts),
-        };
-        if (!validate(linear, ValidationOptions{.level = ValidationLevel::Semantic}).success())
-        {
-            return fail("forward def-use is valid LinearProgram input to a real scheduler");
-        }
-
-        BaselineActivityScheduleStage scheduler;
-        wolvrix::lib::diag::Diagnostics diagnostics;
-        const std::optional<ExecutableModel> model =
-            scheduler.schedule(std::move(linear), ActivityScheduleOptions{}, diagnostics);
-        if (model || !diagnostics.hasError())
-        {
-            return fail("baseline smoke scheduler must reject non-executable linear order");
-        }
-        return 0;
-    }
-
-    int testBaselineRejectsHostInteractions()
-    {
-        {
-            LinearProgramBuilder builder;
-            const TypeId valueType = builder.addType(Type::bitVector(8));
-            const StringId functionName = builder.addString("host_read");
-            const VariableId result = builder.addVariable(valueType, builder.undefInit());
-            const std::array<VariableId, 1> results = {result};
-            const InstructionId call =
-                builder.addInstruction(Opcode::SystemFunction, results, {});
-            builder.setSystemFunctionAttributes(
-                call,
-                SystemFunctionAttributes{
-                    .name = functionName,
-                    .schedule = CallSchedule::Normal,
-                    .hasSideEffects = false,
-                });
-            SchedulingFacts facts;
-            facts.variableRoles = {VariableRole::None};
-            facts.instructionEffects = {InstructionEffect::HostRead};
-            facts.orderedEffects = {
-                OrderedEffect{.instruction = call, .group = 0, .ordinal = 0},
-            };
-            LinearProgramArtifact linear{
-                .program = builder.finish(),
-                .schedulingFacts = std::move(facts),
-            };
-            if (!validate(linear, ValidationOptions{.level = ValidationLevel::Semantic}).success())
-            {
-                return fail("valid HostRead artifact must pass the lowering validation gate");
-            }
-            BaselineActivityScheduleStage scheduler;
-            wolvrix::lib::diag::Diagnostics diagnostics;
-            const std::optional<ExecutableModel> model =
-                scheduler.schedule(std::move(linear), ActivityScheduleOptions{}, diagnostics);
-            if (model || !diagnostics.hasError())
-            {
-                return fail("baseline scheduler must reject HostRead instructions");
-            }
-        }
-
-        {
-            LinearProgramBuilder builder;
-            const TypeId eventType = builder.addType(Type::bitVector(1));
-            const StringId taskName = builder.addString("host_effect");
-            const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
-            const std::array<VariableId, 1> operands = {condition};
-            const InstructionId call =
-                builder.addInstruction(Opcode::SystemTask, {}, operands);
-            builder.setSystemTaskAttributes(
-                call,
-                SystemTaskAttributes{
-                    .name = taskName,
-                    .eventCount = 0,
-                    .schedule = CallSchedule::Normal,
-                });
-            SchedulingFacts facts;
-            facts.variableRoles = {VariableRole::None};
-            facts.instructionEffects = {InstructionEffect::HostEffect};
-            facts.orderedEffects = {
-                OrderedEffect{.instruction = call, .group = 0, .ordinal = 0},
-            };
-            LinearProgramArtifact linear{
-                .program = builder.finish(),
-                .schedulingFacts = std::move(facts),
-            };
-            if (!validate(linear, ValidationOptions{.level = ValidationLevel::Semantic}).success())
-            {
-                return fail("valid HostEffect artifact must pass the lowering validation gate");
-            }
-            BaselineActivityScheduleStage scheduler;
-            wolvrix::lib::diag::Diagnostics diagnostics;
-            const std::optional<ExecutableModel> model =
-                scheduler.schedule(std::move(linear), ActivityScheduleOptions{}, diagnostics);
-            if (model || !diagnostics.hasError())
-            {
-                return fail("baseline scheduler must reject HostEffect instructions");
-            }
-        }
-        return 0;
-    }
-
-    int testBaselineWatchesOtherwiseUnusedInputs()
+    int testProductionWatchesOtherwiseUnusedInputs()
     {
         LinearProgramArtifact linear = makeLinearArtifact();
-        BaselineActivityScheduleStage scheduler;
+        ProductionActivityScheduleStage scheduler;
         wolvrix::lib::diag::Diagnostics diagnostics;
         std::optional<ExecutableModel> model =
             scheduler.schedule(std::move(linear), ActivityScheduleOptions{}, diagnostics);
@@ -1242,7 +1078,7 @@ namespace
             model->program.blockSize(BlockId{0}) != 2 ||
             model->program.blockSize(BlockId{1}) != 0)
         {
-            return fail("baseline scheduler must materialize a watch Block for an otherwise unused input");
+            return fail("production scheduler must materialize a watch Block for an otherwise unused input");
         }
         const InstructionId changed = model->program.blockInstruction(BlockId{0}, 0);
         const InstructionId activate = model->program.blockInstruction(BlockId{0}, 1);
@@ -1255,135 +1091,8 @@ namespace
         return 0;
     }
 
-    int testBaselineDerivesReadWriteStateTargets()
+    int testOpcodeTraitsExposeMemoryAccessAndOrdering()
     {
-        LinearProgramBuilder builder;
-        const TypeId eventType = builder.addType(Type::bitVector(1));
-        const TypeId valueType = builder.addType(Type::bitVector(8));
-        const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
-        const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
-        const VariableId nextValue = builder.addVariable(valueType, builder.zeroInit());
-        const VariableId target = builder.addVariable(valueType, builder.zeroInit());
-        const VariableId event = builder.addVariable(eventType, builder.zeroInit());
-        const std::array<VariableId, 5> operands = {
-            condition,
-            mask,
-            nextValue,
-            target,
-            event,
-        };
-        const InstructionId write =
-            builder.addInstruction(Opcode::RegisterWrite, {}, operands);
-        SchedulingFacts facts;
-        facts.variableRoles.assign(5, VariableRole::None);
-        facts.instructionEffects = {InstructionEffect::StateReadWrite};
-        facts.orderedEffects = {
-            OrderedEffect{.instruction = write, .group = 0, .ordinal = 0},
-        };
-        LinearProgramArtifact linear{
-            .program = builder.finish(),
-            .schedulingFacts = std::move(facts),
-        };
-        if (validate(linear, ValidationOptions{.level = ValidationLevel::Semantic}).success())
-        {
-            return fail("artifact validation must still require the explicit State role");
-        }
-
-        BaselineActivityScheduleStage scheduler;
-        wolvrix::lib::diag::Diagnostics diagnostics;
-        const std::optional<ExecutableModel> model =
-            scheduler.schedule(std::move(linear), ActivityScheduleOptions{}, diagnostics);
-        if (!model || diagnostics.hasError() || model->program.blockCount() != 2 ||
-            model->program.blockSize(BlockId{1}) != 3)
-        {
-            return fail("baseline must derive read-write state targets from opcode traits");
-        }
-        const ProgramView view = model->program.view();
-        const InstructionId changed = model->program.blockInstruction(BlockId{1}, 1);
-        const auto changedOperands = view.operands(changed);
-        if (view.opcode(changed) != Opcode::ChangedAny || changedOperands.size() != 2 ||
-            changedOperands.front() != target ||
-            !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success())
-        {
-            return fail("derived state target must drive the baseline convergence watch");
-        }
-        return 0;
-    }
-
-    int testBaselineActivityScheduleMaterializesProgramSemantics()
-    {
-        LinearProgramBuilder builder;
-        const TypeId valueType = builder.addType(Type::bitVector(8));
-        const StringId inputName = builder.addString("input");
-        const StringId outputName = builder.addString("output");
-        const VariableId input = builder.addVariable(valueType, builder.zeroInit());
-        const VariableId state = builder.addVariable(valueType, builder.zeroInit());
-        const VariableId output = builder.addVariable(valueType, builder.undefInit());
-        const std::array<VariableId, 1> assignResults = {output};
-        const std::array<VariableId, 1> assignOperands = {state};
-        const InstructionId assign =
-            builder.addInstruction(Opcode::Assign, assignResults, assignOperands);
-
-        ProgramInterface interface;
-        interface.ports = {
-            PortBinding{
-                .name = inputName,
-                .direction = PortDirection::Input,
-                .input = input,
-            },
-            PortBinding{
-                .name = outputName,
-                .direction = PortDirection::Output,
-                .output = output,
-            },
-        };
-        SchedulingFacts facts;
-        facts.variableRoles = {
-            VariableRole::ExternalInput,
-            VariableRole::State,
-            VariableRole::ExternalOutput,
-        };
-        facts.instructionEffects = {InstructionEffect::Pure};
-        LinearProgramArtifact linear{
-            .program = builder.finish(),
-            .interface = std::move(interface),
-            .schedulingFacts = std::move(facts),
-        };
-
-        BaselineActivityScheduleStage scheduler;
-        wolvrix::lib::diag::Diagnostics diagnostics;
-        std::optional<ExecutableModel> model =
-            scheduler.schedule(std::move(linear), ActivityScheduleOptions{}, diagnostics);
-        if (!model || diagnostics.hasError() || model->program.blockCount() != 2 ||
-            model->program.blockSize(BlockId{0}) != 2 ||
-            model->program.blockSize(BlockId{1}) != 3)
-        {
-            return fail("baseline scheduler must materialize B0 and a conservative normal Block");
-        }
-
-        const ProgramView view = model->program.view();
-        const InstructionId entryChanged = model->program.blockInstruction(BlockId{0}, 0);
-        const InstructionId entryAct = model->program.blockInstruction(BlockId{0}, 1);
-        const InstructionId bodyAssign = model->program.blockInstruction(BlockId{1}, 0);
-        const InstructionId stateChanged = model->program.blockInstruction(BlockId{1}, 1);
-        const InstructionId stateAct = model->program.blockInstruction(BlockId{1}, 2);
-        const auto entryTargets = view.activationAttributes(entryAct);
-        const auto stateTargets = view.activationAttributes(stateAct);
-        if (view.opcode(entryChanged) != Opcode::ChangedAny ||
-            view.opcode(entryAct) != Opcode::ActForward || bodyAssign != assign ||
-            view.opcode(stateChanged) != Opcode::ChangedAny ||
-            view.opcode(stateAct) != Opcode::ActBackward || !entryTargets || !stateTargets ||
-            entryTargets->targets.size() != 1 || stateTargets->targets.size() != 1 ||
-            entryTargets->targets.front() != BlockId{1} ||
-            stateTargets->targets.front() != BlockId{1})
-        {
-            return fail("baseline scheduler emitted the wrong changed/activation structure");
-        }
-        if (!validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success())
-        {
-            return fail("baseline scheduler output must satisfy executable-model validation");
-        }
-
         const OpcodeTraits readTraits = opcodeTraits(Opcode::MemoryRead);
         const OpcodeTraits writeTraits = opcodeTraits(Opcode::MemoryWrite);
         if (!readTraits.memoryAccess || readTraits.effect != OpcodeEffect::StateRead ||
@@ -1396,222 +1105,227 @@ namespace
         return 0;
     }
 
-    ExecutableModel makeCommitPlanValidationModel(bool aliasedCaptures,
-                                                   bool emptyGroup,
-                                                   bool definedCaptureTarget)
-    {
-        LinearProgramBuilder linear;
-        const TypeId type = linear.addType(Type::bitVector(8));
-        const VariableId source =
-            linear.addVariable(type, linear.zeroInit());
-        const VariableId middle =
-            linear.addVariable(type, linear.zeroInit());
-        const VariableId target =
-            linear.addVariable(type, linear.zeroInit());
-        InstructionId definition = InstructionId::invalid();
-        if (definedCaptureTarget)
-        {
-            const std::array<VariableId, 1> results = {middle};
-            const std::array<VariableId, 1> operands = {source};
-            definition = linear.addInstruction(Opcode::Assign, results, operands);
-        }
-        ScheduledProgramBuilder scheduled(linear.finish());
-        scheduled.addBlock({});
-        if (definition.valid())
-        {
-            const std::array<InstructionId, 1> instructions = {definition};
-            scheduled.addBlock(instructions);
-        }
-        else
-        {
-            scheduled.addBlock({});
-        }
-        scheduled.addBlock({});
-
-        std::vector<CommitOperandCapture> captures = {
-            CommitOperandCapture{.source = source, .target = middle},
-        };
-        std::vector<uint32_t> captureOffsets = {0, 1, 1};
-        if (aliasedCaptures)
-        {
-            captures.push_back(
-                CommitOperandCapture{.source = middle, .target = target});
-            captureOffsets = {0, 1, 2};
-        }
-        return ExecutableModel{
-            .program = scheduled.finish(),
-            .interface = {},
-            .commitBlockBegin = 1,
-            .commitBlockEnd = 3,
-            .commitBlockOrder = {BlockId{1}, BlockId{2}},
-            .commitGroupOffsets = emptyGroup ? std::vector<uint32_t>{0, 0, 2}
-                                             : std::vector<uint32_t>{0, 1, 2},
-            .commitOperandCaptures = std::move(captures),
-            .commitOperandCaptureOffsets = std::move(captureOffsets),
-        };
-    }
-
-    int testCommitPlanValidationRejectsAmbiguousBatches()
-    {
-        {
-            ExecutableModel model =
-                makeCommitPlanValidationModel(false, false, false);
-            if (!validate(model,
-                          ValidationOptions{.level = ValidationLevel::Semantic})
-                     .success())
-            {
-                return fail("well-formed commit capture plan was rejected");
-            }
-        }
-        {
-            ExecutableModel model =
-                makeCommitPlanValidationModel(false, true, false);
-            const ValidationResult validation = validate(
-                model, ValidationOptions{.level = ValidationLevel::Semantic});
-            if (validation.success() ||
-                !containsError(validation,
-                               "invalid commit Block execution plan"))
-            {
-                return fail("empty commit groups must be rejected");
-            }
-        }
-        {
-            ExecutableModel model =
-                makeCommitPlanValidationModel(true, false, false);
-            const ValidationResult validation = validate(
-                model, ValidationOptions{.level = ValidationLevel::Semantic});
-            if (validation.success() ||
-                !containsError(
-                    validation,
-                    "commit operand capture sources and targets must not alias"))
-            {
-                return fail("capture source/target alias chains must be rejected");
-            }
-        }
-        {
-            ExecutableModel model =
-                makeCommitPlanValidationModel(false, false, true);
-            const ValidationResult validation = validate(
-                model, ValidationOptions{.level = ValidationLevel::Semantic});
-            if (validation.success() ||
-                !containsError(
-                    validation,
-                    "capture target must not have an instruction definition"))
-            {
-                return fail("instruction-defined capture targets must be rejected");
-            }
-        }
-        return 0;
-    }
-
-    enum class CommitEventOwnershipViolation
+    enum class CommitStructureViolation
     {
         None,
-        ResultWriter,
-        StateTarget,
+        NonContiguousCommitRange,
+        StateWriteOutsideCommit,
+        ActForwardInsideCommit,
+        ActForwardTargetsCommit,
+        ActBackwardOutsideCommit,
+        ActBackwardTargetsCommit,
+        ChangedResultFlowsBackward,
     };
 
-    ExecutableModel makeCommitEventOwnershipModel(
-        CommitEventOwnershipViolation violation)
+    // B0 watches a source event, B1 reads the state, B2 commits the state
+    // write and reactivates the reader: the one commit/act layout the round
+    // model allows. Each violation breaks exactly one structural rule.
+    ExecutableModel makeCommitStructureModel(CommitStructureViolation violation)
     {
         LinearProgramBuilder linear;
         const TypeId type = linear.addType(Type::bitVector(1));
-        const VariableId source =
-            linear.addVariable(type, linear.zeroInit());
-        const VariableId oldValue =
-            linear.addVariable(type, linear.undefInit());
-        const VariableId event =
-            linear.addVariable(type, linear.zeroInit());
-        const VariableId state =
-            linear.addVariable(type, linear.zeroInit());
+        const VariableId source = linear.addVariable(type, linear.zeroInit());
+        const VariableId oldValue = linear.addVariable(type, linear.undefInit());
+        const VariableId event = linear.addVariable(type, linear.zeroInit());
+        const VariableId state = linear.addVariable(type, linear.zeroInit());
+        const VariableId stateOld = linear.addVariable(type, linear.undefInit());
+        const VariableId stateEvent = linear.addVariable(type, linear.zeroInit());
+        const VariableId reader = linear.addVariable(type, linear.zeroInit());
         const std::array<VariableId, 1> changedResults = {event};
         const std::array<VariableId, 2> changedOperands = {source, oldValue};
-        const InstructionId changed = linear.addInstruction(
-            Opcode::ChangedAny, changedResults, changedOperands);
+        const InstructionId inputChanged =
+            linear.addInstruction(Opcode::ChangedAny, changedResults, changedOperands);
         const std::array<VariableId, 5> writeOperands = {
-            source, source, source, state, event,
+            source,
+            source,
+            source,
+            state,
+            event,
         };
         const InstructionId write =
             linear.addInstruction(Opcode::RegisterWrite, {}, writeOperands);
-        InstructionId stateWriter = InstructionId::invalid();
-        if (violation == CommitEventOwnershipViolation::StateTarget)
-        {
-            const std::array<VariableId, 4> latchOperands = {
-                source, source, source, event,
-            };
-            stateWriter =
-                linear.addInstruction(Opcode::LatchWrite, {}, latchOperands);
-        }
+        const std::array<VariableId, 1> stateChangedResults = {stateEvent};
+        const std::array<VariableId, 2> stateChangedOperands = {state, stateOld};
+        const InstructionId stateChanged = linear.addInstruction(
+            Opcode::ChangedAny, stateChangedResults, stateChangedOperands);
+        const bool backwardFlow =
+            violation == CommitStructureViolation::ChangedResultFlowsBackward;
+        const std::array<VariableId, 1> readerResults = {reader};
+        const std::array<VariableId, 1> readerOperands = {backwardFlow ? stateEvent : state};
+        const InstructionId read =
+            linear.addInstruction(Opcode::Assign, readerResults, readerOperands);
 
         ScheduledProgramBuilder scheduled(linear.finish());
-        InstructionId resultWriter = InstructionId::invalid();
-        if (violation == CommitEventOwnershipViolation::ResultWriter)
+        const std::array<VariableId, 1> stateEventOperands = {stateEvent};
+        const InstructionId reactivate =
+            scheduled.addInstruction(Opcode::ActBackward, {}, stateEventOperands);
+        const std::array<BlockId, 1> reactivateTargets = {
+            violation == CommitStructureViolation::ActBackwardTargetsCommit ? BlockId{2}
+                                                                          : BlockId{1},
+        };
+        scheduled.setActivationTargets(reactivate, reactivateTargets);
+
+        InstructionId forward = InstructionId::invalid();
+        if (violation == CommitStructureViolation::ActForwardInsideCommit ||
+            violation == CommitStructureViolation::ActForwardTargetsCommit)
         {
-            const std::array<VariableId, 1> results = {event};
-            const std::array<VariableId, 1> operands = {source};
-            resultWriter =
-                scheduled.addInstruction(Opcode::Assign, results, operands);
+            const bool insideCommit =
+                violation == CommitStructureViolation::ActForwardInsideCommit;
+            const std::array<VariableId, 1> forwardOperands = {
+                insideCommit ? stateEvent : reader,
+            };
+            forward = scheduled.addInstruction(Opcode::ActForward, {}, forwardOperands);
+            const std::array<BlockId, 1> forwardTargets = {
+                insideCommit ? BlockId{1} : BlockId{2},
+            };
+            scheduled.setActivationTargets(forward, forwardTargets);
         }
-        if (resultWriter.valid())
+        InstructionId backward = InstructionId::invalid();
+        if (violation == CommitStructureViolation::ActBackwardOutsideCommit)
         {
-            const std::array<InstructionId, 2> entry = {changed, resultWriter};
-            scheduled.addBlock(entry);
+            const std::array<VariableId, 1> readerEventOperands = {reader};
+            backward =
+                scheduled.addInstruction(Opcode::ActBackward, {}, readerEventOperands);
+            const std::array<BlockId, 1> backwardTargets = {BlockId{1}};
+            scheduled.setActivationTargets(backward, backwardTargets);
+        }
+
+        const std::array<InstructionId, 1> entry = {inputChanged};
+        scheduled.addBlock(entry);
+        if (violation == CommitStructureViolation::StateWriteOutsideCommit)
+        {
+            const std::array<InstructionId, 2> compute = {write, read};
+            scheduled.addBlock(compute);
+        }
+        else if (violation == CommitStructureViolation::ActForwardTargetsCommit)
+        {
+            const std::array<InstructionId, 2> compute = {read, forward};
+            scheduled.addBlock(compute);
+        }
+        else if (violation == CommitStructureViolation::ActBackwardOutsideCommit)
+        {
+            const std::array<InstructionId, 2> compute = {read, backward};
+            scheduled.addBlock(compute);
         }
         else
         {
-            const std::array<InstructionId, 1> entry = {changed};
-            scheduled.addBlock(entry);
+            const std::array<InstructionId, 1> compute = {read};
+            scheduled.addBlock(compute);
         }
-        if (stateWriter.valid())
+        if (violation == CommitStructureViolation::StateWriteOutsideCommit)
         {
-            const std::array<InstructionId, 2> commit = {write, stateWriter};
+            const std::array<InstructionId, 2> commit = {stateChanged, reactivate};
+            scheduled.addBlock(commit);
+        }
+        else if (violation == CommitStructureViolation::ActForwardInsideCommit)
+        {
+            const std::array<InstructionId, 4> commit = {
+                write,
+                stateChanged,
+                reactivate,
+                forward,
+            };
             scheduled.addBlock(commit);
         }
         else
         {
-            const std::array<InstructionId, 1> commit = {write};
+            const std::array<InstructionId, 3> commit = {write, stateChanged, reactivate};
             scheduled.addBlock(commit);
         }
+
+        const bool badRange =
+            violation == CommitStructureViolation::NonContiguousCommitRange;
         return ExecutableModel{
             .program = scheduled.finish(),
             .interface = {},
-            .commitBlockBegin = 1,
-            .commitBlockEnd = 2,
-            .commitBlockOrder = {BlockId{1}},
-            .commitGroupOffsets = {0, 1},
+            .commitBlockBegin = badRange ? 1U : 2U,
+            .commitBlockEnd = badRange ? 2U : 3U,
         };
     }
 
-    int testCommitEventOwnershipValidation()
+    int testExecutableCommitStructureValidation()
     {
-        if (!validate(
-                 makeCommitEventOwnershipModel(CommitEventOwnershipViolation::None),
-                 ValidationOptions{.level = ValidationLevel::Semantic})
+        if (!validate(makeCommitStructureModel(CommitStructureViolation::None),
+                      ValidationOptions{.level = ValidationLevel::Semantic})
                  .success())
         {
-            return fail("well-formed commit event ownership was rejected");
+            return fail("well-formed commit Block structure was rejected");
         }
         {
             const ValidationResult validation = validate(
-                makeCommitEventOwnershipModel(
-                    CommitEventOwnershipViolation::ResultWriter),
+                makeCommitStructureModel(CommitStructureViolation::NonContiguousCommitRange),
                 ValidationOptions{.level = ValidationLevel::Semantic});
             if (validation.success() ||
                 !containsError(validation,
-                               "non-Changed instruction result writer"))
+                               "commit Blocks must form a contiguous suffix"))
             {
-                return fail("commit event result aliases must be rejected");
+                return fail("commit Blocks outside one contiguous suffix must be rejected");
             }
         }
         {
             const ValidationResult validation = validate(
-                makeCommitEventOwnershipModel(
-                    CommitEventOwnershipViolation::StateTarget),
+                makeCommitStructureModel(CommitStructureViolation::StateWriteOutsideCommit),
                 ValidationOptions{.level = ValidationLevel::Semantic});
             if (validation.success() ||
-                !containsError(validation, "commit event is a state write target"))
+                !containsError(validation,
+                               "state write instruction outside a commit Block"))
             {
-                return fail("commit event state targets must be rejected");
+                return fail("state writes outside commit Blocks must be rejected");
+            }
+        }
+        {
+            const ValidationResult validation = validate(
+                makeCommitStructureModel(CommitStructureViolation::ActForwardInsideCommit),
+                ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(validation,
+                               "ActForward instruction inside a commit Block"))
+            {
+                return fail("act.f inside commit Blocks must be rejected");
+            }
+        }
+        {
+            const ValidationResult validation = validate(
+                makeCommitStructureModel(CommitStructureViolation::ActForwardTargetsCommit),
+                ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(validation,
+                               "ActForward target is not a later compute Block"))
+            {
+                return fail("act.f targeting a commit Block must be rejected");
+            }
+        }
+        {
+            const ValidationResult validation = validate(
+                makeCommitStructureModel(CommitStructureViolation::ActBackwardOutsideCommit),
+                ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(validation,
+                               "ActBackward instruction outside a commit Block"))
+            {
+                return fail("act.b outside commit Blocks must be rejected");
+            }
+        }
+        {
+            const ValidationResult validation = validate(
+                makeCommitStructureModel(CommitStructureViolation::ActBackwardTargetsCommit),
+                ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(validation,
+                               "ActBackward target is not a compute Block"))
+            {
+                return fail("act.b targeting a commit Block must be rejected");
+            }
+        }
+        {
+            const ValidationResult validation = validate(
+                makeCommitStructureModel(CommitStructureViolation::ChangedResultFlowsBackward),
+                ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(validation,
+                               "Changed result is consumed by an earlier Block"))
+            {
+                return fail("cross-Block changed results must flow strictly forward");
             }
         }
         return 0;
@@ -1669,35 +1383,15 @@ int main()
     {
         return result;
     }
-    if (const int result = testBaselineRejectsReversedOrderedEffects(); result != 0)
+    if (const int result = testProductionWatchesOtherwiseUnusedInputs(); result != 0)
     {
         return result;
     }
-    if (const int result = testBaselineRejectsForwardDefUseOrder(); result != 0)
+    if (const int result = testOpcodeTraitsExposeMemoryAccessAndOrdering(); result != 0)
     {
         return result;
     }
-    if (const int result = testBaselineRejectsHostInteractions(); result != 0)
-    {
-        return result;
-    }
-    if (const int result = testBaselineWatchesOtherwiseUnusedInputs(); result != 0)
-    {
-        return result;
-    }
-    if (const int result = testBaselineDerivesReadWriteStateTargets(); result != 0)
-    {
-        return result;
-    }
-    if (const int result = testBaselineActivityScheduleMaterializesProgramSemantics(); result != 0)
-    {
-        return result;
-    }
-    if (const int result = testCommitPlanValidationRejectsAmbiguousBatches(); result != 0)
-    {
-        return result;
-    }
-    if (const int result = testCommitEventOwnershipValidation(); result != 0)
+    if (const int result = testExecutableCommitStructureValidation(); result != 0)
     {
         return result;
     }

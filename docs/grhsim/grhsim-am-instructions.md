@@ -360,13 +360,25 @@ Signedness 不参与边沿判断。三条指令的 `%res` 都必须是 `BV<1, un
 后端或同一后端的不同运行一致。实现必须为 `%old` 选择类型合法的 Value，不能把 AM 层
 UB 实现成宿主语言 UB。`%old` 的内部更新本身不激活 Block。
 
-`%res` 表示当前 epoch 观察到的事件。Machine 在每次 `eval()` 开始、执行 EntryBlock
-前，以及进入每个后续 epoch 前，将所有 `changed` 的 `%res` 清零；执行 `changed` 后，
-结果保持到当前 epoch 结束，因此可以作为同一 epoch 后续 Block 中 `reg.write`、
-`mem.write` 或 `mem.fill` 的 event。
-由普通组合指令派生的 event 没有这种隐式清零语义，遵循普通 Variable 的读写规则。
-`act.f/act.b` 必须与产生其 event 的 `changed` 或组合指令位于同一 Block。后端可以
-融合相邻的 `changed` 和 act，且不物化 `%res`。
+`%res` 表示当前轮（round）观察到的事件。`%res` 的生命周期按消费者位置分类：
+
+- 消费者全部在同一 Block 内（典型：同块 `act.f`/`act.b`）时不需要清理：Block 每次
+  执行时 `changed` 必定先于消费者重写 `%res`，Block 不执行时消费者也不执行，旧值
+  没有读者；
+- 存在跨 Block 消费者（其他 Block 中 `reg.write`/`mem.write`/`mem.fill` 的
+  event/guard operand、host 指令的 event operand 或普通指令的数据 operand）时，
+  `%res` 是 round-local 状态：Machine 在每轮结束（以及每次 `eval()` 开始）将这些
+  result 清零，实现只需把为真的 result 记入 dirty-list 并稀疏清理。跨块 event 必须
+  同轮先产后读，生产 Block 的 BlockId 必须小于消费 Block；下一轮若未重新产生则
+  读到 0。
+
+因此 compute 阶段产生的跨块 event（如 clock posedge）在同一轮的 commit 阶段可读；
+commit Block 内喂同块 `act.b` 的判变 `%res` 属同块消费，且 commit Block 每轮必跑、
+`%res` 每轮重写，不进 dirty-list。`%old` 基线不受上述清理影响：检测后立刻
+`%old = %new`，跨轮、跨 `eval()` 一直保持。由普通组合指令派生的 event 没有这种
+隐式清零语义，遵循普通 Variable 的读写规则。`act.f/act.b` 必须与产生其 event 的
+`changed` 或组合指令位于同一 Block。后端可以融合相邻的 `changed` 和 act，且不物化
+`%res`。
 
 例如：
 
@@ -434,8 +446,11 @@ target'[i] = mask[i] ? nextValue[i] : target[i]
 `%target` 必须与所有 event 使用不同 VarId；它可以在 Type 允许时与
 `%cond/%mask/%nextValue` 使用相同 VarId，上述“先读后写”规则保证别名时仍使用指令
 开始时读到的值。`reg.write` 不产生 result，目标 Signedness 不参与 mask 选择。
-`reg.write` 也不隐式激活读取 `%target` 的 Block；lower 必须在本次最终写回之后使用
-`changed.any %target, %targetOld` 检测实际状态变化，再通过 `act.f/act.b` 传播。
+`reg.write` 只位于 commit Block：commit Block 每轮总是执行，指令按文本顺序读取
+执行点可见的 operand，由块内 guard/event 决定是否真正写入。`reg.write` 也不隐式激活
+读取 `%target` 的 Block；使 `%target` 实际变化且存在 reader 时，同块判变 detector
+激活 reader compute Block，因此 lower 必须在同块最终写回之后使用
+`changed.any %target, %targetOld` 检测实际状态变化，再通过 `act.b` 传播。
 
 GRH `eventEdge[i]` 与 `events[i]` 在 lower 时先转换成 event：`posedge` 使用
 `changed.pos`，`negedge` 使用 `changed.neg`。同一 (边沿种类, 被观测 Variable) 的
@@ -452,7 +467,7 @@ reg.write %writeCond, %allMask, %selectedNext, %q, %clkpos, %rstneg
 
 `%clkpos` 或 `%rstneg` 任一个为 1 都满足事件条件，最终是否写以及写入 data 仍分别由
 `%writeCond` 和 `%selectedNext` 决定。同一原始信号同时需要 posedge 和 negedge 时，
-可以按第 11 节示例只执行一次 `changed.any`，再在 `reg.write` 所在 Block 中根据当前
+可以按第 11 节示例只执行一次 `changed.any`，再在 B0 或 compute Block 中根据当前
 单 bit 值派生 `%event`。
 
 例如：
@@ -460,25 +475,32 @@ reg.write %writeCond, %allMask, %selectedNext, %q, %clkpos, %rstneg
 ```text
 B0:
     %clkchanged = changed.any %clk, %oldclk
-    act.f %clkchanged {targets = [4]}
-
-B4:
     %clkpos = logic_and %clkchanged, %clk
+    act.f %clkchanged {targets = [3]}
+
+B3:  // compute Block：读取 %clkchanged、%q 等，计算 %en、%wmask、%d
+    ...
+
+B7:  // commit Block
     reg.write %en, %wmask, %d, %q, %clkpos
     %qchanged = changed.any %q, %qold
-    act.f %qchanged {targets = [5]}
+    act.b %qchanged {targets = [3]}
 ```
 
-这等价于在 `%clk` 上升沿且 `%en = 1` 时执行逐 bit masked write；下降沿虽然会激活 B4，
-但 `%clkpos = 0`，因此不会写 `%q`。只有 `%q` 的最终位模式实际变化时才激活 B5。
+这等价于在 `%clk` 上升沿且 `%en = 1` 时执行逐 bit masked write；下降沿的轮次中
+`%clkpos = 0`，因此 B7 不会写 `%q`（commit Block 每轮总是执行，不需要激活）。只有
+`%q` 的最终位模式实际变化时 `%qchanged` 才为 1，`act.b` 激发并要求下一轮重新执行
+reader compute Block B3。
 
-同一 `%target` 的多条 `reg.write` 按 `(EpochCounter, BlockId, 指令文本位置)` 确定的实际
-执行顺序生效。若多条指令在同一次 `eval()` 中触发，后执行者读取前一条写后的 target；
+同一 `%target` 的多条 `reg.write` 按 `(round 序号, BlockId, 指令文本位置)` 确定的实际
+执行顺序生效。若多条指令在同一轮中触发，后执行者读取前一条写后的 target；
 重叠 mask bit 由后执行者覆盖。需要与源设计一致的优先级时，lower 必须通过 Block
 顺序、互斥 cond 或预先合并 nextValue/mask 显式编码，不得依赖 GRH Operation 的原始
-遍历顺序。同一 target 的候选写应排在一次共享的 `changed.any %target, %targetOld`
-之前，由这一个 detector 在最终写回后统一激活 register readers，不能为每条写分别创建
-target old。
+遍历顺序。同一 commit Block 内同一 target 的全部候选写排在该块共享的
+`changed.any %target, %targetOld` 之前，由这一个 detector 在块尾统一检测实际变化，
+不能为每条写分别创建 target old；跨 commit Block 的多写由 commit 段静态 BlockId
+顺序表达优先级，每个 commit Block 各自物化判变 detector，reader 一律在下一轮执行，
+只看到本轮最终值。
 
 ### 12.2 Memory
 
@@ -552,8 +574,9 @@ target'[k]    = target[k]                               for k != r
 ```
 
 因此越界写不更新任何 row。`mem.write` 不产生 result，也不隐式激活读取 `%target` 的
-Block；需要传播实际 memory 变化时，lower 使用 `changed.any` 检测最终 Array Value，
-再通过 `act.f/act.b` 激活相关 reader。event 的 OR 语义、eventEdge lowering 以及上游
+Block；`mem.write` 只位于 commit Block，需要传播实际 memory 变化时，lower 使用同块
+`changed.any` 检测最终 Array Value，再通过 `act.b` 激活相关 reader compute Block。
+event 的 OR 语义、eventEdge lowering 以及上游
 cond/nextValue 优先级编码与 `reg.write` 相同。
 
 例如：
@@ -570,8 +593,10 @@ mem.write %wen, %waddr, %wmask, %wdata, %mem, %clkpos
 的写端口必须保持在同一顺序域，并按 priority 从大到小 lower，使 priority 0 最后执行。
 没有 priority 属性的写端口不能从 GRH Operation 遍历顺序推导源级碰撞优先级。
 同一 target 的 `mem.read` 和 `mem.write` 也按实际执行顺序观察状态：read 在 write 前
-执行时读取旧 row，在 write 后执行时读取更新后的 row。同一 target 的全部候选写之后
-只需一次共享的 `changed.any` 检测最终 Array Value 并传播变化。
+执行时读取旧 row，在 write 后执行时读取更新后的 row。同一 commit Block 内同一
+target 的全部候选写之后只需一次共享的 `changed.any` 检测最终 Array Value 并传播
+变化；跨 commit Block 的多写由 commit 段静态顺序表达优先级，reader 在下一轮才观察
+到本轮最终值。
 
 #### 12.2.3 `mem.fill`
 
@@ -608,8 +633,9 @@ target'[r][j] = width(data) = W ? data[j] : data[r * W + j]
 ```
 
 当 `N = 1` 时两种 data 宽度相同，两种解释产生相同结果。`mem.fill` 不产生 result，
-也不隐式激活 memory reader；实际 Array Value 的变化仍由最终写回后的共享
-`changed.any` 检测。event 的 OR 语义和 eventEdge lowering 与 `reg.write/mem.write`
+也不隐式激活 memory reader；`mem.fill` 只位于 commit Block，实际 Array Value 的
+变化仍由同块最终写回后的共享 `changed.any` 检测并经 `act.b` 传播。event 的 OR
+语义和 eventEdge lowering 与 `reg.write/mem.write`
 相同。
 
 例如，`%mem` 为 `Array<4, BV<8, unsigned>>`：
@@ -652,8 +678,9 @@ target'[i] = mask[i] ? nextValue[i] : target[i]
 
 `%target` 可以在 Type 允许时与 `%cond/%mask/%nextValue` 使用相同 VarId，结果仍基于
 指令开始时读取的值。`latch.write` 不产生 result，也不隐式激活读取 `%target` 的
-Block；最终 stored value 的实际变化由共享的 `changed.any %target, %targetOld` 检测并
-传播。与带 event 的状态写不同，`latch.write` 是 level-sensitive：任何一次 Block
+Block；`latch.write` 只位于 commit Block，最终 stored value 的实际变化由同块共享的
+`changed.any %target, %targetOld` 检测并经 `act.b` 传播。与带 event 的状态写不同，
+`latch.write` 是 level-sensitive：任何一次 Block
 执行都会按当时的 `%cond` 判断是否更新。
 
 建议在 lower 到 GRHSIM-AM 前运行 GRH
@@ -680,13 +707,15 @@ transform 后，原 `kLatchReadPort` 仍映射到 `%target`，新增的 `not/and
 例如：
 
 ```text
+// commit Block
 latch.write %gate, %allMask, %d, %q
 %qchanged = changed.any %q, %qold
-act.f %qchanged {targets = [5]}
+act.b %qchanged {targets = [5]}
 ```
 
 每次执行时，`%gate = 1` 使 `%q` 更新为 `%d`，`%gate = 0` 使 `%q` 保持。只有 stored
-`%q` 的位模式实际变化时才激活 B5。
+`%q` 的位模式实际变化时 `%qchanged` 才为 1，`act.b` 激发并在下一轮激活 reader
+compute Block B5。
 
 ## 13. 非指令：层次与跨层引用
 
@@ -827,7 +856,7 @@ fire_immediate = truth(cond) && ((E = 0) || raw_event_hit)
 ```
 
 `event_mode = immediate` 直接使用 `fire_immediate`，不保存 raw event。display、assert、
-difftest observer 等必须与当前 event 和当前参数快照绑定的调用使用这一模式；后续 epoch
+difftest observer 等必须与当前 event 和当前参数快照绑定的调用使用这一模式；后续 round
 即使 `%cond` 变为 true，也不能重放已经消失的 event。
 
 `event_mode = pending` 且 `E > 0` 时，该指令独占一个初始化为 false 的内部
@@ -839,14 +868,14 @@ fire_pending = truth(cond) && pending_event
 ```
 
 多个 event 仍是 OR 关系；同一次执行中命中一个或多个 event 都只把同一个 bit 置为 true。
-`pending_event` 可以跨同一次顶层 `eval()` 内的 AM epoch 保留，raw event 在后续 epoch
+`pending_event` 可以跨同一次顶层 `eval()` 内的 AM round 保留，raw event 在后续 round
 变为 0 不会清除它。每次顶层 `eval()` 开始前，Machine 清零所有此类 bit，因此 pending
 event 不能跨两个顶层 `eval()` 调用传播。`E = 0` 时两种 mode 等价，均不分配或读取
 `pending_event`。
 
 `pending_event` 只保存“至少发生过一个事件”，不保存事件发生时的 `%cond` 或参数。
 指令按 mode 选择 `fire = fire_immediate` 或 `fire = fire_pending`。`fire = false` 时不调用
-binding；pending mode 在后续 epoch 消费 event 时，重新读取该次
+binding；pending mode 在后续 round 消费 event 时，重新读取该次
 指令执行时的 `%cond` 和参数快照。`fire = true` 时，以当前快照按顺序调用
 `host_system_task(name, args)`；pending mode 调用成功后把该指令的 `pending_event` 清为
 false。
@@ -877,7 +906,7 @@ GRH lower 时：
 - `hasTiming` 本身不保留；时序触发已由显式 event 和 `once` 的 completed 状态表达；
 - `name` 去除且只去除一个源级前导 `$`，参数 Variable 保持源程序顺序；
 - 当前 GRH lowering 对 `system.task` 选择 `event_mode = immediate`，避免旧 event 使用
-  后续 epoch 的 task 参数重放副作用。
+  后续 round 的 task 参数重放副作用。
 
 例如：
 
@@ -889,7 +918,7 @@ system.task %true, %format, %data, %clkpos {
 ```
 
 仅当 `%true = 1` 且 `%clkpos = 1` 的本次执行才调用 `display`；该 event 不会在后续
-epoch 重放。
+round 重放。
 
 ## 15. DPI Call
 
@@ -929,7 +958,7 @@ real64 保留 binary64，real32 在调用边界舍入/扩展，String 必须保�
 序列。无法满足某个 DpiImport ABI 的后端必须在 Machine 创建期间拒绝该 binding。
 
 执行时使用与 `system.task` 相同的 `event_mode` 和 `fire` 计算。pending mode 同样只跨
-一次顶层 `eval()` 内的 epoch 保留，并在成功调用后清零；pending bit 不保存事件发生时
+一次顶层 `eval()` 内的 round 保留，并在成功调用后清零；pending bit 不保存事件发生时
 的 cond 或参数，消费时读取当时的 cond、全部 input/inout 输入侧以及 event 快照。
 `fire = false` 时不调用外部函数，也不写任何 Result；Result 保留执行前的值。
 `fire = true` 时：
@@ -955,7 +984,7 @@ Lowering 使用 DpiImport 声明和 GRH `inArgName/outArgName/inoutArgName` 将�
 `eventEdge` 按第 14.2 节规则 lower，`eventEdge` 不保留。当前 lowering 对产生 return、
 output 或 inout Result 的调用选择 `event_mode = pending`，使值生产调用可以等待同一次
 `eval()` 内的 guard 和参数收敛；无 Result 的 observer 调用选择
-`event_mode = immediate`，避免旧 event 使用后续 epoch 的参数重放副作用。
+`event_mode = immediate`，避免旧 event 使用后续 round 的参数重放副作用。
 
 例如声明 `add(input logic[31:0] a, input logic[31:0] b) -> logic[31:0]` 时：
 
@@ -989,20 +1018,27 @@ act.b %event {targets = [TargetBlockId...]}
 ```
 
 `targets` 是静态确定的非空 BlockId set Attribute，记作 `Targets`；集合没有顺序和
-重复元素，文本形式按 BlockId 升序规范化。`Active(b)` 和 `NextEpochActive(b)` 是基础
-设计定义的 ActiveArea 槽位别名；对它们的写入是 opcode 的隐式效果，不是 `%` 操作数。
+重复元素，文本形式按 BlockId 升序规范化。普通 Block 分为 compute 段和 commit 段，
+commit Block 占据 Block 空间的连续后缀，记其起点为 `CommitBegin`（无 commit Block
+时 `CommitBegin = BlockCount`）。ActiveArea 为每个 Block 保存一个 `Active(b)` Bool
+槽（单一集合，不分 current/next，也没有分层 summary；commit Block 的槽恒为 false，
+因为 commit Block 每轮总是执行、不需要激活）；对 `Active(b)` 的写入是 opcode 的
+隐式效果，不是 `%` 操作数。
 
 `%event` 必须是 `BV<1, unsigned>`，且必须由同一 Block 中排在 act 之前的指令写入，
-保证每次执行 act 前都已刷新 event。event 为 1 时，`act.f` 对每个
-`b in Targets` 设置 `Active(b) = true`，`act.b` 对每个 `b in Targets` 设置
-`NextEpochActive(b) = true`；event 为 0 时不产生激活。act 不写 VariableArea，也不维护
+保证每次执行 act 前都已刷新 event。event 为 1 时，`act.f`/`act.b` 都对每个
+`b in Targets` 设置 `Active(b) = true`；`act.b` 只出现在 commit Block，而 commit
+阶段在 compute 阶段之后执行，其置位留给下一轮，因此任一 `act.b` 激发（event 为 1）
+即表示需要下一轮。event 为 0 时不产生激活。act 不写 VariableArea，也不维护
 历史值。同一个 event 可以由同一 Block 中的多条 act 消费。
 
-- 设指令所在 Block 为 B：`act.f` 的每个 Target 必须满足
-  `B.BlockId < Target < BlockCount`；`act.b` 的每个 Target 必须满足
-  `1 <= Target < BlockCount`；
-- 对应 Bool 槽一旦置为 true，不因同一 epoch 内后续 event 为 0 而清除；其清除由
-  `eval()` 调度语义完成。
+- `act.f` 只允许出现在 B0 和 compute Block；设指令所在 Block 为 B，其每个 Target
+  必须满足 `B.BlockId < Target < CommitBegin`，即严格前向的 compute Block，置位在
+  同一趟 compute 扫描内被消费；
+- `act.b` 只允许出现在 commit Block，其每个 Target 必须满足
+  `1 <= Target < CommitBegin`，即 compute Block，BlockId 任意；
+- `Active(b)` 一旦置为 true，不因同一轮内后续 event 为 0 而清除；compute 阶段按
+  BlockId 升序扫描、执行即清，其清除由 `eval()` 调度语义完成。
 
 例如，同一输入变化需要激活 Block 3 和 5 时，一条 act 即可完成：
 
@@ -1016,7 +1052,7 @@ act.f %2 {targets = [3, 5]}
 BlockId 0 的 EntryBlock 每次 `eval()` 开始时执行一次，可以包含 `changed`、用于派生
 event 的第 3 至 10 节组合指令以及 `act.f`，不能包含 `act.b` 或其他有状态指令。
 EntryBlock 中 act 使用的 event 必须在本次 EntryBlock 执行中先行计算。除
-`S[FirstEvalId]` 控制的首次全量激活外，`act.f/act.b` 是唯一的 Block 激活来源。每个
+`FirstEval` 控制的首次全量激活外，`act.f/act.b` 是唯一的 Block 激活来源。每个
 `act.f`-Target 对直接派生一条 Forward 依赖，每个 `act.b`-Target 对直接派生一条
 Backward 依赖。
 
@@ -1036,7 +1072,8 @@ Backward 依赖。
   Type 完全相同的单 bit BV；三者的 res 都是 `BV<1, unsigned>`；new、old、res 的
   VarId 两两不同；res 不是 constant 且使用空 Init，old 使用 `Init = undef`；两者分别
   只属于这一条 `changed`，old 不出现于其他指令；
-- epoch 0 开始前和每次进入后续 epoch 前，所有 `changed` 的 res 均被清零；act 使用的
+- 每次 `eval()` 开始和每轮结束时，存在跨 Block 消费者的 `changed` res 均被清零；
+  跨块消费的 res 其生产 Block 的 BlockId 必须小于消费 Block；act 使用的
   组合派生 event 在 act 所在 Block 中先行计算；
 - `reg.write` 的 cond、mask、nextValue、target 和 event 数量及 Type 满足第 12.1 节；
   target 不是 constant，且与每个 event 使用不同 VarId；
@@ -1062,8 +1099,11 @@ Backward 依赖。
   Result 非 constant 且 VarId 两两不同；同一有序调用组完整且按 ordinal 顺序 lower；
 - `act.f/act.b` 的 event 是 `BV<1, unsigned>`，并由同一 Block 中更早的指令写入；
 - `slice_static.lsb` 是满足第 10 节范围约束的 Nat，且该指令没有其他 Attribute；
-- `targets` 是静态非空 BlockId set Attribute，且 act 没有其他 Attribute；对所在 Block B，`act.f` 的每个 Target 满足
-  `B.BlockId < Target < BlockCount`，`act.b` 的每个 Target 满足
-  `1 <= Target < BlockCount`；
+- `targets` 是静态非空 BlockId set Attribute，且 act 没有其他 Attribute；commit Block
+  构成 Block 空间的连续后缀 `[CommitBegin, BlockCount)`；state write
+  （`reg.write/latch.write/mem.write/mem.fill`）只位于 commit Block；`act.f` 只位于
+  B0 和 compute Block，对所在 Block B 其每个 Target 满足
+  `B.BlockId < Target < CommitBegin`；`act.b` 只位于 commit Block，其每个 Target
+  满足 `1 <= Target < CommitBegin`；
 - EntryBlock 只包含 `changed`、event 派生所需的组合指令和 `act.f`；其中 `changed`
   的 new 不是 constant，也不作为任何普通 Block 指令的目标。

@@ -148,8 +148,6 @@ namespace wolvrix::lib::grhsim::am
 
             ProgramView program;
             uint32_t blockCount = 0;
-            uint32_t commitBlockBegin = 0;
-            uint32_t commitBlockEnd = 0;
             std::vector<Type> variableTypes;
             std::vector<Storage> variableStorage;
             uint64_t wideWords = 0;
@@ -164,9 +162,9 @@ namespace wolvrix::lib::grhsim::am
             uint32_t onceSlotCount = 0;
             std::unordered_map<uint32_t, uint32_t> pendingEventSlotByInstruction;
             uint32_t pendingEventSlotCount = 0;
-            std::unordered_map<uint32_t, uint32_t> completedCommitWriteSlotByInstruction;
-            uint32_t completedCommitWriteSlotCount = 0;
-            std::vector<uint32_t> commitEventSlotByVariable;
+            // Changed results read from a block other than their definition:
+            // only these join the round-cleared dirty list.
+            std::vector<bool> crossBlockChangedResults;
             std::unordered_map<uint32_t, DpiImportId> dpiImportBySymbol;
             std::vector<bool> referencedDpiImports;
             std::vector<InstructionId> finalSystemTasks;
@@ -264,14 +262,16 @@ namespace wolvrix::lib::grhsim::am
             return state.variableStorage.at(variable.value);
         }
 
-        std::string changedResultCallPrefix(const EmitState &state, VariableId variable)
+        std::string changedResultAssignPrefix(const EmitState &state, VariableId variable)
         {
-            const uint32_t slot = state.commitEventSlotByVariable.at(variable.value);
-            if (slot == std::numeric_limits<uint32_t>::max())
+            // A result read by another block is round-local state and goes
+            // through the dirty list; a same-block result is rewritten before
+            // every same-block read and is a plain assignment.
+            if (state.crossBlockChangedResults[variable.value])
             {
                 return "set_changed_result(" + std::to_string(variable.value) + ", ";
             }
-            return "set_commit_changed_result(" + std::to_string(slot) + ", ";
+            return valueExpr(state, variable) + " = (";
         }
 
         bool isWideBitVector(const EmitState &state, VariableId variable)
@@ -1118,23 +1118,8 @@ namespace wolvrix::lib::grhsim::am
                     const std::string eventHit = eventHitExpr(
                         state, operands,
                         static_cast<uint32_t>(operands.size() - eventBegin));
-                    const auto slot =
-                        state.completedCommitWriteSlotByInstruction.find(instruction.value);
-                    if (slot == state.completedCommitWriteSlotByInstruction.end())
-                    {
-                        return "if (" + condition + " && " + eventHit + ") { " + body +
-                               " }\n";
-                    }
-
-                    const std::string completed =
-                        "completedCommitWrites_[" + std::to_string(slot->second) + "]";
-                    const std::string event =
-                        "commit_event_hit_" + std::to_string(instruction.value);
-                    return "{ const bool " + event + " = " + eventHit + ";\n" +
-                           "if (" + event + " && !" + completed + ") {\n" +
-                           completed + " = true;\n" +
-                           "if (" + condition + ") { " + body + " }\n" +
-                           "}\n}\n";
+                    return "if (" + condition + " && " + eventHit + ") { " + body +
+                           " }\n";
                 };
 
             if (opcode == Opcode::Assign &&
@@ -1172,7 +1157,7 @@ namespace wolvrix::lib::grhsim::am
                 opcode == Opcode::ChangedNeg)
             {
                 const std::string setResult =
-                    changedResultCallPrefix(state, results.front());
+                    changedResultAssignPrefix(state, results.front());
                 const Type &type = variableType(state, operands.front());
                 if (type.kind == TypeKind::Array)
                 {
@@ -1488,7 +1473,7 @@ namespace wolvrix::lib::grhsim::am
                         event = "(" + valueExpr(state, operands[1]) + " != 0 && " +
                                 valueExpr(state, operands[0]) + " == 0)";
                     }
-                    return changedResultCallPrefix(state, results.front()) + event +
+                    return changedResultAssignPrefix(state, results.front()) + event +
                            ");\n" +
                            valueExpr(state, operands[1]) + " = " + valueExpr(state, operands[0]) + ";\n";
                 }
@@ -1601,29 +1586,10 @@ namespace wolvrix::lib::grhsim::am
                 {
                     const auto attributes = state.program.activationAttributes(instruction);
                     const bool forward = opcode == Opcode::ActForward;
-                    // Two emission forms per act instruction, chosen per destination
-                    // class by estimated site footprint. XiangShan-scale generated
-                    // models are front-end bound (IPC ~0.2), so the winning form is
-                    // the smaller one, not the one retiring fewer instructions:
-                    //   call: one activate_* call per target (~10 bytes/site), with
-                    //         word/bit and summary logic in two shared helpers;
-                    //   mask: constant-mask OR per touched 64-block word (~11 bytes)
-                    //         + one per summary word (~11); commit words cost ~45
-                    //         (they also invalidate the captured bit). Removes the
-                    //         call and its branches, but a low-fanout act pays more
-                    //         site bytes than the call chain it replaces.
-                    // The mask form mirrors activate_forward/activate_backward
-                    // exactly: compute targets OR into active/nextActive words;
-                    // commit targets OR into pending/nextCommit words and clear the
-                    // captured bit of every target that was not already pending
-                    // (per-bit checks on one word commute, so the batched
-                    // newlyPending mask clears the same bit set as the per-target
-                    // loop). Summary bits are set unconditionally, which is safe
-                    // (a spurious summary bit only costs an empty scan).
-                    std::vector<BlockId> computeTargets;
-                    std::vector<BlockId> commitTargets;
-                    std::map<uint32_t, uint64_t> computeMasks;
-                    std::map<uint32_t, uint64_t> commitMasks;
+                    // Act targets are always compute Blocks, so activation is a
+                    // constant-mask OR into the single active bitmap. A fired
+                    // ActBackward also flags that another round is needed.
+                    std::map<uint32_t, uint64_t> masks;
                     for (BlockId target : attributes->targets)
                     {
                         if (target.value >= state.blockCount)
@@ -1631,98 +1597,24 @@ namespace wolvrix::lib::grhsim::am
                             error = "AM activation target BlockId out of range";
                             return std::nullopt;
                         }
-                        const bool isCommit = state.commitBlockBegin != 0 &&
-                                              target.value >= state.commitBlockBegin &&
-                                              target.value < state.commitBlockEnd;
-                        (isCommit ? commitTargets : computeTargets).push_back(target);
-                        (isCommit ? commitMasks : computeMasks)[target.value / 64U] |=
-                            UINT64_C(1) << (target.value % 64U);
+                        masks[target.value / 64U] |= UINT64_C(1) << (target.value % 64U);
                     }
-                    const auto summaryMasks = [](const std::map<uint32_t, uint64_t> &masks) {
-                        std::map<uint32_t, uint64_t> summaries;
-                        for (const auto &[word, mask] : masks)
-                        {
-                            summaries[word / 64U] |= UINT64_C(1) << (word % 64U);
-                        }
-                        return summaries;
-                    };
-                    const std::map<uint32_t, uint64_t> computeSummaryMasks =
-                        summaryMasks(computeMasks);
-                    const std::map<uint32_t, uint64_t> commitSummaryMasks =
-                        summaryMasks(commitMasks);
-                    const auto inlineCost = [](std::size_t words, std::size_t summaries,
-                                               std::size_t perWord) {
-                        return 10 + perWord * words + 11 * summaries;
-                    };
-                    const auto callCost = [](std::size_t targets) { return 10 * targets; };
-                    const bool maskCompute =
-                        !computeTargets.empty() &&
-                        inlineCost(computeMasks.size(), computeSummaryMasks.size(), 11) <
-                            callCost(computeTargets.size());
-                    const bool maskCommit =
-                        !commitTargets.empty() &&
-                        inlineCost(commitMasks.size(), commitSummaryMasks.size(), 45) <
-                            callCost(commitTargets.size());
                     std::string code = "if (" + boolExpr(state, operands.front()) + ") {\n";
-                    const std::size_t maskedCount =
-                        (maskCompute ? computeTargets.size() : 0) +
-                        (maskCommit ? commitTargets.size() : 0);
-                    if (state.runtimeProfile && maskedCount != 0)
+                    if (state.runtimeProfile && !attributes->targets.empty())
                     {
                         code += "if (runtimeProfileEnabled_) ";
                         code += forward ? "profileActivateForward_ += " :
                                           "profileActivateBackward_ += ";
-                        code += std::to_string(maskedCount) + ";\n";
+                        code += std::to_string(attributes->targets.size()) + ";\n";
                     }
-                    const auto emitCalls = [&](const std::vector<BlockId> &targets) {
-                        for (BlockId target : targets)
-                        {
-                            code += forward ? "activate_forward(" : "activate_backward(";
-                            code += std::to_string(target.value) + ");\n";
-                        }
-                    };
-                    if (maskCompute)
+                    for (const auto &[word, mask] : masks)
                     {
-                        for (const auto &[word, mask] : computeMasks)
-                        {
-                            code += forward ? "activeWords_[" : "nextActiveWords_[";
-                            code += std::to_string(word) + "] |= " + wordMaskLiteral(mask) +
-                                    ";\n";
-                        }
-                        for (const auto &[word, mask] : computeSummaryMasks)
-                        {
-                            code += forward ? "activeSummary_[" : "nextActiveSummary_[";
-                            code += std::to_string(word) + "] |= " + wordMaskLiteral(mask) +
-                                    ";\n";
-                        }
+                        code += "activeWords_[" + std::to_string(word) +
+                                "] |= " + wordMaskLiteral(mask) + ";\n";
                     }
-                    else
+                    if (!forward)
                     {
-                        emitCalls(computeTargets);
-                    }
-                    if (maskCommit)
-                    {
-                        for (const auto &[word, mask] : commitMasks)
-                        {
-                            code += "{ const std::uint64_t newlyPending = " +
-                                    wordMaskLiteral(mask) + " & ~pendingCommitWords_[" +
-                                    std::to_string(word) + "]; capturedCommitWords_[" +
-                                    std::to_string(word) + "] &= ~newlyPending; ";
-                            code += forward ? "pendingCommitWords_[" : "nextCommitWords_[";
-                            code += std::to_string(word) + "] |= " + wordMaskLiteral(mask) +
-                                    "; }\n";
-                        }
-                        for (const auto &[word, mask] : commitSummaryMasks)
-                        {
-                            code += forward ? "pendingCommitSummary_[" :
-                                              "nextCommitSummary_[";
-                            code += std::to_string(word) + "] |= " + wordMaskLiteral(mask) +
-                                    ";\n";
-                        }
-                    }
-                    else
-                    {
-                        emitCalls(commitTargets);
+                        code += "backwardFired_ = true;\n";
                     }
                     code += "}\n";
                     return code;
@@ -2222,85 +2114,11 @@ namespace wolvrix::lib::grhsim::am
         }
 
         const ProgramView program = model.program.view();
-        std::vector<uint32_t> commitEventVariables;
-        std::vector<uint32_t> commitWriteInstructions;
-        if (model.commitBlockBegin != 0)
-        {
-            std::vector<bool> changedVariable(program.variableCount(), false);
-            for (uint32_t instructionIndex = 0;
-                 instructionIndex < program.instructionCount(); ++instructionIndex)
-            {
-                const InstructionId instruction{instructionIndex};
-                const Opcode opcode = program.opcode(instruction);
-                if (opcode == Opcode::ChangedAny || opcode == Opcode::ChangedPos ||
-                    opcode == Opcode::ChangedNeg)
-                {
-                    changedVariable[program.results(instruction).front().value] = true;
-                }
-            }
-            for (uint32_t blockIndex = model.commitBlockBegin;
-                 blockIndex < model.commitBlockEnd; ++blockIndex)
-            {
-                const BlockId block{blockIndex};
-                for (std::size_t position = 0;
-                     position < model.program.blockSize(block); ++position)
-                {
-                    const InstructionId instruction =
-                        model.program.blockInstruction(block, position);
-                    const Opcode opcode = program.opcode(instruction);
-                    const auto operands = program.operands(instruction);
-                    std::size_t eventBegin = operands.size();
-                    if (opcode == Opcode::RegisterWrite)
-                    {
-                        commitWriteInstructions.push_back(instruction.value);
-                        eventBegin = 4;
-                    }
-                    else if (opcode == Opcode::MemoryWrite)
-                    {
-                        commitWriteInstructions.push_back(instruction.value);
-                        eventBegin = 5;
-                    }
-                    else if (opcode == Opcode::MemoryFill)
-                    {
-                        commitWriteInstructions.push_back(instruction.value);
-                        eventBegin = 3;
-                    }
-                    for (std::size_t index = eventBegin; index < operands.size(); ++index)
-                    {
-                        if (changedVariable[operands[index].value])
-                        {
-                            commitEventVariables.push_back(operands[index].value);
-                        }
-                    }
-                }
-            }
-            std::sort(commitEventVariables.begin(), commitEventVariables.end());
-            commitEventVariables.erase(
-                std::unique(commitEventVariables.begin(), commitEventVariables.end()),
-                commitEventVariables.end());
-            std::sort(commitWriteInstructions.begin(), commitWriteInstructions.end());
-            commitWriteInstructions.erase(
-                std::unique(commitWriteInstructions.begin(), commitWriteInstructions.end()),
-                commitWriteInstructions.end());
-        }
         EmitState state{.program = program};
         state.blockCount = static_cast<uint32_t>(model.program.blockCount());
-        state.commitBlockBegin = model.commitBlockBegin;
-        state.commitBlockEnd = model.commitBlockEnd;
         const auto runtimeProfileAttribute = options.attributes.find("runtimeProfile");
         state.runtimeProfile = runtimeProfileAttribute != options.attributes.end() &&
                                runtimeProfileAttribute->second == "true";
-        state.commitEventSlotByVariable.assign(
-            program.variableCount(), std::numeric_limits<uint32_t>::max());
-        for (uint32_t slot = 0; slot < commitEventVariables.size(); ++slot)
-        {
-            state.commitEventSlotByVariable[commitEventVariables[slot]] = slot;
-        }
-        for (uint32_t instruction : commitWriteInstructions)
-        {
-            state.completedCommitWriteSlotByInstruction.emplace(
-                instruction, state.completedCommitWriteSlotCount++);
-        }
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
         for (uint32_t index = 0; index < program.variableCount(); ++index)
@@ -2599,7 +2417,7 @@ namespace wolvrix::lib::grhsim::am
         // ST00009: escape analysis for block-local value localization. A value keeps
         // its values_[] slot unless it is a narrow scalar defined by exactly one
         // instruction and only read later in the same block. Anything the runtime,
-        // the host, another block, or a previous epoch can observe escapes.
+        // the host, another block, or a previous round can observe escapes.
         const std::size_t variableCount = program.variableCount();
         state.variableDefBlock.assign(variableCount, kInvalidLocalityBlock);
         state.variableDefPosition.assign(variableCount, 0);
@@ -2607,7 +2425,9 @@ namespace wolvrix::lib::grhsim::am
         state.blockDefinedVariables.assign(blockCount, {});
         state.localValueStamps.assign(variableCount, 0);
         state.localValueIndices.assign(variableCount, 0);
+        state.crossBlockChangedResults.assign(variableCount, false);
         std::vector<uint8_t> variableDefCounts(variableCount, 0);
+        std::vector<bool> changedResultVariables(variableCount, false);
         for (uint32_t blockIndex = 0; blockIndex < blockCount; ++blockIndex)
         {
             const BlockId block{blockIndex};
@@ -2635,17 +2455,18 @@ namespace wolvrix::lib::grhsim::am
                     case Opcode::ChangedAny:
                     case Opcode::ChangedPos:
                     case Opcode::ChangedNeg:
-                        // Watched values persist across epochs; results are written by
-                        // index through set_changed_result.
+                        // Watched values persist across rounds; cross-block results
+                        // are written by index through set_changed_result.
                         escapeOperands();
                         escapeResults();
+                        changedResultVariables[results.front().value] = true;
                         break;
                     case Opcode::RegisterWrite:
                     case Opcode::LatchWrite:
                     case Opcode::MemoryWrite:
                     case Opcode::MemoryFill:
                         // State writes keep persistent slots for every operand
-                        // (targets are state; the rest are commit capture slots).
+                        // (targets are state read again on later rounds).
                         escapeOperands();
                         break;
                     case Opcode::MemoryRead:
@@ -2697,11 +2518,15 @@ namespace wolvrix::lib::grhsim::am
                     if (state.variableDefBlock[variable] != blockIndex)
                     {
                         state.variableEscapeFlags[variable] |= kEscapeCrossBlockUse;
+                        if (changedResultVariables[variable])
+                        {
+                            state.crossBlockChangedResults[variable] = true;
+                        }
                     }
                     else if (static_cast<uint32_t>(position) <=
                              state.variableDefPosition[variable])
                     {
-                        // A read at or before its definition observes a previous epoch.
+                        // A read at or before its definition observes a previous round.
                         state.variableEscapeFlags[variable] |= kEscapeEarlyUse;
                     }
                 }
@@ -2741,16 +2566,6 @@ namespace wolvrix::lib::grhsim::am
         {
             state.variableEscapeFlags[declared.variable.value] |= kEscapeGlobal;
         }
-        for (const PreCommitSnapshot &snapshot : model.preCommitSnapshots)
-        {
-            state.variableEscapeFlags[snapshot.source.value] |= kEscapeGlobal;
-            state.variableEscapeFlags[snapshot.target.value] |= kEscapeGlobal;
-        }
-        for (const CommitOperandCapture &capture : model.commitOperandCaptures)
-        {
-            state.variableEscapeFlags[capture.source.value] |= kEscapeGlobal;
-            state.variableEscapeFlags[capture.target.value] |= kEscapeGlobal;
-        }
 
         if (statsAttribute != options.attributes.end() && statsAttribute->second == "true")
         {
@@ -2774,11 +2589,8 @@ namespace wolvrix::lib::grhsim::am
         const std::size_t blockSourceCount =
             blockCount / *blocksPerSource + (blockCount % *blocksPerSource == 0 ? 0 : 1);
         const std::size_t activityWordCount = (blockCount + 63U) / 64U;
-        const std::size_t activitySummaryWordCount = (activityWordCount + 63U) / 64U;
         const std::size_t dirtyChangedWordCount =
             (static_cast<std::size_t>(program.variableCount()) + 63U) / 64U;
-        const std::size_t commitEventWordCount =
-            (commitEventVariables.size() + 63U) / 64U;
 
         const std::string prefix = "grhsim_" + options.modelName;
         const std::string className = "GrhSIM_" + options.modelName;
@@ -2807,9 +2619,7 @@ namespace wolvrix::lib::grhsim::am
                << "class " << className << " {\npublic:\n"
                << "    " << className << "();\n"
                << "    ~" << className << "();\n"
-               // The activity words are double-buffered through pointer
-               // members; an implicitly copied model would alias the source
-               // buffers, so copying is disabled.
+               // A model owns live simulation and host state; copying is disabled.
                << "    " << className << "(const " << className << " &) = delete;\n"
                << "    " << className << " &operator=(const " << className << " &) = delete;\n"
                << "    void init();\n"
@@ -2847,32 +2657,12 @@ namespace wolvrix::lib::grhsim::am
                        << "(std::size_t block);\n";
             }
         }
-        header << "    void activate_forward(std::size_t block);\n"
-               << "    void activate_backward(std::size_t block);\n"
-               << "    void activate_all_blocks();\n"
-               << "    void execute_active_blocks();\n"
-               << "    void drain_next_active_activity();\n"
-               << "    void drain_next_commit_activity();\n"
-               << "    bool execute_next_commit_group();\n"
-               << "    void capture_pending_commit_operands();\n"
-               << "    [[nodiscard]] bool has_active_blocks() const;\n"
-               << "    [[nodiscard]] bool has_next_active_blocks() const;\n"
-               << "    [[nodiscard]] bool has_pending_commit_blocks() const;\n"
-               << "    [[nodiscard]] static bool is_commit_block(std::size_t block);\n"
-               << "    void capture_commit_events();\n"
-               << "    void restore_commit_events();\n"
-               << "    void clear_pending_commit_events();\n"
+        header << "    [[nodiscard]] static bool is_commit_block(std::size_t block);\n"
                << "    void set_changed_result(std::size_t variable, bool event) {\n"
                << "        values_[variable] = event ? 1 : 0;\n"
                << "        if (event) mark_changed_result(variable);\n"
                << "    }\n"
-               << "    void set_commit_changed_result(std::uint32_t commitEventSlot, bool event) {\n"
-               << "        const std::size_t variable = kCommitEventVariables_[commitEventSlot];\n"
-               << "        values_[variable] = event ? 1 : 0;\n"
-               << "        if (event) mark_commit_changed_result(variable, commitEventSlot);\n"
-               << "    }\n"
                << "    void mark_changed_result(std::size_t variable);\n"
-               << "    void mark_commit_changed_result(std::size_t variable, std::uint32_t commitEventSlot);\n"
                << "    void clear_changed_results();\n"
                << "    static constexpr std::uint64_t bit_mask(std::uint32_t width) {\n"
                << "        return width >= 64 ? UINT64_MAX : ((UINT64_C(1) << width) - 1);\n"
@@ -2922,77 +2712,38 @@ namespace wolvrix::lib::grhsim::am
                << model.commitBlockEnd << ";\n"
                << "    static constexpr std::size_t kCommitBlockCount = "
                << (model.commitBlockEnd - model.commitBlockBegin) << ";\n"
+               // Compute Blocks are 1..kComputeBlockEnd-1 (B0 is the entry
+               // Block); commit Blocks are the remaining suffix.
+               << "    static constexpr std::size_t kComputeBlockEnd = kCommitBlockBegin != 0 ? kCommitBlockBegin : kBlockCount;\n"
                << "    static constexpr std::size_t kActivityWordCount = " << activityWordCount
                << ";\n"
-               << "    static constexpr std::size_t kActivitySummaryWordCount = "
-               << activitySummaryWordCount << ";\n"
                << "    static constexpr std::size_t kDirtyChangedWordCount = "
                << dirtyChangedWordCount << ";\n"
-               << "    static constexpr std::size_t kCommitEventCount = "
-               << commitEventVariables.size() << ";\n"
-               << "    static constexpr std::size_t kCommitEventWordCount = "
-               << commitEventWordCount << ";\n"
-               << "    static const std::array<std::uint32_t, kCommitEventCount> "
-                  "kCommitEventVariables_;\n"
-               << "    static constexpr std::size_t kCommitOperandCaptureCount = "
-               << model.commitOperandCaptures.size() << ";\n"
-               << "    static const std::array<std::uint32_t, kCommitBlockCount + 1> "
-                  "kCommitOperandCaptureOffsets_;\n"
-               << "    static const std::array<std::uint32_t, kCommitOperandCaptureCount> "
-                  "kCommitOperandCaptureSources_;\n"
-               << "    static const std::array<std::uint32_t, kCommitOperandCaptureCount> "
-                  "kCommitOperandCaptureTargets_;\n"
-               << "    static const std::array<std::uint32_t, kCommitOperandCaptureCount> "
-                  "kCommitOperandCaptureWords_;\n"
                << "    std::array<std::uint64_t, " << program.variableCount() << "> values_{};\n"
                << "    std::array<std::uint64_t, " << state.wideWords << "> wideValues_{};\n"
                << "    std::array<std::uint64_t, " << state.realValues << "> realValues_{};\n"
                << "    std::array<std::string, " << state.stringValues << "> stringValues_{};\n"
-               << "    std::array<std::uint64_t, kActivityWordCount> activeWordBuffers_[2]{};\n"
-               << "    std::array<std::uint64_t, kActivitySummaryWordCount> activeSummaryBuffers_[2]{};\n"
-               // Compute activity is double-buffered: the epoch advance swaps
-               // the cur/next pointers instead of copying the arrays (the
-               // compute scan has drained the cur side to all-zero by then).
-               // nextCommit activity keeps single storage and is sparse-drained
-               // into the pending set; the commit merge semantics are unchanged.
-               << "    std::uint64_t *activeWords_ = activeWordBuffers_[0].data();\n"
-               << "    std::uint64_t *nextActiveWords_ = activeWordBuffers_[1].data();\n"
-               << "    std::uint64_t *activeSummary_ = activeSummaryBuffers_[0].data();\n"
-               << "    std::uint64_t *nextActiveSummary_ = activeSummaryBuffers_[1].data();\n"
-               << "    std::array<std::uint64_t, kActivityWordCount> pendingCommitWords_{};\n"
-               << "    std::array<std::uint64_t, kActivityWordCount> forcedCommitWords_{};\n"
-               << "    std::array<std::uint64_t, kActivityWordCount> nextCommitWords_{};\n"
-               << "    std::array<std::uint64_t, kActivityWordCount> capturedCommitWords_{};\n"
-               << "    std::array<std::uint64_t, kActivitySummaryWordCount> pendingCommitSummary_{};\n"
-               << "    std::array<std::uint64_t, kActivitySummaryWordCount> nextCommitSummary_{};\n"
+               << "    std::array<std::uint64_t, kActivityWordCount> activeWords_{};\n"
+               << "    bool backwardFired_ = false;\n"
+               << "    std::uint64_t roundCounter_ = 0;\n"
                << "    std::array<std::uint64_t, kDirtyChangedWordCount> dirtyChangedBits_{};\n"
                << "    std::vector<std::uint32_t> dirtyChangedResults_;\n"
-               << "    std::vector<std::uint32_t> dirtyCommitEventSlots_;\n"
-               << "    std::vector<std::uint32_t> pendingCommitEventSlots_;\n"
-               << "    std::array<std::uint64_t, kCommitEventWordCount> pendingCommitEventBits_{};\n"
-               << "    std::array<bool, " << state.completedCommitWriteSlotCount
-               << "> completedCommitWrites_{};\n"
                << "    std::array<bool, " << state.onceSlotCount << "> onceCompleted_{};\n"
                << "    std::array<bool, " << state.pendingEventSlotCount
                << "> pendingHostEvents_{};\n"
                << "    bool firstEval_ = true;\n"
-               << "    std::uint64_t epochCounter_ = 0;\n"
                << "    std::uint64_t randomSeed_ = 0;\n";
         if (state.runtimeProfile)
         {
             header << "    bool runtimeProfileEnabled_ = false;\n"
                    << "    std::uint64_t profileEvalCalls_ = 0;\n"
-                   << "    std::uint64_t profileEpochs_ = 0;\n"
+                   << "    std::uint64_t profileRounds_ = 0;\n"
                    << "    std::uint64_t profileBlockExecs_ = 0;\n"
                    << "    std::uint64_t profileCommitBlockExecs_ = 0;\n"
-                   << "    std::uint64_t profileCommitGroups_ = 0;\n"
                    << "    std::uint64_t profileActivateForward_ = 0;\n"
                    << "    std::uint64_t profileActivateBackward_ = 0;\n"
                    << "    std::uint64_t profileChangedMarks_ = 0;\n"
-                   << "    std::uint64_t profileCommitChangedMarks_ = 0;\n"
                    << "    std::uint64_t profileChangedClears_ = 0;\n"
-                   << "    std::uint64_t profileCaptureBlocks_ = 0;\n"
-                   << "    std::uint64_t profileCaptureWords_ = 0;\n"
                    << "    std::uint64_t profileComputeNs_ = 0;\n"
                    << "    std::uint64_t profileCommitNs_ = 0;\n"
                    << "    std::uint64_t profileEvalNs_ = 0;\n"
@@ -3488,93 +3239,6 @@ namespace
         std::ostringstream runtime;
         runtime << "#include \"" << prefix << ".hpp\"\n"
                 << "#include \"" << prefix << "_support.hpp\"\n\n";
-        runtime << "const std::array<std::uint32_t, " << commitEventVariables.size()
-                << "> " << className << "::kCommitEventVariables_ = {\n";
-        constexpr std::size_t commitEventsPerLine = 16;
-        for (std::size_t index = 0; index < commitEventVariables.size(); ++index)
-        {
-            if (index % commitEventsPerLine == 0)
-            {
-                runtime << "    ";
-            }
-            runtime << commitEventVariables[index];
-            if (index + 1 != commitEventVariables.size())
-            {
-                runtime << ", ";
-            }
-            if (index % commitEventsPerLine + 1 == commitEventsPerLine ||
-                index + 1 == commitEventVariables.size())
-            {
-                runtime << '\n';
-            }
-        }
-        runtime << "};\n\n";
-        const auto emitUint32Array = [&](std::string_view name,
-                                         std::span<const uint32_t> values,
-                                         std::size_t declaredSize) {
-            runtime << "const std::array<std::uint32_t, " << declaredSize << "> "
-                    << className << "::" << name << " = {\n";
-            constexpr std::size_t valuesPerLine = 16;
-            for (std::size_t index = 0; index < values.size(); ++index)
-            {
-                if (index % valuesPerLine == 0)
-                {
-                    runtime << "    ";
-                }
-                runtime << values[index];
-                if (index + 1 != values.size())
-                {
-                    runtime << ", ";
-                }
-                if (index % valuesPerLine + 1 == valuesPerLine ||
-                    index + 1 == values.size())
-                {
-                    runtime << '\n';
-                }
-            }
-            runtime << "};\n\n";
-        };
-        std::vector<uint32_t> captureOffsets = model.commitOperandCaptureOffsets;
-        if (captureOffsets.empty())
-        {
-            captureOffsets.resize(
-                static_cast<std::size_t>(model.commitBlockEnd - model.commitBlockBegin) + 1,
-                0);
-        }
-        std::vector<uint32_t> captureSources;
-        std::vector<uint32_t> captureTargets;
-        std::vector<uint32_t> captureWords;
-        captureSources.reserve(model.commitOperandCaptures.size());
-        captureTargets.reserve(model.commitOperandCaptures.size());
-        captureWords.reserve(model.commitOperandCaptures.size());
-        for (const CommitOperandCapture &capture : model.commitOperandCaptures)
-        {
-            const Type &type = variableType(state, capture.source);
-            if (type.bitWidth <= 64)
-            {
-                captureSources.push_back(capture.source.value);
-                captureTargets.push_back(capture.target.value);
-                captureWords.push_back(0);
-            }
-            else
-            {
-                const EmitState::Storage &sourceStorage =
-                    variableStorage(state, capture.source);
-                const EmitState::Storage &targetStorage =
-                    variableStorage(state, capture.target);
-                captureSources.push_back(sourceStorage.offset);
-                captureTargets.push_back(targetStorage.offset);
-                captureWords.push_back(sourceStorage.wordCount);
-            }
-        }
-        emitUint32Array("kCommitOperandCaptureOffsets_", captureOffsets,
-                        captureOffsets.size());
-        emitUint32Array("kCommitOperandCaptureSources_", captureSources,
-                        captureSources.size());
-        emitUint32Array("kCommitOperandCaptureTargets_", captureTargets,
-                        captureTargets.size());
-        emitUint32Array("kCommitOperandCaptureWords_", captureWords,
-                        captureWords.size());
         runtime << className << "::" << className << "() = default;\n"
                << className << "::~" << className << "() { finalize(); }\n\n"
                << "std::size_t " << className
@@ -3846,17 +3510,9 @@ namespace
                << "void " << className
                << "::init() {\n    values_.fill(0); wideValues_.fill(0); realValues_.fill(0);\n"
                << "    for (std::string &value : stringValues_) value.clear();\n"
-               << "    activeWordBuffers_[0].fill(0); activeWordBuffers_[1].fill(0);\n"
-               << "    activeSummaryBuffers_[0].fill(0); activeSummaryBuffers_[1].fill(0);\n"
-               << "    activeWords_ = activeWordBuffers_[0].data(); nextActiveWords_ = activeWordBuffers_[1].data();\n"
-               << "    activeSummary_ = activeSummaryBuffers_[0].data(); nextActiveSummary_ = activeSummaryBuffers_[1].data();\n"
-               << "    pendingCommitWords_.fill(0); forcedCommitWords_.fill(0); nextCommitWords_.fill(0);\n"
-               << "    pendingCommitSummary_.fill(0); nextCommitSummary_.fill(0);\n"
-               << "    pendingCommitEventBits_.fill(0);\n"
-               << "    dirtyCommitEventSlots_.clear(); pendingCommitEventSlots_.clear();\n"
-               << "    completedCommitWrites_.fill(false);\n"
+               << "    activeWords_.fill(0); backwardFired_ = false;\n"
                << "    dirtyChangedBits_.fill(0); dirtyChangedResults_.clear(); onceCompleted_.fill(false);\n"
-               << "    firstEval_ = true; epochCounter_ = 0; finalized_ = false;\n"
+               << "    firstEval_ = true; roundCounter_ = 0; finalized_ = false;\n"
                << "    finishRequested_ = false; stopRequested_ = false; fatalRequested_ = false; systemExitCode_ = 0;\n"
                << "    std::uint64_t initRandomState = randomSeed_;\n";
         const auto emitSetInitialization = [&](VariableId variable,
@@ -4065,248 +3721,6 @@ namespace
                 << "::is_commit_block(std::size_t block) {\n"
                 << "    return kCommitBlockBegin != 0 && block >= kCommitBlockBegin && block < kCommitBlockEnd;\n"
                 << "}\n\nvoid " << className
-                << "::activate_forward(std::size_t block) {\n"
-                << (state.runtimeProfile
-                        ? "    if (runtimeProfileEnabled_) ++profileActivateForward_;\n"
-                        : "")
-                << "    if (block >= kBlockCount) throw std::runtime_error(\"invalid AM BlockId\");\n"
-                << "    const std::size_t word = block / 64U;\n"
-                << "    if (is_commit_block(block)) {\n"
-                << "        const std::uint64_t bit = UINT64_C(1) << (block % 64U);\n"
-                << "        if ((pendingCommitWords_[word] & bit) == 0) capturedCommitWords_[word] &= ~bit;\n"
-                << "        pendingCommitWords_[word] |= UINT64_C(1) << (block % 64U);\n"
-                << "        pendingCommitSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
-                << "        return;\n"
-                << "    }\n"
-                << "    activeWords_[word] |= UINT64_C(1) << (block % 64U);\n"
-                << "    activeSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
-                << "}\n\nvoid " << className
-                << "::activate_backward(std::size_t block) {\n"
-                << (state.runtimeProfile
-                        ? "    if (runtimeProfileEnabled_) ++profileActivateBackward_;\n"
-                        : "")
-                << "    if (block >= kBlockCount) throw std::runtime_error(\"invalid AM BlockId\");\n"
-                << "    const std::size_t word = block / 64U;\n"
-                << "    if (is_commit_block(block)) {\n"
-                << "        const std::uint64_t bit = UINT64_C(1) << (block % 64U);\n"
-                << "        if ((pendingCommitWords_[word] & bit) == 0) capturedCommitWords_[word] &= ~bit;\n"
-                << "        nextCommitWords_[word] |= UINT64_C(1) << (block % 64U);\n"
-                << "        nextCommitSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
-                << "        return;\n"
-                << "    }\n"
-                << "    nextActiveWords_[word] |= UINT64_C(1) << (block % 64U);\n"
-                << "    nextActiveSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
-                << "}\n\nvoid " << className
-                << "::activate_all_blocks() {\n"
-                << "    std::fill_n(activeWords_, kActivityWordCount, UINT64_MAX);\n"
-                << "    const std::size_t tailBits = kBlockCount - (kActivityWordCount - 1U) * 64U;\n"
-                << "    activeWords_[kActivityWordCount - 1U] &= bit_mask(static_cast<std::uint32_t>(tailBits));\n"
-                << "    activeWords_[0] &= ~UINT64_C(1);\n"
-                << "    for (std::size_t block = kCommitBlockBegin; block < kCommitBlockEnd; ++block) {\n"
-                << "        const std::size_t word = block / 64U;\n"
-                << "        const std::uint64_t bit = UINT64_C(1) << (block % 64U);\n"
-                << "        activeWords_[word] &= ~bit;\n"
-                << "        forcedCommitWords_[word] |= bit;\n"
-                << "        pendingCommitSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
-                << "    }\n"
-                << "    std::fill_n(activeSummary_, kActivitySummaryWordCount, 0);\n"
-                << "    for (std::size_t word = 0; word < kActivityWordCount; ++word) {\n"
-                << "        if (activeWords_[word] != 0) activeSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
-                << "    }\n"
-                << "}\n\nvoid " << className
-                << "::execute_active_blocks() {\n"
-                << "    for (std::size_t summaryWord = 0; summaryWord < kActivitySummaryWordCount; ++summaryWord) {\n"
-                << "        while (activeSummary_[summaryWord] != 0) {\n"
-                << "            const std::size_t summaryBit = static_cast<std::size_t>(std::countr_zero(activeSummary_[summaryWord]));\n"
-                << "            const std::size_t activityWord = summaryWord * 64U + summaryBit;\n"
-                << "            if (activityWord >= kActivityWordCount) {\n"
-                << "                activeSummary_[summaryWord] &= ~(UINT64_C(1) << summaryBit);\n"
-                << "                continue;\n"
-                << "            }\n"
-                << "            while (activeWords_[activityWord] != 0) {\n"
-                << "                const std::size_t blockBit = static_cast<std::size_t>(std::countr_zero(activeWords_[activityWord]));\n"
-                << "                activeWords_[activityWord] &= ~(UINT64_C(1) << blockBit);\n"
-                << "                if (activeWords_[activityWord] == 0) {\n"
-                << "                    activeSummary_[summaryWord] &= ~(UINT64_C(1) << summaryBit);\n"
-                << "                }\n"
-                << "                const std::size_t block = activityWord * 64U + blockBit;\n"
-                << "                if (block != 0 && block < kBlockCount) execute_block(block);\n"
-                << "            }\n"
-                << "        }\n"
-                << "    }\n"
-                << "}\n\nbool " << className
-                << "::has_active_blocks() const {\n"
-                << "    for (std::size_t word = 0; word < kActivitySummaryWordCount; ++word) {\n"
-                << "        if (activeSummary_[word] != 0) return true;\n"
-                << "    }\n"
-                << "    return false;\n"
-                << "}\n\nbool " << className
-                << "::has_next_active_blocks() const {\n"
-                << "    for (std::size_t word = 0; word < kActivitySummaryWordCount; ++word) {\n"
-                << "        if (nextActiveSummary_[word] != 0 || nextCommitSummary_[word] != 0) return true;\n"
-                << "    }\n"
-                << "    return false;\n"
-                << "}\n\nvoid " << className
-                << "::drain_next_active_activity() {\n"
-                // On the next side the summary is an exact nonzero-word mirror:
-                // activation always sets a word bit and its summary bit
-                // together, and the next side is only cleared here. Drain cost
-                // is proportional to the words actually set, not the array size.
-                << "    for (std::size_t summaryWord = 0; summaryWord < kActivitySummaryWordCount; ++summaryWord) {\n"
-                << "        std::uint64_t bits = nextActiveSummary_[summaryWord];\n"
-                << "        if (bits == 0) continue;\n"
-                << "        nextActiveSummary_[summaryWord] = 0;\n"
-                << "        while (bits != 0) {\n"
-                << "            const std::size_t bit = static_cast<std::size_t>(std::countr_zero(bits));\n"
-                << "            bits &= bits - 1;\n"
-                << "            const std::size_t word = summaryWord * 64U + bit;\n"
-                << "            if (word >= kActivityWordCount) continue;\n"
-                << "            activeWords_[word] |= nextActiveWords_[word];\n"
-                << "            activeSummary_[summaryWord] |= UINT64_C(1) << bit;\n"
-                << "            nextActiveWords_[word] = 0;\n"
-                << "        }\n"
-                << "    }\n"
-                << "}\n\nvoid " << className
-                << "::drain_next_commit_activity() {\n"
-                << "    for (std::size_t summaryWord = 0; summaryWord < kActivitySummaryWordCount; ++summaryWord) {\n"
-                << "        std::uint64_t bits = nextCommitSummary_[summaryWord];\n"
-                << "        if (bits == 0) continue;\n"
-                << "        nextCommitSummary_[summaryWord] = 0;\n"
-                << "        while (bits != 0) {\n"
-                << "            const std::size_t bit = static_cast<std::size_t>(std::countr_zero(bits));\n"
-                << "            bits &= bits - 1;\n"
-                << "            const std::size_t word = summaryWord * 64U + bit;\n"
-                << "            if (word >= kActivityWordCount) continue;\n"
-                << "            pendingCommitWords_[word] |= nextCommitWords_[word];\n"
-                << "            pendingCommitSummary_[summaryWord] |= UINT64_C(1) << bit;\n"
-                << "            nextCommitWords_[word] = 0;\n"
-                << "        }\n"
-                << "    }\n"
-                << "}\n\nbool " << className
-                << "::has_pending_commit_blocks() const {\n"
-                << "    for (const std::uint64_t summary : pendingCommitSummary_) {\n"
-                << "        if (summary != 0) return true;\n"
-                << "    }\n"
-                << "    return false;\n"
-                << "}\n\nvoid " << className
-                << "::capture_pending_commit_operands() {\n"
-                << "    for (std::size_t word = 0; word < kActivityWordCount; ++word) {\n"
-                << "        std::uint64_t uncaptured = (pendingCommitWords_[word] | forcedCommitWords_[word]) & ~capturedCommitWords_[word];\n"
-                << "        while (uncaptured != 0) {\n"
-                << "            const std::size_t bit = static_cast<std::size_t>(std::countr_zero(uncaptured));\n"
-                << "            uncaptured &= ~(UINT64_C(1) << bit);\n"
-                << "            const std::size_t block = word * 64U + bit;\n"
-                << "            if (block < kCommitBlockBegin || block >= kCommitBlockEnd) continue;\n"
-                << (state.runtimeProfile
-                        ? "            if (runtimeProfileEnabled_) ++profileCaptureBlocks_;\n"
-                        : "")
-                << "            const std::size_t local = block - kCommitBlockBegin;\n"
-                << "            for (std::uint32_t index = kCommitOperandCaptureOffsets_[local]; index < kCommitOperandCaptureOffsets_[local + 1]; ++index) {\n"
-                << "                const std::uint32_t words = kCommitOperandCaptureWords_[index];\n"
-                << (state.runtimeProfile
-                        ? "                if (runtimeProfileEnabled_) profileCaptureWords_ += words == 0 ? 1 : words;\n"
-                        : "")
-                << "                if (words == 0) values_[kCommitOperandCaptureTargets_[index]] = values_[kCommitOperandCaptureSources_[index]];\n"
-                << "                else std::copy_n(wideValues_.data() + kCommitOperandCaptureSources_[index], words, wideValues_.data() + kCommitOperandCaptureTargets_[index]);\n"
-                << "            }\n"
-                << "            capturedCommitWords_[word] |= UINT64_C(1) << bit;\n"
-                << "        }\n"
-                << "    }\n"
-                << "}\n\nbool " << className
-                << "::execute_next_commit_group() {\n";
-        for (std::size_t group = 0; group + 1 < model.commitGroupOffsets.size(); ++group)
-        {
-            const uint32_t begin = model.commitGroupOffsets[group];
-            const uint32_t end = model.commitGroupOffsets[group + 1];
-            runtime << "    if (";
-            for (uint32_t index = begin; index < end; ++index)
-            {
-                if (index != begin)
-                {
-                    runtime << " || ";
-                }
-                const uint32_t block = model.commitBlockOrder[index].value;
-                runtime << "((pendingCommitWords_[" << block / 64U
-                        << "] | forcedCommitWords_[" << block / 64U
-                        << "]) & capturedCommitWords_[" << block / 64U
-                        << "] & (UINT64_C(1) << " << block % 64U << ")) != 0";
-            }
-            runtime << ") {\n";
-            for (uint32_t index = begin; index < end; ++index)
-            {
-                const uint32_t block = model.commitBlockOrder[index].value;
-                runtime << "        const bool selectedCommitBlock" << block
-                        << " = ((pendingCommitWords_[" << block / 64U
-                        << "] | forcedCommitWords_[" << block / 64U
-                        << "]) & capturedCommitWords_[" << block / 64U
-                        << "] & (UINT64_C(1) << " << block % 64U << ")) != 0;\n";
-            }
-            for (uint32_t index = begin; index < end; ++index)
-            {
-                const uint32_t block = model.commitBlockOrder[index].value;
-                runtime << "        if (selectedCommitBlock" << block << ") {\n"
-                        << "            pendingCommitWords_[" << block / 64U
-                        << "] &= ~(UINT64_C(1) << " << block % 64U << ");\n"
-                        << "            forcedCommitWords_[" << block / 64U
-                        << "] &= ~(UINT64_C(1) << " << block % 64U << ");\n"
-                        << "            if ((pendingCommitWords_[" << block / 64U
-                        << "] | forcedCommitWords_[" << block / 64U
-                        << "]) == 0) pendingCommitSummary_[" << (block / 64U) / 64U
-                        << "] &= ~(UINT64_C(1) << " << (block / 64U) % 64U << ");\n"
-                        << "            capturedCommitWords_[" << block / 64U
-                        << "] &= ~(UINT64_C(1) << " << block % 64U << ");\n"
-                        << "        }\n";
-            }
-            for (uint32_t index = begin; index < end; ++index)
-            {
-                const uint32_t block = model.commitBlockOrder[index].value;
-                runtime << "        if (selectedCommitBlock" << block
-                        << ") execute_block(" << block << ");\n";
-            }
-            if (state.runtimeProfile)
-            {
-                runtime << "        if (runtimeProfileEnabled_) ++profileCommitGroups_;\n";
-            }
-            runtime << "        return true;\n"
-                    << "    }\n";
-        }
-        runtime << "    return false;\n"
-                << "}\n\nvoid " << className
-                << "::capture_commit_events() {\n"
-                << "    for (const std::uint32_t slot : dirtyCommitEventSlots_) {\n"
-                << "        const std::uint32_t variable = kCommitEventVariables_[slot];\n"
-                << "        if (values_[variable] == 0) continue;\n"
-                << "        const std::size_t word = slot / 64U;\n"
-                << "        const std::uint64_t bit = UINT64_C(1) << (slot % 64U);\n"
-                << "        if ((pendingCommitEventBits_[word] & bit) == 0) {\n"
-                << "            pendingCommitEventBits_[word] |= bit;\n"
-                << "            pendingCommitEventSlots_.push_back(slot);\n"
-                << "        }\n"
-                << "    }\n"
-                << "}\n\nvoid " << className
-                << "::restore_commit_events() {\n"
-                << "    for (const std::uint32_t slot : pendingCommitEventSlots_) {\n"
-                << "        set_commit_changed_result(slot, true);\n"
-                << "    }\n"
-                << "}\n\nvoid " << className
-                << "::clear_pending_commit_events() {\n"
-                << "    for (const std::uint32_t slot : pendingCommitEventSlots_) {\n"
-                << "        pendingCommitEventBits_[slot / 64U] &= ~(UINT64_C(1) << (slot % 64U));\n"
-                << "    }\n"
-                << "    pendingCommitEventSlots_.clear();\n"
-                << "}\n\nvoid " << className
-                << "::mark_commit_changed_result(std::size_t variable, std::uint32_t commitEventSlot) {\n"
-                << (state.runtimeProfile
-                        ? "    if (runtimeProfileEnabled_) ++profileCommitChangedMarks_;\n"
-                        : "")
-                << "    const std::size_t word = variable / 64U;\n"
-                << "    const std::uint64_t bit = UINT64_C(1) << (variable % 64U);\n"
-                << "    if ((dirtyChangedBits_[word] & bit) == 0) {\n"
-                << "        dirtyChangedBits_[word] |= bit;\n"
-                << "        dirtyChangedResults_.push_back(static_cast<std::uint32_t>(variable));\n"
-                << "        dirtyCommitEventSlots_.push_back(commitEventSlot);\n"
-                << "    }\n"
-                << "}\n\nvoid " << className
                 << "::mark_changed_result(std::size_t variable) {\n"
                 << (state.runtimeProfile
                         ? "    if (runtimeProfileEnabled_) ++profileChangedMarks_;\n"
@@ -4327,7 +3741,6 @@ namespace
                 << "        dirtyChangedBits_[variable / 64U] &= ~(UINT64_C(1) << (variable % 64U));\n"
                 << "    }\n"
                 << "    dirtyChangedResults_.clear();\n"
-                << "    dirtyCommitEventSlots_.clear();\n"
                 << "}\n\nvoid " << className << "::execute_block(std::size_t block) {\n"
                 << "    if (block >= kBlockCount) throw std::runtime_error(\"invalid AM BlockId\");\n"
                 << (state.runtimeProfile
@@ -4421,84 +3834,52 @@ namespace
                 }
             }
         }
-        for (const PreCommitSnapshot &snapshot : model.preCommitSnapshots)
-        {
-            const Type &type = variableType(state, snapshot.source);
-            runtime << "    "
-                    << assignVariableStatement(state, snapshot.target,
-                                               snapshot.source,
-                                               type.signedness);
-        }
         runtime << "    const bool initial = firstEval_;\n"
-                << "    epochCounter_ = 0;\n"
-                << "    activeWordBuffers_[0].fill(0); activeWordBuffers_[1].fill(0);\n"
-                << "    activeSummaryBuffers_[0].fill(0); activeSummaryBuffers_[1].fill(0);\n"
-                << "    activeWords_ = activeWordBuffers_[0].data(); nextActiveWords_ = activeWordBuffers_[1].data();\n"
-                << "    activeSummary_ = activeSummaryBuffers_[0].data(); nextActiveSummary_ = activeSummaryBuffers_[1].data();\n"
-                << "    pendingCommitWords_.fill(0); forcedCommitWords_.fill(0); pendingCommitSummary_.fill(0);\n"
-                << "    nextCommitWords_.fill(0); nextCommitSummary_.fill(0);\n"
-                << "    capturedCommitWords_.fill(0);\n"
-                << "    clear_pending_commit_events();\n"
-                << "    completedCommitWrites_.fill(false);\n"
-                << "    pendingHostEvents_.fill(false);\n"
+                << "    activeWords_.fill(0);\n"
                 << "    clear_changed_results();\n"
+                << "    pendingHostEvents_.fill(false);\n"
+                << "    roundCounter_ = 0;\n"
                 << "    execute_block(0);\n"
-                << "    if (initial) activate_all_blocks();\n"
+                << "    if (initial) {\n"
+                << "        for (std::size_t block = 1; block < kComputeBlockEnd; ++block) {\n"
+                << "            activeWords_[block / 64U] |= UINT64_C(1) << (block % 64U);\n"
+                << "        }\n"
+                << "    }\n"
                 << "    while (true) {\n"
+                << "        backwardFired_ = false;\n"
                 << (state.runtimeProfile
                         ? "        const auto profileComputeStart = runtimeProfileEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};\n"
                         : "")
-                << "        execute_active_blocks();\n"
+                // Compute phase: ascending scan of the active bitmap, clearing
+                // each bit as its Block executes.
+                << "        for (std::size_t word = 0; word < kActivityWordCount; ++word) {\n"
+                << "            while (activeWords_[word] != 0) {\n"
+                << "                const std::size_t bit = static_cast<std::size_t>(std::countr_zero(activeWords_[word]));\n"
+                << "                activeWords_[word] &= ~(UINT64_C(1) << bit);\n"
+                << "                const std::size_t block = word * 64U + bit;\n"
+                << "                if (block >= 1U && block < kComputeBlockEnd) execute_block(block);\n"
+                << "            }\n"
+                << "        }\n"
                 << (state.runtimeProfile
                         ? "        if (runtimeProfileEnabled_) profileComputeNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profileComputeStart).count());\n"
                         : "")
-                << "        if (has_next_active_blocks()) {\n"
-                // The compute scan has drained activeWords_/activeSummary_ to
-                // all-zero, so swapping buffer roles replaces the old
-                // copy-then-fill epoch advance; the commit side keeps its
-                // pending |= next merge, now sparse via drain.
-                << "            std::swap(activeWords_, nextActiveWords_);\n"
-                << "            std::swap(activeSummary_, nextActiveSummary_);\n"
-                << "            drain_next_commit_activity();\n"
-                << "            if (has_pending_commit_blocks()) capture_commit_events();\n"
-                << "            ++epochCounter_;\n"
-                << "            clear_changed_results();\n"
-                << "            if (epochCounter_ > UINT64_C(1000000)) throw std::runtime_error(\"AM eval did not converge\");\n"
-                << "            continue;\n"
-                << "        }\n"
-                << "        if (has_pending_commit_blocks()) {\n"
                 << (state.runtimeProfile
-                        ? "            const auto profileCommitStart = runtimeProfileEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};\n"
+                        ? "        const auto profileCommitStart = runtimeProfileEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};\n"
                         : "")
-                << "            capture_pending_commit_operands();\n"
-                << "            capture_commit_events();\n"
-                << "            restore_commit_events();\n"
-                << "            if (!execute_next_commit_group()) throw std::runtime_error(\"pending commit Block is absent from its execution plan\");\n"
+                // Commit phase: commit Blocks always execute in ascending order.
+                << "        for (std::size_t block = kCommitBlockBegin; block < kCommitBlockEnd; ++block) execute_block(block);\n"
                 << (state.runtimeProfile
-                        ? "            if (runtimeProfileEnabled_) profileCommitNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profileCommitStart).count());\n"
+                        ? "        if (runtimeProfileEnabled_) profileCommitNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profileCommitStart).count());\n"
                         : "")
-                << "            if (has_next_active_blocks()) {\n"
-                // Both active and next may be nonzero here (commit Blocks may
-                // activate forward during the commit phase), so merge next into
-                // cur with the sparse drain instead of swapping.
-                << "                drain_next_active_activity();\n"
-                << "                drain_next_commit_activity();\n"
-                << "                if (has_pending_commit_blocks()) capture_commit_events();\n"
-                << "                ++epochCounter_;\n"
-                << "                clear_changed_results();\n"
-                << "                if (epochCounter_ > UINT64_C(1000000)) throw std::runtime_error(\"AM eval did not converge\");\n"
-                << "                continue;\n"
-                << "            }\n"
-                << "            if (has_active_blocks()) { clear_changed_results(); continue; }\n"
-                << "            if (!has_pending_commit_blocks()) { clear_pending_commit_events(); clear_changed_results(); }\n"
-                << "            continue;\n"
-                << "        }\n"
-                << "        break;\n"
+                << "        clear_changed_results();\n"
+                << "        ++roundCounter_;\n"
+                << "        if (roundCounter_ > UINT64_C(1000000)) throw std::runtime_error(\"AM eval did not converge\");\n"
+                << "        if (!backwardFired_) break;\n"
                 << "    }\n"
                 << "    if (initial) firstEval_ = false;\n"
                 << (state.runtimeProfile
                         ? "    if (runtimeProfileEnabled_) {\n"
-                          "        profileEpochs_ += epochCounter_;\n"
+                          "        profileRounds_ += roundCounter_;\n"
                           "        profileEvalNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profileEvalStart).count());\n"
                           "    }\n"
                         : "");
@@ -4541,14 +3922,12 @@ namespace
                     << "    const double evalMs = static_cast<double>(profileEvalNs_) / 1.0e6;\n"
                     << "    const double computeMs = static_cast<double>(profileComputeNs_) / 1.0e6;\n"
                     << "    const double commitMs = static_cast<double>(profileCommitNs_) / 1.0e6;\n"
-                    << "    std::cerr << \"[am-profile] eval calls: \" << profileEvalCalls_ << \", epochs: \" << profileEpochs_\n"
-                    << "              << \" (\" << (profileEvalCalls_ != 0 ? static_cast<double>(profileEpochs_) / static_cast<double>(profileEvalCalls_) : 0.0) << \" per eval)\\n\";\n"
+                    << "    std::cerr << \"[am-profile] eval calls: \" << profileEvalCalls_ << \", rounds: \" << profileRounds_\n"
+                    << "              << \" (\" << (profileEvalCalls_ != 0 ? static_cast<double>(profileRounds_) / static_cast<double>(profileEvalCalls_) : 0.0) << \" per eval)\\n\";\n"
                     << "    std::cerr << \"[am-profile] block execs: \" << totalBlockExecs << \" (compute \" << profileBlockExecs_\n"
-                    << "              << \", commit \" << profileCommitBlockExecs_ << \", commit groups \" << profileCommitGroups_ << \")\\n\";\n"
+                    << "              << \", commit \" << profileCommitBlockExecs_ << \")\\n\";\n"
                     << "    std::cerr << \"[am-profile] activations: forward \" << profileActivateForward_ << \", backward \" << profileActivateBackward_ << \"\\n\";\n"
-                    << "    std::cerr << \"[am-profile] changed marks: \" << profileChangedMarks_ << \" (commit events \" << profileCommitChangedMarks_\n"
-                    << "              << \"), clears \" << profileChangedClears_ << \"\\n\";\n"
-                    << "    std::cerr << \"[am-profile] commit captures: blocks \" << profileCaptureBlocks_ << \", words \" << profileCaptureWords_ << \"\\n\";\n"
+                    << "    std::cerr << \"[am-profile] changed marks: \" << profileChangedMarks_ << \", clears \" << profileChangedClears_ << \"\\n\";\n"
                     << "    std::cerr << \"[am-profile] time ms: eval \" << evalMs << \", compute \" << computeMs << \" (\"\n"
                     << "              << (evalMs > 0.0 ? 100.0 * computeMs / evalMs : 0.0) << \"%), commit \" << commitMs << \" (\"\n"
                     << "              << (evalMs > 0.0 ? 100.0 * commitMs / evalMs : 0.0) << \"%), other \" << (evalMs - computeMs - commitMs) << \"\\n\";\n"
