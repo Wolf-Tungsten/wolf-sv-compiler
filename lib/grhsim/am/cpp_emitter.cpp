@@ -2807,6 +2807,11 @@ namespace wolvrix::lib::grhsim::am
                << "class " << className << " {\npublic:\n"
                << "    " << className << "();\n"
                << "    ~" << className << "();\n"
+               // The activity words are double-buffered through pointer
+               // members; an implicitly copied model would alias the source
+               // buffers, so copying is disabled.
+               << "    " << className << "(const " << className << " &) = delete;\n"
+               << "    " << className << " &operator=(const " << className << " &) = delete;\n"
                << "    void init();\n"
                << "    void eval();\n"
                << "    void finalize();\n"
@@ -2846,6 +2851,8 @@ namespace wolvrix::lib::grhsim::am
                << "    void activate_backward(std::size_t block);\n"
                << "    void activate_all_blocks();\n"
                << "    void execute_active_blocks();\n"
+               << "    void drain_next_active_activity();\n"
+               << "    void drain_next_commit_activity();\n"
                << "    bool execute_next_commit_group();\n"
                << "    void capture_pending_commit_operands();\n"
                << "    [[nodiscard]] bool has_active_blocks() const;\n"
@@ -2941,14 +2948,21 @@ namespace wolvrix::lib::grhsim::am
                << "    std::array<std::uint64_t, " << state.wideWords << "> wideValues_{};\n"
                << "    std::array<std::uint64_t, " << state.realValues << "> realValues_{};\n"
                << "    std::array<std::string, " << state.stringValues << "> stringValues_{};\n"
-               << "    std::array<std::uint64_t, kActivityWordCount> activeWords_{};\n"
-               << "    std::array<std::uint64_t, kActivityWordCount> nextActiveWords_{};\n"
+               << "    std::array<std::uint64_t, kActivityWordCount> activeWordBuffers_[2]{};\n"
+               << "    std::array<std::uint64_t, kActivitySummaryWordCount> activeSummaryBuffers_[2]{};\n"
+               // Compute activity is double-buffered: the epoch advance swaps
+               // the cur/next pointers instead of copying the arrays (the
+               // compute scan has drained the cur side to all-zero by then).
+               // nextCommit activity keeps single storage and is sparse-drained
+               // into the pending set; the commit merge semantics are unchanged.
+               << "    std::uint64_t *activeWords_ = activeWordBuffers_[0].data();\n"
+               << "    std::uint64_t *nextActiveWords_ = activeWordBuffers_[1].data();\n"
+               << "    std::uint64_t *activeSummary_ = activeSummaryBuffers_[0].data();\n"
+               << "    std::uint64_t *nextActiveSummary_ = activeSummaryBuffers_[1].data();\n"
                << "    std::array<std::uint64_t, kActivityWordCount> pendingCommitWords_{};\n"
                << "    std::array<std::uint64_t, kActivityWordCount> forcedCommitWords_{};\n"
                << "    std::array<std::uint64_t, kActivityWordCount> nextCommitWords_{};\n"
                << "    std::array<std::uint64_t, kActivityWordCount> capturedCommitWords_{};\n"
-               << "    std::array<std::uint64_t, kActivitySummaryWordCount> activeSummary_{};\n"
-               << "    std::array<std::uint64_t, kActivitySummaryWordCount> nextActiveSummary_{};\n"
                << "    std::array<std::uint64_t, kActivitySummaryWordCount> pendingCommitSummary_{};\n"
                << "    std::array<std::uint64_t, kActivitySummaryWordCount> nextCommitSummary_{};\n"
                << "    std::array<std::uint64_t, kDirtyChangedWordCount> dirtyChangedBits_{};\n"
@@ -3832,8 +3846,10 @@ namespace
                << "void " << className
                << "::init() {\n    values_.fill(0); wideValues_.fill(0); realValues_.fill(0);\n"
                << "    for (std::string &value : stringValues_) value.clear();\n"
-               << "    activeWords_.fill(0); nextActiveWords_.fill(0);\n"
-               << "    activeSummary_.fill(0); nextActiveSummary_.fill(0);\n"
+               << "    activeWordBuffers_[0].fill(0); activeWordBuffers_[1].fill(0);\n"
+               << "    activeSummaryBuffers_[0].fill(0); activeSummaryBuffers_[1].fill(0);\n"
+               << "    activeWords_ = activeWordBuffers_[0].data(); nextActiveWords_ = activeWordBuffers_[1].data();\n"
+               << "    activeSummary_ = activeSummaryBuffers_[0].data(); nextActiveSummary_ = activeSummaryBuffers_[1].data();\n"
                << "    pendingCommitWords_.fill(0); forcedCommitWords_.fill(0); nextCommitWords_.fill(0);\n"
                << "    pendingCommitSummary_.fill(0); nextCommitSummary_.fill(0);\n"
                << "    pendingCommitEventBits_.fill(0);\n"
@@ -4082,9 +4098,9 @@ namespace
                 << "    nextActiveSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
                 << "}\n\nvoid " << className
                 << "::activate_all_blocks() {\n"
-                << "    activeWords_.fill(UINT64_MAX);\n"
+                << "    std::fill_n(activeWords_, kActivityWordCount, UINT64_MAX);\n"
                 << "    const std::size_t tailBits = kBlockCount - (kActivityWordCount - 1U) * 64U;\n"
-                << "    activeWords_.back() &= bit_mask(static_cast<std::uint32_t>(tailBits));\n"
+                << "    activeWords_[kActivityWordCount - 1U] &= bit_mask(static_cast<std::uint32_t>(tailBits));\n"
                 << "    activeWords_[0] &= ~UINT64_C(1);\n"
                 << "    for (std::size_t block = kCommitBlockBegin; block < kCommitBlockEnd; ++block) {\n"
                 << "        const std::size_t word = block / 64U;\n"
@@ -4093,7 +4109,7 @@ namespace
                 << "        forcedCommitWords_[word] |= bit;\n"
                 << "        pendingCommitSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
                 << "    }\n"
-                << "    activeSummary_.fill(0);\n"
+                << "    std::fill_n(activeSummary_, kActivitySummaryWordCount, 0);\n"
                 << "    for (std::size_t word = 0; word < kActivityWordCount; ++word) {\n"
                 << "        if (activeWords_[word] != 0) activeSummary_[word / 64U] |= UINT64_C(1) << (word % 64U);\n"
                 << "    }\n"
@@ -4120,8 +4136,8 @@ namespace
                 << "    }\n"
                 << "}\n\nbool " << className
                 << "::has_active_blocks() const {\n"
-                << "    for (const std::uint64_t summary : activeSummary_) {\n"
-                << "        if (summary != 0) return true;\n"
+                << "    for (std::size_t word = 0; word < kActivitySummaryWordCount; ++word) {\n"
+                << "        if (activeSummary_[word] != 0) return true;\n"
                 << "    }\n"
                 << "    return false;\n"
                 << "}\n\nbool " << className
@@ -4130,6 +4146,42 @@ namespace
                 << "        if (nextActiveSummary_[word] != 0 || nextCommitSummary_[word] != 0) return true;\n"
                 << "    }\n"
                 << "    return false;\n"
+                << "}\n\nvoid " << className
+                << "::drain_next_active_activity() {\n"
+                // On the next side the summary is an exact nonzero-word mirror:
+                // activation always sets a word bit and its summary bit
+                // together, and the next side is only cleared here. Drain cost
+                // is proportional to the words actually set, not the array size.
+                << "    for (std::size_t summaryWord = 0; summaryWord < kActivitySummaryWordCount; ++summaryWord) {\n"
+                << "        std::uint64_t bits = nextActiveSummary_[summaryWord];\n"
+                << "        if (bits == 0) continue;\n"
+                << "        nextActiveSummary_[summaryWord] = 0;\n"
+                << "        while (bits != 0) {\n"
+                << "            const std::size_t bit = static_cast<std::size_t>(std::countr_zero(bits));\n"
+                << "            bits &= bits - 1;\n"
+                << "            const std::size_t word = summaryWord * 64U + bit;\n"
+                << "            if (word >= kActivityWordCount) continue;\n"
+                << "            activeWords_[word] |= nextActiveWords_[word];\n"
+                << "            activeSummary_[summaryWord] |= UINT64_C(1) << bit;\n"
+                << "            nextActiveWords_[word] = 0;\n"
+                << "        }\n"
+                << "    }\n"
+                << "}\n\nvoid " << className
+                << "::drain_next_commit_activity() {\n"
+                << "    for (std::size_t summaryWord = 0; summaryWord < kActivitySummaryWordCount; ++summaryWord) {\n"
+                << "        std::uint64_t bits = nextCommitSummary_[summaryWord];\n"
+                << "        if (bits == 0) continue;\n"
+                << "        nextCommitSummary_[summaryWord] = 0;\n"
+                << "        while (bits != 0) {\n"
+                << "            const std::size_t bit = static_cast<std::size_t>(std::countr_zero(bits));\n"
+                << "            bits &= bits - 1;\n"
+                << "            const std::size_t word = summaryWord * 64U + bit;\n"
+                << "            if (word >= kActivityWordCount) continue;\n"
+                << "            pendingCommitWords_[word] |= nextCommitWords_[word];\n"
+                << "            pendingCommitSummary_[summaryWord] |= UINT64_C(1) << bit;\n"
+                << "            nextCommitWords_[word] = 0;\n"
+                << "        }\n"
+                << "    }\n"
                 << "}\n\nbool " << className
                 << "::has_pending_commit_blocks() const {\n"
                 << "    for (const std::uint64_t summary : pendingCommitSummary_) {\n"
@@ -4379,8 +4431,10 @@ namespace
         }
         runtime << "    const bool initial = firstEval_;\n"
                 << "    epochCounter_ = 0;\n"
-                << "    activeWords_.fill(0); activeSummary_.fill(0);\n"
-                << "    nextActiveWords_.fill(0); nextActiveSummary_.fill(0);\n"
+                << "    activeWordBuffers_[0].fill(0); activeWordBuffers_[1].fill(0);\n"
+                << "    activeSummaryBuffers_[0].fill(0); activeSummaryBuffers_[1].fill(0);\n"
+                << "    activeWords_ = activeWordBuffers_[0].data(); nextActiveWords_ = activeWordBuffers_[1].data();\n"
+                << "    activeSummary_ = activeSummaryBuffers_[0].data(); nextActiveSummary_ = activeSummaryBuffers_[1].data();\n"
                 << "    pendingCommitWords_.fill(0); forcedCommitWords_.fill(0); pendingCommitSummary_.fill(0);\n"
                 << "    nextCommitWords_.fill(0); nextCommitSummary_.fill(0);\n"
                 << "    capturedCommitWords_.fill(0);\n"
@@ -4399,12 +4453,13 @@ namespace
                         ? "        if (runtimeProfileEnabled_) profileComputeNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profileComputeStart).count());\n"
                         : "")
                 << "        if (has_next_active_blocks()) {\n"
-                << "            activeWords_ = nextActiveWords_;\n"
-                << "            activeSummary_ = nextActiveSummary_;\n"
-                << "            for (std::size_t word = 0; word < kActivityWordCount; ++word) pendingCommitWords_[word] |= nextCommitWords_[word];\n"
-                << "            for (std::size_t word = 0; word < kActivitySummaryWordCount; ++word) pendingCommitSummary_[word] |= nextCommitSummary_[word];\n"
-                << "            nextActiveWords_.fill(0); nextActiveSummary_.fill(0);\n"
-                << "            nextCommitWords_.fill(0); nextCommitSummary_.fill(0);\n"
+                // The compute scan has drained activeWords_/activeSummary_ to
+                // all-zero, so swapping buffer roles replaces the old
+                // copy-then-fill epoch advance; the commit side keeps its
+                // pending |= next merge, now sparse via drain.
+                << "            std::swap(activeWords_, nextActiveWords_);\n"
+                << "            std::swap(activeSummary_, nextActiveSummary_);\n"
+                << "            drain_next_commit_activity();\n"
                 << "            if (has_pending_commit_blocks()) capture_commit_events();\n"
                 << "            ++epochCounter_;\n"
                 << "            clear_changed_results();\n"
@@ -4423,16 +4478,11 @@ namespace
                         ? "            if (runtimeProfileEnabled_) profileCommitNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profileCommitStart).count());\n"
                         : "")
                 << "            if (has_next_active_blocks()) {\n"
-                << "                for (std::size_t word = 0; word < kActivityWordCount; ++word) {\n"
-                << "                    activeWords_[word] |= nextActiveWords_[word];\n"
-                << "                    pendingCommitWords_[word] |= nextCommitWords_[word];\n"
-                << "                }\n"
-                << "                for (std::size_t word = 0; word < kActivitySummaryWordCount; ++word) {\n"
-                << "                    activeSummary_[word] |= nextActiveSummary_[word];\n"
-                << "                    pendingCommitSummary_[word] |= nextCommitSummary_[word];\n"
-                << "                }\n"
-                << "                nextActiveWords_.fill(0); nextActiveSummary_.fill(0);\n"
-                << "                nextCommitWords_.fill(0); nextCommitSummary_.fill(0);\n"
+                // Both active and next may be nonzero here (commit Blocks may
+                // activate forward during the commit phase), so merge next into
+                // cur with the sparse drain instead of swapping.
+                << "                drain_next_active_activity();\n"
+                << "                drain_next_commit_activity();\n"
                 << "                if (has_pending_commit_blocks()) capture_commit_events();\n"
                 << "                ++epochCounter_;\n"
                 << "                clear_changed_results();\n"

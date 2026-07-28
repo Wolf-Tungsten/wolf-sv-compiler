@@ -967,7 +967,7 @@ namespace
         }
         const std::optional<std::string> runtimeText =
             readTextFile(outputDirectory / "grhsim_ArrayInitTop_runtime.cpp");
-        if (!runtimeText || countOccurrences(*runtimeText, "std::fill_n(") != 1 ||
+        if (!runtimeText || countOccurrences(*runtimeText, "std::fill_n(wideValues_.data()") != 1 ||
             runtimeText->find(", 64, (UINT64_C(") == std::string::npos ||
             countOccurrences(*runtimeText, "for (std::size_t initElement_") != 2)
         {
@@ -1305,15 +1305,22 @@ namespace
                              std::to_string(activityWordCount)) == std::string::npos ||
             headerText->find("kActivitySummaryWordCount = " +
                              std::to_string(activitySummaryWordCount)) == std::string::npos ||
-            headerText->find("std::array<std::uint64_t, kActivityWordCount> activeWords_{};") ==
+            headerText->find(
+                "std::array<std::uint64_t, kActivityWordCount> activeWordBuffers_[2]{};") ==
                 std::string::npos ||
-            headerText->find("std::array<std::uint64_t, kActivityWordCount> nextActiveWords_{};") ==
+            headerText->find("std::uint64_t *activeWords_ = activeWordBuffers_[0].data();") ==
                 std::string::npos ||
             headerText->find(
-                "std::array<std::uint64_t, kActivitySummaryWordCount> activeSummary_{};") ==
+                "std::uint64_t *nextActiveWords_ = activeWordBuffers_[1].data();") ==
                 std::string::npos ||
             headerText->find(
-                "std::array<std::uint64_t, kActivitySummaryWordCount> nextActiveSummary_{};") ==
+                "std::array<std::uint64_t, kActivitySummaryWordCount> activeSummaryBuffers_[2]{};") ==
+                std::string::npos ||
+            headerText->find(
+                "std::uint64_t *activeSummary_ = activeSummaryBuffers_[0].data();") ==
+                std::string::npos ||
+            headerText->find(
+                "std::uint64_t *nextActiveSummary_ = activeSummaryBuffers_[1].data();") ==
                 std::string::npos ||
             headerText->find("dirtyChangedResults_") == std::string::npos ||
             headerText->find("dirtyChangedBits_") == std::string::npos)
@@ -1335,6 +1342,21 @@ namespace
                 std::string::npos)
         {
             return fail("generated activity runtime retained dense activation or changed-result paths");
+        }
+        // The epoch advance swaps the double-buffered compute activity pointers
+        // and sparse-drains the next commit side; the old whole-array
+        // copy/merge/fill sequence must not come back.
+        if (runtimeText->find("std::swap(activeWords_, nextActiveWords_);") == std::string::npos ||
+            runtimeText->find("std::swap(activeSummary_, nextActiveSummary_);") ==
+                std::string::npos ||
+            runtimeText->find("drain_next_active_activity();") == std::string::npos ||
+            runtimeText->find("drain_next_commit_activity();") == std::string::npos ||
+            runtimeText->find("activeWords_ = nextActiveWords_;") != std::string::npos ||
+            runtimeText->find("nextActiveWords_.fill(0);") != std::string::npos ||
+            runtimeText->find("nextCommitWords_.fill(0); nextCommitSummary_.fill(0);\n            if (has_pending_commit_blocks())") !=
+                std::string::npos)
+        {
+            return fail("generated activity runtime did not use the swap-based epoch advance");
         }
         // Low-fanout acts keep the compact per-target call form; the eight-target
         // act is emitted as constant-mask writes (see the fixture's manyTargets).
