@@ -522,10 +522,13 @@ namespace
                 .maxInstructionsPerBlock = 8,
                 .enableCoarsening = true,
                 .collectStats = true,
+                // Explicit budget so this scenario does not depend on the
+                // automatic coarsen-budget default.
+                .dpCoarsenBudget = 256,
             },
             diagnostics);
         // The chain stays 64 separate atoms, but the coarsen budget
-        // (32 * maxInstructionsPerBlock) contracts it into one cluster, so the
+        // (256) contracts it into one cluster, so the
         // segment DP emits a single compute Block preserving program order.
         if (!model || diagnostics.hasError() || model->program.blockCount() != 2) {
             return fail("implicit host order did not pack into one ordered compute Block");
@@ -2003,6 +2006,9 @@ namespace
         const ActivityScheduleOptions coarsenedOptions{
             .maxInstructionsPerBlock = 2,
             .enableCoarsening = true,
+            // Explicit budget so this scenario does not depend on the
+            // automatic coarsen-budget default.
+            .dpCoarsenBudget = 64,
         };
         wolvrix::lib::diag::Diagnostics firstDiagnostics;
         std::optional<ExecutableModel> first =

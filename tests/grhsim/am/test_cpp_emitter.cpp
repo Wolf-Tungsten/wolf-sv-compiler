@@ -1057,6 +1057,7 @@ namespace
         VariableId forwardOutput;
         VariableId backwardOutput;
         VariableId inputChanged;
+        VariableId forwardChanged;
         VariableId backwardChanged;
     };
 
@@ -1231,6 +1232,7 @@ namespace
             .forwardOutput = forwardOutput,
             .backwardOutput = backwardOutput,
             .inputChanged = inputChanged,
+            .forwardChanged = forwardChanged,
             .backwardChanged = backwardChanged,
         };
     }
@@ -1310,17 +1312,41 @@ namespace
         const std::optional<std::string> lastShardText =
             readTextFile(outputDirectory / "grhsim_PackedActivityTop_blocks_7.cpp");
         if (!firstShardText || !secondShardText || !lastShardText ||
-            firstShardText->find("    case 0: {") == std::string::npos ||
-            firstShardText->find("    case 16: {") == std::string::npos ||
-            firstShardText->find("    case 17: {") != std::string::npos ||
-            secondShardText->find("    case 17: {") == std::string::npos ||
-            secondShardText->find("    case 33: {") == std::string::npos ||
-            secondShardText->find("    case 16: {") != std::string::npos ||
-            secondShardText->find("    case 34: {") != std::string::npos ||
-            lastShardText->find("    case 119: {") == std::string::npos ||
-            lastShardText->find("    case 130: {") == std::string::npos ||
-            lastShardText->find("    case 118: {") != std::string::npos ||
-            lastShardText->find("    case 131: {") != std::string::npos)
+            firstShardText->find(
+                "void GrhSIM_PackedActivityTop::execute_block_0() {") ==
+                std::string::npos ||
+            firstShardText->find(
+                "void GrhSIM_PackedActivityTop::eval_scan_0() {") ==
+                std::string::npos ||
+            firstShardText->find("active_byte_ref(0) & UINT8_C(0xfe)") ==
+                std::string::npos ||
+            firstShardText->find("active_byte_ref(0) &= UINT8_C(0x1)") ==
+                std::string::npos ||
+            firstShardText->find("active_byte_ref(2) & UINT8_C(0x1)") ==
+                std::string::npos ||
+            firstShardText->find("active_byte_ref(3") != std::string::npos ||
+            firstShardText->find("eval_commit_") != std::string::npos ||
+            secondShardText->find(
+                "void GrhSIM_PackedActivityTop::eval_scan_1() {") ==
+                std::string::npos ||
+            secondShardText->find("execute_block_0") != std::string::npos ||
+            secondShardText->find("eval_commit_") != std::string::npos ||
+            secondShardText->find("active_byte_ref(2) & UINT8_C(0xfe)") ==
+                std::string::npos ||
+            secondShardText->find("active_byte_ref(4) & UINT8_C(0x3)") ==
+                std::string::npos ||
+            secondShardText->find("active_byte_ref(5") != std::string::npos ||
+            lastShardText->find(
+                "void GrhSIM_PackedActivityTop::eval_scan_7() {") ==
+                std::string::npos ||
+            lastShardText->find(
+                "void GrhSIM_PackedActivityTop::eval_commit_7() {") ==
+                std::string::npos ||
+            lastShardText->find("active_byte_ref(14) & UINT8_C(0x80)") ==
+                std::string::npos ||
+            lastShardText->find("active_byte_ref(16) & UINT8_C(0x3)") ==
+                std::string::npos ||
+            lastShardText->find("active_byte_ref(17") != std::string::npos)
         {
             return fail("packed activity model emitted an invalid shard Block range");
         }
@@ -1357,6 +1383,14 @@ namespace
             headerText->find("std::uint64_t roundCounter_ = 0;") == std::string::npos ||
             headerText->find("dirtyChangedResults_") == std::string::npos ||
             headerText->find("dirtyChangedBits_") == std::string::npos ||
+            headerText->find("void execute_block_0();") == std::string::npos ||
+            headerText->find("void eval_scan_0();") == std::string::npos ||
+            headerText->find("void eval_scan_7();") == std::string::npos ||
+            headerText->find("void eval_commit_7();") == std::string::npos ||
+            headerText->find("void eval_commit_0();") != std::string::npos ||
+            headerText->find("active_byte_ref(std::size_t byte)") ==
+                std::string::npos ||
+            headerText->find("void execute_block(") != std::string::npos ||
             headerText->find("nextActiveWords_") != std::string::npos ||
             headerText->find("activeSummary_") != std::string::npos ||
             headerText->find("SummaryWordCount") != std::string::npos ||
@@ -1364,15 +1398,70 @@ namespace
         {
             return fail("generated activity runtime did not use the single-bitmap round activity state");
         }
+        // Persistent narrow values are independent v<VariableId> members (the
+        // GSIM form), declared without initializers and zeroed by init()'s
+        // member-region memset; only the cross-block changed results keep a
+        // dense runtime-indexed array. In this fixture forwardChanged is the
+        // sole cross-block changed result (dense id 0), so the dirty bitmap
+        // shrinks to one word and v<forwardChanged> has no member declaration.
+        const std::string forwardChangedMember =
+            "std::uint64_t v" + std::to_string(fixture.forwardChanged.value) + ";";
+        if (headerText->find(
+                "static constexpr std::size_t kChangedResultCount = 1;") ==
+                std::string::npos ||
+            headerText->find(
+                "static constexpr std::size_t kDirtyChangedWordCount = 1;") ==
+                std::string::npos ||
+            headerText->find(
+                "std::array<std::uint64_t, kChangedResultCount> changedResults_{};") ==
+                std::string::npos ||
+            headerText->find("std::uint64_t v" +
+                             std::to_string(fixture.input.value) + ";") ==
+                std::string::npos ||
+            headerText->find("std::uint64_t v" +
+                             std::to_string(fixture.inputChanged.value) + ";") ==
+                std::string::npos ||
+            headerText->find(forwardChangedMember) != std::string::npos ||
+            headerText->find("values_[") != std::string::npos ||
+            headerText->find("> values_{};") != std::string::npos ||
+            generatedSourceText.find("set_changed_result(0, ") == std::string::npos ||
+            runtimeText->find("std::memset(&v" +
+                              std::to_string(fixture.input.value) +
+                              ", 0, sizeof(v") == std::string::npos ||
+            runtimeText->find("    v" + std::to_string(fixture.input.value) +
+                              " = static_cast<std::uint64_t>(activity_input) & ") ==
+                std::string::npos ||
+            runtimeText->find("forward_output = static_cast<bool>(v" +
+                              std::to_string(fixture.forwardOutput.value) + ");") ==
+                std::string::npos)
+        {
+            return fail("generated activity runtime did not use member-variable narrow value storage");
+        }
+        // The Makefile precompiles the member-heavy model header once (PCH)
+        // and compiles every translation unit against it; the support header
+        // stays a textual include dependency.
+        const std::optional<std::string> makefileText =
+            readTextFile(outputDirectory / "Makefile");
+        if (!makefileText ||
+            makefileText->find("PCH_HEADER := grhsim_PackedActivityTop.hpp") ==
+                std::string::npos ||
+            makefileText->find("PCH_FILE := $(PCH_HEADER).pch") == std::string::npos ||
+            makefileText->find("$(PCH_FILE): $(PCH_HEADER)") == std::string::npos ||
+            makefileText->find("-x c++-header") == std::string::npos ||
+            makefileText->find("-include-pch $(PCH_FILE)") == std::string::npos ||
+            makefileText->find("rm -f $(OBJS) $(LIB) $(PCH_FILE)") ==
+                std::string::npos)
+        {
+            return fail("generated activity runtime Makefile did not precompile the model header");
+        }
         if (runtimeText->find("activate_forward(") != std::string::npos ||
             runtimeText->find("activate_backward(") != std::string::npos ||
             countOccurrences(generatedSourceText, "set_changed_result(") < 1 ||
             runtimeText->find("dirtyChangedResults_") == std::string::npos ||
             runtimeText->find("dirtyChangedBits_") == std::string::npos ||
-            runtimeText->find("if (block >= kBlockCount)") == std::string::npos ||
-            runtimeText->find("switch (block / 17U)") == std::string::npos ||
-            runtimeText->find("case 0: execute_blocks_0(block); return;") ==
-                std::string::npos ||
+            runtimeText->find("execute_block(") != std::string::npos ||
+            runtimeText->find("switch (block") != std::string::npos ||
+            runtimeText->find("std::countr_zero") != std::string::npos ||
             runtimeText->find("if (block < 17)") != std::string::npos ||
             runtimeText->find("std::none_of(nextActive_.begin()") != std::string::npos ||
             runtimeText->find("for (std::size_t block = 1; block < active_.size();") !=
@@ -1380,14 +1469,21 @@ namespace
         {
             return fail("generated activity runtime retained dense activation or changed-result paths");
         }
-        // The eval loop is one active bitmap scanned to a fixed point plus an
-        // unconditional commit scan per round; the double-buffered epoch
-        // advance and the commit activity channels must not come back.
+        // The eval loop is a static straight-line dispatch: B0 runs once per
+        // eval, then each round calls the per-part compute scans in ascending
+        // (source, part) order followed by the commit scans; the
+        // double-buffered epoch advance and the commit activity channels must
+        // not come back.
+        const std::size_t firstScanCall =
+            runtimeText->find("        eval_scan_0();\n");
+        const std::size_t commitCall =
+            runtimeText->find("        eval_commit_7();\n");
         if (runtimeText->find("activeWords_.fill(0);") == std::string::npos ||
+            runtimeText->find("execute_block_0();") == std::string::npos ||
             runtimeText->find("backwardFired_ = false;") == std::string::npos ||
-            runtimeText->find(
-                "for (std::size_t block = kCommitBlockBegin; block < kCommitBlockEnd; ++block) execute_block(block);") ==
-                std::string::npos ||
+            firstScanCall == std::string::npos ||
+            runtimeText->find("        eval_scan_7();\n") == std::string::npos ||
+            commitCall == std::string::npos || commitCall < firstScanCall ||
             runtimeText->find("++roundCounter_;") == std::string::npos ||
             runtimeText->find("if (!backwardFired_) break;") == std::string::npos ||
             runtimeText->find("std::swap(activeWords_") != std::string::npos ||
@@ -1400,9 +1496,12 @@ namespace
             return fail("generated activity runtime did not use the two-phase round loop");
         }
         // Every act is emitted as constant-mask writes into the single active
-        // bitmap (see the fixture's manyTargets); an act.b also raises
-        // backwardFired_. This fixture opts into the compile-time runtime
-        // profile, so the mask path also carries its counted profile statement.
+        // bitmap, except forward targets in the same activity byte owned by
+        // the emitting chunk, which relay into the scan-local byteFlags (see
+        // the fixture's manyTargets: 66 and 67 relay, 68..73 stay global); an
+        // act.b also raises backwardFired_. This fixture opts into the
+        // compile-time runtime profile, so the mask path also carries its
+        // counted profile statement (6 masked + 2 relayed = 8).
         if (headerText->find("static constexpr bool kRuntimeProfileCompiled = true;") ==
                 std::string::npos ||
             headerText->find("profilePerBlockExecs_") == std::string::npos ||
@@ -1412,7 +1511,11 @@ namespace
                 std::string::npos ||
             generatedSourceText.find("activeWords_[2] |= UINT64_C(0x2);") ==
                 std::string::npos ||
-            generatedSourceText.find("activeWords_[1] |= UINT64_C(0x3fc);") ==
+            generatedSourceText.find("byteFlags |= UINT8_C(0xc);") ==
+                std::string::npos ||
+            generatedSourceText.find("activeWords_[1] |= UINT64_C(0x3f0);") ==
+                std::string::npos ||
+            generatedSourceText.find("activeWords_[1] |= UINT64_C(0x3fc);") !=
                 std::string::npos ||
             generatedSourceText.find("activeWords_[1] |= UINT64_C(0x2);") ==
                 std::string::npos ||
@@ -1424,22 +1527,48 @@ namespace
         {
             return fail("generated activity runtime did not use constant-mask activation writes");
         }
+        // Per-Block profile counters move into the dispatch form: scan Blocks
+        // count at the top of their bit-test branch, the commit Block counts
+        // unconditionally, and B0 counts only its per-Block entry. The scan
+        // itself is straight-line: no switch, countr_zero, or do-while.
+        if (generatedSourceText.find(
+                "if ((byteFlags & UINT8_C(0x1)) != 0) {\n"
+                "                if (runtimeProfileEnabled_) { profilePerBlockExecs_[64] += 1; ++profileBlockExecs_; }") ==
+                std::string::npos ||
+            generatedSourceText.find(
+                "        if (runtimeProfileEnabled_) { profilePerBlockExecs_[130] += 1; ++profileCommitBlockExecs_; }") ==
+                std::string::npos ||
+            generatedSourceText.find(
+                "::execute_block_0() {\n"
+                "    if (runtimeProfileEnabled_) { profilePerBlockExecs_[0] += 1; }") ==
+                std::string::npos ||
+            generatedSourceText.find("std::countr_zero") != std::string::npos ||
+            generatedSourceText.find("do {") != std::string::npos ||
+            generatedSourceText.find("switch (block") != std::string::npos)
+        {
+            return fail("generated activity runtime misplaced the per-Block profile counters");
+        }
         for (std::size_t source = 0; source < 8; ++source)
         {
-            const std::string dispatch = "case " + std::to_string(source) +
-                                         ": execute_blocks_" + std::to_string(source) +
-                                         "(block); return;";
-            if (runtimeText->find(dispatch) == std::string::npos)
+            const std::string call =
+                "        eval_scan_" + std::to_string(source) + "();\n";
+            if (runtimeText->find(call) == std::string::npos)
             {
-                return fail("generated activity runtime omitted a shard dispatch case");
+                return fail("generated activity runtime omitted a shard scan call");
             }
         }
+        // Changed results are never statically cleared: same-Block ones are
+        // plain members rewritten before every read, and the cross-Block one
+        // (forwardChanged, dense id 0) is cleared only through the round-end
+        // dirty list, whose clear loop indexes changedResults_ by the runtime
+        // dirty id rather than a compile-time constant.
         const std::string legacyInputClear =
-            "values_[" + std::to_string(fixture.inputChanged.value) + "] = 0;";
+            "v" + std::to_string(fixture.inputChanged.value) + " = 0;";
         const std::string legacyBackwardClear =
-            "values_[" + std::to_string(fixture.backwardChanged.value) + "] = 0;";
+            "v" + std::to_string(fixture.backwardChanged.value) + " = 0;";
         if (runtimeText->find(legacyInputClear) != std::string::npos ||
-            runtimeText->find(legacyBackwardClear) != std::string::npos)
+            runtimeText->find(legacyBackwardClear) != std::string::npos ||
+            runtimeText->find("changedResults_[0] = 0;") != std::string::npos)
         {
             return fail("generated activity runtime statically clears every changed result");
         }
@@ -1673,7 +1802,7 @@ int main()
             headerText->find("bool backwardFired_ = false;") == std::string::npos ||
             headerText->find(
                 "void set_changed_result(std::size_t variable, bool event) {\n"
-                "        values_[variable] = event ? 1 : 0;\n"
+                "        changedResults_[variable] = event ? 1 : 0;\n"
                 "        if (event) mark_changed_result(variable);\n"
                 "    }") == std::string::npos ||
             headerText->find(
@@ -1703,13 +1832,12 @@ int main()
             runtimeText->find("::bit_mask(") != std::string::npos ||
             runtimeText->find("::resize_value(") != std::string::npos ||
             runtimeText->find("::concat_value(") != std::string::npos ||
-            evalBody.find("execute_block(0);") == std::string_view::npos ||
-            evalBody.find(
-                "if (block >= 1U && block < kComputeBlockEnd) execute_block(block);") ==
+            evalBody.find("execute_block_0();") == std::string_view::npos ||
+            evalBody.find("        eval_scan_0();\n        eval_commit_0();\n") ==
                 std::string_view::npos ||
-            evalBody.find(
-                "for (std::size_t block = kCommitBlockBegin; block < kCommitBlockEnd; ++block) execute_block(block);") ==
-                std::string_view::npos ||
+            evalBody.find("execute_block(") != std::string_view::npos ||
+            evalBody.find("switch (block") != std::string_view::npos ||
+            evalBody.find("std::countr_zero") != std::string_view::npos ||
             evalBody.find("++roundCounter_;") == std::string_view::npos ||
             evalBody.find("if (!backwardFired_) break;") ==
                 std::string_view::npos ||
@@ -1719,9 +1847,34 @@ int main()
             runtimeText->find("pendingCommitWords_") != std::string::npos ||
             runtimeText->find("forcedCommitWords_") != std::string::npos ||
             runtimeText->find("set_commit_changed_result") != std::string::npos ||
-            blockText->find("set_changed_result(") == std::string::npos)
+            blockText->find("set_changed_result(0, ") == std::string::npos)
         {
             return fail("AM C++ emitter did not generate the two-phase round commit runtime");
+        }
+
+        // Narrow-value storage: persistent scalars are independent
+        // v<VariableId> members without initializers (zeroed by init()'s
+        // member-region memset); the sole cross-Block changed result
+        // (posedge, VariableId 9) moves into the dense runtime-indexed
+        // changedResults_ array, so v9 has no member.
+        if (headerText->find(
+                "static constexpr std::size_t kChangedResultCount = 1;") ==
+                std::string::npos ||
+            headerText->find(
+                "std::array<std::uint64_t, kChangedResultCount> changedResults_{};") ==
+                std::string::npos ||
+            headerText->find("std::uint64_t v0;") == std::string::npos ||
+            headerText->find("std::uint64_t v9;") != std::string::npos ||
+            headerText->find("values_[") != std::string::npos ||
+            headerText->find("> values_{};") != std::string::npos ||
+            blockText->find("resize_value(changedResults_[0], ") == std::string::npos ||
+            runtimeText->find("std::memset(&v0, 0, sizeof(v0) * ") ==
+                std::string::npos ||
+            runtimeText->find("changedResults_[variable] = 0;") == std::string::npos ||
+            runtimeText->find(
+                "    v0 = static_cast<std::uint64_t>(clock) & ") == std::string::npos)
+        {
+            return fail("AM C++ emitter did not use member-variable narrow value storage");
         }
 
         // The runtime profile is a compile-time switch and defaults to off: no
@@ -1742,6 +1895,31 @@ int main()
                 std::string::npos)
         {
             return fail("AM C++ emitter kept runtime profile code with the switch off");
+        }
+
+        // The static straight-line dispatch carries the compute Blocks in
+        // eval_scan_0 (one byte chunk owning Blocks 1 and 2), the entry Block
+        // in execute_block_0, and the commit Block in eval_commit_0.
+        if (blockText->find("void GrhSIM_PhasedCommitTop::execute_block_0() {") ==
+                std::string::npos ||
+            blockText->find("void GrhSIM_PhasedCommitTop::eval_scan_0() {") ==
+                std::string::npos ||
+            blockText->find("active_byte_ref(0) & UINT8_C(0x6)") ==
+                std::string::npos ||
+            blockText->find("active_byte_ref(0) &= UINT8_C(0xf9)") ==
+                std::string::npos ||
+            blockText->find(
+                "            if ((byteFlags & UINT8_C(0x2)) != 0) {") ==
+                std::string::npos ||
+            blockText->find(
+                "            if ((byteFlags & UINT8_C(0x4)) != 0) {") ==
+                std::string::npos ||
+            blockText->find("void GrhSIM_PhasedCommitTop::eval_commit_0() {") ==
+                std::string::npos ||
+            blockText->find("switch") != std::string::npos ||
+            blockText->find("    case ") != std::string::npos)
+        {
+            return fail("AM C++ emitter did not split the static scan and commit dispatch");
         }
 
         const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
@@ -2133,25 +2311,38 @@ int main()
         readTextFile(outputDirectory / "grhsim_TestTop_blocks_0_part_1.cpp");
     if (!splitHeaderText || !splitRuntimeText || !splitFirstPartText ||
         !splitSecondPartText ||
-        splitHeaderText->find("void execute_blocks_0(std::size_t block);") ==
+        splitHeaderText->find("void execute_block_0();") == std::string::npos ||
+        splitHeaderText->find("void eval_scan_0_part_1();") ==
             std::string::npos ||
-        splitHeaderText->find("void execute_blocks_0_part_1(std::size_t block);") ==
+        splitHeaderText->find("void eval_scan_0();") != std::string::npos ||
+        splitHeaderText->find("void eval_commit_") != std::string::npos ||
+        splitHeaderText->find("void execute_block(std::size_t block);") !=
             std::string::npos ||
-        splitHeaderText->find("void execute_blocks_1(std::size_t block);") !=
+        splitHeaderText->find("active_byte_ref(std::size_t byte)") ==
             std::string::npos ||
-        splitRuntimeText->find("switch (block / 16U)") == std::string::npos ||
-        splitRuntimeText->find(
-            "case 0:\n        if (block < 1U) { execute_blocks_0(block); return; }\n"
-            "        execute_blocks_0_part_1(block); return;") == std::string::npos ||
-        splitRuntimeText->find("\n    case 1:") != std::string::npos ||
-        splitFirstPartText->find("void GrhSIM_TestTop::execute_blocks_0(") ==
+        splitRuntimeText->find("execute_block_0();") == std::string::npos ||
+        splitRuntimeText->find("        eval_scan_0_part_1();\n") ==
             std::string::npos ||
-        splitFirstPartText->find("    case 0: {") == std::string::npos ||
-        splitFirstPartText->find("    case 1: {") != std::string::npos ||
+        splitRuntimeText->find("switch (block /") != std::string::npos ||
+        splitRuntimeText->find("execute_block(") != std::string::npos ||
+        splitFirstPartText->find("void GrhSIM_TestTop::execute_block_0() {") ==
+            std::string::npos ||
+        splitFirstPartText->find("eval_scan_") != std::string::npos ||
+        splitFirstPartText->find("eval_commit_") != std::string::npos ||
+        splitFirstPartText->find("switch") != std::string::npos ||
         splitSecondPartText->find(
-            "void GrhSIM_TestTop::execute_blocks_0_part_1(") == std::string::npos ||
-        splitSecondPartText->find("    case 0: {") != std::string::npos ||
-        splitSecondPartText->find("    case 1: {") == std::string::npos)
+            "void GrhSIM_TestTop::eval_scan_0_part_1() {") ==
+            std::string::npos ||
+        splitSecondPartText->find(
+            "std::uint8_t byteFlags = active_byte_ref(0) & UINT8_C(0x2);") ==
+            std::string::npos ||
+        splitSecondPartText->find("active_byte_ref(0) &= UINT8_C(0xfd);") ==
+            std::string::npos ||
+        splitSecondPartText->find(
+            "            if ((byteFlags & UINT8_C(0x2)) != 0) {") ==
+            std::string::npos ||
+        splitSecondPartText->find("execute_block_0") != std::string::npos ||
+        splitSecondPartText->find("switch") != std::string::npos)
     {
         return fail("AM C++ emitter produced an inconsistent physical source split");
     }

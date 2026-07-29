@@ -67,6 +67,28 @@ normalized GRH
 > 来源仍是逐 Block 动态 dispatch、detector 密度与 commit 段常扫描（见
 > `grhsim-am-vs-legacy-analysis-20260727.md` §3.4/§3.5）。
 >
+> 实现进展（2026-07-29）：三项对齐落地。① 运行时 dispatch 整体替换为 legacy
+> batch 形态：`eval_scan_*()` 静态调用 + 8 Block/byte chunk 活动字节快照 + 升序直线
+> 位测试 + 内联 body + 同 byte 前向 act 局部接力，commit 段 `eval_commit_*()` 无条件
+> 内联，废弃 `execute_block` 三级动态分派与位图扫描主循环。② coarsen budget 自动
+> 公式从 32×cap 改为 1.5×cap（=192）：32× 在单指令 atom DAG 上跑满收敛产出
+> (128,4096] DP 不可拆 oversized singleton（XS 9,415 compute 块、均值 ~470 指令），
+> 1.5× 恢复 legacy 粒度（33,738 vs 31,534）；扫参矩阵与机制分析见
+> `grhsim-am-vs-legacy-analysis-20260727.md` §8.2。③ 持久化窄值改为独立类成员
+> `v<VariableId>`（XS 6.64M 个，gsim 形态）；跨块 changed result 单列密集
+> `changedResults_`（唯一运行时下标访问）；生成 Makefile 带 clang PCH 与
+> `ifeq ($(origin CXX),default)` 兜底。期间发现 clang 22.1.2 对数万以上 `{}` 初始化
+> 成员的隐式默认 ctor 静默截断初始化（XS 上 stringValues_ 未构造 → init() SIGSEGV），
+> 修复为成员不带初始化式 + init() 单条 memset 清零连续成员区。
+> Gate 状态：ctest AM 8/8、全量 54/57（3 个既有无关失败）；xs-components
+> 053/044/100 各 20,000 向量与 legacy bit-exact；XS difftest 2k/20k 双配置通过、
+> 50k 通过（退休指令数 73,580、IPC 1.471718 与 legacy 一致）。host time（干净机）：
+> 最终 b192 = 2k 81,760 / 20k 905,050 / 50k 1,982,820 ms，对比 07-28 基线
+> 50k −26.1%；对 legacy 同窗口 50k 为 11.7x（07-28 为 15.8x）。静态 dispatch 在同
+> 块数下仍净回退（+19~22%，扫描胶取指开销，与 P4/P4.5 同机制），由块细化抵消并
+> 反超；成员存储在 20k 再贡献 −1.4~1.8%。剩余差距方向：commit operand capture、
+> detector 密度、commit 段每轮无条件全扫（分析文档 §6/§7.5）。
+>
 > 历史记录（2026-07-25，对应上述重构前的旧模型）：production scheduler 已删除
 > `Isolated` class，commit write 曾采用 consume-on-event（该机制已删除），wide-result
 > shift 已在执行前按 result 宽度扩展 lhs。
@@ -640,15 +662,31 @@ GRH 风格 def-use 图。跨 shard 需要的静态信息应来自一次紧凑索
 
 生成 runtime 把 compute Block 的激活状态表示为每 64 个 Block 一个 word 的单一
 active 位图（不分 current/next，没有 summary 层；commit Block 每轮总是执行，不占用
-激活状态）。`eval()` 主循环是两阶段 round：compute 阶段按 BlockId 升序扫描位图，
-取位即清并执行对应 Block，`act.f` 置位更大的 compute Block，因严格前向而在同一趟
-扫描内被消费；commit 阶段按 BlockId 升序总是执行全部 commit Block，`act.b` 置位
+激活状态）。`eval()` 主循环是两阶段 round（2026-07-29 起为静态 dispatch 形态）：
+compute 阶段按 (source, part) 升序直接调用每个覆盖 compute 段的 `eval_scan_*()` 成员
+函数，函数内按 8 个 Block 一个 byte chunk 消费位图——把活动字节快照进局部
+`byteFlags`、清掉全局字节中本 chunk 拥有的位，然后对拥有的位做升序直线
+`if ((byteFlags & bit) != 0) { ... }` 测试并内联执行 Block 体（legacy/GSIM 的 batch
+形态）；`act.f` 的目标恒为更大的 compute Block，同 byte 且属本 chunk 的目标改写
+在位 `byteFlags`（局部接力），其余经编译期常量掩码写全局位图，两者都因严格前向而
+在同一趟升序遍历内被消费。commit 阶段按 (source, part) 升序直接调用
+`eval_commit_*()`，无条件内联执行全部 commit Block，`act.b` 置位
 reader compute Block 并置 `backwardFired_`，作为“需要下一轮”的唯一信号。一轮完整
 遍历没有任何 `act.b` 激发即收敛；round 计数超过上限（1,000,000）报 did not converge。
 首次 `eval()` 仍激活所有 compute Block。跨块消费的 `changed` 结果使用
 `set_changed_result` 将实际为真的结果加入 dirty list，每轮结束只清理这些结果，而不是
 生成每个 detector 的静态 clear store；同块消费的 result 每次执行都被重写，不进
 dirty list。
+
+生成模型的持久化存储（2026-07-29 起）：窄标量值（BitVector ≤ 64 bit）凡持久化的一律
+是独立类成员 `v<VariableId>`（gsim 式成员变量形态，让编译器把每个值当独立变量做
+静态排布与寄存器分配；块内局部值仍物化为 C++ 局部变量，不占成员）；跨块消费的
+`changed` 结果是唯一被运行时下标访问的值（dirty list 清零），单列密集数组
+`changedResults_[denseId]`；宽值（> 64 bit 与 Array）仍在 `wideValues_` 数组。
+生成的 Makefile 用 clang `-x c++-header` + 每 TU `-include-pch` 预编译模型头
+（成员声明达数百万行量级，PCH 是编译耗时摊销的关键），并用
+`ifeq ($(origin CXX),default)` 兜底 GNU make 内建的 g++ 默认值（g++ 不支持
+`-include-pch`）。
 
 ## 5. 与旧 Graph + session emitter 的并轨边界
 

@@ -129,8 +129,10 @@ namespace wolvrix::lib::grhsim::am
         bool collectStats = false;
         // DP fixed cost per segment boundary; legacy hard-codes +1 per segment.
         double dpSegmentPenalty = 1.0;
-        // 0 = automatic (32 * maxInstructionsPerBlock), matching the legacy
-        // coarsen cluster instruction cap.
+        // 0 = automatic (1.5 * maxInstructionsPerBlock). The legacy 32x factor
+        // lets AM's single-instruction-atom coarsen converge into
+        // DP-indivisible oversized clusters far above the segment cap; 1.5x
+        // keeps the legacy block granularity (XiangShan ~33.7k vs 31.5k).
         std::size_t dpCoarsenBudget = 0;
     };
 

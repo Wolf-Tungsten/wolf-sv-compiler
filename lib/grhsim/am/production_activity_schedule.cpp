@@ -940,9 +940,17 @@ namespace wolvrix::lib::grhsim::am
             .maxInstructionsPerBlock = options.maxInstructionsPerBlock,
             .maxCommitInstructionsPerBlock = options.maxCommitInstructionsPerBlock,
             .enableCoarsening = options.enableCoarsening,
+            // Auto budget: 1.5x the per-block instruction cap. The legacy
+            // 32x cap runs AM's single-instruction-atom DAG to full coarsen
+            // convergence, which pushes clusters into (cap, 32x cap] as
+            // DP-indivisible oversized singletons (~9.4k blocks on XiangShan,
+            // avg ~470 instructions/block). 1.5x keeps clusters at cap size
+            // so the segment DP's maxInstructionsPerBlock actually binds,
+            // landing XiangShan at ~33.7k compute blocks (legacy: 31.5k)
+            // and measurably faster host time than the old default.
             .coarsenBudget = options.dpCoarsenBudget != 0
                                  ? options.dpCoarsenBudget
-                                 : 32 * options.maxInstructionsPerBlock,
+                                 : (3 * options.maxInstructionsPerBlock) / 2,
             .segmentPenalty = options.dpSegmentPenalty,
         };
         std::string blockError;

@@ -138,6 +138,18 @@ namespace wolvrix::lib::grhsim::am
             return "UINT64_C(0x" + std::string(buffer, end) + ")";
         }
 
+        std::string byteMaskLiteral(uint8_t mask)
+        {
+            char buffer[2];
+            const auto [end, error] =
+                std::to_chars(buffer, buffer + sizeof(buffer), mask, 16);
+            if (error != std::errc{})
+            {
+                return "UINT8_C(" + std::to_string(mask) + ")";
+            }
+            return "UINT8_C(0x" + std::string(buffer, end) + ")";
+        }
+
         struct EmitState
         {
             struct Storage
@@ -163,15 +175,30 @@ namespace wolvrix::lib::grhsim::am
             std::unordered_map<uint32_t, uint32_t> pendingEventSlotByInstruction;
             uint32_t pendingEventSlotCount = 0;
             // Changed results read from a block other than their definition:
-            // only these join the round-cleared dirty list.
+            // only these join the round-cleared dirty list. They are also the
+            // only persistent narrow values addressed by a runtime index
+            // (set_changed_result / clear_changed_results), so they keep a
+            // dense array storage (changedResults_[denseId]) while every other
+            // persistent narrow value becomes an independent class member
+            // (v<VariableId>). Non-CR variables map to ~0u.
             std::vector<bool> crossBlockChangedResults;
+            std::vector<uint32_t> changedResultDenseIndex;
+            uint32_t changedResultCount = 0;
+            // First VariableId that gets a v<K> member and the total member
+            // count, recorded while emitting the member declarations. Members
+            // are declared without initializers (clang miscompiles the
+            // implicit default constructor at multi-million {}-initialized
+            // members); init() zeroes the contiguous member region with one
+            // memset from the first member instead.
+            uint32_t firstMemberVariable = std::numeric_limits<uint32_t>::max();
+            uint32_t memberValueCount = 0;
             std::unordered_map<uint32_t, DpiImportId> dpiImportBySymbol;
             std::vector<bool> referencedDpiImports;
             std::vector<InstructionId> finalSystemTasks;
             // ST00009 block-local value localization: a narrow scalar value defined in
             // exactly one block and only read later in the same block is emitted as a
-            // C++ local instead of a values_[] slot. variableEscapeFlags != 0 keeps the
-            // values_[] slot (kEscape* bits below).
+            // C++ local instead of a persistent member. variableEscapeFlags != 0 keeps
+            // the persistent storage (kEscape* bits below).
             std::vector<uint32_t> variableDefBlock;
             std::vector<uint32_t> variableDefPosition;
             std::vector<uint8_t> variableEscapeFlags;
@@ -180,12 +207,22 @@ namespace wolvrix::lib::grhsim::am
             mutable std::vector<uint32_t> localValueIndices;
             mutable uint32_t activeLocalityBlock = std::numeric_limits<uint32_t>::max();
             mutable std::vector<uint32_t> activeLocalityDeclarations;
+            // Static-scan local-relay context. While a compute Block is emitted
+            // into the byte-chunk scan form, forward activations whose target
+            // bit is owned by the current byte chunk set the scan-local
+            // byteFlags variable instead of the global activity words (the
+            // legacy batch-local relay idiom). scanRelayByte < 0 disables the
+            // relay (entry/commit Blocks and any non-scan emission context).
+            mutable int32_t scanRelayByte = -1;
+            mutable uint8_t scanRelayMask = 0;
         };
 
         constexpr uint8_t kEscapeGlobal = 1U << 0U;
         constexpr uint8_t kEscapeCrossBlockUse = 1U << 1U;
         constexpr uint8_t kEscapeEarlyUse = 1U << 2U;
         constexpr uint32_t kInvalidLocalityBlock = std::numeric_limits<uint32_t>::max();
+        constexpr uint32_t kInvalidChangedResultIndex =
+            std::numeric_limits<uint32_t>::max();
 
         bool isLocalValue(const EmitState &state, VariableId variable)
         {
@@ -199,7 +236,12 @@ namespace wolvrix::lib::grhsim::am
             {
                 return "local_" + std::to_string(state.localValueIndices[variable.value]);
             }
-            return "values_[" + std::to_string(variable.value) + "]";
+            const uint32_t denseIndex = state.changedResultDenseIndex[variable.value];
+            if (denseIndex != kInvalidChangedResultIndex)
+            {
+                return "changedResults_[" + std::to_string(denseIndex) + "]";
+            }
+            return "v" + std::to_string(variable.value);
         }
 
         std::string boolExpr(const EmitState &state, VariableId variable)
@@ -266,10 +308,13 @@ namespace wolvrix::lib::grhsim::am
         {
             // A result read by another block is round-local state and goes
             // through the dirty list; a same-block result is rewritten before
-            // every same-block read and is a plain assignment.
+            // every same-block read and is a plain assignment. The dirty list
+            // is indexed by the dense changed-result id, not the VariableId.
             if (state.crossBlockChangedResults[variable.value])
             {
-                return "set_changed_result(" + std::to_string(variable.value) + ", ";
+                return "set_changed_result(" +
+                       std::to_string(state.changedResultDenseIndex[variable.value]) +
+                       ", ";
             }
             return valueExpr(state, variable) + " = (";
         }
@@ -1589,7 +1634,12 @@ namespace wolvrix::lib::grhsim::am
                     // Act targets are always compute Blocks, so activation is a
                     // constant-mask OR into the single active bitmap. A fired
                     // ActBackward also flags that another round is needed.
+                    // While emitting a scan Block, same-byte forward targets
+                    // owned by the current byte chunk relay into the scan-local
+                    // byteFlags instead (strictly forward, so the bit is still
+                    // pending in this chunk's ascending test sequence).
                     std::map<uint32_t, uint64_t> masks;
+                    uint8_t relayMask = 0;
                     for (BlockId target : attributes->targets)
                     {
                         if (target.value >= state.blockCount)
@@ -1597,9 +1647,22 @@ namespace wolvrix::lib::grhsim::am
                             error = "AM activation target BlockId out of range";
                             return std::nullopt;
                         }
+                        const uint32_t bit = target.value % 8U;
+                        if (forward && state.scanRelayByte >= 0 &&
+                            target.value / 8U ==
+                                static_cast<uint32_t>(state.scanRelayByte) &&
+                            ((state.scanRelayMask >> bit) & 1U) != 0)
+                        {
+                            relayMask = static_cast<uint8_t>(relayMask | (1U << bit));
+                            continue;
+                        }
                         masks[target.value / 64U] |= UINT64_C(1) << (target.value % 64U);
                     }
                     std::string code = "if (" + boolExpr(state, operands.front()) + ") {\n";
+                    if (relayMask != 0)
+                    {
+                        code += "byteFlags |= " + byteMaskLiteral(relayMask) + ";\n";
+                    }
                     if (state.runtimeProfile && !attributes->targets.empty())
                     {
                         code += "if (runtimeProfileEnabled_) ";
@@ -1749,10 +1812,21 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
-        std::string blockSourceFunctionName(std::size_t sourceIndex,
-                                            std::size_t partIndex)
+        std::string scanSourceFunctionName(std::size_t sourceIndex,
+                                           std::size_t partIndex)
         {
-            std::string name = "execute_blocks_" + std::to_string(sourceIndex);
+            std::string name = "eval_scan_" + std::to_string(sourceIndex);
+            if (partIndex != 0)
+            {
+                name += "_part_" + std::to_string(partIndex);
+            }
+            return name;
+        }
+
+        std::string commitSourceFunctionName(std::size_t sourceIndex,
+                                             std::size_t partIndex)
+        {
+            std::string name = "eval_commit_" + std::to_string(sourceIndex);
             if (partIndex != 0)
             {
                 name += "_part_" + std::to_string(partIndex);
@@ -1773,21 +1847,173 @@ namespace wolvrix::lib::grhsim::am
             return name + ".cpp";
         }
 
-        std::string blockSourcePrologue(std::string_view prefix,
-                                        std::string_view className,
-                                        std::size_t sourceIndex,
-                                        std::size_t partIndex)
+        // Compute Blocks are 1..computeEnd-1 with
+        // computeEnd = commitBlockBegin != 0 ? commitBlockBegin : blockCount;
+        // commit Blocks are the suffix [commitBlockBegin, commitBlockEnd) when
+        // commitBlockBegin != 0. Both helpers clip a part's [firstBlock,
+        // endBlock) span to the respective phase range.
+        std::pair<std::size_t, std::size_t>
+        computeBlockRange(std::size_t firstBlock,
+                          std::size_t endBlock,
+                          std::size_t blockCount,
+                          uint32_t commitBlockBegin)
         {
-            return "#include \"" + std::string(prefix) + ".hpp\"\n" +
-                   "#include \"" + std::string(prefix) + "_support.hpp\"\n\n" +
-                   "void " + std::string(className) + "::" +
-                   blockSourceFunctionName(sourceIndex, partIndex) +
-                   "(std::size_t block) {\n    switch (block) {\n";
+            const std::size_t computeEnd =
+                commitBlockBegin != 0 ? commitBlockBegin : blockCount;
+            const std::size_t lo = std::max(firstBlock, static_cast<std::size_t>(1));
+            const std::size_t hi = std::min(endBlock, computeEnd);
+            return {lo, std::max(lo, hi)};
         }
 
-        constexpr std::string_view kBlockSourceEpilogue =
-            "    default: throw std::runtime_error(\"invalid AM BlockId\");\n"
-            "    }\n}\n";
+        std::pair<std::size_t, std::size_t>
+        commitBlockRange(std::size_t firstBlock,
+                         std::size_t endBlock,
+                         uint32_t commitBlockBegin,
+                         uint32_t commitBlockEnd)
+        {
+            if (commitBlockBegin == 0)
+            {
+                return {0, 0};
+            }
+            const std::size_t lo =
+                std::max(firstBlock, static_cast<std::size_t>(commitBlockBegin));
+            const std::size_t hi =
+                std::min(endBlock, static_cast<std::size_t>(commitBlockEnd));
+            return {lo, std::max(lo, hi)};
+        }
+
+        // One 8-Block byte segment of a scan range owned by a single part.
+        // Parts may split inside a byte (maxSourceBytes), so each chunk
+        // carries the mask of byte bits it dispatches; bits owned by a
+        // sibling chunk are left untouched in the global byte for that
+        // chunk's later pass.
+        struct ScanByteChunk
+        {
+            std::size_t byteIndex = 0;
+            std::size_t firstBlock = 0;
+            std::size_t endBlock = 0;
+            uint8_t ownedMask = 0;
+        };
+
+        std::vector<ScanByteChunk> scanByteChunks(std::size_t rangeLo,
+                                                  std::size_t rangeHi)
+        {
+            std::vector<ScanByteChunk> chunks;
+            for (std::size_t byte = rangeLo / 8U; byte <= (rangeHi - 1U) / 8U; ++byte)
+            {
+                const std::size_t first = std::max(rangeLo, byte * 8U);
+                const std::size_t end = std::min(rangeHi, byte * 8U + 8U);
+                uint8_t ownedMask = 0;
+                for (std::size_t block = first; block < end; ++block)
+                {
+                    ownedMask = static_cast<uint8_t>(ownedMask | (1U << (block % 8U)));
+                }
+                chunks.push_back(ScanByteChunk{
+                    .byteIndex = byte,
+                    .firstBlock = first,
+                    .endBlock = end,
+                    .ownedMask = ownedMask,
+                });
+            }
+            return chunks;
+        }
+
+        std::string blockSourceIncludes(std::string_view prefix)
+        {
+            return "#include \"" + std::string(prefix) + ".hpp\"\n" +
+                   "#include \"" + std::string(prefix) + "_support.hpp\"\n";
+        }
+
+        std::string entryBlockSourcePrologue(std::string_view className)
+        {
+            return "\nvoid " + std::string(className) + "::execute_block_0() {\n";
+        }
+
+        // Runtime-profile counter for the entry Block: per-Block count only
+        // (B0 is neither a scan-dispatched compute Block nor a commit Block).
+        std::string entryBlockProfileLine()
+        {
+            return "    if (runtimeProfileEnabled_) { profilePerBlockExecs_[0] += 1; }\n";
+        }
+
+        std::string scanSourcePrologue(std::string_view className,
+                                       std::size_t sourceIndex,
+                                       std::size_t partIndex)
+        {
+            return "\nvoid " + std::string(className) + "::" +
+                   scanSourceFunctionName(sourceIndex, partIndex) + "() {\n";
+        }
+
+        std::string commitSourcePrologue(std::string_view className,
+                                         std::size_t sourceIndex,
+                                         std::size_t partIndex)
+        {
+            return "\nvoid " + std::string(className) + "::" +
+                   commitSourceFunctionName(sourceIndex, partIndex) + "() {\n";
+        }
+
+        constexpr std::string_view kBlockSourceFunctionEpilogue = "}\n";
+
+        // One byte chunk of the static compute scan: snapshot the activity
+        // byte into a local, clear the owned bits from the global byte, then
+        // consume the snapshot with straight-line ascending bit tests (the
+        // legacy/GSIM batch idiom). Same-byte forward activations relay into
+        // the local byteFlags, so they are picked up later in the same pass.
+        std::string scanByteChunkPrologue(std::size_t byteIndex, uint8_t ownedMask)
+        {
+            std::string text = "    {\n        std::uint8_t byteFlags = active_byte_ref(" +
+                               std::to_string(byteIndex) + ")";
+            if (ownedMask == 0xffU)
+            {
+                text += ";\n        if (byteFlags != 0) {\n            active_byte_ref(" +
+                        std::to_string(byteIndex) + ") = 0;\n";
+            }
+            else
+            {
+                text += " & " + byteMaskLiteral(ownedMask) +
+                        ";\n        if (byteFlags != 0) {\n            active_byte_ref(" +
+                        std::to_string(byteIndex) + ") &= " +
+                        byteMaskLiteral(static_cast<uint8_t>(~ownedMask)) + ";\n";
+            }
+            return text;
+        }
+
+        constexpr std::string_view kScanByteChunkEpilogue =
+            "        }\n"
+            "    }\n";
+
+        std::string scanBlockTestPrologue(std::size_t blockIndex,
+                                          bool runtimeProfile)
+        {
+            std::string text =
+                "            if ((byteFlags & " +
+                byteMaskLiteral(static_cast<uint8_t>(1U << (blockIndex % 8U))) +
+                ") != 0) {\n";
+            if (runtimeProfile)
+            {
+                text += "                if (runtimeProfileEnabled_) { profilePerBlockExecs_[" +
+                        std::to_string(blockIndex) +
+                        "] += 1; ++profileBlockExecs_; }\n";
+            }
+            return text;
+        }
+
+        constexpr std::string_view kScanBlockTestEpilogue = "            }\n";
+
+        std::string commitBlockPrologue(std::size_t blockIndex,
+                                        bool runtimeProfile)
+        {
+            std::string text = "    {\n";
+            if (runtimeProfile)
+            {
+                text += "        if (runtimeProfileEnabled_) { profilePerBlockExecs_[" +
+                        std::to_string(blockIndex) +
+                        "] += 1; ++profileCommitBlockExecs_; }\n";
+            }
+            return text;
+        }
+
+        constexpr std::string_view kCommitBlockEpilogue = "    }\n";
 
         bool addByteCount(uint64_t &total, uint64_t increment)
         {
@@ -1828,16 +2054,16 @@ namespace wolvrix::lib::grhsim::am
         }
 
         std::optional<uint64_t>
-        measureBlockCase(const ExecutableModel &model,
+        measureBlockBody(const ExecutableModel &model,
                          const EmitState &state,
                          std::size_t blockIndex,
+                         std::string_view indentation,
                          wolvrix::lib::diag::Diagnostics &diagnostics)
         {
-            uint64_t byteCount = static_cast<uint64_t>(
-                ("    case " + std::to_string(blockIndex) + ": {\n").size());
+            uint64_t byteCount = 0;
             beginLocalityBlock(state, static_cast<uint32_t>(blockIndex));
             const std::optional<uint64_t> declarationBytes =
-                indentedLineByteCount(localValueDeclarations(state), "        ");
+                indentedLineByteCount(localValueDeclarations(state), indentation);
             if (!declarationBytes || !addByteCount(byteCount, *declarationBytes))
             {
                 endLocalityBlock(state);
@@ -1863,7 +2089,7 @@ namespace wolvrix::lib::grhsim::am
                     return std::nullopt;
                 }
                 const std::optional<uint64_t> codeBytes =
-                    indentedLineByteCount(*code, "        ");
+                    indentedLineByteCount(*code, indentation);
                 if (!codeBytes || !addByteCount(byteCount, *codeBytes))
                 {
                     endLocalityBlock(state);
@@ -1874,12 +2100,99 @@ namespace wolvrix::lib::grhsim::am
                 }
             }
             endLocalityBlock(state);
-            constexpr std::string_view kBlockCaseEpilogue =
-                "        break;\n    }\n";
-            if (!addByteCount(byteCount, kBlockCaseEpilogue.size()))
+            return byteCount;
+        }
+
+        // Scan-form compute Block: a straight-line bit test inside its byte
+        // chunk. Empty Blocks (no instructions and no local declarations)
+        // emit no test at all; the chunk-level byte clear still consumes
+        // their activity bit.
+        std::optional<uint64_t>
+        measureScanBlockCase(const ExecutableModel &model,
+                             const EmitState &state,
+                             std::size_t blockIndex,
+                             wolvrix::lib::diag::Diagnostics &diagnostics)
+        {
+            // Planning-time relay context: forward targets in the same byte
+            // above the source bit (the writer recomputes the exact owned
+            // mask from the final part layout; splits only shave relays, so
+            // the byte error is negligible).
+            state.scanRelayByte = static_cast<int32_t>(blockIndex / 8U);
+            state.scanRelayMask =
+                static_cast<uint8_t>(0xfeU << (blockIndex % 8U));
+            const std::optional<uint64_t> bodyBytes =
+                measureBlockBody(model, state, blockIndex, "                ", diagnostics);
+            state.scanRelayByte = -1;
+            state.scanRelayMask = 0;
+            if (!bodyBytes)
+            {
+                return std::nullopt;
+            }
+            if (*bodyBytes == 0)
+            {
+                return static_cast<uint64_t>(0);
+            }
+            uint64_t byteCount = static_cast<uint64_t>(
+                scanBlockTestPrologue(blockIndex, state.runtimeProfile).size());
+            if (!addByteCount(byteCount, *bodyBytes) ||
+                !addByteCount(byteCount, kScanBlockTestEpilogue.size()))
             {
                 diagnostics.error("AM C++ emitter source size overflow: block=" +
                                       std::to_string(blockIndex),
+                                  std::string(kContext));
+                return std::nullopt;
+            }
+            return byteCount;
+        }
+
+        std::optional<uint64_t>
+        measureCommitBlockCase(const ExecutableModel &model,
+                               const EmitState &state,
+                               std::size_t blockIndex,
+                               wolvrix::lib::diag::Diagnostics &diagnostics)
+        {
+            const std::optional<uint64_t> bodyBytes =
+                measureBlockBody(model, state, blockIndex, "        ", diagnostics);
+            if (!bodyBytes)
+            {
+                return std::nullopt;
+            }
+            uint64_t byteCount = static_cast<uint64_t>(
+                commitBlockPrologue(blockIndex, state.runtimeProfile).size());
+            if (!addByteCount(byteCount, *bodyBytes) ||
+                !addByteCount(byteCount, kCommitBlockEpilogue.size()))
+            {
+                diagnostics.error("AM C++ emitter source size overflow: block=" +
+                                      std::to_string(blockIndex),
+                                  std::string(kContext));
+                return std::nullopt;
+            }
+            return byteCount;
+        }
+
+        std::optional<uint64_t>
+        measureEntryBlockCase(const ExecutableModel &model,
+                              const EmitState &state,
+                              wolvrix::lib::diag::Diagnostics &diagnostics)
+        {
+            const std::optional<uint64_t> bodyBytes =
+                measureBlockBody(model, state, 0, "    ", diagnostics);
+            if (!bodyBytes)
+            {
+                return std::nullopt;
+            }
+            uint64_t byteCount = 0;
+            if (state.runtimeProfile &&
+                !addByteCount(byteCount,
+                              static_cast<uint64_t>(entryBlockProfileLine().size())))
+            {
+                diagnostics.error("AM C++ emitter source size overflow: block=0",
+                                  std::string(kContext));
+                return std::nullopt;
+            }
+            if (!addByteCount(byteCount, *bodyBytes))
+            {
+                diagnostics.error("AM C++ emitter source size overflow: block=0",
                                   std::string(kContext));
                 return std::nullopt;
             }
@@ -1918,29 +2231,89 @@ namespace wolvrix::lib::grhsim::am
                 bool partHasBlock = false;
                 uint64_t partBytes = 0;
                 const auto resetPartBytes = [&]() {
-                    partBytes = static_cast<uint64_t>(
-                                    blockSourcePrologue(prefix,
-                                                        className,
-                                                        sourceIndex,
-                                                        partIndex)
-                                        .size()) +
-                                static_cast<uint64_t>(kBlockSourceEpilogue.size());
+                    // Fixed per-part overhead: the shared includes plus the
+                    // prologue/epilogue of every Block function form the part
+                    // may emit (unused forms are a small constant
+                    // overestimate).
+                    partBytes =
+                        static_cast<uint64_t>(blockSourceIncludes(prefix).size()) +
+                        static_cast<uint64_t>(
+                            entryBlockSourcePrologue(className).size()) +
+                        static_cast<uint64_t>(
+                            scanSourcePrologue(className, sourceIndex, partIndex)
+                                .size()) +
+                        static_cast<uint64_t>(
+                            commitSourcePrologue(className, sourceIndex, partIndex)
+                                .size()) +
+                        3U * static_cast<uint64_t>(
+                                 kBlockSourceFunctionEpilogue.size());
                 };
                 resetPartBytes();
+                std::size_t lastScanByte = std::numeric_limits<std::size_t>::max();
+                const auto scanChunkOverhead = [&](std::size_t blockIndex,
+                                                   uint64_t &pendingBytes) {
+                    // First scan Block of an activity byte in this part:
+                    // account for the byte-chunk prologue/epilogue. The owned
+                    // mask assumes the part keeps the rest of the byte; a
+                    // mid-byte split only shaves bits off the mask.
+                    const std::size_t scanByte = blockIndex / 8U;
+                    const std::size_t byteEnd =
+                        std::min(endBlock, scanByte * 8U + 8U);
+                    uint8_t ownedMask = 0;
+                    for (std::size_t block = blockIndex; block < byteEnd; ++block)
+                    {
+                        const bool commitBlock =
+                            model.commitBlockBegin != 0 &&
+                            block >= model.commitBlockBegin &&
+                            block < model.commitBlockEnd;
+                        if (!commitBlock)
+                        {
+                            ownedMask = static_cast<uint8_t>(
+                                ownedMask | (1U << (block % 8U)));
+                        }
+                    }
+                    return addByteCount(
+                        pendingBytes,
+                        static_cast<uint64_t>(
+                            scanByteChunkPrologue(scanByte, ownedMask).size()) +
+                            static_cast<uint64_t>(kScanByteChunkEpilogue.size()));
+                };
 
                 for (std::size_t blockIndex = firstBlock;
                      blockIndex < endBlock;
                      ++blockIndex)
                 {
+                    const bool isEntry = blockIndex == 0;
+                    const bool isCommit = model.commitBlockBegin != 0 &&
+                                          blockIndex >= model.commitBlockBegin &&
+                                          blockIndex < model.commitBlockEnd;
+                    const bool isScan = !isEntry && !isCommit;
                     const std::optional<uint64_t> blockBytes =
-                        measureBlockCase(model, state, blockIndex, diagnostics);
+                        isEntry
+                            ? measureEntryBlockCase(model, state, diagnostics)
+                            : isCommit
+                                  ? measureCommitBlockCase(
+                                        model, state, blockIndex, diagnostics)
+                                  : measureScanBlockCase(
+                                        model, state, blockIndex, diagnostics);
                     if (!blockBytes)
                     {
                         return std::nullopt;
                     }
+                    uint64_t pendingBytes = *blockBytes;
+                    const std::size_t scanByte = blockIndex / 8U;
+                    if (isScan && scanByte != lastScanByte &&
+                        !scanChunkOverhead(blockIndex, pendingBytes))
+                    {
+                        diagnostics.error(
+                            "AM C++ emitter source size overflow: block=" +
+                                std::to_string(blockIndex),
+                            std::string(kContext));
+                        return std::nullopt;
+                    }
                     const bool exceedsBudget =
                         partBytes > maxSourceBytes ||
-                        *blockBytes > maxSourceBytes - partBytes;
+                        pendingBytes > maxSourceBytes - partBytes;
                     if (partHasBlock && exceedsBudget)
                     {
                         plan[sourceIndex].push_back(BlockSourcePart{
@@ -1953,8 +2326,25 @@ namespace wolvrix::lib::grhsim::am
                         partFirstBlock = blockIndex;
                         partHasBlock = false;
                         resetPartBytes();
+                        lastScanByte = std::numeric_limits<std::size_t>::max();
+                        if (isScan)
+                        {
+                            pendingBytes = *blockBytes;
+                            if (!scanChunkOverhead(blockIndex, pendingBytes))
+                            {
+                                diagnostics.error(
+                                    "AM C++ emitter source size overflow: block=" +
+                                        std::to_string(blockIndex),
+                                    std::string(kContext));
+                                return std::nullopt;
+                            }
+                        }
                     }
-                    if (!addByteCount(partBytes, *blockBytes))
+                    if (isScan)
+                    {
+                        lastScanByte = scanByte;
+                    }
+                    if (!addByteCount(partBytes, pendingBytes))
                     {
                         diagnostics.error("AM C++ emitter source size overflow: block=" +
                                               std::to_string(blockIndex),
@@ -2415,9 +2805,11 @@ namespace wolvrix::lib::grhsim::am
         const std::size_t blockCount = model.program.blockCount();
 
         // ST00009: escape analysis for block-local value localization. A value keeps
-        // its values_[] slot unless it is a narrow scalar defined by exactly one
-        // instruction and only read later in the same block. Anything the runtime,
-        // the host, another block, or a previous round can observe escapes.
+        // its persistent storage (an independent v<VariableId> member, or a
+        // changedResults_[] slot for cross-block changed results) unless it is a
+        // narrow scalar defined by exactly one instruction and only read later in
+        // the same block. Anything the runtime, the host, another block, or a
+        // previous round can observe escapes.
         const std::size_t variableCount = program.variableCount();
         state.variableDefBlock.assign(variableCount, kInvalidLocalityBlock);
         state.variableDefPosition.assign(variableCount, 0);
@@ -2483,7 +2875,7 @@ namespace wolvrix::lib::grhsim::am
                         break;
                 }
                 // The emitter only assigns results.front(); keep any extra result
-                // conservatively in its values_[] slot.
+                // conservatively in persistent storage.
                 for (std::size_t extra = 1; extra < results.size(); ++extra)
                 {
                     state.variableEscapeFlags[results[extra].value] |= kEscapeGlobal;
@@ -2532,6 +2924,19 @@ namespace wolvrix::lib::grhsim::am
                 }
             }
         }
+        // Dense id space for the cross-block changed results: these are the
+        // only values written through a runtime index (set_changed_result and
+        // the round-end dirty-list clear), so they share one dense array and
+        // the dirty bitmap word count shrinks to their count.
+        state.changedResultDenseIndex.assign(variableCount, kInvalidChangedResultIndex);
+        state.changedResultCount = 0;
+        for (uint32_t index = 0; index < variableCount; ++index)
+        {
+            if (state.crossBlockChangedResults[index])
+            {
+                state.changedResultDenseIndex[index] = state.changedResultCount++;
+            }
+        }
         for (uint32_t index = 0; index < variableCount; ++index)
         {
             const Type &type = state.variableTypes[index];
@@ -2543,7 +2948,7 @@ namespace wolvrix::lib::grhsim::am
             const InitDescriptor &init = program.init(program.variable(VariableId{index}).init);
             if (init.kind == InitKind::Constant || init.kind == InitKind::Actions)
             {
-                // init() assigns values_[] slots by index.
+                // init() assigns persistent storage slots by index.
                 state.variableEscapeFlags[index] |= kEscapeGlobal;
             }
         }
@@ -2590,7 +2995,7 @@ namespace wolvrix::lib::grhsim::am
             blockCount / *blocksPerSource + (blockCount % *blocksPerSource == 0 ? 0 : 1);
         const std::size_t activityWordCount = (blockCount + 63U) / 64U;
         const std::size_t dirtyChangedWordCount =
-            (static_cast<std::size_t>(program.variableCount()) + 63U) / 64U;
+            (static_cast<std::size_t>(state.changedResultCount) + 63U) / 64U;
 
         const std::string prefix = "grhsim_" + options.modelName;
         const std::string className = "GrhSIM_" + options.modelName;
@@ -2614,7 +3019,7 @@ namespace wolvrix::lib::grhsim::am
         }
         std::ostringstream header;
         header << "#pragma once\n"
-               << "#include <array>\n#include <chrono>\n#include <cstddef>\n#include <cstdint>\n#include <string>\n#include <vector>\n\n"
+               << "#include <array>\n#include <chrono>\n#include <cstddef>\n#include <cstdint>\n#include <cstring>\n#include <string>\n#include <vector>\n\n"
                << "#define WOLVRIX_GRHSIM_PERF 0\n\n"
                << "class " << className << " {\npublic:\n"
                << "    " << className << "();\n"
@@ -2646,20 +3051,50 @@ namespace wolvrix::lib::grhsim::am
             header << "    " << cppPortType(type) << " " << program.string(port.name)
                    << "{};\n";
         }
-        header << "\nprivate:\n"
-               << "    void execute_block(std::size_t block);\n";
+        header << "\nprivate:\n";
         for (const std::vector<BlockSourcePart> &sourceParts : *blockSourcePlan)
         {
             for (const BlockSourcePart &part : sourceParts)
             {
-                header << "    void "
-                       << blockSourceFunctionName(part.sourceIndex, part.partIndex)
-                       << "(std::size_t block);\n";
+                if (part.firstBlock == 0)
+                {
+                    header << "    void execute_block_0();\n";
+                }
+                const auto [scanLo, scanHi] =
+                    computeBlockRange(part.firstBlock,
+                                      part.endBlock,
+                                      blockCount,
+                                      model.commitBlockBegin);
+                if (scanLo < scanHi)
+                {
+                    header << "    void "
+                           << scanSourceFunctionName(part.sourceIndex,
+                                                     part.partIndex)
+                           << "();\n";
+                }
+                const auto [commitLo, commitHi] =
+                    commitBlockRange(part.firstBlock,
+                                     part.endBlock,
+                                     model.commitBlockBegin,
+                                     model.commitBlockEnd);
+                if (commitLo < commitHi)
+                {
+                    header << "    void "
+                           << commitSourceFunctionName(part.sourceIndex,
+                                                       part.partIndex)
+                           << "();\n";
+                }
             }
         }
-        header << "    [[nodiscard]] static bool is_commit_block(std::size_t block);\n"
+        header << "    // Byte view of the packed activity words for the static compute scan, which\n"
+                  "    // consumes activity in 8-Block bytes (the legacy/GSIM batch granularity).\n"
+                  "    // Relies on little-endian byte order (the generated models target x86_64 hosts).\n"
+                  "    [[nodiscard]] std::uint8_t &active_byte_ref(std::size_t byte) {\n"
+                  "        return reinterpret_cast<std::uint8_t *>(activeWords_.data())[byte];\n"
+                  "    }\n"
+               << "    [[nodiscard]] static bool is_commit_block(std::size_t block);\n"
                << "    void set_changed_result(std::size_t variable, bool event) {\n"
-               << "        values_[variable] = event ? 1 : 0;\n"
+               << "        changedResults_[variable] = event ? 1 : 0;\n"
                << "        if (event) mark_changed_result(variable);\n"
                << "    }\n"
                << "    void mark_changed_result(std::size_t variable);\n"
@@ -2717,9 +3152,49 @@ namespace wolvrix::lib::grhsim::am
                << "    static constexpr std::size_t kComputeBlockEnd = kCommitBlockBegin != 0 ? kCommitBlockBegin : kBlockCount;\n"
                << "    static constexpr std::size_t kActivityWordCount = " << activityWordCount
                << ";\n"
+               << "    static constexpr std::size_t kChangedResultCount = "
+               << state.changedResultCount << ";\n"
                << "    static constexpr std::size_t kDirtyChangedWordCount = "
-               << dirtyChangedWordCount << ";\n"
-               << "    std::array<std::uint64_t, " << program.variableCount() << "> values_{};\n"
+               << dirtyChangedWordCount << ";\n";
+        // Persistent narrow values (BitVector <= 64 bits) become independent
+        // members so the compiler lays out and register-allocates each value
+        // on its own instead of indexing one big shared array (the GSIM
+        // form). Block-local values (ST00009) stay C++ locals inside their
+        // defining block; cross-block changed results stay in the dense
+        // changedResults_ array because they are written through a runtime
+        // index (set_changed_result and the dirty-list clear). Members are
+        // Members are declared in ascending VariableId order without
+        // initializers: clang miscompiles the implicit default constructor
+        // once a class carries tens of thousands of {}-initialized members
+        // (only a small prefix is actually initialized), so init() zeroes
+        // the contiguous member region with a single memset instead. The
+        // declaration burst is built in memory to keep emission fast on
+        // multi-million-value models.
+        {
+            std::ostringstream memberDeclarations;
+            for (uint32_t index = 0; index < variableCount; ++index)
+            {
+                const Type &type = state.variableTypes[index];
+                if (type.kind != TypeKind::BitVector || type.bitWidth > 64 ||
+                    state.crossBlockChangedResults[index])
+                {
+                    continue;
+                }
+                if (state.variableEscapeFlags[index] == 0 &&
+                    state.variableDefBlock[index] != kInvalidLocalityBlock)
+                {
+                    continue;
+                }
+                if (state.memberValueCount == 0)
+                {
+                    state.firstMemberVariable = index;
+                }
+                ++state.memberValueCount;
+                memberDeclarations << "    std::uint64_t v" << index << ";\n";
+            }
+            header << memberDeclarations.str();
+        }
+        header << "    std::array<std::uint64_t, kChangedResultCount> changedResults_{};\n"
                << "    std::array<std::uint64_t, " << state.wideWords << "> wideValues_{};\n"
                << "    std::array<std::uint64_t, " << state.realValues << "> realValues_{};\n"
                << "    std::array<std::string, " << state.stringValues << "> stringValues_{};\n"
@@ -3508,7 +3983,16 @@ namespace
                << "    if (width == 0 || index >= (baseWidth + width - 1) / width) return 0;\n"
                << "    return slice_value(value, index * width, width);\n}\n\n"
                << "void " << className
-               << "::init() {\n    values_.fill(0); wideValues_.fill(0); realValues_.fill(0);\n"
+               << "::init() {\n";
+        // Zero the contiguous v<K> member region with one memset (members
+        // are declared without initializers; see the header emission note).
+        if (state.memberValueCount != 0)
+        {
+            runtime << "    std::memset(&v" << state.firstMemberVariable
+                    << ", 0, sizeof(v" << state.firstMemberVariable << ") * "
+                    << state.memberValueCount << "U);\n";
+        }
+        runtime << "    changedResults_.fill(0); wideValues_.fill(0); realValues_.fill(0);\n"
                << "    for (std::string &value : stringValues_) value.clear();\n"
                << "    activeWords_.fill(0); backwardFired_ = false;\n"
                << "    dirtyChangedBits_.fill(0); dirtyChangedResults_.clear(); onceCompleted_.fill(false);\n"
@@ -3544,8 +4028,8 @@ namespace
                 {
                     value = "split_mix64(" + randomState + ")";
                 }
-                runtime << "    values_[" << variable.value << "] = (" << value << ") & "
-                        << maskExpr(type.bitWidth) << ";\n";
+                runtime << "    " << valueExpr(state, variable) << " = (" << value
+                        << ") & " << maskExpr(type.bitWidth) << ";\n";
             }
             else if (type.kind == TypeKind::BitVector)
             {
@@ -3737,51 +4221,11 @@ namespace
                         ? "    if (runtimeProfileEnabled_) profileChangedClears_ += dirtyChangedResults_.size();\n"
                         : "")
                 << "    for (const std::uint32_t variable : dirtyChangedResults_) {\n"
-                << "        values_[variable] = 0;\n"
+                << "        changedResults_[variable] = 0;\n"
                 << "        dirtyChangedBits_[variable / 64U] &= ~(UINT64_C(1) << (variable % 64U));\n"
                 << "    }\n"
                 << "    dirtyChangedResults_.clear();\n"
-                << "}\n\nvoid " << className << "::execute_block(std::size_t block) {\n"
-                << "    if (block >= kBlockCount) throw std::runtime_error(\"invalid AM BlockId\");\n"
-                << (state.runtimeProfile
-                        ? "    if (runtimeProfileEnabled_) {\n"
-                          "        profilePerBlockExecs_[block] += 1;\n"
-                          "        if (is_commit_block(block)) ++profileCommitBlockExecs_; else ++profileBlockExecs_;\n"
-                          "    }\n"
-                        : "")
-                << "    switch (block / " << *blocksPerSource << "U) {\n";
-        for (std::size_t sourceIndex = 0;
-             sourceIndex < blockSourcePlan->size();
-             ++sourceIndex)
-        {
-            const std::vector<BlockSourcePart> &sourceParts =
-                (*blockSourcePlan)[sourceIndex];
-            if (sourceParts.size() == 1)
-            {
-                runtime << "    case " << sourceIndex << ": "
-                        << blockSourceFunctionName(sourceIndex, 0)
-                        << "(block); return;\n";
-                continue;
-            }
-            runtime << "    case " << sourceIndex << ":\n";
-            for (std::size_t partIndex = 0;
-                 partIndex + 1U < sourceParts.size();
-                 ++partIndex)
-            {
-                const BlockSourcePart &part = sourceParts[partIndex];
-                runtime << "        if (block < " << part.endBlock << "U) { "
-                        << blockSourceFunctionName(sourceIndex, part.partIndex)
-                        << "(block); return; }\n";
-            }
-            const BlockSourcePart &lastPart = sourceParts.back();
-            runtime << "        "
-                    << blockSourceFunctionName(sourceIndex, lastPart.partIndex)
-                    << "(block); return;\n";
-        }
-        runtime << "    default: throw std::runtime_error(\"invalid AM BlockId\");\n"
-                << "    }\n"
-                << "}\n\n"
-                << "void " << className << "::finalize() {\n"
+                << "}\n\nvoid " << className << "::finalize() {\n"
                 << "    if (finalized_) return;\n"
                 << "    finalized_ = true;\n";
         for (InstructionId instruction : state.finalSystemTasks)
@@ -3816,8 +4260,8 @@ namespace
             const Type &type = variableType(state, port.input);
             if (type.bitWidth <= 64)
             {
-                runtime << "    values_[" << port.input.value
-                        << "] = static_cast<std::uint64_t>(" << program.string(port.name)
+                runtime << "    " << valueExpr(state, port.input)
+                        << " = static_cast<std::uint64_t>(" << program.string(port.name)
                         << ") & " << maskExpr(type.bitWidth) << ";\n";
             }
             else
@@ -3839,7 +4283,7 @@ namespace
                 << "    clear_changed_results();\n"
                 << "    pendingHostEvents_.fill(false);\n"
                 << "    roundCounter_ = 0;\n"
-                << "    execute_block(0);\n"
+                << "    execute_block_0();\n"
                 << "    if (initial) {\n"
                 << "        for (std::size_t block = 1; block < kComputeBlockEnd; ++block) {\n"
                 << "            activeWords_[block / 64U] |= UINT64_C(1) << (block % 64U);\n"
@@ -3849,26 +4293,55 @@ namespace
                 << "        backwardFired_ = false;\n"
                 << (state.runtimeProfile
                         ? "        const auto profileComputeStart = runtimeProfileEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};\n"
-                        : "")
-                // Compute phase: ascending scan of the active bitmap, clearing
-                // each bit as its Block executes.
-                << "        for (std::size_t word = 0; word < kActivityWordCount; ++word) {\n"
-                << "            while (activeWords_[word] != 0) {\n"
-                << "                const std::size_t bit = static_cast<std::size_t>(std::countr_zero(activeWords_[word]));\n"
-                << "                activeWords_[word] &= ~(UINT64_C(1) << bit);\n"
-                << "                const std::size_t block = word * 64U + bit;\n"
-                << "                if (block >= 1U && block < kComputeBlockEnd) execute_block(block);\n"
-                << "            }\n"
-                << "        }\n"
-                << (state.runtimeProfile
+                        : "");
+        // Compute phase: one static call per source part covering compute
+        // Blocks, in ascending (source, part) order; each part consumes its
+        // activity byte chunks with straight-line ascending bit tests.
+        for (const std::vector<BlockSourcePart> &sourceParts : *blockSourcePlan)
+        {
+            for (const BlockSourcePart &part : sourceParts)
+            {
+                const auto [scanLo, scanHi] =
+                    computeBlockRange(part.firstBlock,
+                                      part.endBlock,
+                                      blockCount,
+                                      model.commitBlockBegin);
+                if (scanLo >= scanHi)
+                {
+                    continue;
+                }
+                runtime << "        "
+                        << scanSourceFunctionName(part.sourceIndex, part.partIndex)
+                        << "();\n";
+            }
+        }
+        runtime << (state.runtimeProfile
                         ? "        if (runtimeProfileEnabled_) profileComputeNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profileComputeStart).count());\n"
                         : "")
                 << (state.runtimeProfile
                         ? "        const auto profileCommitStart = runtimeProfileEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};\n"
-                        : "")
-                // Commit phase: commit Blocks always execute in ascending order.
-                << "        for (std::size_t block = kCommitBlockBegin; block < kCommitBlockEnd; ++block) execute_block(block);\n"
-                << (state.runtimeProfile
+                        : "");
+        // Commit phase: one static call per source part covering commit
+        // Blocks, in ascending (source, part) order; commit Blocks always run.
+        for (const std::vector<BlockSourcePart> &sourceParts : *blockSourcePlan)
+        {
+            for (const BlockSourcePart &part : sourceParts)
+            {
+                const auto [commitLo, commitHi] =
+                    commitBlockRange(part.firstBlock,
+                                     part.endBlock,
+                                     model.commitBlockBegin,
+                                     model.commitBlockEnd);
+                if (commitLo >= commitHi)
+                {
+                    continue;
+                }
+                runtime << "        "
+                        << commitSourceFunctionName(part.sourceIndex, part.partIndex)
+                        << "();\n";
+            }
+        }
+        runtime << (state.runtimeProfile
                         ? "        if (runtimeProfileEnabled_) profileCommitNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profileCommitStart).count());\n"
                         : "")
                 << "        clear_changed_results();\n"
@@ -3893,8 +4366,8 @@ namespace
             if (type.bitWidth <= 64)
             {
                 runtime << "    " << program.string(port.name) << " = static_cast<"
-                        << cppScalarType(type.bitWidth) << ">(values_["
-                        << port.output.value << "]);\n";
+                        << cppScalarType(type.bitWidth) << ">("
+                        << valueExpr(state, port.output) << ");\n";
             }
             else
             {
@@ -3976,7 +4449,12 @@ namespace
         }
 
         std::ostringstream makefile;
-        makefile << "CXX ?= clang++\n"
+        // The GNU make built-in default CXX=g++ counts as defined for `?=`
+        // but cannot consume the clang-style PCH flags below; only honor an
+        // explicit environment/command-line compiler, otherwise pin clang++.
+        makefile << "ifeq ($(origin CXX),default)\n"
+                 << "CXX := clang++\n"
+                 << "endif\n"
                  << "AR ?= ar\n"
                  << "ARFLAGS ?= rcs\n"
                  << "CXXFLAGS ?= -std=c++20 -O3\n"
@@ -3986,13 +4464,20 @@ namespace
         {
             makefile << " " << sourceName;
         }
+        // Precompile the model header (which carries one member declaration
+        // per persistent narrow value) once per build, mirroring the legacy
+        // GSIM emitter Makefile; the support header stays a textual include.
         makefile << "\n"
-                 << "OBJS := $(SRCS:.cpp=.o)\n\n"
+                 << "OBJS := $(SRCS:.cpp=.o)\n"
+                 << "PCH_HEADER := " << prefix << ".hpp\n"
+                 << "PCH_FILE := $(PCH_HEADER).pch\n\n"
                  << "all: $(LIB)\n\n"
                  << "$(LIB): $(OBJS)\n\t$(AR) $(ARFLAGS) $@ $^\n\n"
-                 << "%.o: %.cpp " << prefix << ".hpp " << prefix << "_support.hpp\n"
-                 << "\t$(CXX) $(CXXFLAGS) -I. -c $< -o $@\n\n"
-                 << "clean:\n\trm -f $(OBJS) $(LIB)\n";
+                 << "$(PCH_FILE): $(PCH_HEADER)\n"
+                 << "\t$(CXX) $(CXXFLAGS) -I. -x c++-header $< -o $@\n\n"
+                 << "%.o: %.cpp $(PCH_FILE) " << prefix << "_support.hpp\n"
+                 << "\t$(CXX) $(CXXFLAGS) -I. -include-pch $(PCH_FILE) -c $< -o $@\n\n"
+                 << "clean:\n\trm -f $(OBJS) $(LIB) $(PCH_FILE)\n";
 
         try
         {
@@ -4078,17 +4563,12 @@ namespace
                     break;
                 }
 
-                blockSource << blockSourcePrologue(prefix,
-                                                   className,
-                                                   part.sourceIndex,
-                                                   part.partIndex);
-                for (std::size_t blockIndex = part.firstBlock;
-                     blockIndex < part.endBlock;
-                     ++blockIndex)
-                {
-                    blockSource << "    case " << blockIndex << ": {\n";
+                const auto writeBlockBody = [&](std::size_t blockIndex,
+                                                std::string_view indentation) {
                     beginLocalityBlock(state, static_cast<uint32_t>(blockIndex));
-                    writeIndentedLines(blockSource, localValueDeclarations(state), "        ");
+                    writeIndentedLines(blockSource,
+                                       localValueDeclarations(state),
+                                       indentation);
                     const BlockId block{static_cast<uint32_t>(blockIndex)};
                     for (std::size_t index = 0;
                          index < model.program.blockSize(block);
@@ -4101,26 +4581,123 @@ namespace
                             emitInstruction(state, instruction, error);
                         if (!code)
                         {
+                            endLocalityBlock(state);
                             diagnostics.error(error + ": instruction=" +
                                                   std::to_string(instruction.value),
                                               std::string(kContext));
-                            blocksGenerated = false;
-                            break;
+                            return false;
                         }
-                        writeIndentedLines(blockSource, *code, "        ");
+                        writeIndentedLines(blockSource, *code, indentation);
                     }
                     endLocalityBlock(state);
+                    return true;
+                };
+                // A scan Block with no instructions and no local declarations
+                // emits no bit test; the byte-chunk clear still consumes its
+                // activity bit.
+                const auto scanBlockIsEmpty = [&](std::size_t blockIndex) {
+                    beginLocalityBlock(state, static_cast<uint32_t>(blockIndex));
+                    const bool empty =
+                        localValueDeclarations(state).empty() &&
+                        model.program.blockSize(
+                            BlockId{static_cast<uint32_t>(blockIndex)}) == 0;
+                    endLocalityBlock(state);
+                    return empty;
+                };
+
+                blockSource << blockSourceIncludes(prefix);
+                if (part.firstBlock == 0)
+                {
+                    blockSource << entryBlockSourcePrologue(className);
+                    if (state.runtimeProfile)
+                    {
+                        blockSource << entryBlockProfileLine();
+                    }
+                    if (!writeBlockBody(0, "    "))
+                    {
+                        blocksGenerated = false;
+                        break;
+                    }
+                    blockSource << kBlockSourceFunctionEpilogue;
+                }
+                const auto [scanLo, scanHi] =
+                    computeBlockRange(part.firstBlock,
+                                      part.endBlock,
+                                      blockCount,
+                                      model.commitBlockBegin);
+                if (scanLo < scanHi)
+                {
+                    blockSource << scanSourcePrologue(className,
+                                                      part.sourceIndex,
+                                                      part.partIndex);
+                    for (const ScanByteChunk &chunk :
+                         scanByteChunks(scanLo, scanHi))
+                    {
+                        blockSource << scanByteChunkPrologue(chunk.byteIndex,
+                                                             chunk.ownedMask);
+                        state.scanRelayByte =
+                            static_cast<int32_t>(chunk.byteIndex);
+                        state.scanRelayMask = chunk.ownedMask;
+                        for (std::size_t blockIndex = chunk.firstBlock;
+                             blockIndex < chunk.endBlock;
+                             ++blockIndex)
+                        {
+                            if (scanBlockIsEmpty(blockIndex))
+                            {
+                                continue;
+                            }
+                            blockSource << scanBlockTestPrologue(
+                                blockIndex, state.runtimeProfile);
+                            if (!writeBlockBody(blockIndex, "                "))
+                            {
+                                blocksGenerated = false;
+                                break;
+                            }
+                            blockSource << kScanBlockTestEpilogue;
+                        }
+                        state.scanRelayByte = -1;
+                        state.scanRelayMask = 0;
+                        if (!blocksGenerated)
+                        {
+                            break;
+                        }
+                        blockSource << kScanByteChunkEpilogue;
+                    }
                     if (!blocksGenerated)
                     {
                         break;
                     }
-                    blockSource << "        break;\n    }\n";
+                    blockSource << kBlockSourceFunctionEpilogue;
                 }
-                if (!blocksGenerated)
+                const auto [commitLo, commitHi] =
+                    commitBlockRange(part.firstBlock,
+                                     part.endBlock,
+                                     model.commitBlockBegin,
+                                     model.commitBlockEnd);
+                if (commitLo < commitHi)
                 {
-                    break;
+                    blockSource << commitSourcePrologue(className,
+                                                        part.sourceIndex,
+                                                        part.partIndex);
+                    for (std::size_t blockIndex = commitLo;
+                         blockIndex < commitHi;
+                         ++blockIndex)
+                    {
+                        blockSource << commitBlockPrologue(blockIndex,
+                                                           state.runtimeProfile);
+                        if (!writeBlockBody(blockIndex, "        "))
+                        {
+                            blocksGenerated = false;
+                            break;
+                        }
+                        blockSource << kCommitBlockEpilogue;
+                    }
+                    if (!blocksGenerated)
+                    {
+                        break;
+                    }
+                    blockSource << kBlockSourceFunctionEpilogue;
                 }
-                blockSource << kBlockSourceEpilogue;
                 if (!finishWrittenFile(blockSource,
                                        blockPath,
                                        options.maxOutputFileBytes,
