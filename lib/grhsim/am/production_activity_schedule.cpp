@@ -6,8 +6,12 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <map>
@@ -297,6 +301,404 @@ namespace wolvrix::lib::grhsim::am
             return traits.stateTargetOperand < operands.size()
                        ? std::optional<VariableId>(operands[traits.stateTargetOperand])
                        : std::nullopt;
+        }
+
+        // Research export switch (topo-partition-proj harness): when
+        // WOLVRIX_GRHSIM_AM_INSTRUCTION_GRAPH_JSONL names a path, schedule()
+        // dumps the pre-scheduling instruction graph (def-use + ordered-effect
+        // edges plus the comb-loop SCC packing) as JSONL before block
+        // formation, reusing the exact graph/SCC built above.
+        constexpr char kInstructionGraphExportEnv[] =
+            "WOLVRIX_GRHSIM_AM_INSTRUCTION_GRAPH_JSONL";
+        constexpr std::string_view kInstructionGraphFormat =
+            "wolvrix.am-instruction-graph.v1";
+
+        uint64_t exportedVariableWidth(ProgramView program, VariableId variable)
+        {
+            const Type &type = program.type(program.variable(variable).type);
+            switch (type.kind) {
+            case TypeKind::BitVector:
+                return type.bitWidth;
+            case TypeKind::Array:
+                return static_cast<uint64_t>(type.bitWidth) * type.elementCount;
+            case TypeKind::Real:
+                return 64;
+            case TypeKind::String:
+                break;
+            }
+            return 0;
+        }
+
+        // Instruction-graph JSONL runs to tens of millions of lines on
+        // XiangShan, so lines are assembled in a large scratch buffer and
+        // flushed in chunks instead of per-line iostream traffic.
+        class JsonlGraphWriter
+        {
+        public:
+            explicit JsonlGraphWriter(std::ostream &output) : output_(output)
+            {
+                buffer_.reserve(kFlushThreshold * 2);
+            }
+
+            JsonlGraphWriter &raw(std::string_view text)
+            {
+                buffer_.append(text);
+                return *this;
+            }
+
+            JsonlGraphWriter &number(uint64_t value)
+            {
+                std::array<char, 20> digits{};
+                const auto [end, error] =
+                    std::to_chars(digits.data(), digits.data() + digits.size(), value);
+                buffer_.append(digits.data(), end);
+                return *this;
+            }
+
+            JsonlGraphWriter &boolean(bool value)
+            {
+                return raw(value ? std::string_view("true") : std::string_view("false"));
+            }
+
+            void endLine()
+            {
+                buffer_.push_back('\n');
+                if (buffer_.size() >= kFlushThreshold) {
+                    flush();
+                }
+            }
+
+            bool flush()
+            {
+                output_.write(buffer_.data(), static_cast<std::streamsize>(buffer_.size()));
+                buffer_.clear();
+                return output_.good();
+            }
+
+        private:
+            static constexpr std::size_t kFlushThreshold = std::size_t{1} << 20;
+            std::ostream &output_;
+            std::string buffer_;
+        };
+
+        // Iterates unique (variable, using instruction) reads: one def-use
+        // edge per (defining instruction, using instruction) pair, plus
+        // source-less reads of variables with no defining instruction (state
+        // targets, interface inputs). Uses are instruction-ordered, so
+        // duplicate reads of one variable by one instruction are adjacent.
+        template <typename Callback>
+        void forEachExportedValueRead(const DefUseIndex &defUse, Callback &&callback)
+        {
+            for (uint32_t variable = 0; variable < defUse.definitions.size(); ++variable) {
+                const uint32_t definition = defUse.definitions[variable];
+                uint32_t previousTarget = kInvalidIndex;
+                for (uint32_t offset = defUse.useOffsets[variable];
+                     offset < defUse.useOffsets[variable + 1]; ++offset) {
+                    const uint32_t target = defUse.uses[offset];
+                    if (target == previousTarget) {
+                        continue;
+                    }
+                    previousTarget = target;
+                    if (definition == kInvalidIndex) {
+                        callback(variable, kInvalidIndex, target);
+                    } else if (definition != target) {
+                        callback(variable, definition, target);
+                    }
+                }
+            }
+        }
+
+        bool exportInstructionGraphJsonl(ProgramView program, const DefUseIndex &defUse,
+                                         std::span<const OrderEdge> orderedEdges,
+                                         const SccResult &scc,
+                                         const std::filesystem::path &path,
+                                         wolvrix::lib::diag::Diagnostics &diagnostics)
+        {
+            const uint32_t instructionCount =
+                static_cast<uint32_t>(program.instructionCount());
+            std::vector<uint32_t> atomSizes(scc.count, 0);
+            for (uint32_t index = 0; index < instructionCount; ++index) {
+                ++atomSizes[scc.component[index]];
+            }
+            uint32_t combLoopAtomCount = 0;
+            for (const uint32_t size : atomSizes) {
+                combLoopAtomCount += size > 1 ? 1U : 0U;
+            }
+
+            uint64_t defUseEdgeCount = 0;
+            uint64_t externalReadCount = 0;
+            forEachExportedValueRead(defUse, [&](uint32_t, uint32_t source, uint32_t) {
+                if (source == kInvalidIndex) {
+                    ++externalReadCount;
+                } else {
+                    ++defUseEdgeCount;
+                }
+            });
+            uint64_t orderEdgeCount = 0;
+            for (const OrderEdge &edge : orderedEdges) {
+                orderEdgeCount += edge.source != edge.target ? 1U : 0U;
+            }
+
+            if (path.has_parent_path()) {
+                std::error_code error;
+                std::filesystem::create_directories(path.parent_path(), error);
+                if (error) {
+                    diagnostics.error("failed to create AM instruction graph export directory: " +
+                                          path.parent_path().string(),
+                                      std::string(kDiagnosticContext));
+                    return false;
+                }
+            }
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            if (!output) {
+                diagnostics.error("failed to open AM instruction graph export path: " +
+                                      path.string(),
+                                  std::string(kDiagnosticContext));
+                return false;
+            }
+
+            JsonlGraphWriter writer(output);
+            writer.raw("{\"record\":\"header\",\"format\":\"")
+                .raw(kInstructionGraphFormat)
+                .raw("\",\"instructions\":")
+                .number(instructionCount)
+                .raw(",\"variables\":")
+                .number(static_cast<uint64_t>(program.variableCount()))
+                .raw(",\"atoms\":")
+                .number(scc.count)
+                .raw(",\"comb_loop_atoms\":")
+                .number(combLoopAtomCount)
+                .raw(",\"def_use_edges\":")
+                .number(defUseEdgeCount)
+                .raw(",\"external_reads\":")
+                .number(externalReadCount)
+                .raw(",\"order_edges\":")
+                .number(orderEdgeCount)
+                .raw("}");
+            writer.endLine();
+
+            for (uint32_t index = 0; index < instructionCount; ++index) {
+                const InstructionId instruction{index};
+                uint64_t width = 0;
+                for (const VariableId result : program.results(instruction)) {
+                    width += exportedVariableWidth(program, result);
+                }
+                const uint32_t atom = scc.component[index];
+                writer.raw("{\"record\":\"node\",\"id\":")
+                    .number(index)
+                    .raw(",\"op\":")
+                    .number(static_cast<uint8_t>(program.opcode(instruction)))
+                    .raw(",\"opcode\":\"")
+                    .raw(toString(program.opcode(instruction)))
+                    .raw("\",\"width\":")
+                    .number(width)
+                    .raw(",\"state_write\":")
+                    .boolean(stateWriteTarget(program, instruction).has_value())
+                    .raw(",\"atom\":")
+                    .number(atom)
+                    .raw(",\"comb_loop_atom\":")
+                    .boolean(atomSizes[atom] > 1)
+                    .raw("}");
+                writer.endLine();
+            }
+
+            forEachExportedValueRead(
+                defUse, [&](uint32_t variable, uint32_t source, uint32_t target) {
+                    const uint64_t width =
+                        exportedVariableWidth(program, VariableId{variable});
+                    if (source == kInvalidIndex) {
+                        writer.raw("{\"record\":\"edge\",\"kind\":\"external_read\",\"dst\":")
+                            .number(target)
+                            .raw(",\"var\":")
+                            .number(variable)
+                            .raw(",\"width\":")
+                            .number(width)
+                            .raw("}");
+                    } else {
+                        writer.raw("{\"record\":\"edge\",\"kind\":\"def_use\",\"src\":")
+                            .number(source)
+                            .raw(",\"dst\":")
+                            .number(target)
+                            .raw(",\"var\":")
+                            .number(variable)
+                            .raw(",\"width\":")
+                            .number(width)
+                            .raw("}");
+                    }
+                    writer.endLine();
+                });
+
+            for (const OrderEdge &edge : orderedEdges) {
+                if (edge.source == edge.target) {
+                    continue;
+                }
+                writer.raw("{\"record\":\"edge\",\"kind\":\"order\",\"src\":")
+                    .number(edge.source)
+                    .raw(",\"dst\":")
+                    .number(edge.target)
+                    .raw("}");
+                writer.endLine();
+            }
+
+            if (!writer.flush()) {
+                diagnostics.error("failed while writing AM instruction graph export: " +
+                                      path.string(),
+                                  std::string(kDiagnosticContext));
+                return false;
+            }
+            diagnostics.info("exported AM instruction graph: path=" + path.string() +
+                                 " instructions=" + std::to_string(instructionCount) +
+                                 " def_use_edges=" + std::to_string(defUseEdgeCount) +
+                                 " external_reads=" + std::to_string(externalReadCount) +
+                                 " order_edges=" + std::to_string(orderEdgeCount) +
+                                 " comb_loop_atoms=" + std::to_string(combLoopAtomCount),
+                             std::string(kDiagnosticContext));
+            return true;
+        }
+
+        // Second research export (topo-partition-proj harness): the production
+        // block assignment itself (the plain baseline) plus the structural
+        // scoreboard numbers recomputed from production internals, so the
+        // offline scorer can be reconciled against them.
+        constexpr char kBlockAssignmentExportEnv[] =
+            "WOLVRIX_GRHSIM_AM_BLOCK_ASSIGNMENT_JSONL";
+        constexpr std::string_view kBlockAssignmentFormat =
+            "wolvrix.am-block-assignment.v1";
+
+        bool exportBlockAssignmentJsonl(ProgramView program, const DefUseIndex &defUse,
+                                        std::span<const uint32_t> instructionBlock,
+                                        uint32_t normalBlockCount, uint32_t computeBlockCount,
+                                        uint32_t commitBlockBegin, uint32_t commitBlockEnd,
+                                        uint32_t inputSinkBlock,
+                                        std::span<const uint32_t> blockInstructionCounts,
+                                        const std::filesystem::path &path,
+                                        wolvrix::lib::diag::Diagnostics &diagnostics)
+        {
+            const uint32_t instructionCount =
+                static_cast<uint32_t>(program.instructionCount());
+            const auto isCommitBlock = [&](uint32_t block) {
+                return commitBlockBegin != 0 && block >= commitBlockBegin;
+            };
+
+            // Scoreboard, mirroring the segment DP's incoming-activation cost:
+            // per variable, each distinct consuming compute block whose block
+            // does not define the variable contributes one (value, block) pair
+            // and ceil(width/64) copies. State targets and interface inputs
+            // have no defining instruction and count as permanent boundaries.
+            // dag_edges dedups (producer block, consumer block) over def-use
+            // reads across all block kinds.
+            uint64_t computeComputeValuePairs = 0;
+            uint64_t incomingCopyCost = 0;
+            std::vector<uint64_t> dagPairs;
+            std::vector<uint32_t> pairMark(normalBlockCount + 1, 0);
+            for (uint32_t variable = 0; variable < defUse.definitions.size(); ++variable) {
+                const uint32_t definition = defUse.definitions[variable];
+                const uint32_t sourceBlock =
+                    definition == kInvalidIndex ? kInvalidIndex : instructionBlock[definition];
+                const uint32_t stamp = variable + 1;
+                const uint64_t copyCost = std::max<uint64_t>(
+                    1, (exportedVariableWidth(program, VariableId{variable}) + 63) / 64);
+                for (uint32_t offset = defUse.useOffsets[variable];
+                     offset < defUse.useOffsets[variable + 1]; ++offset) {
+                    const uint32_t targetBlock = instructionBlock[defUse.uses[offset]];
+                    if (pairMark[targetBlock] == stamp) {
+                        continue;
+                    }
+                    pairMark[targetBlock] = stamp;
+                    if (sourceBlock != kInvalidIndex) {
+                        if (targetBlock == sourceBlock) {
+                            continue;
+                        }
+                        dagPairs.push_back((static_cast<uint64_t>(sourceBlock) << 32) |
+                                           targetBlock);
+                    }
+                    if (!isCommitBlock(targetBlock)) {
+                        ++computeComputeValuePairs;
+                        incomingCopyCost += copyCost;
+                    }
+                }
+            }
+            std::sort(dagPairs.begin(), dagPairs.end());
+            const uint64_t dagEdges = static_cast<uint64_t>(
+                std::unique(dagPairs.begin(), dagPairs.end()) - dagPairs.begin());
+
+            if (path.has_parent_path()) {
+                std::error_code error;
+                std::filesystem::create_directories(path.parent_path(), error);
+                if (error) {
+                    diagnostics.error("failed to create AM block assignment export directory: " +
+                                          path.parent_path().string(),
+                                      std::string(kDiagnosticContext));
+                    return false;
+                }
+            }
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            if (!output) {
+                diagnostics.error("failed to open AM block assignment export path: " +
+                                      path.string(),
+                                  std::string(kDiagnosticContext));
+                return false;
+            }
+
+            JsonlGraphWriter writer(output);
+            writer.raw("{\"record\":\"header\",\"format\":\"")
+                .raw(kBlockAssignmentFormat)
+                .raw("\",\"instructions\":")
+                .number(instructionCount)
+                .raw(",\"variables\":")
+                .number(static_cast<uint64_t>(program.variableCount()))
+                .raw(",\"blocks\":")
+                .number(normalBlockCount)
+                .raw(",\"compute_blocks\":")
+                .number(computeBlockCount)
+                .raw(",\"commit_blocks\":")
+                .number(commitBlockBegin == 0 ? 0 : commitBlockEnd - commitBlockBegin)
+                .raw(",\"input_sink_block\":")
+                .number(inputSinkBlock)
+                .raw(",\"dag_edges\":")
+                .number(dagEdges)
+                .raw(",\"compute_compute_value_pairs\":")
+                .number(computeComputeValuePairs)
+                .raw(",\"incoming_copy_cost\":")
+                .number(incomingCopyCost)
+                .raw("}");
+            writer.endLine();
+
+            for (uint32_t block = 1; block <= normalBlockCount; ++block) {
+                writer.raw("{\"record\":\"block\",\"id\":")
+                    .number(block)
+                    .raw(",\"kind\":\"")
+                    .raw(isCommitBlock(block) ? std::string_view("commit")
+                                              : std::string_view("compute"))
+                    .raw("\",\"size\":")
+                    .number(blockInstructionCounts[block])
+                    .raw("}");
+                writer.endLine();
+            }
+
+            for (uint32_t instruction = 0; instruction < instructionCount; ++instruction) {
+                writer.raw("{\"record\":\"assign\",\"instr\":")
+                    .number(instruction)
+                    .raw(",\"block\":")
+                    .number(instructionBlock[instruction])
+                    .raw("}");
+                writer.endLine();
+            }
+
+            if (!writer.flush()) {
+                diagnostics.error("failed while writing AM block assignment export: " +
+                                      path.string(),
+                                  std::string(kDiagnosticContext));
+                return false;
+            }
+            diagnostics.info("exported AM block assignment: path=" + path.string() +
+                                 " blocks=" + std::to_string(normalBlockCount) +
+                                 " dag_edges=" + std::to_string(dagEdges) +
+                                 " compute_compute_value_pairs=" +
+                                 std::to_string(computeComputeValuePairs) +
+                                 " incoming_copy_cost=" + std::to_string(incomingCopyCost),
+                             std::string(kDiagnosticContext));
+            return true;
         }
 
         using CommitEventPart = std::pair<uint8_t, uint32_t>;
@@ -761,6 +1163,16 @@ namespace wolvrix::lib::grhsim::am
             instructionAtom[index] = scc.component[index];
         }
 
+        if (const char *exportPath = std::getenv(kInstructionGraphExportEnv)) {
+            if (exportPath[0] == '\0' ||
+                !exportInstructionGraphJsonl(program, defUse, orderedEdges, scc,
+                                             std::filesystem::path(exportPath), diagnostics)) {
+                diagnostics.error("AM instruction graph export failed",
+                                  std::string(kDiagnosticContext));
+                return std::nullopt;
+            }
+        }
+
         std::vector<uint32_t> atomMemberOffsets(atomCount + 1, 0);
         for (uint32_t atom : instructionAtom) {
             ++atomMemberOffsets[atom + 1];
@@ -1051,6 +1463,18 @@ namespace wolvrix::lib::grhsim::am
         const auto isCommitBlock = [&](uint32_t block) {
             return commitBlockBegin != 0 && block >= commitBlockBegin;
         };
+
+        if (const char *exportPath = std::getenv(kBlockAssignmentExportEnv)) {
+            if (exportPath[0] == '\0' ||
+                !exportBlockAssignmentJsonl(program, defUse, instructionBlock, normalBlockCount,
+                                            computeBlockCount, commitBlockBegin, commitBlockEnd,
+                                            inputSinkBlock, semanticBlockCounts,
+                                            std::filesystem::path(exportPath), diagnostics)) {
+                diagnostics.error("AM block assignment export failed",
+                                  std::string(kDiagnosticContext));
+                return std::nullopt;
+            }
+        }
 
         std::vector<ActivationEdge> activationEdges;
         activationEdges.reserve(defUse.uses.size() + externalInputs.size());

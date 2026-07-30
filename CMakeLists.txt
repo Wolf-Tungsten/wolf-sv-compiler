@@ -499,6 +499,11 @@ target_link_libraries(grhsim-am-production-schedule
         wolvrix-lib
 )
 
+target_compile_definitions(grhsim-am-production-schedule
+    PRIVATE
+        WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+)
+
 register_test_exe(grhsim-am-production-schedule)
 
 add_executable(grhsim-am-lowering

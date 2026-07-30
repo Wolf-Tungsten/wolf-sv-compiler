@@ -4,8 +4,12 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <utility>
@@ -2243,6 +2247,319 @@ namespace
         }
         return 0;
     }
+
+    bool lineMatches(const std::string &line, const std::string &prefix,
+                     const std::string &suffix)
+    {
+        return line.size() >= prefix.size() + suffix.size() &&
+               line.compare(0, prefix.size(), prefix) == 0 &&
+               line.compare(line.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
+
+    int testInstructionGraphExportWritesJsonl()
+    {
+        namespace fs = std::filesystem;
+        const fs::path exportDir =
+            fs::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) / "instruction-graph-export";
+        std::error_code fsError;
+        fs::create_directories(exportDir, fsError);
+        const fs::path exportPath = exportDir / "graph.jsonl";
+
+        LinearProgramBuilder builder;
+        const TypeId valueType = builder.addType(Type::bitVector(8));
+        const TypeId eventType = builder.addType(Type::bitVector(1));
+        const StringId firstName = builder.addString("first_host_read");
+        const StringId secondName = builder.addString("second_host_read");
+        const VariableId input = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId valueA = builder.addVariable(valueType, builder.undefInit());
+        const VariableId valueB = builder.addVariable(valueType, builder.undefInit());
+        const VariableId loopLhs = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId loopRhs = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId firstResult = builder.addVariable(valueType, builder.undefInit());
+        const VariableId secondResult = builder.addVariable(valueType, builder.undefInit());
+        const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
+        const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId data = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId state = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId event = builder.addVariable(eventType, builder.zeroInit());
+
+        const std::array<VariableId, 1> readResults = {valueA};
+        const std::array<VariableId, 1> readOperands = {input};
+        const InstructionId readInput =
+            builder.addInstruction(Opcode::Assign, readResults, readOperands);
+        const std::array<VariableId, 1> passResults = {valueB};
+        const std::array<VariableId, 1> passOperands = {valueA};
+        const InstructionId passA =
+            builder.addInstruction(Opcode::Assign, passResults, passOperands);
+        const std::array<VariableId, 1> lhsResults = {loopLhs};
+        const std::array<VariableId, 1> lhsOperands = {loopRhs};
+        const InstructionId loopForward =
+            builder.addInstruction(Opcode::Assign, lhsResults, lhsOperands);
+        const std::array<VariableId, 1> rhsResults = {loopRhs};
+        const std::array<VariableId, 1> rhsOperands = {loopLhs};
+        const InstructionId loopBackward =
+            builder.addInstruction(Opcode::Assign, rhsResults, rhsOperands);
+        const std::array<VariableId, 1> firstResults = {firstResult};
+        const InstructionId firstHostRead =
+            builder.addInstruction(Opcode::SystemFunction, firstResults, {});
+        builder.setSystemFunctionAttributes(firstHostRead,
+                                            SystemFunctionAttributes{
+                                                .name = firstName,
+                                                .schedule = CallSchedule::Normal,
+                                                .hasSideEffects = false,
+                                            });
+        const std::array<VariableId, 1> secondResults = {secondResult};
+        const InstructionId secondHostRead =
+            builder.addInstruction(Opcode::SystemFunction, secondResults, {});
+        builder.setSystemFunctionAttributes(secondHostRead,
+                                            SystemFunctionAttributes{
+                                                .name = secondName,
+                                                .schedule = CallSchedule::Normal,
+                                                .hasSideEffects = false,
+                                            });
+        const std::array<VariableId, 5> writeOperands = {condition, mask, data, state, event};
+        const InstructionId writer =
+            builder.addInstruction(Opcode::RegisterWrite, {}, writeOperands);
+
+        SchedulingFacts facts;
+        facts.variableRoles.assign(12, VariableRole::None);
+        facts.variableRoles[state.value] = VariableRole::State;
+        facts.instructionEffects = {
+            InstructionEffect::Pure,     InstructionEffect::Pure,
+            InstructionEffect::Pure,     InstructionEffect::Pure,
+            InstructionEffect::HostRead, InstructionEffect::HostRead,
+            InstructionEffect::StateReadWrite,
+        };
+        facts.orderedEffects = {
+            OrderedEffect{.instruction = firstHostRead, .group = 5, .ordinal = 0},
+            OrderedEffect{.instruction = secondHostRead, .group = 5, .ordinal = 1},
+        };
+        LinearProgramArtifact linear{
+            .program = builder.finish(),
+            .schedulingFacts = std::move(facts),
+        };
+
+        setenv("WOLVRIX_GRHSIM_AM_INSTRUCTION_GRAPH_JSONL", exportPath.string().c_str(), 1);
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        std::optional<ExecutableModel> model =
+            schedule(std::move(linear),
+                     ActivityScheduleOptions{
+                         .maxInstructionsPerBlock = 8,
+                         .enableCoarsening = false,
+                     },
+                     diagnostics);
+        unsetenv("WOLVRIX_GRHSIM_AM_INSTRUCTION_GRAPH_JSONL");
+        if (!model || diagnostics.hasError()) {
+            return fail("instruction graph export run was not scheduled cleanly");
+        }
+
+        std::ifstream in(exportPath);
+        if (!in) {
+            return fail("instruction graph export did not create the JSONL file");
+        }
+        std::vector<std::string> lines;
+        for (std::string line; std::getline(in, line);) {
+            lines.push_back(line);
+        }
+        // 1 header + 7 nodes + 3 def-use edges + 5 external reads + 1 order edge.
+        if (lines.size() != 17) {
+            return fail("instruction graph export wrote an unexpected line count: " +
+                        std::to_string(lines.size()));
+        }
+        const std::string expectedHeader =
+            "{\"record\":\"header\",\"format\":\"wolvrix.am-instruction-graph.v1\","
+            "\"instructions\":7,\"variables\":12,\"atoms\":6,\"comb_loop_atoms\":1,"
+            "\"def_use_edges\":3,\"external_reads\":5,\"order_edges\":1}";
+        if (lines.front() != expectedHeader) {
+            return fail("instruction graph export header mismatch: " + lines.front());
+        }
+
+        const auto nodeLineOk = [&](uint32_t id, Opcode opcode, uint64_t width,
+                                    bool stateWrite, bool combLoop) {
+            const std::string prefix =
+                "{\"record\":\"node\",\"id\":" + std::to_string(id) +
+                ",\"op\":" + std::to_string(static_cast<uint8_t>(opcode)) + ",\"opcode\":\"" +
+                std::string(toString(opcode)) + "\",\"width\":" + std::to_string(width) +
+                ",\"state_write\":" + (stateWrite ? "true" : "false") + ",\"atom\":";
+            const std::string suffix = std::string(",\"comb_loop_atom\":") +
+                                       (combLoop ? "true" : "false") + "}";
+            return lineMatches(lines[1 + id], prefix, suffix);
+        };
+        if (!nodeLineOk(readInput.value, Opcode::Assign, 8, false, false) ||
+            !nodeLineOk(passA.value, Opcode::Assign, 8, false, false) ||
+            !nodeLineOk(loopForward.value, Opcode::Assign, 8, false, true) ||
+            !nodeLineOk(loopBackward.value, Opcode::Assign, 8, false, true) ||
+            !nodeLineOk(firstHostRead.value, Opcode::SystemFunction, 8, false, false) ||
+            !nodeLineOk(secondHostRead.value, Opcode::SystemFunction, 8, false, false) ||
+            !nodeLineOk(writer.value, Opcode::RegisterWrite, 0, true, false)) {
+            return fail("instruction graph export node records are incomplete");
+        }
+
+        const auto defUseEdge = [&](VariableId variable, InstructionId source,
+                                    InstructionId target, uint64_t width) {
+            return std::string("{\"record\":\"edge\",\"kind\":\"def_use\",\"src\":") +
+                   std::to_string(source.value) + ",\"dst\":" + std::to_string(target.value) +
+                   ",\"var\":" + std::to_string(variable.value) +
+                   ",\"width\":" + std::to_string(width) + "}";
+        };
+        const auto externalRead = [&](VariableId variable, InstructionId target,
+                                      uint64_t width) {
+            return std::string("{\"record\":\"edge\",\"kind\":\"external_read\",\"dst\":") +
+                   std::to_string(target.value) + ",\"var\":" +
+                   std::to_string(variable.value) + ",\"width\":" + std::to_string(width) + "}";
+        };
+        const std::set<std::string> edgeLines(lines.begin() + 8, lines.end());
+        const std::string orderEdge = std::string("{\"record\":\"edge\",\"kind\":\"order\",\"src\":") +
+                                      std::to_string(firstHostRead.value) +
+                                      ",\"dst\":" + std::to_string(secondHostRead.value) + "}";
+        if (edgeLines.count(defUseEdge(valueA, readInput, passA, 8)) != 1 ||
+            edgeLines.count(defUseEdge(loopLhs, loopForward, loopBackward, 8)) != 1 ||
+            edgeLines.count(defUseEdge(loopRhs, loopBackward, loopForward, 8)) != 1 ||
+            edgeLines.count(externalRead(input, readInput, 8)) != 1 ||
+            edgeLines.count(externalRead(condition, writer, 1)) != 1 ||
+            edgeLines.count(externalRead(mask, writer, 8)) != 1 ||
+            edgeLines.count(externalRead(data, writer, 8)) != 1 ||
+            edgeLines.count(externalRead(event, writer, 1)) != 1 ||
+            edgeLines.count(orderEdge) != 1) {
+            return fail("instruction graph export edge records are incomplete");
+        }
+        return 0;
+    }
+
+    int testInstructionGraphExportFailureIsReported()
+    {
+        namespace fs = std::filesystem;
+        const fs::path exportDir =
+            fs::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) / "instruction-graph-export";
+        std::error_code fsError;
+        fs::create_directories(exportDir, fsError);
+        const fs::path blocker = exportDir / "blocker";
+        {
+            std::ofstream out(blocker);
+            out << "not a directory\n";
+        }
+        const fs::path badPath = blocker / "graph.jsonl";
+
+        setenv("WOLVRIX_GRHSIM_AM_INSTRUCTION_GRAPH_JSONL", badPath.string().c_str(), 1);
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        std::optional<ExecutableModel> model =
+            schedule(makePureCycle(),
+                     ActivityScheduleOptions{
+                         .maxInstructionsPerBlock = 8,
+                         .enableCoarsening = false,
+                     },
+                     diagnostics);
+        unsetenv("WOLVRIX_GRHSIM_AM_INSTRUCTION_GRAPH_JSONL");
+        if (model || !diagnostics.hasError()) {
+            return fail("instruction graph export failure was not surfaced as an error");
+        }
+        return 0;
+    }
+
+    int testBlockAssignmentExportWritesJsonl()
+    {
+        namespace fs = std::filesystem;
+        const fs::path exportDir =
+            fs::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) / "instruction-graph-export";
+        std::error_code fsError;
+        fs::create_directories(exportDir, fsError);
+        const fs::path exportPath = exportDir / "block_assignment.jsonl";
+
+        LinearProgramBuilder builder;
+        const TypeId valueType = builder.addType(Type::bitVector(8));
+        const TypeId eventType = builder.addType(Type::bitVector(1));
+        const VariableId input = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId valueA = builder.addVariable(valueType, builder.undefInit());
+        const VariableId valueB = builder.addVariable(valueType, builder.undefInit());
+        const VariableId loopLhs = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId loopRhs = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
+        const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId state = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId event = builder.addVariable(eventType, builder.zeroInit());
+
+        const std::array<VariableId, 1> readResults = {valueA};
+        const std::array<VariableId, 1> readOperands = {input};
+        builder.addInstruction(Opcode::Assign, readResults, readOperands);
+        const std::array<VariableId, 1> passResults = {valueB};
+        const std::array<VariableId, 1> passOperands = {valueA};
+        builder.addInstruction(Opcode::Assign, passResults, passOperands);
+        const std::array<VariableId, 1> lhsResults = {loopLhs};
+        const std::array<VariableId, 1> lhsOperands = {loopRhs};
+        builder.addInstruction(Opcode::Assign, lhsResults, lhsOperands);
+        const std::array<VariableId, 1> rhsResults = {loopRhs};
+        const std::array<VariableId, 1> rhsOperands = {loopLhs};
+        builder.addInstruction(Opcode::Assign, rhsResults, rhsOperands);
+        const std::array<VariableId, 5> writeOperands = {condition, mask, valueB, state, event};
+        builder.addInstruction(Opcode::RegisterWrite, {}, writeOperands);
+
+        SchedulingFacts facts;
+        facts.variableRoles.assign(9, VariableRole::None);
+        facts.variableRoles[state.value] = VariableRole::State;
+        facts.instructionEffects = {
+            InstructionEffect::Pure, InstructionEffect::Pure,
+            InstructionEffect::Pure, InstructionEffect::Pure,
+            InstructionEffect::StateReadWrite,
+        };
+        LinearProgramArtifact linear{
+            .program = builder.finish(),
+            .schedulingFacts = std::move(facts),
+        };
+
+        setenv("WOLVRIX_GRHSIM_AM_BLOCK_ASSIGNMENT_JSONL", exportPath.string().c_str(), 1);
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        std::optional<ExecutableModel> model =
+            schedule(std::move(linear),
+                     ActivityScheduleOptions{
+                         .maxInstructionsPerBlock = 8,
+                         .enableCoarsening = false,
+                     },
+                     diagnostics);
+        unsetenv("WOLVRIX_GRHSIM_AM_BLOCK_ASSIGNMENT_JSONL");
+        if (!model || diagnostics.hasError()) {
+            return fail("block assignment export run was not scheduled cleanly");
+        }
+
+        std::ifstream in(exportPath);
+        if (!in) {
+            return fail("block assignment export did not create the JSONL file");
+        }
+        std::vector<std::string> lines;
+        for (std::string line; std::getline(in, line);) {
+            lines.push_back(line);
+        }
+        // 1 header + 2 block records + 5 assign records.
+        if (lines.size() != 8) {
+            return fail("block assignment export wrote an unexpected line count: " +
+                        std::to_string(lines.size()));
+        }
+        // One compute block (instructions 0-3, cap 8) and one commit block
+        // (the register write). The only cross-block value is valueB flowing
+        // compute->commit; the only permanent-boundary compute read is input.
+        const std::string expectedHeader =
+            "{\"record\":\"header\",\"format\":\"wolvrix.am-block-assignment.v1\","
+            "\"instructions\":5,\"variables\":9,\"blocks\":2,\"compute_blocks\":1,"
+            "\"commit_blocks\":1,\"input_sink_block\":0,\"dag_edges\":1,"
+            "\"compute_compute_value_pairs\":1,\"incoming_copy_cost\":1}";
+        if (lines.front() != expectedHeader) {
+            return fail("block assignment export header mismatch: " + lines.front());
+        }
+        if (lines[1] != "{\"record\":\"block\",\"id\":1,\"kind\":\"compute\",\"size\":4}" ||
+            lines[2] != "{\"record\":\"block\",\"id\":2,\"kind\":\"commit\",\"size\":1}") {
+            return fail("block assignment export block records mismatch");
+        }
+        for (uint32_t instruction = 0; instruction < 5; ++instruction) {
+            const std::string expected =
+                std::string("{\"record\":\"assign\",\"instr\":") +
+                std::to_string(instruction) +
+                ",\"block\":" + (instruction < 4 ? "1" : "2") + "}";
+            if (lines[3 + instruction] != expected) {
+                return fail("block assignment export assign record mismatch: " +
+                            lines[3 + instruction]);
+            }
+        }
+        return 0;
+    }
 } // namespace
 
 int main()
@@ -2320,6 +2637,15 @@ int main()
         return result;
     }
     if (const int result = testOversizedIndivisibleAtomFormsOneBlock(); result != 0) {
+        return result;
+    }
+    if (const int result = testInstructionGraphExportWritesJsonl(); result != 0) {
+        return result;
+    }
+    if (const int result = testInstructionGraphExportFailureIsReported(); result != 0) {
+        return result;
+    }
+    if (const int result = testBlockAssignmentExportWritesJsonl(); result != 0) {
         return result;
     }
     return 0;

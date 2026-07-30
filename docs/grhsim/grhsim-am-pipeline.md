@@ -567,6 +567,73 @@ CoreMark/NEMU 严格在前一档通过后才启动下一档：
 instruction/cycle 计数与旧功能基线完全一致；但 host time 为 4,178,703 ms，约为
 355,000 ms 旧性能目标的 11.77 倍，因而本轮关闭的是功能 gate，不是性能 gate。
 
+### 3.2.4 指令图研究导出（JSONL，2026-07-30）
+
+`ProductionActivityScheduleStage::schedule` 支持把**调度前**的指令图导出为 JSONL，
+供 topo-partition-proj 的离线分区研究（harness/打分/搜索/训练）使用。设置环境变量即触发，
+不影响正常调度流程；导出失败（路径不可写等）会使调度报错退出，不会静默跳过：
+
+```bash
+WOLVRIX_GRHSIM_AM_INSTRUCTION_GRAPH_JSONL=/path/to/graph.jsonl \
+    grhsim-am-lower-json design.json SimTop --schedule
+```
+
+导出点位于 def-use 索引、ordered effect 边和 SCC 都建好之后、block 形成之前，因此导出
+内容就是调度器自己看到的那张图（环收缩直接复用生产 SCC 结果）。格式为
+`wolvrix.am-instruction-graph.v1`，每行一条 JSON 记录：
+
+- 首行 header：`{"record":"header","format":...,"instructions":N,"variables":M,"atoms":A,`
+  `"comb_loop_atoms":C,"def_use_edges":E1,"external_reads":E2,"order_edges":E3}`；
+- 节点：`{"record":"node","id":I,"op":<Opcode 数值>,"opcode":"<名称>","width":W,`
+  `"state_write":B,"atom":A,"comb_loop_atom":B}`。`width` 为该指令全部 result 的位宽之和
+  （Array 类型按 元素位宽×深度 计，Real 计 64）；`state_write` 等价于"属于 commit 类指令"
+  （RegisterWrite/MemoryWrite/MemoryFill/LatchWrite）；`atom` 为 SCC 分量编号，
+  `comb_loop_atom` 表示所属 SCC 含 ≥2 条指令（纯组合环打包，真实设计上恒为 false）；
+- 数据依赖边：`{"record":"edge","kind":"def_use","src":S,"dst":D,"var":V,"width":W}`，
+  按 (src, dst, var) 去重；`width` 为变量位宽，可直接折算 `ceil(W/64)` 拷贝数；
+- 外部读：`{"record":"edge","kind":"external_read","dst":D,"var":V,"width":W}`，表示
+  无定义指令的变量（state target、接口输入等）被指令 D 读取——生产段 DP 把这类变量当作
+  永久边界计入 incoming 成本，打分器需要它们对齐口径；state target 操作数本身按依赖
+  规则不算 use，不会出现在这里；
+- 顺序约束边：`{"record":"edge","kind":"order","src":S,"dst":D}`，来自 ordered effect
+  组链与隐式 host 序链，不带位宽。
+
+注意 use 不去除 commit 指令内的读（段 DP 口径会跳过 commit 内 use），需要与生产 DP
+完全同口径时由消费方按 `state_write` 标志自行过滤。全香山（466 万指令）导出约
+10.4M 条 def_use 边，文件为 GB 级，消费方应按行流式读取。
+
+同一 schedule 运行还支持导出**生产 block assignment（plain 基线解）**，供 harness
+对账（scorer 重算 vs 生产统计）。设置环境变量即触发，与指令图导出相互独立、可同次
+运行同时开启：
+
+```bash
+WOLVRIX_GRHSIM_AM_BLOCK_ASSIGNMENT_JSONL=/path/to/block_assignment.jsonl \
+    grhsim-am-lower-json design.json SimTop --schedule
+```
+
+格式为 `wolvrix.am-block-assignment.v1`，每行一条记录：
+
+- 首行 header：指令/变量数、`blocks`（normal block 数，不含 entry block 0）、
+  `compute_blocks`、`commit_blocks`、`input_sink_block`（无则为 0），以及生产侧
+  算出的三个对账指标（见下）；
+- block 记录：`{"record":"block","id":B,"kind":"compute|commit","size":S}`，
+  覆盖 1..blocks（input sink 为 size 0 的 compute 块）；entry block 0 不含线性
+  指令，不出现在记录中；
+- assign 记录：`{"record":"assign","instr":I,"block":B}`，指令 id 与指令图导出
+  的节点 id 一致。
+
+header 中的三个对账指标在生产内部按如下口径计算（harness  scorer 应独立复算到
+相同数值；`exp/tools/reconcile_baseline.py` 即为参考实现）：
+
+- `dag_edges`：def_use 边跨 block 时按 (producer block, consumer block) 去重的
+  块间依赖边数（order 边不计入）；
+- `compute_compute_value_pairs`：按 (value, 消费它的 compute block) 去重的跨块
+  传值对数；value 不在该 block 定义才计入，state target / 接口输入等无定义变量
+  是永久边界、对每个消费 compute 块都计一次，commit 块内的读不计——与段 DP 的
+  incoming activation 成本同口径；
+- `incoming_copy_cost`：上述每个对按 `max(1, ceil(width/64))` 折算的拷贝总数，
+  即 topo-partition-proj 04 文档第一阶段优化目标。
+
 ### 3.3 临时 scheduling facts
 
 以下内容只属于 scheduler workspace，不进入 ScheduledProgram 或 session 的长期公共契约：
