@@ -1054,6 +1054,9 @@ namespace
     {
         ExecutableModel model;
         VariableId input;
+        VariableId inputOld;
+        VariableId backwardState;
+        VariableId backwardStateOld;
         VariableId forwardOutput;
         VariableId backwardOutput;
         VariableId inputChanged;
@@ -1229,6 +1232,9 @@ namespace
                 .commitBlockEnd = kCommitBlock + 1,
             },
             .input = input,
+            .inputOld = inputOld,
+            .backwardState = backwardState,
+            .backwardStateOld = backwardStateOld,
             .forwardOutput = forwardOutput,
             .backwardOutput = backwardOutput,
             .inputChanged = inputChanged,
@@ -1404,6 +1410,9 @@ namespace
         // dense runtime-indexed array. In this fixture forwardChanged is the
         // sole cross-block changed result (dense id 0), so the dirty bitmap
         // shrinks to one word and v<forwardChanged> has no member declaration.
+        // ST00010: the same-block detector events (inputChanged in B0,
+        // backwardChanged in the commit Block) fold into block-local detector
+        // group flags, so their event members disappear as well.
         const std::string forwardChangedMember =
             "std::uint64_t v" + std::to_string(fixture.forwardChanged.value) + ";";
         if (headerText->find(
@@ -1419,7 +1428,10 @@ namespace
                              std::to_string(fixture.input.value) + ";") ==
                 std::string::npos ||
             headerText->find("std::uint64_t v" +
-                             std::to_string(fixture.inputChanged.value) + ";") ==
+                             std::to_string(fixture.inputChanged.value) + ";") !=
+                std::string::npos ||
+            headerText->find("std::uint64_t v" +
+                             std::to_string(fixture.backwardChanged.value) + ";") !=
                 std::string::npos ||
             headerText->find(forwardChangedMember) != std::string::npos ||
             headerText->find("values_[") != std::string::npos ||
@@ -1526,6 +1538,28 @@ namespace
                 std::string::npos)
         {
             return fail("generated activity runtime did not use constant-mask activation writes");
+        }
+        // ST00010 detector-group folding: the B0 input detector and the commit
+        // Block's state detector accumulate branchlessly into a block-local
+        // detGrp_0 flag (updating their private old baselines as before) and
+        // merge once; the folded event variables keep no member and no
+        // assignment. The commit merge still raises backwardFired_.
+        const std::string entryAccumulate =
+            "bool detGrp_0 = (v" + std::to_string(fixture.input.value) + " != v" +
+            std::to_string(fixture.inputOld.value) + ");";
+        const std::string commitAccumulate =
+            "bool detGrp_0 = (v" + std::to_string(fixture.backwardState.value) +
+            " != v" + std::to_string(fixture.backwardStateOld.value) + ");";
+        if (generatedSourceText.find(entryAccumulate) == std::string::npos ||
+            generatedSourceText.find(commitAccumulate) == std::string::npos ||
+            generatedSourceText.find("if (detGrp_0) {") == std::string::npos ||
+            generatedSourceText.find("profileActivateForward_ += 2;") ==
+                std::string::npos ||
+            generatedSourceText.find("v" + std::to_string(fixture.inputOld.value) +
+                                     " = v" + std::to_string(fixture.input.value) +
+                                     ";") == std::string::npos)
+        {
+            return fail("generated activity runtime did not fold detector groups");
         }
         // Per-Block profile counters move into the dispatch form: scan Blocks
         // count at the top of their bit-test branch, the commit Block counts

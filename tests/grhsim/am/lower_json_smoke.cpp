@@ -108,7 +108,8 @@ int main(int argc, char **argv)
     {
         std::cerr << "usage: grhsim-am-lower-json <design.json> [top] [--schedule] "
                      "[--emit <output-directory>] [--blocks-per-source <count>] "
-                     "[--max-source-bytes <count>] [--max-instructions-per-block <count>] "
+                     "[--max-source-bytes <count>] [--max-commit-source-bytes <count>] "
+                     "[--max-instructions-per-block <count>] "
                      "[--dp-segment-penalty <value>] "
                      "[--dp-coarsen-budget <count>] [--runtime-profile]\n";
         return 2;
@@ -119,6 +120,7 @@ int main(int argc, char **argv)
     std::filesystem::path emitDirectory;
     std::optional<std::string> blocksPerSource;
     std::optional<std::string> maxSourceBytes;
+    std::optional<std::string> maxCommitSourceBytes;
     std::size_t maxInstructionsPerBlock = 128;
     double dpSegmentPenalty = 1.0;
     std::size_t dpCoarsenBudget = 0;
@@ -160,6 +162,19 @@ int main(int argc, char **argv)
                 return 2;
             }
             maxSourceBytes = std::to_string(value);
+        }
+        else if (argument == "--max-commit-source-bytes" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            uint64_t value = 0;
+            const auto [end, error] =
+                std::from_chars(text.data(), text.data() + text.size(), value);
+            if (error != std::errc{} || end != text.data() + text.size() || value == 0)
+            {
+                std::cerr << "invalid --max-commit-source-bytes value: " << text << '\n';
+                return 2;
+            }
+            maxCommitSourceBytes = std::to_string(value);
         }
         else if (argument == "--max-instructions-per-block" && index + 1 < argc)
         {
@@ -345,6 +360,11 @@ int main(int argc, char **argv)
                 if (maxSourceBytes)
                 {
                     emitOptions.attributes.emplace("maxSourceBytes", *maxSourceBytes);
+                }
+                if (maxCommitSourceBytes)
+                {
+                    emitOptions.attributes.emplace("maxCommitSourceBytes",
+                                                   *maxCommitSourceBytes);
                 }
                 if (runtimeProfile)
                 {

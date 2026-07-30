@@ -89,6 +89,21 @@ normalized GRH
 > 反超；成员存储在 20k 再贡献 −1.4~1.8%。剩余差距方向：commit operand capture、
 > detector 密度、commit 段每轮无条件全扫（分析文档 §6/§7.5）。
 >
+> 实现进展（2026-07-29，ST00010 detector 分组折叠）：分析文档 §6 的 P2' 方向
+> 落地为 emitter 侧 peephole（IR/scheduler/validator 不动）。对每 Block 尾部的
+> (changed.*, act.f/act.b) watch-group run，按激活目标签名（方向 + 排序 target
+> 集合）在发射期重新分组：组内 detector 的比较无分支地累加进块局部标志
+> `detGrp_N`（old 基线仍逐 detector 私有、原位置更新），每组一次合并写掩码；
+> 纯同 byte relay 的 forward 组进一步退化为无分支形式
+> `byteFlags |= -detGrp & mask`（legacy deferred-group 惯用法）。被折叠 event
+> 变量不再有成员（XS 规模下约省 2M × 8B 静态状态）。折叠条件：窄标量、非跨块
+> changed result、event 全部 use 都是同 run 的 act、操作数不定义在 run 内。
+> Gate 状态：ctest AM 8/8、全量 54/57（3 个既有无关失败）；xs-components
+> 053/044/100 各 20,000 向量与 legacy bit-exact。折叠覆盖：053 案 1,594/1,636
+> detector 折为 308 组（58 组无分支 relay）、044 案 1,793/1,843 折为 327 组。
+> XS difftest 2k/20k 与 host time 对照（b192 基线 81,760 / 905,050 ms）进行中，
+> 结果补记于 `pdocs/grh_notepad`。
+>
 > 历史记录（2026-07-25，对应上述重构前的旧模型）：production scheduler 已删除
 > `Isolated` class，commit write 曾采用 consume-on-event（该机制已删除），wide-result
 > shift 已在执行前按 result 宽度扩展 lhs。

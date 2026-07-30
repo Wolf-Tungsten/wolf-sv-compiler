@@ -215,6 +215,43 @@ namespace wolvrix::lib::grhsim::am
             // relay (entry/commit Blocks and any non-scan emission context).
             mutable int32_t scanRelayByte = -1;
             mutable uint8_t scanRelayMask = 0;
+            // ST00010 detector-group folding: block-tail runs of
+            // scheduler-materialized (changed.*, act.f/act.b) watch groups are
+            // re-grouped at emit time by activation target signature. All
+            // detectors of one group accumulate branchlessly into a block-local
+            // flag (detGrp_N) and the group merges once, replacing one branch +
+            // one activation write per detector with one per group. Folded
+            // event variables are never assigned, so they are dropped from the
+            // v<K> member declarations. The equivalence argument: activity bits
+            // are idempotent and order-free, so "any event of the group fired"
+            // activates exactly the same targets as the per-detector branches;
+            // each detector still owns and updates its private old baseline.
+            struct DetectorGroupPlan
+            {
+                struct Group
+                {
+                    bool forward = true;
+                    // Union of the member act target lists (identical by
+                    // construction: the group key is the sorted target set).
+                    std::vector<BlockId> targets;
+                    // Sum of member act target counts; preserves the per-act
+                    // profile counter semantics under one merged merge.
+                    uint64_t originalTargetCount = 0;
+                };
+                std::vector<Group> groups;
+                // All maps are keyed by block instruction position.
+                // Folded changed instruction -> group ids it accumulates into
+                // (one per consumed act direction, so 1 or 2 entries).
+                std::unordered_map<uint32_t, std::vector<uint32_t>> accumGroups;
+                // Member acts replaced by their group's merge.
+                std::unordered_set<uint32_t> skippedActs;
+                // Position after which each group's merge is emitted.
+                std::unordered_map<uint32_t, std::vector<uint32_t>> mergesAfter;
+            };
+            std::vector<std::optional<DetectorGroupPlan>> blockDetectorPlans;
+            std::vector<uint8_t> foldedDetectorEvents;
+            uint64_t detectorFoldedCount = 0;
+            uint64_t detectorGroupCount = 0;
         };
 
         constexpr uint8_t kEscapeGlobal = 1U << 0U;
@@ -317,6 +354,105 @@ namespace wolvrix::lib::grhsim::am
                        ", ";
             }
             return valueExpr(state, variable) + " = (";
+        }
+
+        bool isDetectorChangedOpcode(Opcode opcode)
+        {
+            return opcode == Opcode::ChangedAny || opcode == Opcode::ChangedPos ||
+                   opcode == Opcode::ChangedNeg;
+        }
+
+        // Boolean change expression for a narrow scalar (BitVector <= 64 bits)
+        // changed.* instruction; kept in lockstep with the scalar ChangedAny/
+        // ChangedPos/ChangedNeg case in emitInstruction.
+        std::string narrowChangedEventExpr(const EmitState &state, Opcode opcode,
+                                           VariableId watched, VariableId old)
+        {
+            if (opcode == Opcode::ChangedAny)
+            {
+                return valueExpr(state, watched) + " != " + valueExpr(state, old);
+            }
+            if (opcode == Opcode::ChangedPos)
+            {
+                return "(" + valueExpr(state, old) + " == 0 && " +
+                       valueExpr(state, watched) + " != 0)";
+            }
+            return "(" + valueExpr(state, old) + " != 0 && " +
+                   valueExpr(state, watched) + " == 0)";
+        }
+
+        // Splits an activation target list into the scan-local relay mask
+        // (same-byte forward targets owned by the current chunk) and the global
+        // per-word masks. Returns false on an out-of-range target.
+        bool splitActivationTargets(const EmitState &state, bool forward,
+                                    std::span<const BlockId> targets, uint8_t &relayMask,
+                                    std::map<uint32_t, uint64_t> &masks, std::string &error)
+        {
+            relayMask = 0;
+            masks.clear();
+            for (const BlockId target : targets)
+            {
+                if (target.value >= state.blockCount)
+                {
+                    error = "AM activation target BlockId out of range";
+                    return false;
+                }
+                const uint32_t bit = target.value % 8U;
+                if (forward && state.scanRelayByte >= 0 &&
+                    target.value / 8U == static_cast<uint32_t>(state.scanRelayByte) &&
+                    ((state.scanRelayMask >> bit) & 1U) != 0)
+                {
+                    relayMask = static_cast<uint8_t>(relayMask | (1U << bit));
+                    continue;
+                }
+                masks[target.value / 64U] |= UINT64_C(1) << (target.value % 64U);
+            }
+            return true;
+        }
+
+        // Emits one conditional activation merge: the shared body of an
+        // act.f/act.b instruction and of a folded detector-group merge
+        // (ST00010). A pure same-byte relay can drop the branch entirely
+        // (allowBranchlessRelay): OR-ing the sign-extended flag keeps the merge
+        // in registers, the legacy deferred-group idiom. Global mask writes
+        // stay conditional so a quiet group does not dirty the shared activity
+        // words.
+        std::string emitActivationMerge(const EmitState &state, bool forward,
+                                        uint8_t relayMask,
+                                        const std::map<uint32_t, uint64_t> &masks,
+                                        uint64_t originalTargetCount,
+                                        const std::string &condition,
+                                        bool allowBranchlessRelay)
+        {
+            if (allowBranchlessRelay && forward && relayMask != 0 && masks.empty() &&
+                !state.runtimeProfile)
+            {
+                return "byteFlags |= (std::uint8_t)((0U - (std::uint8_t)(" + condition +
+                       ")) & " + byteMaskLiteral(relayMask) + ");\n";
+            }
+            std::string code = "if (" + condition + ") {\n";
+            if (relayMask != 0)
+            {
+                code += "byteFlags |= " + byteMaskLiteral(relayMask) + ";\n";
+            }
+            if (state.runtimeProfile && originalTargetCount != 0)
+            {
+                code += "if (runtimeProfileEnabled_) ";
+                code += forward ? "profileActivateForward_ += "
+                                : "profileActivateBackward_ += ";
+                code += std::to_string(originalTargetCount) + ";\n";
+            }
+            for (const auto &[word, mask] : masks)
+            {
+                code += "activeWords_[" + std::to_string(word) +
+                        "] |= " + wordMaskLiteral(mask) + ";\n";
+            }
+            if (!forward)
+            {
+                code += "backwardFired_ = true;\n";
+            }
+            code += "}\n";
+            return code;
         }
 
         bool isWideBitVector(const EmitState &state, VariableId variable)
@@ -1503,24 +1639,11 @@ namespace wolvrix::lib::grhsim::am
                 case Opcode::ChangedPos:
                 case Opcode::ChangedNeg:
                 {
-                    std::string event;
-                    if (opcode == Opcode::ChangedAny)
-                    {
-                        event = valueExpr(state, operands[0]) + " != " + valueExpr(state, operands[1]);
-                    }
-                    else if (opcode == Opcode::ChangedPos)
-                    {
-                        event = "(" + valueExpr(state, operands[1]) + " == 0 && " +
-                                valueExpr(state, operands[0]) + " != 0)";
-                    }
-                    else
-                    {
-                        event = "(" + valueExpr(state, operands[1]) + " != 0 && " +
-                                valueExpr(state, operands[0]) + " == 0)";
-                    }
-                    return changedResultAssignPrefix(state, results.front()) + event +
+                    return changedResultAssignPrefix(state, results.front()) +
+                           narrowChangedEventExpr(state, opcode, operands[0], operands[1]) +
                            ");\n" +
-                           valueExpr(state, operands[1]) + " = " + valueExpr(state, operands[0]) + ";\n";
+                           valueExpr(state, operands[1]) + " = " +
+                           valueExpr(state, operands[0]) + ";\n";
                 }
                 case Opcode::RegisterWrite:
                 {
@@ -1640,47 +1763,15 @@ namespace wolvrix::lib::grhsim::am
                     // pending in this chunk's ascending test sequence).
                     std::map<uint32_t, uint64_t> masks;
                     uint8_t relayMask = 0;
-                    for (BlockId target : attributes->targets)
+                    if (!splitActivationTargets(state, forward, attributes->targets,
+                                                relayMask, masks, error))
                     {
-                        if (target.value >= state.blockCount)
-                        {
-                            error = "AM activation target BlockId out of range";
-                            return std::nullopt;
-                        }
-                        const uint32_t bit = target.value % 8U;
-                        if (forward && state.scanRelayByte >= 0 &&
-                            target.value / 8U ==
-                                static_cast<uint32_t>(state.scanRelayByte) &&
-                            ((state.scanRelayMask >> bit) & 1U) != 0)
-                        {
-                            relayMask = static_cast<uint8_t>(relayMask | (1U << bit));
-                            continue;
-                        }
-                        masks[target.value / 64U] |= UINT64_C(1) << (target.value % 64U);
+                        return std::nullopt;
                     }
-                    std::string code = "if (" + boolExpr(state, operands.front()) + ") {\n";
-                    if (relayMask != 0)
-                    {
-                        code += "byteFlags |= " + byteMaskLiteral(relayMask) + ";\n";
-                    }
-                    if (state.runtimeProfile && !attributes->targets.empty())
-                    {
-                        code += "if (runtimeProfileEnabled_) ";
-                        code += forward ? "profileActivateForward_ += " :
-                                          "profileActivateBackward_ += ";
-                        code += std::to_string(attributes->targets.size()) + ";\n";
-                    }
-                    for (const auto &[word, mask] : masks)
-                    {
-                        code += "activeWords_[" + std::to_string(word) +
-                                "] |= " + wordMaskLiteral(mask) + ";\n";
-                    }
-                    if (!forward)
-                    {
-                        code += "backwardFired_ = true;\n";
-                    }
-                    code += "}\n";
-                    return code;
+                    return emitActivationMerge(state, forward, relayMask, masks,
+                                               attributes->targets.size(),
+                                               boolExpr(state, operands.front()),
+                                               /*allowBranchlessRelay=*/false);
                 }
                 case Opcode::SystemFunction:
                     error = "unsupported opcode in the initial AM C++ emitter: " +
@@ -1721,6 +1812,137 @@ namespace wolvrix::lib::grhsim::am
                 return false;
             }
             return true;
+        }
+
+        const EmitState::DetectorGroupPlan *detectorPlanFor(const EmitState &state,
+                                                            std::size_t blockIndex)
+        {
+            if (state.blockDetectorPlans.empty())
+            {
+                return nullptr;
+            }
+            const auto &slot = state.blockDetectorPlans[blockIndex];
+            return slot ? &*slot : nullptr;
+        }
+
+        // ST00010: emits the branchless accumulate for one folded detector:
+        // the change comparison feeds the group flag(s) and the detector's
+        // private old baseline is updated unconditionally, exactly as the
+        // un-folded form did.
+        std::optional<std::string>
+        emitDetectorAccumulate(const EmitState &state, InstructionId instruction,
+                               const std::vector<uint32_t> &groups,
+                               std::vector<uint8_t> &groupDeclared, std::string &error)
+        {
+            const Opcode opcode = state.program.opcode(instruction);
+            const auto operands = state.program.operands(instruction);
+            if (!isDetectorChangedOpcode(opcode) || operands.size() < 2 || groups.empty())
+            {
+                error = "invalid folded detector instruction";
+                return std::nullopt;
+            }
+            const std::string event =
+                narrowChangedEventExpr(state, opcode, operands[0], operands[1]);
+            std::string code;
+            if (groups.size() == 1)
+            {
+                const uint32_t group = groups.front();
+                code += groupDeclared[group] ? "detGrp_" : "bool detGrp_";
+                code += std::to_string(group);
+                code += groupDeclared[group] ? " |= (" : " = (";
+                code += event + ");\n";
+                groupDeclared[group] = 1;
+            }
+            else
+            {
+                const std::string temporary = "detEv_" + std::to_string(instruction.value);
+                code += "const bool " + temporary + " = (" + event + ");\n";
+                for (const uint32_t group : groups)
+                {
+                    code += groupDeclared[group] ? "detGrp_" : "bool detGrp_";
+                    code += std::to_string(group);
+                    code += groupDeclared[group] ? " |= " : " = ";
+                    code += temporary + ";\n";
+                    groupDeclared[group] = 1;
+                }
+            }
+            code += valueExpr(state, operands[1]) + " = " + valueExpr(state, operands[0]) +
+                    ";\n";
+            return code;
+        }
+
+        // ST00010: emits the single merged activation for one detector group.
+        std::optional<std::string>
+        emitDetectorGroupMerge(const EmitState &state,
+                               const EmitState::DetectorGroupPlan &plan, uint32_t groupId,
+                               std::string &error)
+        {
+            const EmitState::DetectorGroupPlan::Group &group = plan.groups[groupId];
+            std::map<uint32_t, uint64_t> masks;
+            uint8_t relayMask = 0;
+            if (!splitActivationTargets(state, group.forward, group.targets, relayMask,
+                                        masks, error))
+            {
+                return std::nullopt;
+            }
+            return emitActivationMerge(state, group.forward, relayMask, masks,
+                                       group.originalTargetCount,
+                                       "detGrp_" + std::to_string(groupId),
+                                       /*allowBranchlessRelay=*/true);
+        }
+
+        // Emits all code hanging off one block instruction position: the
+        // instruction itself (or its folded replacement), plus any
+        // detector-group merges anchored after it (ST00010).
+        std::optional<std::string>
+        emitBlockPositionCode(const EmitState &state,
+                              const EmitState::DetectorGroupPlan *plan,
+                              InstructionId instruction, uint32_t index,
+                              std::vector<uint8_t> &groupDeclared, std::string &error)
+        {
+            std::string code;
+            if (plan != nullptr && plan->skippedActs.count(index) != 0)
+            {
+                // Replaced by the group merge anchored at the run end.
+            }
+            else if (plan != nullptr && plan->accumGroups.count(index) != 0)
+            {
+                std::optional<std::string> accum = emitDetectorAccumulate(
+                    state, instruction, plan->accumGroups.at(index), groupDeclared, error);
+                if (!accum)
+                {
+                    return std::nullopt;
+                }
+                code += *accum;
+            }
+            else
+            {
+                std::optional<std::string> emitted =
+                    emitInstruction(state, instruction, error);
+                if (!emitted)
+                {
+                    return std::nullopt;
+                }
+                code += *emitted;
+            }
+            if (plan != nullptr)
+            {
+                const auto merges = plan->mergesAfter.find(index);
+                if (merges != plan->mergesAfter.end())
+                {
+                    for (const uint32_t groupId : merges->second)
+                    {
+                        std::optional<std::string> merge =
+                            emitDetectorGroupMerge(state, *plan, groupId, error);
+                        if (!merge)
+                        {
+                            return std::nullopt;
+                        }
+                        code += *merge;
+                    }
+                }
+            }
+            return code;
         }
 
         std::optional<std::size_t>
@@ -1769,6 +1991,41 @@ namespace wolvrix::lib::grhsim::am
             {
                 diagnostics.error(
                     "AM C++ emitter maxSourceBytes must be a positive integer: " +
+                        attribute->second,
+                    std::string(kContext));
+                return std::nullopt;
+            }
+            return value;
+        }
+
+        // Commit Blocks are unconditionally inlined into their part's
+        // eval_commit_* function and are individually dense (thousands of
+        // masked writes each), so the 4 MiB source budget yields single
+        // functions of tens of thousands of lines — deep in the superlinear
+        // regime of the optimizer (SLP/GVN/JumpThreading; measured 470 s and
+        // 13 GB RSS for one 58k-line function). The commit budget keeps each
+        // eval_commit_* function small; every part is an independent TU, so
+        // this also restores build parallelism across the commit shard.
+        std::optional<uint64_t>
+        parseMaxCommitSourceBytes(const GrhSimAmCppOptions &options,
+                                  wolvrix::lib::diag::Diagnostics &diagnostics)
+        {
+            constexpr uint64_t kDefaultMaxCommitSourceBytes =
+                UINT64_C(512) * UINT64_C(1024);
+            const auto attribute = options.attributes.find("maxCommitSourceBytes");
+            if (attribute == options.attributes.end())
+            {
+                return kDefaultMaxCommitSourceBytes;
+            }
+
+            uint64_t value = 0;
+            const char *const begin = attribute->second.data();
+            const char *const end = begin + attribute->second.size();
+            const auto [parsedEnd, error] = std::from_chars(begin, end, value);
+            if (error != std::errc{} || parsedEnd != end || value == 0)
+            {
+                diagnostics.error(
+                    "AM C++ emitter maxCommitSourceBytes must be a positive integer: " +
                         attribute->second,
                     std::string(kContext));
                 return std::nullopt;
@@ -2073,13 +2330,19 @@ namespace wolvrix::lib::grhsim::am
                 return std::nullopt;
             }
             const BlockId block{static_cast<uint32_t>(blockIndex)};
+            const EmitState::DetectorGroupPlan *detectorPlan =
+                detectorPlanFor(state, blockIndex);
+            std::vector<uint8_t> detectorGroupDeclared(
+                detectorPlan != nullptr ? detectorPlan->groups.size() : 0, 0);
             for (std::size_t index = 0; index < model.program.blockSize(block); ++index)
             {
                 const InstructionId instruction =
                     model.program.blockInstruction(block, index);
                 std::string error;
                 const std::optional<std::string> code =
-                    emitInstruction(state, instruction, error);
+                    emitBlockPositionCode(state, detectorPlan, instruction,
+                                          static_cast<uint32_t>(index),
+                                          detectorGroupDeclared, error);
                 if (!code)
                 {
                     endLocalityBlock(state);
@@ -2215,6 +2478,7 @@ namespace wolvrix::lib::grhsim::am
                          std::size_t blocksPerSource,
                          std::size_t sourceCount,
                          uint64_t maxSourceBytes,
+                         uint64_t maxCommitSourceBytes,
                          std::string_view prefix,
                          std::string_view className,
                          wolvrix::lib::diag::Diagnostics &diagnostics)
@@ -2311,9 +2575,11 @@ namespace wolvrix::lib::grhsim::am
                             std::string(kContext));
                         return std::nullopt;
                     }
+                    const uint64_t blockBudget =
+                        isCommit ? maxCommitSourceBytes : maxSourceBytes;
                     const bool exceedsBudget =
-                        partBytes > maxSourceBytes ||
-                        pendingBytes > maxSourceBytes - partBytes;
+                        partBytes > blockBudget ||
+                        pendingBytes > blockBudget - partBytes;
                     if (partHasBlock && exceedsBudget)
                     {
                         plan[sourceIndex].push_back(BlockSourcePart{
@@ -2467,6 +2733,255 @@ namespace wolvrix::lib::grhsim::am
                 }
             }
             return true;
+        }
+
+        // ST00010 detector-group folding analysis. For each Block, scans the
+        // maximal runs of scheduler-materialized watch-group instructions
+        // (changed.* detectors and act.f/act.b activations) and re-groups the
+        // foldable detectors by activation target signature (direction +
+        // sorted target set). A detector is foldable when:
+        //   - it compares a narrow scalar (BitVector <= 64 bits);
+        //   - its event result stays block-local (cross-block changed results
+        //     go through the runtime-indexed dirty list and keep their form);
+        //   - every use of the event is an act inside the same run;
+        //   - neither operand is defined inside the run (re-ordering detectors
+        //     and hoisting the merges to the run end cannot cross a def).
+        // Activity bits are idempotent and order-free and each detector keeps
+        // its private old baseline update, so the grouped form is equivalent.
+        void planDetectorGroups(const ExecutableModel &model, EmitState &state)
+        {
+            state.blockDetectorPlans.clear();
+            state.blockDetectorPlans.resize(state.blockCount);
+            state.foldedDetectorEvents.assign(state.program.variableCount(), 0);
+            state.detectorFoldedCount = 0;
+            state.detectorGroupCount = 0;
+            for (uint32_t blockIndex = 0; blockIndex < state.blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                const std::size_t blockSize = model.program.blockSize(block);
+                if (blockSize < 2)
+                {
+                    continue;
+                }
+                const auto opcodeAt = [&](std::size_t position) {
+                    return state.program.opcode(model.program.blockInstruction(
+                        block, position));
+                };
+                const auto isRunInstruction = [&](std::size_t position) {
+                    const Opcode opcode = opcodeAt(position);
+                    return isDetectorChangedOpcode(opcode) ||
+                           opcode == Opcode::ActForward || opcode == Opcode::ActBackward;
+                };
+                bool hasAct = false;
+                for (std::size_t position = 0; position < blockSize; ++position)
+                {
+                    const Opcode opcode = opcodeAt(position);
+                    if (opcode == Opcode::ActForward || opcode == Opcode::ActBackward)
+                    {
+                        hasAct = true;
+                        break;
+                    }
+                }
+                if (!hasAct)
+                {
+                    continue;
+                }
+                // Operand use positions within the block, in ascending order.
+                std::unordered_map<uint32_t, std::vector<uint32_t>> uses;
+                for (std::size_t position = 0; position < blockSize; ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    for (const VariableId operand : state.program.operands(instruction))
+                    {
+                        uses[operand.value].push_back(static_cast<uint32_t>(position));
+                    }
+                }
+
+                EmitState::DetectorGroupPlan plan;
+                bool anyFold = false;
+                std::size_t position = 0;
+                while (position < blockSize)
+                {
+                    if (!isRunInstruction(position))
+                    {
+                        ++position;
+                        continue;
+                    }
+                    const std::size_t runBegin = position;
+                    while (position < blockSize && isRunInstruction(position))
+                    {
+                        ++position;
+                    }
+                    const std::size_t runEnd = position;
+
+                    // Foldable detectors in the run.
+                    std::unordered_set<uint32_t> foldable;
+                    for (std::size_t index = runBegin; index < runEnd; ++index)
+                    {
+                        const InstructionId instruction =
+                            model.program.blockInstruction(block, index);
+                        if (!isDetectorChangedOpcode(state.program.opcode(instruction)))
+                        {
+                            continue;
+                        }
+                        const auto operands = state.program.operands(instruction);
+                        const auto results = state.program.results(instruction);
+                        if (operands.size() < 2 || results.empty())
+                        {
+                            continue;
+                        }
+                        const VariableId watched = operands[0];
+                        const VariableId old = operands[1];
+                        const VariableId event = results.front();
+                        const Type &watchedType = variableType(state, watched);
+                        if (watchedType.kind != TypeKind::BitVector ||
+                            watchedType.bitWidth > 64)
+                        {
+                            continue;
+                        }
+                        if (state.crossBlockChangedResults[event.value])
+                        {
+                            continue;
+                        }
+                        const auto useEntry = uses.find(event.value);
+                        if (useEntry == uses.end())
+                        {
+                            continue;
+                        }
+                        bool eligible = true;
+                        for (const uint32_t use : useEntry->second)
+                        {
+                            if (use < runBegin || use >= runEnd)
+                            {
+                                eligible = false;
+                                break;
+                            }
+                            const Opcode useOpcode = opcodeAt(use);
+                            if (useOpcode != Opcode::ActForward &&
+                                useOpcode != Opcode::ActBackward)
+                            {
+                                eligible = false;
+                                break;
+                            }
+                        }
+                        if (!eligible)
+                        {
+                            continue;
+                        }
+                        for (const VariableId operand : {watched, old})
+                        {
+                            if (state.variableDefBlock[operand.value] == blockIndex &&
+                                state.variableDefPosition[operand.value] >= runBegin &&
+                                state.variableDefPosition[operand.value] <
+                                    static_cast<uint32_t>(runEnd))
+                            {
+                                eligible = false;
+                                break;
+                            }
+                        }
+                        if (eligible)
+                        {
+                            foldable.insert(static_cast<uint32_t>(index));
+                        }
+                    }
+                    if (foldable.empty())
+                    {
+                        continue;
+                    }
+
+                    // Group the member acts of each foldable detector by
+                    // (direction, sorted targets). Groups never span runs, so
+                    // each merge is anchored exactly once at the run end.
+                    std::map<std::pair<bool, std::vector<uint32_t>>, uint32_t> groupByKey;
+                    std::vector<uint32_t> runGroups;
+                    for (std::size_t index = runBegin; index < runEnd; ++index)
+                    {
+                        if (foldable.count(static_cast<uint32_t>(index)) == 0)
+                        {
+                            continue;
+                        }
+                        const InstructionId instruction =
+                            model.program.blockInstruction(block, index);
+                        const VariableId event = state.program.results(instruction).front();
+                        // Validate every consuming act before committing any
+                        // group state, so a mid-list failure cannot leave an
+                        // accumulator-less group behind.
+                        bool eligible = true;
+                        for (const uint32_t use : uses.at(event.value))
+                        {
+                            const InstructionId act =
+                                model.program.blockInstruction(block, use);
+                            if (!state.program.activationAttributes(act))
+                            {
+                                eligible = false;
+                                break;
+                            }
+                        }
+                        if (!eligible)
+                        {
+                            continue;
+                        }
+                        std::vector<uint32_t> groups;
+                        for (const uint32_t use : uses.at(event.value))
+                        {
+                            const InstructionId act =
+                                model.program.blockInstruction(block, use);
+                            const auto attributes = state.program.activationAttributes(act);
+                            const bool forward =
+                                state.program.opcode(act) == Opcode::ActForward;
+                            std::vector<uint32_t> targets;
+                            targets.reserve(attributes->targets.size());
+                            for (const BlockId target : attributes->targets)
+                            {
+                                targets.push_back(target.value);
+                            }
+                            std::sort(targets.begin(), targets.end());
+                            const auto key = std::make_pair(forward, std::move(targets));
+                            const auto [entry, inserted] = groupByKey.emplace(
+                                key, static_cast<uint32_t>(plan.groups.size()));
+                            if (inserted)
+                            {
+                                EmitState::DetectorGroupPlan::Group group;
+                                group.forward = forward;
+                                group.targets.reserve(entry->first.second.size());
+                                for (const uint32_t target : entry->first.second)
+                                {
+                                    group.targets.push_back(BlockId{target});
+                                }
+                                plan.groups.push_back(std::move(group));
+                                runGroups.push_back(entry->second);
+                            }
+                            plan.groups[entry->second].originalTargetCount +=
+                                attributes->targets.size();
+                            groups.push_back(entry->second);
+                        }
+                        if (groups.empty())
+                        {
+                            continue;
+                        }
+                        for (const uint32_t use : uses.at(event.value))
+                        {
+                            plan.skippedActs.insert(use);
+                        }
+                        plan.accumGroups.emplace(static_cast<uint32_t>(index),
+                                                 std::move(groups));
+                        state.foldedDetectorEvents[event.value] = 1;
+                        ++state.detectorFoldedCount;
+                        anyFold = true;
+                    }
+                    if (!runGroups.empty())
+                    {
+                        plan.mergesAfter.emplace(static_cast<uint32_t>(runEnd - 1),
+                                                 std::move(runGroups));
+                    }
+                }
+                if (anyFold)
+                {
+                    state.detectorGroupCount += plan.groups.size();
+                    state.blockDetectorPlans[blockIndex] = std::move(plan);
+                }
+            }
         }
     } // namespace
 
@@ -2802,6 +3317,12 @@ namespace wolvrix::lib::grhsim::am
         {
             return result;
         }
+        const std::optional<uint64_t> maxCommitSourceBytes =
+            parseMaxCommitSourceBytes(options, diagnostics);
+        if (!maxCommitSourceBytes)
+        {
+            return result;
+        }
         const std::size_t blockCount = model.program.blockCount();
 
         // ST00009: escape analysis for block-local value localization. A value keeps
@@ -2972,6 +3493,12 @@ namespace wolvrix::lib::grhsim::am
             state.variableEscapeFlags[declared.variable.value] |= kEscapeGlobal;
         }
 
+        // ST00010 detector-group folding: plan the emit-time re-grouping of
+        // block-tail watch-group runs before the member declarations (folded
+        // event variables are dropped from the v<K> region) and before the
+        // block source measure/write passes (both consume the plan).
+        planDetectorGroups(model, state);
+
         if (statsAttribute != options.attributes.end() && statsAttribute->second == "true")
         {
             uint64_t localValues = 0;
@@ -2987,7 +3514,11 @@ namespace wolvrix::lib::grhsim::am
             }
             diagnostics.info("AM C++ emitter locality stats: local_values=" +
                                  std::to_string(localValues) + " escaped_values=" +
-                                 std::to_string(variableCount - localValues),
+                                 std::to_string(variableCount - localValues) +
+                                 " folded_detectors=" +
+                                 std::to_string(state.detectorFoldedCount) +
+                                 " detector_groups=" +
+                                 std::to_string(state.detectorGroupCount),
                              std::string(kContext));
         }
 
@@ -3005,6 +3536,7 @@ namespace wolvrix::lib::grhsim::am
                              *blocksPerSource,
                              blockSourceCount,
                              *maxSourceBytes,
+                             *maxCommitSourceBytes,
                              prefix,
                              className,
                              diagnostics);
@@ -3182,6 +3714,13 @@ namespace wolvrix::lib::grhsim::am
                 }
                 if (state.variableEscapeFlags[index] == 0 &&
                     state.variableDefBlock[index] != kInvalidLocalityBlock)
+                {
+                    continue;
+                }
+                // ST00010: a folded detector's event variable is never
+                // assigned or read (the group flag replaces it), and its
+                // zeroInit needs no explicit init write, so it gets no member.
+                if (state.foldedDetectorEvents[index])
                 {
                     continue;
                 }
@@ -4570,6 +5109,10 @@ namespace
                                        localValueDeclarations(state),
                                        indentation);
                     const BlockId block{static_cast<uint32_t>(blockIndex)};
+                    const EmitState::DetectorGroupPlan *detectorPlan =
+                        detectorPlanFor(state, blockIndex);
+                    std::vector<uint8_t> detectorGroupDeclared(
+                        detectorPlan != nullptr ? detectorPlan->groups.size() : 0, 0);
                     for (std::size_t index = 0;
                          index < model.program.blockSize(block);
                          ++index)
@@ -4578,7 +5121,9 @@ namespace
                             model.program.blockInstruction(block, index);
                         std::string error;
                         const std::optional<std::string> code =
-                            emitInstruction(state, instruction, error);
+                            emitBlockPositionCode(state, detectorPlan, instruction,
+                                                  static_cast<uint32_t>(index),
+                                                  detectorGroupDeclared, error);
                         if (!code)
                         {
                             endLocalityBlock(state);
