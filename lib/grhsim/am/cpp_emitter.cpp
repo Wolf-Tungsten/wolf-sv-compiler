@@ -289,6 +289,20 @@ namespace wolvrix::lib::grhsim::am
             // planned write site / detector.
             mutable int32_t arrayWriteAccum = -1;
             mutable int32_t arrayDetectorAccum = -1;
+            // ST00012 commit event batch gating: every state write in a commit
+            // Block is already individually guarded by (cond && (e1 || ...)),
+            // so a Block whose watched event set is entirely quiet performs no
+            // write, no write-site flag, and no useful tail-detector work
+            // (baseline-drift firings from other writer Blocks are redundant
+            // duplicates: activation is idempotent and each writer Block covers
+            // all readers). The emitter therefore wraps the whole Block body
+            // in one batch event check (the legacy commit-batch idiom),
+            // replacing per-statement event loads with one branch per Block on
+            // quiet rounds. Eligibility: every state write carries at least
+            // one event operand and no event operand is produced inside the
+            // Block (an in-block producer would be read before assignment).
+            std::vector<std::optional<std::string>> blockCommitGate;
+            uint64_t commitGateBlockCount = 0;
         };
 
         constexpr uint8_t kEscapeGlobal = 1U << 0U;
@@ -2567,6 +2581,17 @@ namespace wolvrix::lib::grhsim::am
             }
             uint64_t byteCount = static_cast<uint64_t>(
                 commitBlockPrologue(blockIndex, state.runtimeProfile).size());
+            const auto &commitGate = state.blockCommitGate[blockIndex];
+            if (commitGate &&
+                (!addByteCount(byteCount,
+                               static_cast<uint64_t>(12 + commitGate->size() + 4)) ||
+                 !addByteCount(byteCount, static_cast<uint64_t>(10))))
+            {
+                diagnostics.error("AM C++ emitter source size overflow: block=" +
+                                      std::to_string(blockIndex),
+                                  std::string(kContext));
+                return std::nullopt;
+            }
             if (!addByteCount(byteCount, *bodyBytes) ||
                 !addByteCount(byteCount, kCommitBlockEpilogue.size()))
             {
@@ -3275,6 +3300,100 @@ namespace wolvrix::lib::grhsim::am
                 }
             }
         }
+
+        // ST00012: computes the per-Block batch event gate expression for
+        // commit Blocks (see EmitState::blockCommitGate). The gate is the
+        // deduplicated OR of every state write's event operands, reused in
+        // the same boolExpr form the individual writes emit.
+        void planCommitEventGates(const ExecutableModel &model, EmitState &state)
+        {
+            state.blockCommitGate.clear();
+            state.blockCommitGate.resize(state.blockCount);
+            state.commitGateBlockCount = 0;
+            if (model.commitBlockBegin == 0)
+            {
+                return;
+            }
+            for (uint32_t blockIndex = model.commitBlockBegin;
+                 blockIndex < state.blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                const std::size_t blockSize = model.program.blockSize(block);
+                if (blockSize == 0)
+                {
+                    continue;
+                }
+                std::vector<uint32_t> eventVars;
+                bool anyWrite = false;
+                bool eligible = true;
+                for (std::size_t position = 0; position < blockSize && eligible;
+                     ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    const Opcode opcode = state.program.opcode(instruction);
+                    std::size_t eventBegin = 0;
+                    switch (opcode)
+                    {
+                    case Opcode::RegisterWrite: eventBegin = 4; break;
+                    case Opcode::MemoryWrite: eventBegin = 5; break;
+                    case Opcode::MemoryFill: eventBegin = 3; break;
+                    case Opcode::LatchWrite:
+                        // Latch writes are event-less (guard-only), so the
+                        // Block can never be event-gated as a whole.
+                        eligible = false;
+                        continue;
+                    default: continue;
+                    }
+                    anyWrite = true;
+                    const auto operands = state.program.operands(instruction);
+                    if (operands.size() <= eventBegin)
+                    {
+                        // A state write without any event operand executes on
+                        // its guard alone; the Block cannot be gated.
+                        eligible = false;
+                        break;
+                    }
+                    for (std::size_t index = eventBegin; index < operands.size();
+                         ++index)
+                    {
+                        eventVars.push_back(operands[index].value);
+                    }
+                }
+                if (!eligible || !anyWrite)
+                {
+                    continue;
+                }
+                std::sort(eventVars.begin(), eventVars.end());
+                eventVars.erase(std::unique(eventVars.begin(), eventVars.end()),
+                                eventVars.end());
+                for (const uint32_t variable : eventVars)
+                {
+                    if (state.variableDefBlock[variable] == blockIndex)
+                    {
+                        // An in-block event producer would be read before
+                        // assignment by a Block-level gate.
+                        eligible = false;
+                        break;
+                    }
+                }
+                if (!eligible)
+                {
+                    continue;
+                }
+                std::string gate;
+                for (const uint32_t variable : eventVars)
+                {
+                    if (!gate.empty())
+                    {
+                        gate += " || ";
+                    }
+                    gate += boolExpr(state, VariableId{variable});
+                }
+                state.blockCommitGate[blockIndex] = std::move(gate);
+                ++state.commitGateBlockCount;
+            }
+        }
     } // namespace
 
     GrhSimAmCppResult
@@ -3795,6 +3914,9 @@ namespace wolvrix::lib::grhsim::am
         // Planned after the escape analysis (it reads crossBlockChangedResults)
         // and before the measure/write passes.
         planArrayWatchGroups(model, state);
+        // ST00012 commit event batch gating: one event-union branch per
+        // commit Block replaces per-statement event loads on quiet rounds.
+        planCommitEventGates(model, state);
 
         if (statsAttribute != options.attributes.end() && statsAttribute->second == "true")
         {
@@ -3817,7 +3939,9 @@ namespace wolvrix::lib::grhsim::am
                                  " detector_groups=" +
                                  std::to_string(state.detectorGroupCount) +
                                  " array_watch_write_point=" +
-                                 std::to_string(state.arrayWatchReplacedCount),
+                                 std::to_string(state.arrayWatchReplacedCount) +
+                                 " commit_gated_blocks=" +
+                                 std::to_string(state.commitGateBlockCount),
                              std::string(kContext));
         }
 
@@ -5585,10 +5709,19 @@ namespace
                     {
                         blockSource << commitBlockPrologue(blockIndex,
                                                            state.runtimeProfile);
+                        const auto &commitGate = state.blockCommitGate[blockIndex];
+                        if (commitGate)
+                        {
+                            blockSource << "        if (" << *commitGate << ") {\n";
+                        }
                         if (!writeBlockBody(blockIndex, "        "))
                         {
                             blocksGenerated = false;
                             break;
+                        }
+                        if (commitGate)
+                        {
+                            blockSource << "        }\n";
                         }
                         blockSource << kCommitBlockEpilogue;
                     }

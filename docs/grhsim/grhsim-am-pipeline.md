@@ -119,6 +119,13 @@ normalized GRH
 > host ms 2k 25,366 / 20k 569,934 / 50k 1,045,557（对 ST00010 2k 2.07x、
 > 20k 1.04x；主要消掉 reset/首评尖峰）。
 >
+> 实现进展（2026-07-30，ST00012 commit 事件批次门控）：每个 commit 块的全部
+> 写/判变/act 包进一条批次事件检查（事件操作数去重后的 OR，legacy
+> commit-batch 惯用法）：被 watch 事件全静默的轮次（如负沿 eval）整块一次
+> 分支跳过，替代逐语句事件加载。块内无事件写、latch 写或事件在块内产生的块
+> 保持原样。emitter peephole（IR/scheduler/validator 不动）。Gate：ctest AM
+> 8/8；xs-components 053/044/100 各 20,000 向量与 legacy bit-exact。
+>
 > 历史记录（2026-07-25，对应上述重构前的旧模型）：production scheduler 已删除
 > `Isolated` class，commit write 曾采用 consume-on-event（该机制已删除），wide-result
 > shift 已在执行前按 result 宽度扩展 lhs。
