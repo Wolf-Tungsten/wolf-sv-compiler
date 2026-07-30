@@ -753,6 +753,26 @@ namespace
             return fail("AM C++ emitter failed to generate the memory model");
         }
 
+        // ST00011 array write-point activation: the commit Block's tail
+        // changed.any on the memory is replaced by change flags accumulated at
+        // the Block's own write sites (mem.write element compare, mem.fill
+        // per-element detect in the fill loop); the whole-array compare and
+        // baseline copy survive only for the compute-Block detector, which has
+        // no same-Block write site.
+        const std::optional<std::string> memoryBlocksText =
+            readTextFile(outputDirectory / "grhsim_MemoryTop_blocks_0.cpp");
+        if (!memoryBlocksText ||
+            countOccurrences(*memoryBlocksText, "masked_write_words_detect(") != 1 ||
+            countOccurrences(*memoryBlocksText, "slice_words_detect(") != 1 ||
+            countOccurrences(*memoryBlocksText, "bool arrChg_0 = false;") != 1 ||
+            countOccurrences(*memoryBlocksText, "= (arrChg_0);") != 1 ||
+            countOccurrences(*memoryBlocksText, "std::equal(") != 1 ||
+            countOccurrences(*memoryBlocksText, "std::copy_n(") != 1)
+        {
+            return fail("AM C++ emitter did not fold the commit memory detector "
+                        "into write-point change flags (ST00011)");
+        }
+
         const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
         std::ofstream harness(harnessPath);
         harness << "#include \"grhsim_MemoryTop.hpp\"\n"

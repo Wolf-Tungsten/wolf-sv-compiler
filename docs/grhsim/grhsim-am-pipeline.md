@@ -104,6 +104,21 @@ normalized GRH
 > XS difftest 2k/20k 与 host time 对照（b192 基线 81,760 / 905,050 ms）进行中，
 > 结果补记于 `pdocs/grh_notepad`。
 >
+> 实现进展（2026-07-30，ST00011 数组写点激活）：根因（gprofng @ AM emu 2k）：
+> commit 块尾部 1,667 个全数组 changed.any 每轮对每个被 watch 的 memory 做一次
+> memcmp + 一次 memcpy 基线回写（libc 热点 ~23%）。emitter peephole（IR/
+> scheduler/validator 不动）：mem.write 在写元素时顺带判变
+> （masked_write_words_detect），mem.fill 在填充循环内逐元素判变
+> （assign_words_detect / slice_words_detect，保持"重填相同值不再激活"的
+> 收敛语义），尾部 detector 改读块局部标志 arrChg_N，memcmp/memcpy/基线
+> 存储全消。等价性：每个写数组的 commit 块都自带 (块, target) detector 且
+> act.b 覆盖全部 reader，只检测本块自己的写仍完备；跨块基线漂移触发本来就
+> 是冗余重复（激活幂等）。XS 规模 std::equal 1,667 → 0（detect 调用点
+> 6,951）。Gate：ctest AM 8/8；xs-components 053/044/100 各 20,000 向量与
+> legacy bit-exact；XS difftest 2k/20k 通过（instrCnt 与历史一致），干净机
+> host ms 2k 25,366 / 20k 569,934 / 50k 1,045,557（对 ST00010 2k 2.07x、
+> 20k 1.04x；主要消掉 reset/首评尖峰）。
+>
 > 历史记录（2026-07-25，对应上述重构前的旧模型）：production scheduler 已删除
 > `Isolated` class，commit write 曾采用 consume-on-event（该机制已删除），wide-result
 > shift 已在执行前按 result 宽度扩展 lhs。

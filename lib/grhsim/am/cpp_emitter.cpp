@@ -252,6 +252,43 @@ namespace wolvrix::lib::grhsim::am
             std::vector<uint8_t> foldedDetectorEvents;
             uint64_t detectorFoldedCount = 0;
             uint64_t detectorGroupCount = 0;
+            // ST00011 array write-point activation: a commit Block's tail
+            // changed.any on an Array state target costs one whole-array
+            // compare (std::equal -> memcmp) plus one whole-array baseline
+            // copy (std::copy_n -> memcpy) every round, because the detector
+            // executes unconditionally with its Block. The replacement moves
+            // change detection to the Block's own write sites: mem.write
+            // compares the touched element words while writing
+            // (masked_write_words_detect), mem.fill tracks per-element change
+            // inside its fill loop (assign_words_detect / slice_words_detect),
+            // and the tail detector becomes a read of the accumulated flag.
+            // Completeness: every Block that writes an Array state target owns
+            // one detector per (Block, target) pair whose ActBackward targets
+            // cover all reader Blocks, so detecting exactly this Block's own
+            // writes still activates every reader of every actual change;
+            // baseline-drift firings caused by other writer Blocks were
+            // redundant duplicates (activation is idempotent). A write that
+            // restores the previous value no longer re-triggers readers,
+            // matching the legacy write-point suppression and keeping eval
+            // convergence identical to the compare-based form.
+            struct ArrayWatchPlan
+            {
+                // changed.any position -> accumulator id consumed instead of
+                // the whole-array compare/copy.
+                std::unordered_map<uint32_t, uint32_t> detectorAccum;
+                // mem.write/mem.fill position -> accumulator id fed by the
+                // write site's fused change detection (at most one detector
+                // per (Block, Array) pair by construction).
+                std::unordered_map<uint32_t, uint32_t> writeAccum;
+                uint32_t accumCount = 0;
+            };
+            std::vector<std::optional<ArrayWatchPlan>> blockArrayWatchPlans;
+            uint64_t arrayWatchReplacedCount = 0;
+            // Mutable emission context for the current instruction position
+            // (same pattern as scanRelayByte): -1 when the position is not a
+            // planned write site / detector.
+            mutable int32_t arrayWriteAccum = -1;
+            mutable int32_t arrayDetectorAccum = -1;
         };
 
         constexpr uint8_t kEscapeGlobal = 1U << 0U;
@@ -1347,6 +1384,14 @@ namespace wolvrix::lib::grhsim::am
                         error = "edge changed opcode requires a bit-vector operand";
                         return std::nullopt;
                     }
+                    if (state.arrayDetectorAccum >= 0)
+                    {
+                        // ST00011: the change flag was accumulated at this
+                        // Block's own write sites; the whole-array compare and
+                        // baseline copy are gone.
+                        return setResult + "arrChg_" +
+                               std::to_string(state.arrayDetectorAccum) + ");\n";
+                    }
                     const uint64_t words = storedWordCount(state, operands.front());
                     const std::string current = wordDataExpr(state, operands[0]);
                     const std::string previous = wordDataExpr(state, operands[1]);
@@ -1710,12 +1755,24 @@ namespace wolvrix::lib::grhsim::am
                     const std::string condition =
                         boolExpr(state, operands[0]) + " && " + index + " != " +
                         std::to_string(memoryType.elementCount);
-                    const std::string body =
-                        "masked_write_words(" + wordDataExpr(state, operands[4]) + " + " +
-                        index + " * " + std::to_string(stride) + ", " +
-                        wordDataExpr(state, operands[3]) + ", " +
-                        wordDataExpr(state, operands[2]) + ", " +
-                        std::to_string(memoryType.bitWidth) + ");";
+                    const std::string writeArgs =
+                        wordDataExpr(state, operands[4]) + " + " + index + " * " +
+                        std::to_string(stride) + ", " + wordDataExpr(state, operands[3]) +
+                        ", " + wordDataExpr(state, operands[2]) + ", " +
+                        std::to_string(memoryType.bitWidth) + ")";
+                    std::string body;
+                    if (state.arrayWriteAccum >= 0)
+                    {
+                        // ST00011: fuse reader-activation change detection
+                        // into the element write (exact: only a real element
+                        // change raises the flag).
+                        body = "arrChg_" + std::to_string(state.arrayWriteAccum) +
+                               " |= masked_write_words_detect(" + writeArgs + ";";
+                    }
+                    else
+                    {
+                        body = "masked_write_words(" + writeArgs + ";";
+                    }
                     code += emitEventfulStateWrite(5, condition, body) + "}\n";
                     return code;
                 }
@@ -1731,22 +1788,48 @@ namespace wolvrix::lib::grhsim::am
                                        element + ") { ";
                     const std::string target = wordDataExpr(state, operands[2]) + " + " + element +
                                                " * " + std::to_string(stride);
+                    std::string elementWrite;
                     if (dataType.bitWidth == memoryType.bitWidth)
                     {
-                        body += "assign_words(" + target + ", " +
-                                std::to_string(memoryType.bitWidth) + ", " +
-                                wordDataExpr(state, operands[1]) + ", " +
-                                std::to_string(dataType.bitWidth) + ", false);";
+                        elementWrite = "assign_words(" + target + ", " +
+                                       std::to_string(memoryType.bitWidth) + ", " +
+                                       wordDataExpr(state, operands[1]) + ", " +
+                                       std::to_string(dataType.bitWidth) + ", false);";
                     }
                     else
                     {
-                        body += "slice_words(" + target + ", " +
+                        elementWrite = "slice_words(" + target + ", " +
+                                       std::to_string(memoryType.bitWidth) + ", " +
+                                       wordDataExpr(state, operands[1]) + ", " +
+                                       std::to_string(dataType.bitWidth) + ", " + element +
+                                       " * " + std::to_string(memoryType.bitWidth) + ");";
+                    }
+                    if (state.arrayWriteAccum >= 0)
+                    {
+                        // ST00011: a re-fill of identical values must not
+                        // re-activate readers (eval convergence), so the flag
+                        // tracks real per-element change inside the loop.
+                        const std::string accum =
+                            "arrChg_" + std::to_string(state.arrayWriteAccum);
+                        if (dataType.bitWidth == memoryType.bitWidth)
+                        {
+                            elementWrite =
+                                accum + " |= assign_words_detect(" + target + ", " +
                                 std::to_string(memoryType.bitWidth) + ", " +
                                 wordDataExpr(state, operands[1]) + ", " +
-                                std::to_string(dataType.bitWidth) + ", " + element + " * " +
-                                std::to_string(memoryType.bitWidth) + ");";
+                                std::to_string(dataType.bitWidth) + ", false);";
+                        }
+                        else
+                        {
+                            elementWrite =
+                                accum + " |= slice_words_detect(" + target + ", " +
+                                std::to_string(memoryType.bitWidth) + ", " +
+                                wordDataExpr(state, operands[1]) + ", " +
+                                std::to_string(dataType.bitWidth) + ", " + element +
+                                " * " + std::to_string(memoryType.bitWidth) + ");";
+                        }
                     }
-                    body += " }";
+                    body += elementWrite + " }";
                     return emitEventfulStateWrite(3, boolExpr(state, operands[0]), body);
                 }
                 case Opcode::ActForward:
@@ -1825,6 +1908,37 @@ namespace wolvrix::lib::grhsim::am
             return slot ? &*slot : nullptr;
         }
 
+        const EmitState::ArrayWatchPlan *arrayWatchPlanFor(const EmitState &state,
+                                                           std::size_t blockIndex)
+        {
+            if (state.blockArrayWatchPlans.empty())
+            {
+                return nullptr;
+            }
+            const auto &slot = state.blockArrayWatchPlans[blockIndex];
+            return slot ? &*slot : nullptr;
+        }
+
+        // ST00011: block-local change-flag declarations (one per replaced
+        // array detector), reset at every Block execution entry.
+        std::string arrayWatchDeclarations(const EmitState::ArrayWatchPlan *plan)
+        {
+            if (plan == nullptr || plan->accumCount == 0)
+            {
+                return {};
+            }
+            std::string code = "bool ";
+            for (uint32_t accum = 0; accum < plan->accumCount; ++accum)
+            {
+                if (accum != 0)
+                {
+                    code += ", ";
+                }
+                code += "arrChg_" + std::to_string(accum) + " = false";
+            }
+            return code + ";\n";
+        }
+
         // ST00010: emits the branchless accumulate for one folded detector:
         // the change comparison feeds the group flag(s) and the detector's
         // private old baseline is updated unconditionally, exactly as the
@@ -1893,10 +2007,13 @@ namespace wolvrix::lib::grhsim::am
 
         // Emits all code hanging off one block instruction position: the
         // instruction itself (or its folded replacement), plus any
-        // detector-group merges anchored after it (ST00010).
+        // detector-group merges anchored after it (ST00010). arrayPlan
+        // (ST00011) rewrites planned array write sites and tail detectors
+        // through the mutable EmitState context consumed by emitInstruction.
         std::optional<std::string>
         emitBlockPositionCode(const EmitState &state,
                               const EmitState::DetectorGroupPlan *plan,
+                              const EmitState::ArrayWatchPlan *arrayPlan,
                               InstructionId instruction, uint32_t index,
                               std::vector<uint8_t> &groupDeclared, std::string &error)
         {
@@ -1917,8 +2034,24 @@ namespace wolvrix::lib::grhsim::am
             }
             else
             {
+                if (arrayPlan != nullptr)
+                {
+                    const auto write = arrayPlan->writeAccum.find(index);
+                    if (write != arrayPlan->writeAccum.end())
+                    {
+                        state.arrayWriteAccum = static_cast<int32_t>(write->second);
+                    }
+                    const auto detector = arrayPlan->detectorAccum.find(index);
+                    if (detector != arrayPlan->detectorAccum.end())
+                    {
+                        state.arrayDetectorAccum =
+                            static_cast<int32_t>(detector->second);
+                    }
+                }
                 std::optional<std::string> emitted =
                     emitInstruction(state, instruction, error);
+                state.arrayWriteAccum = -1;
+                state.arrayDetectorAccum = -1;
                 if (!emitted)
                 {
                     return std::nullopt;
@@ -2329,6 +2462,18 @@ namespace wolvrix::lib::grhsim::am
                                   std::string(kContext));
                 return std::nullopt;
             }
+            const EmitState::ArrayWatchPlan *arrayPlan =
+                arrayWatchPlanFor(state, blockIndex);
+            const std::optional<uint64_t> arrayWatchBytes = indentedLineByteCount(
+                arrayWatchDeclarations(arrayPlan), indentation);
+            if (!arrayWatchBytes || !addByteCount(byteCount, *arrayWatchBytes))
+            {
+                endLocalityBlock(state);
+                diagnostics.error("AM C++ emitter source size overflow: block=" +
+                                      std::to_string(blockIndex),
+                                  std::string(kContext));
+                return std::nullopt;
+            }
             const BlockId block{static_cast<uint32_t>(blockIndex)};
             const EmitState::DetectorGroupPlan *detectorPlan =
                 detectorPlanFor(state, blockIndex);
@@ -2340,7 +2485,7 @@ namespace wolvrix::lib::grhsim::am
                     model.program.blockInstruction(block, index);
                 std::string error;
                 const std::optional<std::string> code =
-                    emitBlockPositionCode(state, detectorPlan, instruction,
+                    emitBlockPositionCode(state, detectorPlan, arrayPlan, instruction,
                                           static_cast<uint32_t>(index),
                                           detectorGroupDeclared, error);
                 if (!code)
@@ -2983,6 +3128,153 @@ namespace wolvrix::lib::grhsim::am
                 }
             }
         }
+
+        // ST00011: plans the emit-time replacement of commit-Block tail
+        // changed.any detectors on Array state targets by write-site change
+        // flags (see EmitState::ArrayWatchPlan). Eligibility per detector:
+        // Array watched type, at least one same-Block write site (mem.write /
+        // mem.fill, the only array-writing opcodes), event consumed only by
+        // same-Block act.f/act.b, and no cross-block changed result. Anything
+        // else keeps the whole-array compare form.
+        void planArrayWatchGroups(const ExecutableModel &model, EmitState &state)
+        {
+            state.blockArrayWatchPlans.clear();
+            state.blockArrayWatchPlans.resize(state.blockCount);
+            state.arrayWatchReplacedCount = 0;
+            if (model.commitBlockBegin == 0)
+            {
+                return;
+            }
+            for (uint32_t blockIndex = model.commitBlockBegin;
+                 blockIndex < state.blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                const std::size_t blockSize = model.program.blockSize(block);
+                if (blockSize < 2)
+                {
+                    continue;
+                }
+                const auto opcodeAt = [&](std::size_t position) {
+                    return state.program.opcode(model.program.blockInstruction(
+                        block, position));
+                };
+                // Operand use positions within the block, in ascending order.
+                std::unordered_map<uint32_t, std::vector<uint32_t>> uses;
+                // Write positions per array target: mem.write / mem.fill are
+                // the only opcodes that write an Array variable.
+                std::unordered_map<uint32_t, std::vector<uint32_t>> arrayWrites;
+                for (std::size_t position = 0; position < blockSize; ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    const Opcode opcode = state.program.opcode(instruction);
+                    const auto operands = state.program.operands(instruction);
+                    if (opcode == Opcode::MemoryWrite)
+                    {
+                        arrayWrites[operands[4].value].push_back(
+                            static_cast<uint32_t>(position));
+                    }
+                    else if (opcode == Opcode::MemoryFill)
+                    {
+                        arrayWrites[operands[2].value].push_back(
+                            static_cast<uint32_t>(position));
+                    }
+                    for (const VariableId operand : operands)
+                    {
+                        uses[operand.value].push_back(static_cast<uint32_t>(position));
+                    }
+                }
+                if (arrayWrites.empty())
+                {
+                    continue;
+                }
+
+                EmitState::ArrayWatchPlan plan;
+                for (std::size_t position = 0; position < blockSize; ++position)
+                {
+                    if (opcodeAt(position) != Opcode::ChangedAny)
+                    {
+                        continue;
+                    }
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    const auto operands = state.program.operands(instruction);
+                    const auto results = state.program.results(instruction);
+                    if (operands.size() < 2 || results.empty())
+                    {
+                        continue;
+                    }
+                    const VariableId watched = operands[0];
+                    const VariableId event = results.front();
+                    if (variableType(state, watched).kind != TypeKind::Array)
+                    {
+                        continue;
+                    }
+                    const auto writes = arrayWrites.find(watched.value);
+                    if (writes == arrayWrites.end() || writes->second.empty())
+                    {
+                        continue;
+                    }
+                    // The detector must observe the Block's own writes, so
+                    // every write site has to precede it.
+                    if (writes->second.back() >= static_cast<uint32_t>(position))
+                    {
+                        continue;
+                    }
+                    if (state.crossBlockChangedResults[event.value])
+                    {
+                        continue;
+                    }
+                    const auto useEntry = uses.find(event.value);
+                    if (useEntry == uses.end())
+                    {
+                        continue;
+                    }
+                    bool eligible = true;
+                    for (const uint32_t use : useEntry->second)
+                    {
+                        const Opcode useOpcode = opcodeAt(use);
+                        if (useOpcode != Opcode::ActForward &&
+                            useOpcode != Opcode::ActBackward)
+                        {
+                            eligible = false;
+                            break;
+                        }
+                    }
+                    if (!eligible)
+                    {
+                        continue;
+                    }
+                    bool collision = false;
+                    for (const uint32_t writePosition : writes->second)
+                    {
+                        if (plan.writeAccum.count(writePosition) != 0)
+                        {
+                            // Should not happen (one detector per (Block,
+                            // array) by construction); keep both sites in the
+                            // compare form rather than guessing.
+                            collision = true;
+                            break;
+                        }
+                    }
+                    if (collision)
+                    {
+                        continue;
+                    }
+                    const uint32_t accum = plan.accumCount++;
+                    plan.detectorAccum.emplace(static_cast<uint32_t>(position), accum);
+                    for (const uint32_t writePosition : writes->second)
+                    {
+                        plan.writeAccum.emplace(writePosition, accum);
+                    }
+                    ++state.arrayWatchReplacedCount;
+                }
+                if (plan.accumCount != 0)
+                {
+                    state.blockArrayWatchPlans[blockIndex] = std::move(plan);
+                }
+            }
+        }
     } // namespace
 
     GrhSimAmCppResult
@@ -3498,6 +3790,11 @@ namespace wolvrix::lib::grhsim::am
         // event variables are dropped from the v<K> region) and before the
         // block source measure/write passes (both consume the plan).
         planDetectorGroups(model, state);
+        // ST00011 array write-point activation: replace commit-Block tail
+        // whole-array changed.any detectors by write-site change flags.
+        // Planned after the escape analysis (it reads crossBlockChangedResults)
+        // and before the measure/write passes.
+        planArrayWatchGroups(model, state);
 
         if (statsAttribute != options.attributes.end() && statsAttribute->second == "true")
         {
@@ -3518,7 +3815,9 @@ namespace wolvrix::lib::grhsim::am
                                  " folded_detectors=" +
                                  std::to_string(state.detectorFoldedCount) +
                                  " detector_groups=" +
-                                 std::to_string(state.detectorGroupCount),
+                                 std::to_string(state.detectorGroupCount) +
+                                 " array_watch_write_point=" +
+                                 std::to_string(state.arrayWatchReplacedCount),
                              std::string(kContext));
         }
 
@@ -3640,6 +3939,9 @@ namespace wolvrix::lib::grhsim::am
                << "    static void assign_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, bool signExtend);\n"
                << "    static void assign_words_from_scalar(std::uint64_t *target, std::uint32_t targetWidth, std::uint64_t source, std::uint32_t sourceWidth, bool signExtend);\n"
                << "    static void masked_write_words(std::uint64_t *target, const std::uint64_t *data, const std::uint64_t *mask, std::uint32_t width);\n"
+               << "    static bool masked_write_words_detect(std::uint64_t *target, const std::uint64_t *data, const std::uint64_t *mask, std::uint32_t width);\n"
+               << "    static bool assign_words_detect(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, bool signExtend);\n"
+               << "    static bool slice_words_detect(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, std::uint64_t start);\n"
                << "    static std::uint64_t resized_word(const std::uint64_t *source, std::uint32_t sourceWidth, bool signExtend, std::size_t index);\n"
                << "    static void zero_words(std::uint64_t *target, std::uint32_t width);\n"
                << "    static void bitwise_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *lhs, std::uint32_t lhsWidth, bool lhsSigned, const std::uint64_t *rhs, std::uint32_t rhsWidth, bool rhsSigned, std::uint32_t operation);\n"
@@ -4301,6 +4603,54 @@ namespace
                << "        const std::uint64_t writeMask = mask[index] & liveMask;\n"
                << "        target[index] = ((target[index] & ~writeMask) | (data[index] & writeMask)) & liveMask;\n"
                << "    }\n"
+               << "}\n"
+               << "bool " << className
+               << "::masked_write_words_detect(std::uint64_t *target, const std::uint64_t *data, const std::uint64_t *mask, std::uint32_t width) {\n"
+               << "    const std::size_t words = word_count(width);\n"
+               << "    bool changed = false;\n"
+               << "    for (std::size_t index = 0; index < words; ++index) {\n"
+               << "        const std::uint32_t bits = index + 1U == words ? width - static_cast<std::uint32_t>(index * 64U) : 64U;\n"
+               << "        const std::uint64_t liveMask = bit_mask(bits);\n"
+               << "        const std::uint64_t writeMask = mask[index] & liveMask;\n"
+               << "        const std::uint64_t next = ((target[index] & ~writeMask) | (data[index] & writeMask)) & liveMask;\n"
+               << "        changed = changed || (next != target[index]);\n"
+               << "        target[index] = next;\n"
+               << "    }\n"
+               << "    return changed;\n"
+               << "}\n"
+               << "bool " << className
+               << "::assign_words_detect(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, bool signExtend) {\n"
+               << "    const std::size_t targetWords = word_count(targetWidth);\n"
+               << "    const std::size_t sourceWords = word_count(sourceWidth);\n"
+               << "    const bool negative = signExtend && targetWidth > sourceWidth && ((source[(sourceWidth - 1U) / 64U] >> ((sourceWidth - 1U) % 64U)) & 1U);\n"
+               << "    const std::size_t signIndex = sourceWidth / 64U;\n"
+               << "    const std::uint32_t signBit = sourceWidth % 64U;\n"
+               << "    bool changed = false;\n"
+               << "    for (std::size_t index = 0; index < targetWords; ++index) {\n"
+               << "        std::uint64_t next = index < std::min(targetWords, sourceWords) ? source[index] : UINT64_C(0);\n"
+               << "        if (negative) {\n"
+               << "            if (signBit != 0) {\n"
+               << "                if (index == signIndex) next |= ~bit_mask(signBit);\n"
+               << "                else if (index > signIndex) next = UINT64_MAX;\n"
+               << "            } else if (index >= signIndex) { next = UINT64_MAX; }\n"
+               << "        }\n"
+               << "        if (index + 1U == targetWords) next &= bit_mask(targetWidth - static_cast<std::uint32_t>(index * 64U));\n"
+               << "        changed = changed || (next != target[index]);\n"
+               << "        target[index] = next;\n"
+               << "    }\n"
+               << "    return changed;\n"
+               << "}\n"
+               << "bool " << className
+               << "::slice_words_detect(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, std::uint64_t start) {\n"
+               << "    const std::size_t words = word_count(targetWidth);\n"
+               << "    bool changed = false;\n"
+               << "    for (std::size_t index = 0; index < words; ++index) {\n"
+               << "        std::uint64_t next = extract_word(source, sourceWidth, start + index * 64U);\n"
+               << "        if (index + 1U == words) next &= bit_mask(targetWidth - static_cast<std::uint32_t>(index * 64U));\n"
+               << "        changed = changed || (next != target[index]);\n"
+               << "        target[index] = next;\n"
+               << "    }\n"
+               << "    return changed;\n"
                << "}\n"
                << "std::uint64_t " << className
                << "::resized_word(const std::uint64_t *source, std::uint32_t sourceWidth, bool signExtend, std::size_t index) {\n"
@@ -5108,6 +5458,11 @@ namespace
                     writeIndentedLines(blockSource,
                                        localValueDeclarations(state),
                                        indentation);
+                    const EmitState::ArrayWatchPlan *arrayPlan =
+                        arrayWatchPlanFor(state, blockIndex);
+                    writeIndentedLines(blockSource,
+                                       arrayWatchDeclarations(arrayPlan),
+                                       indentation);
                     const BlockId block{static_cast<uint32_t>(blockIndex)};
                     const EmitState::DetectorGroupPlan *detectorPlan =
                         detectorPlanFor(state, blockIndex);
@@ -5121,7 +5476,7 @@ namespace
                             model.program.blockInstruction(block, index);
                         std::string error;
                         const std::optional<std::string> code =
-                            emitBlockPositionCode(state, detectorPlan, instruction,
+                            emitBlockPositionCode(state, detectorPlan, arrayPlan, instruction,
                                                   static_cast<uint32_t>(index),
                                                   detectorGroupDeclared, error);
                         if (!code)
