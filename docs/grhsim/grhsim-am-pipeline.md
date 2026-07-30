@@ -126,6 +126,20 @@ normalized GRH
 > 保持原样。emitter peephole（IR/scheduler/validator 不动）。Gate：ctest AM
 > 8/8；xs-components 053/044/100 各 20,000 向量与 legacy bit-exact。
 >
+> 实现进展（2026-07-30，ST00013 标量写点判变融合，分析文档 P5 的 emitter
+> 落地）：RegisterWrite 写点比较 next != target，真变才写并置 wrChg_N
+> （窄路径写抑制、宽路径 masked_write_words_detect），尾部 detector 改读标志
+> （ST00010 组累加或 event 变量），old 基线死亡；多写 target 跨写点 OR 累加
+> （多余激活为规范允许），写回相同值不再激活（收敛性不变）。XS 尾部标量比较
+> 277,431 → 67,394（−75.7%）。Gate：ctest AM 8/8；xs-components 053/044/100
+> 各 20,000 向量与 legacy bit-exact。
+>
+> 组合（ST00011+12+13）XiangShan 干净机 host ms：2k 22,431 / 20k 279,039 /
+> 50k 757,952，difftest 全过且 instrCnt/IPC 与 legacy 完全一致；对干净重测的
+> ST00010（52,431 / 592,416）2.34x / 2.12x（07-29 的 905,050/1,982,820 经
+> 干净重测证伪为并发构建污染）；对 legacy 20k 6.15x、50k 4.47x。剩余差距
+> 主体转向 compute 侧（detector 密度 ~2.0M 站点、跨块值判变、宽值 helper）。
+>
 > 历史记录（2026-07-25，对应上述重构前的旧模型）：production scheduler 已删除
 > `Isolated` class，commit write 曾采用 consume-on-event（该机制已删除），wide-result
 > shift 已在执行前按 result 宽度扩展 lhs。

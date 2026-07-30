@@ -1559,19 +1559,23 @@ namespace
         {
             return fail("generated activity runtime did not use constant-mask activation writes");
         }
-        // ST00010 detector-group folding: the B0 input detector and the commit
-        // Block's state detector accumulate branchlessly into a block-local
-        // detGrp_0 flag (updating their private old baselines as before) and
-        // merge once; the folded event variables keep no member and no
-        // assignment. The commit merge still raises backwardFired_.
+        // ST00010 detector-group folding: the B0 input detector accumulates
+        // branchlessly into a block-local detGrp_0 flag (updating its private
+        // old baseline as before) and merges once; the folded event variables
+        // keep no member and no assignment. The commit merge still raises
+        // backwardFired_.
         const std::string entryAccumulate =
             "bool detGrp_0 = (v" + std::to_string(fixture.input.value) + " != v" +
             std::to_string(fixture.inputOld.value) + ");";
-        const std::string commitAccumulate =
-            "bool detGrp_0 = (v" + std::to_string(fixture.backwardState.value) +
-            " != v" + std::to_string(fixture.backwardStateOld.value) + ");";
+        // ST00013: the commit Block's state detector is fused into the
+        // RegisterWrite site (write-point compare, store and raise only on a
+        // real change); its group accumulator reads the write-point flag
+        // instead of a tail compare, and the old baseline is gone.
+        const std::string commitAccumulate = "bool detGrp_0 = wrChg_0;";
         if (generatedSourceText.find(entryAccumulate) == std::string::npos ||
             generatedSourceText.find(commitAccumulate) == std::string::npos ||
+            generatedSourceText.find("bool wrChg_0 = false;") == std::string::npos ||
+            generatedSourceText.find("wrChg_0 = true;") == std::string::npos ||
             generatedSourceText.find("if (detGrp_0) {") == std::string::npos ||
             generatedSourceText.find("profileActivateForward_ += 2;") ==
                 std::string::npos ||

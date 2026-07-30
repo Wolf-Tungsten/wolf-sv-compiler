@@ -303,6 +303,34 @@ namespace wolvrix::lib::grhsim::am
             // Block (an in-block producer would be read before assignment).
             std::vector<std::optional<std::string>> blockCommitGate;
             uint64_t commitGateBlockCount = 0;
+            // ST00013 scalar write-point detection fusion (P5): a commit Block
+            // tail changed.any on a BitVector state target costs one compare
+            // plus one old-baseline store per round even when nothing was
+            // written. The replacement moves detection into the Block's own
+            // RegisterWrite sites: the write computes its next value, and only
+            // a real change stores and raises a block-local flag (wrChg_N,
+            // the legacy "compare at write point, store on change" idiom).
+            // The tail detector then reads the flag (into its ST00010 group
+            // accumulator when folded, else directly into the event variable)
+            // and its old baseline goes dead. Multi-write targets OR-accumulate
+            // across their sites; a write restoring the previous value raises
+            // nothing, preserving eval convergence. Eligibility: same-Block
+            // RegisterWrite sites cover the target (LatchWrite/MemoryWrite are
+            // not fused), event consumed only by same-Block act.f/act.b, no
+            // cross-block changed result.
+            struct ScalarWatchPlan
+            {
+                // RegisterWrite position -> flag id raised on real change.
+                std::unordered_map<uint32_t, uint32_t> writeRaise;
+                // changed.any position -> flag id replacing the compare+store.
+                std::unordered_map<uint32_t, uint32_t> detectorRaise;
+                uint32_t flagCount = 0;
+            };
+            std::vector<std::optional<ScalarWatchPlan>> blockScalarWatchPlans;
+            uint64_t scalarWatchFusedCount = 0;
+            // Mutable emission context (same pattern as arrayWriteAccum): the
+            // current RegisterWrite position's raise flag, -1 when none.
+            mutable int32_t scalarWriteRaise = -1;
         };
 
         constexpr uint8_t kEscapeGlobal = 1U << 0U;
@@ -1478,11 +1506,21 @@ namespace wolvrix::lib::grhsim::am
                 isWideBitVector(state, operands[3]))
             {
                 const uint32_t width = variableType(state, operands[3]).bitWidth;
-                const std::string body =
-                    "masked_write_words(" + wideDataExpr(state, operands[3]) + ", " +
-                    wideDataExpr(state, operands[2]) + ", " +
-                    wideDataExpr(state, operands[1]) + ", " +
-                    std::to_string(width) + ");";
+                const std::string writeArgs =
+                    wideDataExpr(state, operands[3]) + ", " + wideDataExpr(state, operands[2]) +
+                    ", " + wideDataExpr(state, operands[1]) + ", " + std::to_string(width) + ")";
+                std::string body;
+                if (opcode == Opcode::RegisterWrite && state.scalarWriteRaise >= 0)
+                {
+                    // ST00013: the detect variant performs the same masked
+                    // write and reports a real change for the raise flag.
+                    body = "wrChg_" + std::to_string(state.scalarWriteRaise) +
+                           " |= masked_write_words_detect(" + writeArgs + ";";
+                }
+                else
+                {
+                    body = "masked_write_words(" + writeArgs + ";";
+                }
                 if (opcode == Opcode::RegisterWrite)
                 {
                     return emitEventfulStateWrite(4, boolExpr(state, operands[0]), body);
@@ -1707,11 +1745,28 @@ namespace wolvrix::lib::grhsim::am
                 case Opcode::RegisterWrite:
                 {
                     const VariableId target = operands[3];
-                    const std::string body =
-                        valueExpr(state, target) + " = ((" + valueExpr(state, target) + " & ~" +
-                        valueExpr(state, operands[1]) + ") | (" + valueExpr(state, operands[2]) + " & " +
-                        valueExpr(state, operands[1]) + ")) & " +
-                        maskExpr(variableType(state, target).bitWidth) + ";";
+                    const std::string nextValue =
+                        "((" + valueExpr(state, target) + " & ~" +
+                        valueExpr(state, operands[1]) + ") | (" +
+                        valueExpr(state, operands[2]) + " & " + valueExpr(state, operands[1]) +
+                        ")) & " + maskExpr(variableType(state, target).bitWidth);
+                    std::string body;
+                    if (state.scalarWriteRaise >= 0)
+                    {
+                        // ST00013: compare at the write point and store only
+                        // on a real change (the legacy write-point detection
+                        // idiom); the tail detector reads the raise flag.
+                        const std::string next =
+                            "wrNext_" + std::to_string(instruction.value);
+                        body = "{ const auto " + next + " = " + nextValue + ";\nif (" + next +
+                               " != " + valueExpr(state, target) + ") { " +
+                               valueExpr(state, target) + " = " + next + "; wrChg_" +
+                               std::to_string(state.scalarWriteRaise) + " = true; } }";
+                    }
+                    else
+                    {
+                        body = valueExpr(state, target) + " = " + nextValue + ";";
+                    }
                     return emitEventfulStateWrite(4, boolExpr(state, operands[0]), body);
                 }
                 case Opcode::LatchWrite:
@@ -1933,6 +1988,37 @@ namespace wolvrix::lib::grhsim::am
             return slot ? &*slot : nullptr;
         }
 
+        const EmitState::ScalarWatchPlan *scalarWatchPlanFor(const EmitState &state,
+                                                             std::size_t blockIndex)
+        {
+            if (state.blockScalarWatchPlans.empty())
+            {
+                return nullptr;
+            }
+            const auto &slot = state.blockScalarWatchPlans[blockIndex];
+            return slot ? &*slot : nullptr;
+        }
+
+        // ST00013: block-local write-point flag declarations (one per fused
+        // scalar detector), reset at every Block execution entry.
+        std::string scalarWatchDeclarations(const EmitState::ScalarWatchPlan *plan)
+        {
+            if (plan == nullptr || plan->flagCount == 0)
+            {
+                return {};
+            }
+            std::string code = "bool ";
+            for (uint32_t flag = 0; flag < plan->flagCount; ++flag)
+            {
+                if (flag != 0)
+                {
+                    code += ", ";
+                }
+                code += "wrChg_" + std::to_string(flag) + " = false";
+            }
+            return code + ";\n";
+        }
+
         // ST00011: block-local change-flag declarations (one per replaced
         // array detector), reset at every Block execution entry.
         std::string arrayWatchDeclarations(const EmitState::ArrayWatchPlan *plan)
@@ -2028,6 +2114,7 @@ namespace wolvrix::lib::grhsim::am
         emitBlockPositionCode(const EmitState &state,
                               const EmitState::DetectorGroupPlan *plan,
                               const EmitState::ArrayWatchPlan *arrayPlan,
+                              const EmitState::ScalarWatchPlan *scalarPlan,
                               InstructionId instruction, uint32_t index,
                               std::vector<uint8_t> &groupDeclared, std::string &error)
         {
@@ -2035,6 +2122,30 @@ namespace wolvrix::lib::grhsim::am
             if (plan != nullptr && plan->skippedActs.count(index) != 0)
             {
                 // Replaced by the group merge anchored at the run end.
+            }
+            else if (scalarPlan != nullptr && scalarPlan->detectorRaise.count(index) != 0)
+            {
+                // ST00013: the flag raised at the Block's own write sites
+                // feeds the group accumulator (folded) or the event variable.
+                const uint32_t flag = scalarPlan->detectorRaise.at(index);
+                const std::string flagExpr = "wrChg_" + std::to_string(flag);
+                if (plan != nullptr && plan->accumGroups.count(index) != 0)
+                {
+                    for (const uint32_t group : plan->accumGroups.at(index))
+                    {
+                        code += groupDeclared[group] ? "detGrp_" : "bool detGrp_";
+                        code += std::to_string(group);
+                        code += groupDeclared[group] ? " |= " : " = ";
+                        code += flagExpr + ";\n";
+                        groupDeclared[group] = 1;
+                    }
+                }
+                else
+                {
+                    const auto results = state.program.results(instruction);
+                    code += changedResultAssignPrefix(state, results.front()) + flagExpr +
+                            ");\n";
+                }
             }
             else if (plan != nullptr && plan->accumGroups.count(index) != 0)
             {
@@ -2062,10 +2173,19 @@ namespace wolvrix::lib::grhsim::am
                             static_cast<int32_t>(detector->second);
                     }
                 }
+                if (scalarPlan != nullptr)
+                {
+                    const auto write = scalarPlan->writeRaise.find(index);
+                    if (write != scalarPlan->writeRaise.end())
+                    {
+                        state.scalarWriteRaise = static_cast<int32_t>(write->second);
+                    }
+                }
                 std::optional<std::string> emitted =
                     emitInstruction(state, instruction, error);
                 state.arrayWriteAccum = -1;
                 state.arrayDetectorAccum = -1;
+                state.scalarWriteRaise = -1;
                 if (!emitted)
                 {
                     return std::nullopt;
@@ -2488,6 +2608,18 @@ namespace wolvrix::lib::grhsim::am
                                   std::string(kContext));
                 return std::nullopt;
             }
+            const EmitState::ScalarWatchPlan *scalarPlan =
+                scalarWatchPlanFor(state, blockIndex);
+            const std::optional<uint64_t> scalarWatchBytes = indentedLineByteCount(
+                scalarWatchDeclarations(scalarPlan), indentation);
+            if (!scalarWatchBytes || !addByteCount(byteCount, *scalarWatchBytes))
+            {
+                endLocalityBlock(state);
+                diagnostics.error("AM C++ emitter source size overflow: block=" +
+                                      std::to_string(blockIndex),
+                                  std::string(kContext));
+                return std::nullopt;
+            }
             const BlockId block{static_cast<uint32_t>(blockIndex)};
             const EmitState::DetectorGroupPlan *detectorPlan =
                 detectorPlanFor(state, blockIndex);
@@ -2499,7 +2631,8 @@ namespace wolvrix::lib::grhsim::am
                     model.program.blockInstruction(block, index);
                 std::string error;
                 const std::optional<std::string> code =
-                    emitBlockPositionCode(state, detectorPlan, arrayPlan, instruction,
+                    emitBlockPositionCode(state, detectorPlan, arrayPlan, scalarPlan,
+                                          instruction,
                                           static_cast<uint32_t>(index),
                                           detectorGroupDeclared, error);
                 if (!code)
@@ -3394,6 +3527,145 @@ namespace wolvrix::lib::grhsim::am
                 ++state.commitGateBlockCount;
             }
         }
+
+        // ST00013: plans the emit-time fusion of commit-Block tail changed.any
+        // detectors on BitVector state targets into the Block's own
+        // RegisterWrite sites (see EmitState::ScalarWatchPlan). Eligibility
+        // mirrors ST00011: same-Block write sites cover the target (no
+        // LatchWrite to it), event consumed only by same-Block act.f/act.b,
+        // no cross-block changed result.
+        void planScalarWatchGroups(const ExecutableModel &model, EmitState &state)
+        {
+            state.blockScalarWatchPlans.clear();
+            state.blockScalarWatchPlans.resize(state.blockCount);
+            state.scalarWatchFusedCount = 0;
+            if (model.commitBlockBegin == 0)
+            {
+                return;
+            }
+            for (uint32_t blockIndex = model.commitBlockBegin;
+                 blockIndex < state.blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                const std::size_t blockSize = model.program.blockSize(block);
+                if (blockSize < 2)
+                {
+                    continue;
+                }
+                const auto opcodeAt = [&](std::size_t position) {
+                    return state.program.opcode(model.program.blockInstruction(
+                        block, position));
+                };
+                std::unordered_map<uint32_t, std::vector<uint32_t>> uses;
+                std::unordered_map<uint32_t, std::vector<uint32_t>> registerWrites;
+                std::unordered_set<uint32_t> latchTargets;
+                for (std::size_t position = 0; position < blockSize; ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    const Opcode opcode = state.program.opcode(instruction);
+                    const auto operands = state.program.operands(instruction);
+                    if (opcode == Opcode::RegisterWrite)
+                    {
+                        registerWrites[operands[3].value].push_back(
+                            static_cast<uint32_t>(position));
+                    }
+                    else if (opcode == Opcode::LatchWrite)
+                    {
+                        latchTargets.insert(operands[3].value);
+                    }
+                    for (const VariableId operand : operands)
+                    {
+                        uses[operand.value].push_back(static_cast<uint32_t>(position));
+                    }
+                }
+                if (registerWrites.empty())
+                {
+                    continue;
+                }
+
+                EmitState::ScalarWatchPlan plan;
+                for (std::size_t position = 0; position < blockSize; ++position)
+                {
+                    if (opcodeAt(position) != Opcode::ChangedAny)
+                    {
+                        continue;
+                    }
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    const auto operands = state.program.operands(instruction);
+                    const auto results = state.program.results(instruction);
+                    if (operands.size() < 2 || results.empty())
+                    {
+                        continue;
+                    }
+                    const VariableId watched = operands[0];
+                    const VariableId event = results.front();
+                    if (variableType(state, watched).kind != TypeKind::BitVector)
+                    {
+                        continue;
+                    }
+                    const auto writes = registerWrites.find(watched.value);
+                    if (writes == registerWrites.end() || writes->second.empty() ||
+                        latchTargets.count(watched.value) != 0)
+                    {
+                        continue;
+                    }
+                    if (writes->second.back() >= static_cast<uint32_t>(position))
+                    {
+                        continue;
+                    }
+                    if (state.crossBlockChangedResults[event.value])
+                    {
+                        continue;
+                    }
+                    const auto useEntry = uses.find(event.value);
+                    if (useEntry == uses.end())
+                    {
+                        continue;
+                    }
+                    bool eligible = true;
+                    for (const uint32_t use : useEntry->second)
+                    {
+                        const Opcode useOpcode = opcodeAt(use);
+                        if (useOpcode != Opcode::ActForward &&
+                            useOpcode != Opcode::ActBackward)
+                        {
+                            eligible = false;
+                            break;
+                        }
+                    }
+                    if (!eligible)
+                    {
+                        continue;
+                    }
+                    bool collision = false;
+                    for (const uint32_t writePosition : writes->second)
+                    {
+                        if (plan.writeRaise.count(writePosition) != 0)
+                        {
+                            collision = true;
+                            break;
+                        }
+                    }
+                    if (collision)
+                    {
+                        continue;
+                    }
+                    const uint32_t flag = plan.flagCount++;
+                    plan.detectorRaise.emplace(static_cast<uint32_t>(position), flag);
+                    for (const uint32_t writePosition : writes->second)
+                    {
+                        plan.writeRaise.emplace(writePosition, flag);
+                    }
+                    ++state.scalarWatchFusedCount;
+                }
+                if (plan.flagCount != 0)
+                {
+                    state.blockScalarWatchPlans[blockIndex] = std::move(plan);
+                }
+            }
+        }
     } // namespace
 
     GrhSimAmCppResult
@@ -3917,6 +4189,11 @@ namespace wolvrix::lib::grhsim::am
         // ST00012 commit event batch gating: one event-union branch per
         // commit Block replaces per-statement event loads on quiet rounds.
         planCommitEventGates(model, state);
+        // ST00013 scalar write-point detection fusion: move commit-Block
+        // tail change detection on BitVector targets into the Block's own
+        // RegisterWrite sites. Planned after ST00010 (emission consults its
+        // group assignments).
+        planScalarWatchGroups(model, state);
 
         if (statsAttribute != options.attributes.end() && statsAttribute->second == "true")
         {
@@ -3941,7 +4218,9 @@ namespace wolvrix::lib::grhsim::am
                                  " array_watch_write_point=" +
                                  std::to_string(state.arrayWatchReplacedCount) +
                                  " commit_gated_blocks=" +
-                                 std::to_string(state.commitGateBlockCount),
+                                 std::to_string(state.commitGateBlockCount) +
+                                 " scalar_watch_fused=" +
+                                 std::to_string(state.scalarWatchFusedCount),
                              std::string(kContext));
         }
 
@@ -5587,6 +5866,11 @@ namespace
                     writeIndentedLines(blockSource,
                                        arrayWatchDeclarations(arrayPlan),
                                        indentation);
+                    const EmitState::ScalarWatchPlan *scalarPlan =
+                        scalarWatchPlanFor(state, blockIndex);
+                    writeIndentedLines(blockSource,
+                                       scalarWatchDeclarations(scalarPlan),
+                                       indentation);
                     const BlockId block{static_cast<uint32_t>(blockIndex)};
                     const EmitState::DetectorGroupPlan *detectorPlan =
                         detectorPlanFor(state, blockIndex);
@@ -5600,7 +5884,8 @@ namespace
                             model.program.blockInstruction(block, index);
                         std::string error;
                         const std::optional<std::string> code =
-                            emitBlockPositionCode(state, detectorPlan, arrayPlan, instruction,
+                            emitBlockPositionCode(state, detectorPlan, arrayPlan, scalarPlan,
+                                                  instruction,
                                                   static_cast<uint32_t>(index),
                                                   detectorGroupDeclared, error);
                         if (!code)
