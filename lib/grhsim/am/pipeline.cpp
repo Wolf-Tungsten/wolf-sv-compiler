@@ -1,6 +1,7 @@
 #include "grhsim/am/pipeline.hpp"
 
 #include "grhsim/am/opcode_traits.hpp"
+#include "grhsim/am/optimize.hpp"
 
 #include <algorithm>
 #include <iterator>
@@ -876,6 +877,11 @@ namespace wolvrix::lib::grhsim::am
     {
     }
 
+    void GrhSimAmPipeline::setAmOptimizeOptions(AmOptimizeOptions options)
+    {
+        optimizeOptions_ = options;
+    }
+
     std::optional<LinearProgramArtifact>
     GrhSimAmPipeline::lower(const wolvrix::lib::grh::Graph &graph,
                             wolvrix::lib::diag::Diagnostics &diagnostics)
@@ -907,6 +913,12 @@ namespace wolvrix::lib::grhsim::am
                                        ValidationOptions{.level = ValidationLevel::Semantic}),
                               "grhsim-am-lower",
                               diagnostics))
+        {
+            return result;
+        }
+
+        if (!optimizeLinearProgram(linear, optimizeOptions_, diagnostics) ||
+            diagnostics.hasError())
         {
             return result;
         }

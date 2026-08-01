@@ -634,6 +634,36 @@ header 中的三个对账指标在生产内部按如下口径计算（harness  s
 - `incoming_copy_cost`：上述每个对按 `max(1, ceil(width/64))` 折算的拷贝总数，
   即 topo-partition-proj 04 文档第一阶段优化目标。
 
+### 3.2.5 AM 指令流优化（DCE / const-fold / CSE，2026-07-31）
+
+`grhsim/am/optimize.{hpp,cpp}` 在 lowering 与 schedule 之间提供可选的指令流优化：
+`optimizeLinearProgram(LinearProgramArtifact&, AmOptimizeOptions{dce, constFold, cse},
+Diagnostics&)`。`grhsim-am-lower-json` 经 `--am-optimize=dce,fold,cse`（默认全开）/
+`--no-am-optimize` 控制；实验路径与生产路径均默认开启——生产路径由
+`GrhSimAmPipeline::run` 在 lower 校验后、schedule 前调用，可用
+`setAmOptimizeOptions` 改配或全关。
+动机与两级（GRH 层 + AM 层）实验设计见 topo-partition-proj `docs/20`。
+
+- **DCE**：根集合 = effect ∈ {StateWrite, StateReadWrite, HostRead, HostEffect} 的指令
+  ∪ `orderedEffects` 涉及指令 ∪ 产出 ExternalOutput/Observable 角色的指令，沿 def-use
+  反图标记活指令。StateRead（MemoryRead）结果无引用且不在 `orderedEffects` 中时可删。
+- **const-fold**：操作数全为常量的纯 op 求值进 literal 池（逐位镜像 interpreter
+  语义），与 CSE 迭代至不动点。
+- **CSE**：纯 op hash-cons，key = (opcode, result type, 规范化操作数[可交换 op
+  排序], slice/system 属性)；Memory/DPI/System/Changed 一律不参与。重复指令的结果
+  变量别名为首次出现的变量。
+- **compaction**：删除采用稠密 id 重写（不用 NOP 标记，避免死指令占用分块容量
+  预算）；`instructionEffects` 由 `opcodeTraits(opcode).effect` 机械重算，
+  `variableRoles`、`orderedEffects`、`interface.ports/declaredVariables` 与
+  slice/system/dpi 属性记录全部随 id 重映射。完成后 `validate(artifact)` 自检，
+  失败则保持原 artifact 不变并返回 false。
+
+全香山实测（L1 清理后的 3,946,245 指令输入）：CSE 净删 16,359 条重复纯 op、
+fold 2 条、DCE 0 条（死锥已被 GRH 层收编），耗时 ~6 s；E2（L2-only，未过 L1 的
+脏图）结果见 topo-partition-proj `docs/20` 的实验矩阵。单测
+`tests/grhsim/am/test_optimize.cpp` 覆盖死锥删除、可交换 CSE、fold 级联、
+facts/interface 重映射与根集合安全性。
+
 ### 3.3 临时 scheduling facts
 
 以下内容只属于 scheduler workspace，不进入 ScheduledProgram 或 session 的长期公共契约：

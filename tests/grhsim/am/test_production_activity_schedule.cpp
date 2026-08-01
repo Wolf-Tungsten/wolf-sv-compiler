@@ -1,6 +1,7 @@
 #include "grhsim/am/builder.hpp"
 #include "grhsim/am/interpreter.hpp"
 #include "grhsim/am/production_activity_schedule.hpp"
+#include "grhsim/am/activity_schedule.hpp"
 
 #include <array>
 #include <cstdint>
@@ -8,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <span>
@@ -2560,6 +2562,96 @@ namespace
         }
         return 0;
     }
+
+    // Unit-cost vs width-weighted segment DP (docs/10): 100 compute atoms in
+    // a fixed chain, no coarsening, capacity 60 forces exactly two segments.
+    // v_wide (weight 8) is defined at atom 46 and used at 47..99; v_n1/v_n2
+    // (weight 1) are defined at atom 30 and used at 45..54. The unit-cost DP
+    // crosses v_wide (cost 1) with the cut at 55; the width-weighted DP
+    // prefers crossing v_n1+v_n2 (cost 2) with the cut at 40 over paying 8.
+    int testWidthWeightedCopyCostChangesSegmentation()
+    {
+        constexpr uint32_t kAtoms = 100;
+        std::array<uint32_t, kAtoms + 1> atomOffsets{};
+        std::array<uint32_t, kAtoms - 1> atomTargets{};
+        for (uint32_t atom = 0; atom < kAtoms; ++atom) {
+            atomOffsets[atom] = atom;
+            if (atom + 1 < kAtoms) {
+                atomTargets[atom] = atom + 1;
+            }
+        }
+        atomOffsets[kAtoms] = kAtoms - 1;
+        const std::vector<uint32_t> atomInstructions(kAtoms, 1);
+        const std::vector<uint32_t> atomStateWrites(kAtoms, 0);
+        const std::vector<uint8_t> atomIsCommit(kAtoms, 0);
+        std::vector<uint32_t> atomMinInstruction(kAtoms);
+        std::iota(atomMinInstruction.begin(), atomMinInstruction.end(), uint32_t{0});
+        const std::vector<uint32_t> commitRanks(kAtoms, 0);
+        const std::vector<uint32_t> definitions = {46, 30, 30};
+        std::vector<uint32_t> uses;
+        for (uint32_t use = 47; use < kAtoms; ++use) {
+            uses.push_back(use); // v_wide
+        }
+        for (uint32_t rep = 0; rep < 2; ++rep) {
+            for (uint32_t use = 45; use <= 54; ++use) {
+                uses.push_back(use); // v_n1, v_n2
+            }
+        }
+        const std::array<uint32_t, 4> useOffsets = {0, 53, 63, 73};
+        std::vector<uint32_t> instructionAtom(kAtoms);
+        std::iota(instructionAtom.begin(), instructionAtom.end(), uint32_t{0});
+        const std::array<uint32_t, 3> copyWeights = {8, 1, 1};
+
+        GrhSimAmActivityScheduleInput input{
+            .atomCount = kAtoms,
+            .atomOffsets = atomOffsets,
+            .atomTargets = atomTargets,
+            .atomInstructions = atomInstructions,
+            .atomStateWrites = atomStateWrites,
+            .atomIsCommit = atomIsCommit,
+            .atomMinInstruction = atomMinInstruction,
+            .commitEventRank = commitRanks,
+            .commitGuardRank = commitRanks,
+            .variableCount = 3,
+            .definitions = definitions,
+            .useOffsets = useOffsets,
+            .uses = uses,
+            .instructionAtom = instructionAtom,
+            .maxInstructionsPerBlock = 60,
+            .enableCoarsening = false,
+            .segmentPenalty = 1.0,
+        };
+        std::string error;
+        const auto unitResult = scheduleGrhSimAmActivityBlocks(input, error);
+        if (!unitResult) {
+            return fail("unit-cost block formation failed: " + error);
+        }
+        if (unitResult->dpSegments != 2) {
+            return fail("unit-cost DP should cut into 2 segments");
+        }
+        if (unitResult->atomBlock[54] == unitResult->atomBlock[55]) {
+            return fail("unit-cost DP should cut between atoms 54 and 55");
+        }
+        if (unitResult->atomBlock[39] != unitResult->atomBlock[40]) {
+            return fail("unit-cost DP should not cut between atoms 39 and 40");
+        }
+
+        input.variableCopyWeights = copyWeights;
+        const auto weightedResult = scheduleGrhSimAmActivityBlocks(input, error);
+        if (!weightedResult) {
+            return fail("width-weighted block formation failed: " + error);
+        }
+        if (weightedResult->dpSegments != 2) {
+            return fail("width-weighted DP should cut into 2 segments");
+        }
+        if (weightedResult->atomBlock[39] == weightedResult->atomBlock[40]) {
+            return fail("width-weighted DP should cut between atoms 39 and 40");
+        }
+        if (weightedResult->atomBlock[54] != weightedResult->atomBlock[55]) {
+            return fail("width-weighted DP should not cut between atoms 54 and 55");
+        }
+        return 0;
+    }
 } // namespace
 
 int main()
@@ -2646,6 +2738,9 @@ int main()
         return result;
     }
     if (const int result = testBlockAssignmentExportWritesJsonl(); result != 0) {
+        return result;
+    }
+    if (const int result = testWidthWeightedCopyCostChangesSegmentation(); result != 0) {
         return result;
     }
     return 0;

@@ -1,6 +1,7 @@
 #include "core/grh.hpp"
 #include "grhsim/am/cpp_emitter.hpp"
 #include "grhsim/am/lowering.hpp"
+#include "grhsim/am/optimize.hpp"
 #include "grhsim/am/production_activity_schedule.hpp"
 
 #include <charconv>
@@ -111,7 +112,9 @@ int main(int argc, char **argv)
                      "[--max-source-bytes <count>] [--max-commit-source-bytes <count>] "
                      "[--max-instructions-per-block <count>] "
                      "[--dp-segment-penalty <value>] "
-                     "[--dp-coarsen-budget <count>] [--runtime-profile]\n";
+                     "[--dp-coarsen-budget <count>] [--disable-coarsening] "
+                     "[--dp-width-weighted-cost] [--runtime-profile] "
+                     "[--am-optimize=<dce,fold,cse>] [--no-am-optimize]\n";
         return 2;
     }
     const std::string path = argv[1];
@@ -124,7 +127,10 @@ int main(int argc, char **argv)
     std::size_t maxInstructionsPerBlock = 128;
     double dpSegmentPenalty = 1.0;
     std::size_t dpCoarsenBudget = 0;
+    bool enableCoarsening = true;
+    bool dpWidthWeightedCopyCost = false;
     bool runtimeProfile = false;
+    AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
     {
         const std::string_view argument(argv[index]);
@@ -215,9 +221,72 @@ int main(int argc, char **argv)
             }
             dpCoarsenBudget = value;
         }
+        else if (argument == "--disable-coarsening")
+        {
+            enableCoarsening = false;
+        }
+        else if (argument == "--dp-width-weighted-cost")
+        {
+            dpWidthWeightedCopyCost = true;
+        }
         else if (argument == "--runtime-profile")
         {
             runtimeProfile = true;
+        }
+        else if (argument == "--no-am-optimize")
+        {
+            amOptimize = AmOptimizeOptions{
+                .dce = false,
+                .constFold = false,
+                .cse = false,
+            };
+        }
+        else if (argument.starts_with("--am-optimize="))
+        {
+            const std::string_view list =
+                argument.substr(std::string_view("--am-optimize=").size());
+            AmOptimizeOptions parsed{
+                .dce = false,
+                .constFold = false,
+                .cse = false,
+            };
+            bool valid = true;
+            std::size_t begin = 0;
+            while (valid && begin <= list.size())
+            {
+                const std::size_t comma = list.find(',', begin);
+                const std::string_view token =
+                    comma == std::string_view::npos
+                        ? list.substr(begin)
+                        : list.substr(begin, comma - begin);
+                if (token == "dce")
+                {
+                    parsed.dce = true;
+                }
+                else if (token == "fold")
+                {
+                    parsed.constFold = true;
+                }
+                else if (token == "cse")
+                {
+                    parsed.cse = true;
+                }
+                else if (!token.empty())
+                {
+                    valid = false;
+                }
+                if (comma == std::string_view::npos)
+                {
+                    break;
+                }
+                begin = comma + 1;
+            }
+            if (!valid)
+            {
+                std::cerr << "invalid --am-optimize value: " << list << '\n';
+                return 2;
+            }
+            amOptimize = parsed;
         }
         else if (!argument.starts_with("--") && explicitTop.empty())
         {
@@ -294,6 +363,22 @@ int main(int argc, char **argv)
                       << " peak_rss_kib=" << peakRssKiB() << '\n';
             return 1;
         }
+        if (amOptimize.dce || amOptimize.constFold || amOptimize.cse)
+        {
+            phaseStart = std::chrono::steady_clock::now();
+            const bool optimized =
+                optimizeLinearProgram(*artifact, amOptimize, diagnostics);
+            const uint64_t optimizeMs = elapsedMilliseconds(phaseStart);
+            std::cerr << "[grhsim-am-lower-json] optimize complete ms="
+                      << optimizeMs << " peak_rss_kib=" << peakRssKiB() << '\n';
+            if (!optimized || diagnostics.hasError())
+            {
+                printDiagnostics(diagnostics);
+                std::cerr << "optimize failed after " << optimizeMs << " ms"
+                          << " peak_rss_kib=" << peakRssKiB() << '\n';
+                return 1;
+            }
+        }
         const ProgramStorageStats stats = artifact->program.view().storageStats();
         const std::size_t interfacePorts = artifact->interface.ports.size();
         const std::size_t declaredVariables =
@@ -320,9 +405,10 @@ int main(int argc, char **argv)
                 std::move(*artifact),
                 ActivityScheduleOptions{
                     .maxInstructionsPerBlock = maxInstructionsPerBlock,
-                    .enableCoarsening = true,
+                    .enableCoarsening = enableCoarsening,
                     .collectStats = true,
                     .dpSegmentPenalty = dpSegmentPenalty,
+                    .dpWidthWeightedCopyCost = dpWidthWeightedCopyCost,
                     .dpCoarsenBudget = dpCoarsenBudget,
                 },
                 diagnostics);

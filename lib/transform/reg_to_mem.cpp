@@ -12,6 +12,7 @@
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -288,6 +289,174 @@ namespace wolvrix::lib::transform
             std::size_t groupCount = 0;
             bool verbose = false;
         };
+
+        struct GroupReportRecord
+        {
+            std::string graph;
+            std::size_t groupId = 0;
+            std::string discovery;
+            std::string module;
+            int32_t elementWidth = 0;
+            std::size_t elementCount = 0;
+            std::string outcome;
+            std::string rejectReason;
+            std::string rejectDetail;
+        };
+
+        void recordGroupReject(GroupReportRecord *record, std::string_view reason, std::string detail = {})
+        {
+            if (record == nullptr)
+            {
+                return;
+            }
+            record->rejectReason = std::string(reason);
+            record->rejectDetail = std::move(detail);
+        }
+
+        std::string_view groupDiscoveryKind(const GroupCandidate &group)
+        {
+            if (group.decodedWriteStorage)
+            {
+                return "decoded";
+            }
+            if (group.trueOnlyStorage)
+            {
+                return "true_only";
+            }
+            return "intent";
+        }
+
+        std::string groupModuleName(const Graph &graph, const GroupCandidate &group)
+        {
+            for (const std::string &regSymbol : group.regSymbols)
+            {
+                const OperationId regOpId = graph.findOperation(regSymbol);
+                if (!regOpId.valid())
+                {
+                    continue;
+                }
+                const auto &srcLoc = graph.getOperation(regOpId).srcLoc();
+                if (!srcLoc || srcLoc->file.empty())
+                {
+                    continue;
+                }
+                const std::size_t slash = srcLoc->file.find_last_of("/\\");
+                return slash == std::string::npos ? srcLoc->file : srcLoc->file.substr(slash + 1);
+            }
+            return {};
+        }
+
+        void appendJsonString(std::ostringstream &out, std::string_view text)
+        {
+            out << '"';
+            for (const char ch : text)
+            {
+                switch (ch)
+                {
+                case '"':
+                    out << "\\\"";
+                    break;
+                case '\\':
+                    out << "\\\\";
+                    break;
+                case '\n':
+                    out << "\\n";
+                    break;
+                case '\r':
+                    out << "\\r";
+                    break;
+                case '\t':
+                    out << "\\t";
+                    break;
+                default:
+                    if (static_cast<unsigned char>(ch) < 0x20)
+                    {
+                        out << "\\u";
+                        const char *digits = "0123456789abcdef";
+                        out << '0' << '0' << digits[(ch >> 4) & 0xF] << digits[ch & 0xF];
+                    }
+                    else
+                    {
+                        out << ch;
+                    }
+                    break;
+                }
+            }
+            out << '"';
+        }
+
+        std::string buildGroupReportsJson(const std::vector<GroupReportRecord> &records)
+        {
+            struct ReasonSummary
+            {
+                std::size_t groups = 0;
+                std::size_t elements = 0;
+            };
+            std::map<std::string, ReasonSummary> byReason;
+            std::map<std::string, ReasonSummary> byOutcome;
+
+            std::ostringstream out;
+            out << "{\"groups\":[";
+            bool first = true;
+            for (const GroupReportRecord &record : records)
+            {
+                if (!first)
+                {
+                    out << ',';
+                }
+                first = false;
+                out << "{\"graph\":";
+                appendJsonString(out, record.graph);
+                out << ",\"group_id\":" << record.groupId;
+                out << ",\"discovery\":";
+                appendJsonString(out, record.discovery);
+                out << ",\"module\":";
+                appendJsonString(out, record.module);
+                out << ",\"element_width\":" << record.elementWidth;
+                out << ",\"element_count\":" << record.elementCount;
+                out << ",\"outcome\":";
+                appendJsonString(out, record.outcome);
+                out << ",\"reject_reason\":";
+                appendJsonString(out, record.rejectReason);
+                out << ",\"reject_detail\":";
+                appendJsonString(out, record.rejectDetail);
+                out << '}';
+
+                ++byOutcome[record.outcome].groups;
+                byOutcome[record.outcome].elements += record.elementCount;
+                if (!record.rejectReason.empty())
+                {
+                    ++byReason[record.rejectReason].groups;
+                    byReason[record.rejectReason].elements += record.elementCount;
+                }
+            }
+            out << "],\"summary\":{\"by_reason\":{";
+            bool firstReason = true;
+            for (const auto &[reason, summary] : byReason)
+            {
+                if (!firstReason)
+                {
+                    out << ',';
+                }
+                firstReason = false;
+                appendJsonString(out, reason);
+                out << ":{\"groups\":" << summary.groups << ",\"elements\":" << summary.elements << '}';
+            }
+            out << "},\"by_outcome\":{";
+            bool firstOutcome = true;
+            for (const auto &[outcome, summary] : byOutcome)
+            {
+                if (!firstOutcome)
+                {
+                    out << ',';
+                }
+                firstOutcome = false;
+                appendJsonString(out, outcome);
+                out << ":{\"groups\":" << summary.groups << ",\"elements\":" << summary.elements << '}';
+            }
+            out << "}}}";
+            return out.str();
+        }
 
         bool shouldProfileGroupRow(const GroupProfileContext *groupProfile, std::size_t row, std::size_t rowCount)
         {
@@ -1025,6 +1194,186 @@ namespace wolvrix::lib::transform
             return false;
         }
 
+        // The shift amount of `kShl(1, idx)`: a 2-state constant 1 shifted
+        // left by idx, i.e. the one-hot decode of idx. Bit k of the N-bit
+        // result is 1 exactly when idx == k (for k < N; a larger idx shifts
+        // the single set bit out, matching eq(idx, k) == 0).
+        std::optional<ValueId> matchShiftOneHotIndex(const Graph &graph, ValueId value)
+        {
+            const OperationId opId = graph.valueDef(value);
+            if (!opId.valid())
+            {
+                return std::nullopt;
+            }
+            const Operation op = graph.getOperation(opId);
+            if (op.kind() != OperationKind::kShl || op.operands().size() != 2)
+            {
+                return std::nullopt;
+            }
+            const auto oneConst = getConstantUInt64(graph, op.operands()[0]);
+            if (!oneConst || *oneConst != UINT64_C(1))
+            {
+                return std::nullopt;
+            }
+            const ValueId idx = op.operands()[1];
+            if (getConstantUInt64(graph, idx))
+            {
+                return std::nullopt;
+            }
+            return idx;
+        }
+
+        // R1a: recognize one-hot row-select terms that are equivalent to
+        // eq(idx, k) under 2-state semantics, so guards built from decoded
+        // shift/concat one-hot vectors follow the same row-selection model as
+        // a plain equality. Every form requires the row constant k to be a
+        // 2-state constant (getConstantUInt64 rejects X/Z) and idx to be a
+        // non-constant value; the cross-row family consistency checks then
+        // force idx to be the same ValueId in every row of the family.
+        std::optional<EqualityTerm> matchOneHotRowSelectTerm(const Graph &graph,
+                                                             OperationId opId,
+                                                             const Operation &op)
+        {
+            // Form 1: `(1 << idx)[k]` as a static 1-bit slice; equivalent to
+            // eq(idx, k) by the one-hot argument above.
+            if (op.kind() == OperationKind::kSliceStatic && op.operands().size() == 1)
+            {
+                const auto sliceStart = getAttr<int64_t>(op, "sliceStart");
+                const auto sliceEnd = getAttr<int64_t>(op, "sliceEnd");
+                if (!sliceStart || !sliceEnd || *sliceStart != *sliceEnd || *sliceStart < 0)
+                {
+                    return std::nullopt;
+                }
+                const ValueId shifted = op.operands().front();
+                const auto idx = matchShiftOneHotIndex(graph, shifted);
+                const int32_t shiftedWidth = graph.valueWidth(shifted);
+                if (!idx || static_cast<int64_t>(shiftedWidth) <= *sliceStart)
+                {
+                    return std::nullopt;
+                }
+                return EqualityTerm{.op = opId,
+                                    .addr = *idx,
+                                    .constant = ValueId::invalid(),
+                                    .row = static_cast<uint64_t>(*sliceStart)};
+            }
+            // Form 2: `(1 << idx)[k +: 1]` as a dynamic 1-bit slice with a
+            // constant start; equivalent to eq(idx, k) by the same argument.
+            if (op.kind() == OperationKind::kSliceDynamic && op.operands().size() == 2)
+            {
+                const auto sliceWidth = getAttr<int64_t>(op, "sliceWidth");
+                if (!sliceWidth || *sliceWidth != 1)
+                {
+                    return std::nullopt;
+                }
+                const auto rowConst = getConstantUInt64(graph, op.operands()[1]);
+                if (!rowConst)
+                {
+                    return std::nullopt;
+                }
+                const ValueId shifted = op.operands()[0];
+                const auto idx = matchShiftOneHotIndex(graph, shifted);
+                const int32_t shiftedWidth = graph.valueWidth(shifted);
+                if (!idx || shiftedWidth <= 0 ||
+                    *rowConst >= static_cast<uint64_t>(shiftedWidth))
+                {
+                    return std::nullopt;
+                }
+                return EqualityTerm{.op = opId,
+                                    .addr = *idx,
+                                    .constant = op.operands()[1],
+                                    .row = *rowConst};
+            }
+            // Form 3: `onehotConcat[k]` where the concat packs one bit per row
+            // and bit j is eq(idx, j) with a shared idx; selecting bit k
+            // yields eq(idx, k) directly. Concat operand 0 is the most
+            // significant bit, so operand i must be eq(idx, count - 1 - i).
+            if (op.kind() == OperationKind::kSliceArray && op.operands().size() == 2)
+            {
+                const auto sliceWidth = getAttr<int64_t>(op, "sliceWidth");
+                if (!sliceWidth || *sliceWidth != 1)
+                {
+                    return std::nullopt;
+                }
+                const auto rowConst = getConstantUInt64(graph, op.operands()[1]);
+                if (!rowConst)
+                {
+                    return std::nullopt;
+                }
+                const OperationId concatOpId = graph.valueDef(op.operands()[0]);
+                if (!concatOpId.valid())
+                {
+                    return std::nullopt;
+                }
+                const Operation concatOp = graph.getOperation(concatOpId);
+                if (concatOp.kind() != OperationKind::kConcat || concatOp.operands().size() < 2)
+                {
+                    return std::nullopt;
+                }
+                const std::size_t bitCount = concatOp.operands().size();
+                if (*rowConst >= static_cast<uint64_t>(bitCount))
+                {
+                    return std::nullopt;
+                }
+                std::optional<ValueId> sharedIdx;
+                for (std::size_t operandIndex = 0; operandIndex < bitCount; ++operandIndex)
+                {
+                    const ValueId bit = concatOp.operands()[operandIndex];
+                    const uint64_t bitPosition =
+                        static_cast<uint64_t>(bitCount - 1 - operandIndex);
+                    if (graph.valueWidth(bit) != 1)
+                    {
+                        return std::nullopt;
+                    }
+                    const OperationId bitOpId = graph.valueDef(bit);
+                    if (!bitOpId.valid())
+                    {
+                        return std::nullopt;
+                    }
+                    const Operation bitOp = graph.getOperation(bitOpId);
+                    if (bitOp.kind() != OperationKind::kEq || bitOp.operands().size() != 2)
+                    {
+                        return std::nullopt;
+                    }
+                    const auto lhsConst = getConstantUInt64(graph, bitOp.operands()[0]);
+                    const auto rhsConst = getConstantUInt64(graph, bitOp.operands()[1]);
+                    ValueId idx = ValueId::invalid();
+                    if (lhsConst && !rhsConst && *lhsConst == bitPosition)
+                    {
+                        idx = bitOp.operands()[1];
+                    }
+                    else if (rhsConst && !lhsConst && *rhsConst == bitPosition)
+                    {
+                        idx = bitOp.operands()[0];
+                    }
+                    else
+                    {
+                        return std::nullopt;
+                    }
+                    if (getConstantUInt64(graph, idx))
+                    {
+                        return std::nullopt;
+                    }
+                    if (!sharedIdx)
+                    {
+                        sharedIdx = idx;
+                    }
+                    else if (!sameValueAfterAssign(graph, *sharedIdx, idx))
+                    {
+                        return std::nullopt;
+                    }
+                }
+                if (!sharedIdx)
+                {
+                    return std::nullopt;
+                }
+                return EqualityTerm{.op = opId,
+                                    .addr = *sharedIdx,
+                                    .constant = op.operands()[1],
+                                    .row = *rowConst};
+            }
+            return std::nullopt;
+        }
+
         std::optional<EqualityTerm> matchEqualityTerm(const Graph &graph, ValueId term)
         {
             const auto unwrapped = unwrapAssign(graph, term);
@@ -1077,7 +1426,7 @@ namespace wolvrix::lib::transform
             }
             if (op.kind() != OperationKind::kEq || op.operands().size() != 2)
             {
-                return std::nullopt;
+                return matchOneHotRowSelectTerm(graph, opId, op);
             }
             const auto lhsConst = getConstantUInt64(graph, op.operands()[0]);
             const auto rhsConst = getConstantUInt64(graph, op.operands()[1]);
@@ -1173,7 +1522,9 @@ namespace wolvrix::lib::transform
             const Graph &graph,
             std::span<const ValueId> terms,
             std::size_t rowCount,
-            bool allowCompoundConflictWithoutNarrowSelector = false)
+            bool allowCompoundConflictWithoutNarrowSelector = false,
+            std::optional<uint64_t> expectedRow = std::nullopt,
+            ValueId expectedAddr = ValueId::invalid())
         {
             std::vector<std::pair<ValueId, EqualityTerm>> positiveEqs;
             std::vector<std::pair<ValueId, EqualityTerm>> negativeEqs;
@@ -1195,7 +1546,8 @@ namespace wolvrix::lib::transform
             }
             std::vector<ValueId> commonTerms;
             commonTerms.reserve(terms.size());
-            std::optional<EqualityTerm> positiveEq;
+            std::vector<std::pair<ValueId, EqualityTerm>> selectableEqs;
+            selectableEqs.reserve(positiveEqs.size());
             for (const auto &[term, eq] : positiveEqs)
             {
                 if (!equalityCanSelectStorageRow(graph, eq, rowCount))
@@ -1203,22 +1555,77 @@ namespace wolvrix::lib::transform
                     commonTerms.push_back(term);
                     continue;
                 }
-                if (positiveEq)
+                selectableEqs.emplace_back(term, eq);
+            }
+            if (selectableEqs.empty())
+            {
+                return std::nullopt;
+            }
+
+            // R1a: a guard may carry more than one row-selectable equality
+            // (e.g. `bankSel == b && enqPtr == i`). Exactly one term selects
+            // the storage row; the rest are demoted to common terms and must
+            // still pass the cross-row family consistency checks. Candidates
+            // are narrowed first to the expected logical row when the caller
+            // knows it, then to the address shared by the other rows of the
+            // family. Anything still ambiguous stays rejected.
+            const std::pair<ValueId, EqualityTerm> *selected = &selectableEqs.front();
+            if (selectableEqs.size() > 1)
+            {
+                std::vector<const std::pair<ValueId, EqualityTerm> *> pool;
+                if (expectedRow)
+                {
+                    for (const auto &candidate : selectableEqs)
+                    {
+                        if (candidate.second.row == *expectedRow)
+                        {
+                            pool.push_back(&candidate);
+                        }
+                    }
+                }
+                if (pool.empty())
+                {
+                    // No candidate selects the expected row (or the caller
+                    // provided none); fall back to the unfiltered candidates
+                    // so single-candidate guards keep their existing
+                    // downstream row-mismatch rejection.
+                    for (const auto &candidate : selectableEqs)
+                    {
+                        pool.push_back(&candidate);
+                    }
+                }
+                if (pool.size() > 1 && expectedAddr.valid())
+                {
+                    std::vector<const std::pair<ValueId, EqualityTerm> *> addrPool;
+                    for (const auto *candidate : pool)
+                    {
+                        if (sameValueAfterAssign(graph, candidate->second.addr, expectedAddr))
+                        {
+                            addrPool.push_back(candidate);
+                        }
+                    }
+                    pool = std::move(addrPool);
+                }
+                if (pool.size() != 1)
                 {
                     return std::nullopt;
                 }
-                positiveEq = eq;
+                selected = pool.front();
             }
-            if (!positiveEq)
+            const EqualityTerm positiveEq = selected->second;
+            for (const auto &candidate : selectableEqs)
             {
-                return std::nullopt;
+                if (&candidate != selected)
+                {
+                    commonTerms.push_back(candidate.first);
+                }
             }
 
             std::vector<PriorityConflict> conflicts;
             conflicts.reserve(negativeEqs.size() + otherTerms.size());
             for (const auto &[term, negativeEq] : negativeEqs)
             {
-                if (negativeEq.row != positiveEq->row ||
+                if (negativeEq.row != positiveEq.row ||
                     !equalityCanSelectStorageRow(graph, negativeEq, rowCount))
                 {
                     commonTerms.push_back(term);
@@ -1261,7 +1668,7 @@ namespace wolvrix::lib::transform
                         conflictCommonTerms.push_back(conflictTerm);
                         continue;
                     }
-                    if (eq->row != positiveEq->row || conflictEq)
+                    if (eq->row != positiveEq.row || conflictEq)
                     {
                         validConflict = false;
                         break;
@@ -1280,32 +1687,44 @@ namespace wolvrix::lib::transform
                 });
             }
             return PriorityGuardMatch{
-                .addr = positiveEq->addr,
+                .addr = positiveEq.addr,
                 .commonTerms = std::move(commonTerms),
                 .conflicts = std::move(conflicts),
-                .row = positiveEq->row,
+                .row = positiveEq.row,
             };
         }
 
-        std::optional<PriorityGuardMatch> matchPriorityGuard(const Graph &graph,
-                                                             ValueId guard,
-                                                             std::size_t rowCount = 0)
+        std::optional<PriorityGuardMatch> matchPriorityGuard(
+            const Graph &graph,
+            ValueId guard,
+            std::size_t rowCount = 0,
+            std::optional<uint64_t> expectedRow = std::nullopt,
+            ValueId expectedAddr = ValueId::invalid())
         {
             const std::vector<ValueId> terms = flattenLogicAndTerms(graph, guard);
-            return matchPriorityGuardTerms(graph, terms, rowCount);
+            return matchPriorityGuardTerms(graph,
+                                           terms,
+                                           rowCount,
+                                           false,
+                                           expectedRow,
+                                           expectedAddr);
         }
 
         std::optional<std::vector<PriorityGuardMatch>> matchPriorityGuardAlternatives(
             const Graph &graph,
             ValueId guard,
             std::size_t rowCount,
-            bool allowCompoundConflictWithoutNarrowSelector = false)
+            bool allowCompoundConflictWithoutNarrowSelector = false,
+            std::optional<uint64_t> expectedRow = std::nullopt,
+            ValueId expectedAddr = ValueId::invalid())
         {
             const std::vector<ValueId> directTerms = flattenLogicAndTerms(graph, guard);
             if (auto direct = matchPriorityGuardTerms(graph,
                                                       directTerms,
                                                       rowCount,
-                                                      allowCompoundConflictWithoutNarrowSelector))
+                                                      allowCompoundConflictWithoutNarrowSelector,
+                                                      expectedRow,
+                                                      expectedAddr))
             {
                 std::vector<PriorityGuardMatch> result;
                 result.push_back(std::move(*direct));
@@ -1352,7 +1771,9 @@ namespace wolvrix::lib::transform
                 auto matched = matchPriorityGuardTerms(graph,
                                                        terms,
                                                        rowCount,
-                                                       true);
+                                                       true,
+                                                       expectedRow,
+                                                       expectedAddr);
                 if (!matched)
                 {
                     return std::nullopt;
@@ -2999,6 +3420,40 @@ namespace wolvrix::lib::transform
             return chain;
         }
 
+        // R1b: report whether the definition cone of `value` contains a read
+        // port of register `regSymbol`. A nextValue that reads the register
+        // back must not be merged as a single-branch write: the register
+        // array reads the old content at the clock edge, while the converted
+        // memory could observe read-during-write behavior.
+        bool valueReadsRegister(const Graph &graph, ValueId value, const std::string &regSymbol)
+        {
+            std::unordered_set<ValueId, ValueIdHash> seen;
+            std::vector<ValueId> pending = {value};
+            while (!pending.empty())
+            {
+                const ValueId current = pending.back();
+                pending.pop_back();
+                const auto unwrapped = unwrapAssign(graph, current);
+                if (!unwrapped || !seen.insert(*unwrapped).second)
+                {
+                    continue;
+                }
+                const OperationId opId = graph.valueDef(*unwrapped);
+                if (!opId.valid())
+                {
+                    continue;
+                }
+                const Operation op = graph.getOperation(opId);
+                if (op.kind() == OperationKind::kRegisterReadPort &&
+                    getStringAttr(op, "regSymbol").value_or(std::string()) == regSymbol)
+                {
+                    return true;
+                }
+                pending.insert(pending.end(), op.operands().begin(), op.operands().end());
+            }
+            return false;
+        }
+
         std::optional<MuxWriteChain> matchMuxWriteChain(const Graph &graph, ValueId value)
         {
             MuxWriteChain chain;
@@ -3050,12 +3505,38 @@ namespace wolvrix::lib::transform
             const Graph &graph,
             const GroupCandidate &group,
             const std::unordered_map<std::string, std::vector<WritePortInfo>> &writesByReg,
-            const GroupProfileContext *groupProfile = nullptr)
+            const GroupProfileContext *groupProfile = nullptr,
+            GroupReportRecord *groupReport = nullptr)
         {
             auto reject = [&](std::string_view reason,
                               std::size_t row,
                               std::size_t branch,
                               const std::string &extra = "") -> std::optional<ConsolidatedWriteMatch> {
+                if (groupReport != nullptr)
+                {
+                    std::string detail;
+                    if (row != std::numeric_limits<std::size_t>::max())
+                    {
+                        detail += "row=" + std::to_string(row);
+                    }
+                    if (branch != std::numeric_limits<std::size_t>::max())
+                    {
+                        if (!detail.empty())
+                        {
+                            detail += ' ';
+                        }
+                        detail += "branch=" + std::to_string(branch);
+                    }
+                    if (!extra.empty())
+                    {
+                        if (!detail.empty())
+                        {
+                            detail += ' ';
+                        }
+                        detail += extra;
+                    }
+                    recordGroupReject(groupReport, reason, std::move(detail));
+                }
                 if (groupProfile != nullptr && groupProfile->verbose)
                 {
                     std::string message =
@@ -3155,7 +3636,21 @@ namespace wolvrix::lib::transform
                 }
                 if (!chain)
                 {
-                    return reject("mux_chain", row, kNoIndex);
+                    // R1b: accept a non-mux nextValue as a single-branch
+                    // write: the data is nextValue itself and the branch
+                    // guards are the row-selecting OR terms of updateCond,
+                    // classified by the same fallback-guard path that handles
+                    // mux-chain fallbacks below. A nextValue that reads this
+                    // register back is still rejected to avoid turning the
+                    // register read-during-write behavior into a memory
+                    // hazard.
+                    if (valueReadsRegister(graph, write.nextValue, group.regSymbols[row]))
+                    {
+                        return reject("mux_chain", row, kNoIndex, "self_reference=1");
+                    }
+                    MuxWriteChain singleBranch;
+                    singleBranch.fallback = directWriteData(graph, write.nextValue);
+                    chain = std::move(singleBranch);
                 }
 
                 const std::vector<ValueId> &updateTerms = rowUpdateTerms[row];
@@ -3196,7 +3691,9 @@ namespace wolvrix::lib::transform
                                                  ? std::optional<PriorityGuardMatch>{}
                                                  : matchPriorityGuard(graph,
                                                                       updateTerms[termIndex],
-                                                                      storageElementCount);
+                                                                      storageElementCount,
+                                                                      static_cast<uint64_t>(
+                                                                          logicalRow));
                         if (fallbackGuard && fallbackGuard->row == logicalRow)
                         {
                             effectiveBranches.push_back(MuxWriteBranch{
@@ -3226,10 +3723,21 @@ namespace wolvrix::lib::transform
                      ++sourceBranchIndex)
                 {
                     const MuxWriteBranch &branch = effectiveBranches[sourceBranchIndex];
+                    // Rows after the first can disambiguate a multi-equality
+                    // guard (R1a) by the address the family already selected.
+                    // The hint index follows matchedBranches because one
+                    // source branch can expand to several guard alternatives.
+                    const ValueId familyAddrHint =
+                        row > 0 && matchedBranches.size() < result.regulars.size()
+                            ? result.regulars[matchedBranches.size()].addr
+                            : ValueId::invalid();
                     auto guards = matchPriorityGuardAlternatives(graph,
                                                                  branch.guard,
                                                                  storageElementCount,
-                                                                 group.decodedWriteStorage);
+                                                                 group.decodedWriteStorage,
+                                                                 static_cast<uint64_t>(
+                                                                     logicalRow),
+                                                                 familyAddrHint);
                     if (!guards)
                     {
                         return reject("priority_guard",
@@ -3532,7 +4040,8 @@ namespace wolvrix::lib::transform
             const GroupCandidate &group,
             const std::unordered_map<std::string, std::vector<WritePortInfo>> &writesByReg,
             RegToMemProfile *profile = nullptr,
-            const GroupProfileContext *groupProfile = nullptr)
+            const GroupProfileContext *groupProfile = nullptr,
+            GroupReportRecord *groupReport = nullptr)
         {
             if (groupProfile != nullptr && groupProfile->verbose)
             {
@@ -3559,6 +4068,7 @@ namespace wolvrix::lib::transform
             }
             if (!readClosureEligible)
             {
+                recordGroupReject(groupReport, "read_closure");
                 return std::nullopt;
             }
             stageStart = ProfileClock::now();
@@ -3578,13 +4088,15 @@ namespace wolvrix::lib::transform
             }
             if (!initValues)
             {
+                recordGroupReject(groupReport, "init_attr");
                 return std::nullopt;
             }
             std::vector<RegularWriteFamily> regulars;
             std::vector<WritePortInfo> leftoverWrites;
             std::optional<ResetWriteFamily> reset;
             stageStart = ProfileClock::now();
-            auto consolidatedMatch = matchConsolidatedWriteFamilies(graph, group, writesByReg, groupProfile);
+            auto consolidatedMatch =
+                matchConsolidatedWriteFamilies(graph, group, writesByReg, groupProfile, groupReport);
             const int64_t consolidatedMatchMs = elapsedMs(stageStart);
             if (profile != nullptr)
             {
@@ -3597,6 +4109,11 @@ namespace wolvrix::lib::transform
             }
             else if (group.decodedWriteStorage)
             {
+                // The consolidated matcher already recorded the root-cause reason.
+                if (groupReport != nullptr && groupReport->rejectReason.empty())
+                {
+                    recordGroupReject(groupReport, "decoded_consolidated");
+                }
                 return std::nullopt;
             }
             else
@@ -3619,12 +4136,20 @@ namespace wolvrix::lib::transform
                 }
                 if (!regularMatch)
                 {
+                    // Keep the consolidated matcher's root-cause reason when present.
+                    if (groupReport != nullptr && groupReport->rejectReason.empty())
+                    {
+                        recordGroupReject(groupReport, "regular_write_family");
+                    }
                     return std::nullopt;
                 }
                 if (regularMatch->splitReset)
                 {
                     if (!leftoverWrites.empty())
                     {
+                        recordGroupReject(groupReport,
+                                          "split_reset_leftover",
+                                          "leftover=" + std::to_string(leftoverWrites.size()));
                         return std::nullopt;
                     }
                     reset = std::move(regularMatch->splitReset);
@@ -3633,6 +4158,7 @@ namespace wolvrix::lib::transform
             }
             if (regulars.empty())
             {
+                recordGroupReject(groupReport, "empty_regulars");
                 return std::nullopt;
             }
             if (!reset && !leftoverWrites.empty())
@@ -3654,6 +4180,9 @@ namespace wolvrix::lib::transform
                 }
                 if (!reset)
                 {
+                    recordGroupReject(groupReport,
+                                      "reset_match",
+                                      "leftover=" + std::to_string(leftoverWrites.size()));
                     return std::nullopt;
                 }
                 for (const RegularWriteFamily &regular : regulars)
@@ -3661,6 +4190,7 @@ namespace wolvrix::lib::transform
                     if (valueVectorsEqual(reset->events, regular.events) &&
                         reset->eventEdges == regular.eventEdges)
                     {
+                        recordGroupReject(groupReport, "reset_match", "shared_events=1");
                         return std::nullopt;
                     }
                 }
@@ -3677,6 +4207,7 @@ namespace wolvrix::lib::transform
                 const OperationId regOp = graph.findOperation(regSymbol);
                 if (!regOp.valid())
                 {
+                    recordGroupReject(groupReport, "missing_reg_op", "reg=" + regSymbol);
                     return std::nullopt;
                 }
                 candidate.regOps.push_back(regOp);
@@ -3685,6 +4216,7 @@ namespace wolvrix::lib::transform
                     const auto readIt = readsByReg.find(regSymbol);
                     if (readIt == readsByReg.end() || readIt->second.empty())
                     {
+                        recordGroupReject(groupReport, "read_closure", "reg=" + regSymbol);
                         return std::nullopt;
                     }
                     candidate.readOpsByRow.push_back(readIt->second);
@@ -3711,12 +4243,14 @@ namespace wolvrix::lib::transform
                 const auto writeIt = writesByReg.find(regSymbol);
                 if (writeIt == writesByReg.end())
                 {
+                    recordGroupReject(groupReport, "write_closure_final", "reg=" + regSymbol);
                     return std::nullopt;
                 }
                 for (const WritePortInfo &write : writeIt->second)
                 {
                     if (!selectedWriteOps.contains(write.op))
                     {
+                        recordGroupReject(groupReport, "write_closure_final", "reg=" + regSymbol);
                         return std::nullopt;
                     }
                 }
@@ -4404,6 +4938,7 @@ namespace wolvrix::lib::transform
 
         RegToMemStats stats;
         RegToMemProfile profile;
+        std::vector<GroupReportRecord> groupReports;
         const auto passStart = ProfileClock::now();
         std::size_t graphIndex = 0;
         for (const auto &entry : design().graphs())
@@ -4553,8 +5088,17 @@ namespace wolvrix::lib::transform
             for (auto &group : groups)
             {
                 ++visitedGroups;
+                GroupReportRecord groupReport;
+                groupReport.graph = graph.symbol();
+                groupReport.groupId = visitedGroups;
+                groupReport.discovery = std::string(groupDiscoveryKind(group));
+                groupReport.module = groupModuleName(graph, group);
+                groupReport.elementWidth = group.elementWidth;
+                groupReport.elementCount = group.elementCount;
                 if (group.anchors.empty() && !group.trueOnlyStorage)
                 {
+                    groupReport.outcome = "skipped";
+                    groupReports.push_back(std::move(groupReport));
                     continue;
                 }
                 const bool verboseGroup = visitedGroups <= 20 || visitedGroups % 100 == 0 ||
@@ -4591,7 +5135,8 @@ namespace wolvrix::lib::transform
                                                         group,
                                                         writesByReg,
                                                         &profile,
-                                                        &groupProfile);
+                                                        &groupProfile,
+                                                        &groupReport);
                     if (trueCandidate)
                     {
                         stageStart = ProfileClock::now();
@@ -4636,6 +5181,7 @@ namespace wolvrix::lib::transform
                         {
                             ++stats.skippedTrueCandidates;
                             ++graphSkippedTrue;
+                            recordGroupReject(&groupReport, "rewrite_failed");
                         }
                     }
                     else
@@ -4648,6 +5194,8 @@ namespace wolvrix::lib::transform
                 {
                     ++stats.skippedTrueCandidates;
                     ++graphSkippedTrue;
+                    recordGroupReject(&groupReport,
+                                      group.sharesStorage ? "shares_storage" : "overlap_candidate");
                 }
                 if (group.edgePaddedStorage)
                 {
@@ -4662,10 +5210,16 @@ namespace wolvrix::lib::transform
                 }
                 if (trueMerged)
                 {
+                    groupReport.outcome = "true_merged";
+                    groupReport.rejectReason.clear();
+                    groupReport.rejectDetail.clear();
+                    groupReports.push_back(std::move(groupReport));
                     continue;
                 }
                 if (group.trueOnlyStorage)
                 {
+                    groupReport.outcome = "skipped";
+                    groupReports.push_back(std::move(groupReport));
                     continue;
                 }
                 if (options_.enableIntent)
@@ -4678,7 +5232,13 @@ namespace wolvrix::lib::transform
                     ++graphIntentGroups;
                     stats.intentMembers += group.regSymbols.size();
                     result.changed = true;
+                    groupReport.outcome = "intent_annotated";
                 }
+                else
+                {
+                    groupReport.outcome = "skipped";
+                }
+                groupReports.push_back(std::move(groupReport));
             }
             profileLog("graph_done index=" + std::to_string(graphIndex) +
                        " total_ms=" + std::to_string(elapsedMs(graphStart)) +
@@ -4730,6 +5290,11 @@ namespace wolvrix::lib::transform
                          " intent_groups=" + std::to_string(stats.intentGroups) +
                          " intent_anchors=" + std::to_string(stats.intentAnchors) +
                          " intent_members=" + std::to_string(stats.intentMembers));
+
+        if (!options_.outputKey.empty())
+        {
+            setSessionValue(options_.outputKey, buildGroupReportsJson(groupReports), "reg-to-mem.reports");
+        }
         return result;
     }
 

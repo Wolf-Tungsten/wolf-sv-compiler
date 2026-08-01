@@ -129,11 +129,23 @@ namespace wolvrix::lib::grhsim::am
         bool collectStats = false;
         // DP fixed cost per segment boundary; legacy hard-codes +1 per segment.
         double dpSegmentPenalty = 1.0;
+        // When true, the segment DP charges each incoming variable by
+        // ceil(bitWidth/64) copies (runtime copy count) instead of a unit
+        // cost per variable. The reported scoreboard cost already uses the
+        // width-folded formula either way.
+        bool dpWidthWeightedCopyCost = false;
         // 0 = automatic (1.5 * maxInstructionsPerBlock). The legacy 32x factor
         // lets AM's single-instruction-atom coarsen converge into
         // DP-indivisible oversized clusters far above the segment cap; 1.5x
         // keeps the legacy block granularity (XiangShan ~33.7k vs 31.5k).
         std::size_t dpCoarsenBudget = 0;
+    };
+
+    struct AmOptimizeOptions
+    {
+        bool dce = true;
+        bool constFold = true;
+        bool cse = true;
     };
 
     struct GrhSimAmCppOptions
@@ -196,6 +208,10 @@ namespace wolvrix::lib::grhsim::am
                          AmActivityScheduleStage &scheduler,
                          GrhSimAmCppEmitStage &emitter);
 
+        // Configures the AM optimization stage that runs between lowering and
+        // scheduling. Defaults to all optimizations enabled.
+        void setAmOptimizeOptions(AmOptimizeOptions options);
+
         std::optional<LinearProgramArtifact>
         lower(const wolvrix::lib::grh::Graph &graph,
               wolvrix::lib::diag::Diagnostics &diagnostics);
@@ -212,6 +228,7 @@ namespace wolvrix::lib::grhsim::am
         GrhToAmLoweringStage &lowering_;
         AmActivityScheduleStage &scheduler_;
         GrhSimAmCppEmitStage &emitter_;
+        AmOptimizeOptions optimizeOptions_;
     };
 
 } // namespace wolvrix::lib::grhsim::am

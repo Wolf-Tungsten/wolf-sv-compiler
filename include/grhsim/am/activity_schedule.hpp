@@ -34,6 +34,11 @@ namespace wolvrix::lib::grhsim::am
         bool enableCoarsening = true;   // out1/in1/sibling coarsen stages
         std::size_t coarsenBudget = 64; // coarsen cluster instruction cap
         double segmentPenalty = 1.0;    // DP fixed cost per segment boundary
+        // Optional per-variable incoming-copy weight (e.g. ceil(bitWidth/64),
+        // matching the runtime copy count). Empty span = unit weight per
+        // variable (legacy behavior). When non-empty, size must be
+        // variableCount.
+        std::span<const uint32_t> variableCopyWeights;
     };
 
     struct GrhSimAmActivityScheduleResult

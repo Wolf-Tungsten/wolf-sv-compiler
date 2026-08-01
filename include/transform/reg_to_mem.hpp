@@ -13,6 +13,7 @@ namespace wolvrix::lib::transform
         bool enableOrderedWrites = false;
         bool enableDecodedWriteStorage = true;
         std::size_t minElementCount = 4;
+        std::string outputKey;
     };
 
     class RegToMemPass : public Pass

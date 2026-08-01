@@ -104,7 +104,9 @@ namespace wolvrix::lib::grhsim::am
             input.commitEventRank.size() != atomCount ||
             input.commitGuardRank.size() != atomCount ||
             input.definitions.size() != input.variableCount ||
-            input.useOffsets.size() != static_cast<std::size_t>(input.variableCount) + 1) {
+            input.useOffsets.size() != static_cast<std::size_t>(input.variableCount) + 1 ||
+            (!input.variableCopyWeights.empty() &&
+             input.variableCopyWeights.size() != input.variableCount)) {
             return fail("internal error: malformed coarsen-dp block formation input");
         }
         for (uint32_t atom = 0; atom < atomCount; ++atom) {
@@ -532,10 +534,17 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
-        // Segment DP ported from the legacy activity schedule: minimize the number
-        // of deduplicated variables consumed by a segment but defined before it,
-        // plus one segmentPenalty per segment. Oversized singleton clusters are
-        // allowed to form their own segment.
+        // Segment DP ported from the legacy activity schedule: minimize the
+        // deduplicated incoming-copy cost of each segment (per-variable unit
+        // cost, or variableCopyWeights when provided — e.g. ceil(width/64),
+        // matching the runtime copy count), plus one segmentPenalty per
+        // segment. Oversized singleton clusters are allowed to form their own
+        // segment.
+        const auto copyCostOf = [&](uint32_t variable) -> double {
+            return input.variableCopyWeights.empty()
+                       ? 1.0
+                       : static_cast<double>(input.variableCopyWeights[variable]);
+        };
         const std::size_t count = graph.count;
         const std::size_t maxNodes = input.maxInstructionsPerBlock;
         std::vector<std::size_t> prefixSize(count + 1, 0);
@@ -571,7 +580,7 @@ namespace wolvrix::lib::grhsim::am
                     targetSeen[variable] = stamp;
                     if (sourcePos[variable] == kInvalidIndex || sourcePos[variable] < start) {
                         countedIncoming[variable] = stamp;
-                        incomingActivationCost += 1.0;
+                        incomingActivationCost += copyCostOf(variable);
                     }
                 }
                 for (uint32_t offset = sourceOffsets[start]; offset < sourceOffsets[start + 1];
@@ -579,7 +588,7 @@ namespace wolvrix::lib::grhsim::am
                     const uint32_t variable = sourceValues[offset];
                     if (countedIncoming[variable] == stamp) {
                         countedIncoming[variable] = 0;
-                        incomingActivationCost -= 1.0;
+                        incomingActivationCost -= copyCostOf(variable);
                     }
                 }
                 if (dp[start] == kInf) {

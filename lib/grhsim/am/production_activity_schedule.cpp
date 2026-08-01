@@ -1334,6 +1334,16 @@ namespace wolvrix::lib::grhsim::am
             atomStateWrites[atom] = static_cast<uint32_t>(atomCosts[atom].stateWrites);
             atomIsCommit[atom] = atomCosts[atom].blockClass == BlockClass::Commit ? 1 : 0;
         }
+        // Optional width-folded DP copy weights (docs/10: the runtime copy
+        // count formula, ceil(bitWidth/64) per incoming variable).
+        std::vector<uint32_t> variableCopyWeights;
+        if (options.dpWidthWeightedCopyCost) {
+            variableCopyWeights.reserve(variableCount);
+            for (uint32_t variable = 0; variable < variableCount; ++variable) {
+                variableCopyWeights.push_back(static_cast<uint32_t>(std::max<uint64_t>(
+                    1, (exportedVariableWidth(program, VariableId{variable}) + 63) / 64)));
+            }
+        }
         const GrhSimAmActivityScheduleInput blockInput{
             .atomCount = atomCount,
             .atomOffsets = atomGraph.offsets,
@@ -1364,6 +1374,7 @@ namespace wolvrix::lib::grhsim::am
                                  ? options.dpCoarsenBudget
                                  : (3 * options.maxInstructionsPerBlock) / 2,
             .segmentPenalty = options.dpSegmentPenalty,
+            .variableCopyWeights = variableCopyWeights,
         };
         std::string blockError;
         std::optional<GrhSimAmActivityScheduleResult> scheduled =
