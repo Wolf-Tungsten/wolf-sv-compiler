@@ -400,6 +400,8 @@ def _compile_run_pass(name: str, args: list[str], named: dict[str, Any]) -> tupl
         compiled.extend(_compile_comb_loop_elim_kwargs(named))
     elif canonical_name == "mem-to-reg":
         compiled.extend(_compile_mem_to_reg_kwargs(named))
+    elif canonical_name == "lane-aggregate":
+        compiled.extend(_compile_lane_aggregate_kwargs(named))
     elif canonical_name == "reg-to-mem":
         compiled.extend(_compile_reg_to_mem_kwargs(named))
     elif canonical_name == "simplify":
@@ -527,6 +529,27 @@ def _compile_mem_to_reg_kwargs(named: dict[str, Any]) -> list[str]:
     return out
 
 
+def _compile_lane_aggregate_kwargs(named: dict[str, Any]) -> list[str]:
+    local = dict(named)
+    out: list[str] = []
+    min_lanes = _pop_named(local, "min_lanes", None)
+    if min_lanes is not None:
+        out.extend(["-min-lanes", str(min_lanes)])
+    max_index_holes = _pop_named(local, "max_index_holes", None)
+    if max_index_holes is not None:
+        out.extend(["-max-index-holes", str(max_index_holes)])
+    read_select = _pop_named(local, "read_select", None)
+    if read_select is True:
+        out.append("-read-select")
+    elif read_select is False:
+        out.append("-no-read-select")
+    output_key = _pop_named(local, "out_lane_aggregate_report", None)
+    if output_key is not None:
+        out.extend(["-output-key", str(output_key)])
+    _ensure_no_extra_named("lane-aggregate", local)
+    return out
+
+
 def _compile_reg_to_mem_kwargs(named: dict[str, Any]) -> list[str]:
     local = dict(named)
     out: list[str] = []
@@ -553,6 +576,9 @@ def _compile_reg_to_mem_kwargs(named: dict[str, Any]) -> list[str]:
     min_element_count = _pop_named(local, "min_element_count", None)
     if min_element_count is not None:
         out.extend(["-min-element-count", str(min_element_count)])
+    output_key = _pop_named(local, "out_reg_to_mem_report", None)
+    if output_key is not None:
+        out.extend(["-output-key", str(output_key)])
     _ensure_no_extra_named("reg-to-mem", local)
     return out
 

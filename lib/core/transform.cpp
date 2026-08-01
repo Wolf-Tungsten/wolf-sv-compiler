@@ -1,6 +1,7 @@
 #include "core/transform.hpp"
 
 #include "transform/activity_schedule.hpp"
+#include "transform/array_select_recovery.hpp"
 #include "transform/blackbox_guard.hpp"
 #include "transform/comb_lane_pack.hpp"
 #include "transform/comb_loop_elim.hpp"
@@ -8,11 +9,14 @@
 #include "transform/demo_stats.hpp"
 #include "transform/hier_flatten.hpp"
 #include "transform/instance_inline.hpp"
+#include "transform/lane_aggregate.hpp"
 #include "transform/latch_transparent_read.hpp"
+#include "transform/logic_normalize.hpp"
 #include "transform/mem_to_reg.hpp"
 #include "transform/memory_init_check.hpp"
 #include "transform/memory_read_retime.hpp"
 #include "transform/multidriven_guard.hpp"
+#include "transform/onehot_to_mux.hpp"
 #include "transform/reg_to_mem.hpp"
 #include "transform/repcut.hpp"
 #include "transform/simplify.hpp"
@@ -414,7 +418,11 @@ namespace wolvrix::lib::transform
             "comb-loop-elim",
             "dead-code-elim",
             "activity-schedule",
+            "array-select-recovery",
             "latch-transparent-read",
+            "lane-aggregate",
+            "logic-normalize",
+            "onehot-to-mux",
             "memory-read-retime",
             "slice-index-const",
             "multidriven-guard",
@@ -453,6 +461,181 @@ namespace wolvrix::lib::transform
                 return nullptr;
             }
             return std::make_unique<MultiDrivenGuardPass>();
+        }
+        if (normalized == "array-select-recovery")
+        {
+            ArraySelectRecoveryOptions options;
+            for (std::size_t i = 0; i < args.size(); ++i)
+            {
+                const std::string_view arg = args[i];
+                auto parseBoolArg = [&](std::string_view name, bool &out) -> bool {
+                    if (i + 1 >= args.size())
+                    {
+                        error = std::string(name) + " expects a value";
+                        return false;
+                    }
+                    const std::string_view text = args[++i];
+                    if (text == "true" || text == "1" || text == "on")
+                    {
+                        out = true;
+                        return true;
+                    }
+                    if (text == "false" || text == "0" || text == "off")
+                    {
+                        out = false;
+                        return true;
+                    }
+                    error = std::string("invalid ") + std::string(name) + " value";
+                    return false;
+                };
+
+                if (arg == "-rewrite")
+                {
+                    if (!parseBoolArg("-rewrite", options.rewrite))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-rewrite="))
+                {
+                    const std::string_view text = arg.substr(std::string_view("-rewrite=").size());
+                    if (text == "true" || text == "1" || text == "on")
+                    {
+                        options.rewrite = true;
+                    }
+                    else if (text == "false" || text == "0" || text == "off")
+                    {
+                        options.rewrite = false;
+                    }
+                    else
+                    {
+                        error = "invalid -rewrite value";
+                        return nullptr;
+                    }
+                }
+                else
+                {
+                    error = "unknown array-select-recovery option";
+                    return nullptr;
+                }
+            }
+            return std::make_unique<ArraySelectRecoveryPass>(options);
+        }
+        if (normalized == "logic-normalize")
+        {
+            if (!args.empty())
+            {
+                error = "logic-normalize does not accept arguments";
+                return nullptr;
+            }
+            return std::make_unique<LogicNormalizePass>();
+        }
+        if (normalized == "lane-aggregate")
+        {
+            LaneAggregateOptions options;
+            for (std::size_t i = 0; i < args.size(); ++i)
+            {
+                const std::string_view arg = args[i];
+                auto parseSizeArg = [&](std::string_view name, std::size_t &out) -> bool {
+                    if (i + 1 >= args.size())
+                    {
+                        error = std::string(name) + " expects a value";
+                        return false;
+                    }
+                    try
+                    {
+                        out = static_cast<std::size_t>(std::stoull(std::string(args[++i])));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = std::string("invalid ") + std::string(name) + " value";
+                        return false;
+                    }
+                    return true;
+                };
+
+                if (arg == "-min-lanes")
+                {
+                    if (!parseSizeArg("-min-lanes", options.minLanes))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-min-lanes="))
+                {
+                    try
+                    {
+                        options.minLanes = static_cast<std::size_t>(
+                            std::stoull(std::string(arg.substr(std::string_view("-min-lanes=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -min-lanes value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-max-index-holes")
+                {
+                    if (!parseSizeArg("-max-index-holes", options.maxIndexHoles))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-max-index-holes="))
+                {
+                    try
+                    {
+                        options.maxIndexHoles = static_cast<std::size_t>(
+                            std::stoull(std::string(arg.substr(std::string_view("-max-index-holes=").size()))));
+                    }
+                    catch (const std::exception &)
+                    {
+                        error = "invalid -max-index-holes value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-read-select")
+                {
+                    options.readSelect = true;
+                }
+                else if (arg == "-no-read-select")
+                {
+                    options.readSelect = false;
+                }
+                else if (arg == "-output-key")
+                {
+                    if (i + 1 >= args.size())
+                    {
+                        error = "-output-key expects a value";
+                        return nullptr;
+                    }
+                    options.outputKey = std::string(args[++i]);
+                }
+                else if (arg.starts_with("-output-key="))
+                {
+                    options.outputKey = std::string(arg.substr(std::string_view("-output-key=").size()));
+                }
+                else
+                {
+                    error = "unknown lane-aggregate option";
+                    return nullptr;
+                }
+            }
+            if (options.minLanes < 2)
+            {
+                error = "lane-aggregate -min-lanes must be >= 2";
+                return nullptr;
+            }
+            return std::make_unique<LaneAggregatePass>(options);
+        }
+        if (normalized == "onehot-to-mux")
+        {
+            if (!args.empty())
+            {
+                error = "onehot-to-mux does not accept arguments";
+                return nullptr;
+            }
+            return std::make_unique<OnehotToMuxPass>();
         }
         if (normalized == "blackbox-guard")
         {
@@ -1658,6 +1841,19 @@ namespace wolvrix::lib::transform
                         error = "invalid -min-element-count value";
                         return nullptr;
                     }
+                }
+                else if (arg == "-output-key")
+                {
+                    if (i + 1 >= args.size())
+                    {
+                        error = "-output-key expects a value";
+                        return nullptr;
+                    }
+                    options.outputKey = std::string(args[++i]);
+                }
+                else if (arg.starts_with("-output-key="))
+                {
+                    options.outputKey = std::string(arg.substr(std::string_view("-output-key=").size()));
                 }
                 else
                 {

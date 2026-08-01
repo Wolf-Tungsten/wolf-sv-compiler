@@ -117,6 +117,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/grhsim/am/lowering.cpp
     lib/grhsim/am/activity_schedule.cpp
     lib/grhsim/am/production_activity_schedule.cpp
+    lib/grhsim/am/optimize.cpp
     lib/grhsim/am/interpreter.cpp
     lib/grhsim/am/cpp_emitter.cpp
     lib/emit/grhsim_cpp.cpp
@@ -126,6 +127,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/core/ingest.cpp
     lib/core/transform.cpp
     lib/transform/activity_schedule.cpp
+    lib/transform/array_select_recovery.cpp
     lib/transform/demo_stats.cpp
     lib/transform/const_fold.cpp
     lib/transform/redundant_elim.cpp
@@ -142,7 +144,10 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/hier_flatten.cpp
     lib/transform/instance_inline.cpp
     lib/transform/xmr_resolve.cpp
+    lib/transform/lane_aggregate.cpp
     lib/transform/latch_transparent_read.cpp
+    lib/transform/logic_normalize.cpp
+    lib/transform/onehot_to_mux.cpp
     lib/transform/slice_index_const.cpp
     lib/transform/strip_debug.cpp
     lib/transform/repcut.cpp
@@ -517,6 +522,17 @@ target_link_libraries(grhsim-am-lowering
 
 register_test_exe(grhsim-am-lowering)
 
+add_executable(grhsim-am-optimize
+    tests/grhsim/am/test_optimize.cpp
+)
+
+target_link_libraries(grhsim-am-optimize
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(grhsim-am-optimize)
+
 add_executable(grhsim-am-end-to-end
     tests/grhsim/am/test_end_to_end.cpp
 )
@@ -639,6 +655,50 @@ target_link_libraries(transform-redundant-elim
 )
 
 register_test_exe(transform-redundant-elim)
+
+add_executable(transform-logic-normalize
+    tests/transform/test_logic_normalize.cpp
+)
+
+target_link_libraries(transform-logic-normalize
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-logic-normalize)
+
+add_executable(transform-lane-aggregate
+    tests/transform/test_lane_aggregate.cpp
+)
+
+target_link_libraries(transform-lane-aggregate
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-lane-aggregate)
+
+add_executable(transform-array-select-recovery
+    tests/transform/test_array_select_recovery.cpp
+)
+
+target_link_libraries(transform-array-select-recovery
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-array-select-recovery)
+
+add_executable(transform-onehot-to-mux
+    tests/transform/test_onehot_to_mux.cpp
+)
+
+target_link_libraries(transform-onehot-to-mux
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-onehot-to-mux)
 
 add_executable(transform-const-fold
     tests/transform/test_const_fold_pass.cpp
@@ -779,6 +839,30 @@ target_link_libraries(transform-reg-to-mem
 )
 
 register_test_exe(transform-reg-to-mem)
+
+# transform: reg-to-mem group report
+add_executable(transform-reg-to-mem-report
+    tests/transform/test_reg_to_mem_report.cpp
+)
+
+target_link_libraries(transform-reg-to-mem-report
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-reg-to-mem-report)
+
+# transform: reg-to-mem R1 write-side matching
+add_executable(transform-reg-to-mem-r1
+    tests/transform/test_reg_to_mem_r1.cpp
+)
+
+target_link_libraries(transform-reg-to-mem-r1
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-reg-to-mem-r1)
 
 # transform: strip-debug
 add_executable(transform-strip-debug
