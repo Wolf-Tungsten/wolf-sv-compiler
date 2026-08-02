@@ -1520,3 +1520,201 @@ always @(posedge clk) begin
     y_out = y_val;
 end
 ```
+
+
+## 6.10 数组 value 语义
+
+数组 value 语义将一个 packed `Logic` 值视为 `rows` 个等宽元素的数组视图：值宽 `rows × elemWidth`，lane `i` 占 `[i*elemWidth +: elemWidth]`，lane 0 占 LSB。宽 `rows` 的 `Logic` 值用作守卫/选择向量（每 lane 1 bit）。数组的存储仍为 kMemory（`width=elemWidth`、`row=rows`），经 `memSymbol` attr 引用。维度一致性（值宽必须等于 `row × width`）由消费方（lower/validate）校验。
+
+下文记 `W = elemWidth`、`row = rows`。
+
+### kArrayReadAllPort
+
+数组全量读端口（state 读）。
+
+**operands**: 无
+
+**results**:
+- `res[0]` (data): 全数组 packed 视图值，位宽 `row × W`
+
+**attrs**:
+- `memSymbol` (string): 指向目标 kMemory 的 symbol
+
+**语义**:
+```
+∀i ∈ [0, row): res[0][i*W +: W] = <memSymbol>[i]
+```
+
+**示例**: `kMemory m{width=8, row=4}` → `res[0]` 宽 32，`res[0][15:8] = m[1]`。
+
+
+
+### kArrayWritePort
+
+数组写端口（state 写）。lane 内整写，无逐位 mask；lane 内部分写由上游在生成 `data` 时并入。
+
+**operands**:
+- `oper[0]` (laneMask): 守卫向量（位宽 `row`），每 lane 1 bit 写使能
+- `oper[1]` (data): 写数据（位宽 `row × W`）
+- `oper[2]`..`oper[N-1]` (events): 触发事件信号（如时钟）
+
+**results**: 无
+
+**attrs**:
+- `memSymbol` (string): 指向目标 kMemory 的 symbol
+- `eventEdge` (string[]): 触发边沿列表，长度等于事件信号数
+- `memoryWrite.priorityGroup` (string, optional): 有序写组名称，语义同 kMemoryWritePort
+- `memoryWrite.priority` (int64_t, optional): 组内优先级，语义同 kMemoryWritePort（同组按 priority 从大到小执行，`0` 最后写入）
+
+**语义**:
+```
+∀i ∈ [0, row):
+    laneMask[i] = 1 → <memSymbol>[i] ← data[i*W +: W]
+    laneMask[i] = 0 → <memSymbol>[i] 保持
+```
+
+**示例**: `row=4, W=8`，`laneMask = 4'b0101`，`data = {d3, d2, d1, d0}` → `mem[0] ← d0`、`mem[2] ← d2`，其余 lane 保持。
+
+
+
+### kArrayMux
+
+逐 lane 选择（纯组合）。
+
+**operands**:
+- `oper[0]` (sel): 选择向量（位宽 `row`），每 lane 1 bit
+- `oper[1]` (t): 真值数据（位宽 `row × W`）
+- `oper[2]` (f): 假值数据（位宽 `row × W`）
+
+**results**:
+- `res[0]` (data): 位宽 `row × W`
+
+**attrs**: 无
+
+**语义**:
+```
+∀i ∈ [0, row): res[0][i*W +: W] = sel[i] ? t[i*W +: W] : f[i*W +: W]
+```
+
+**示例**: `row=4, W=8`，`sel = 4'b0011` → `res[0]` 的 lane 0/1 取 `t` 对应 lane，lane 2/3 取 `f` 对应 lane。
+
+
+
+### kArrayReduceOr / kArrayReduceAnd / kArrayReduceXor
+
+数组归约（纯组合）：先逐 lane 内归约，再跨 lane 归约。
+
+**operands**:
+- `oper[0]` (data): 输入数据（位宽 `row × W`）
+
+**results**:
+- `res[0]` (bit): 1-bit 归约结果
+
+**attrs**:
+- `elemWidth` (int64_t): lane 宽度 `W`
+
+**语义**（以 Or 为例，And/Xor 同理）:
+```
+res[0] = OR_{i ∈ [0, row)} ( OR_{b ∈ [0, W)} data[i*W + b] )
+```
+
+**示例**: `row=4, W=8`，`data` 仅 lane 2 为 `8'h01`、其余全 0 → `kArrayReduceOr` 得 `1'b1`，`kArrayReduceAnd` 得 `1'b0`，`kArrayReduceXor` 得 `1'b1`。
+
+注：`row` 宽守卫向量上的全归约直接使用 kReduceOr/kReduceAnd/kReduceXor（1 op），无需 array 变体。
+
+
+
+### kArrayReduceLanesOr / kArrayReduceLanesAnd / kArrayReduceLanesXor
+
+逐 lane 归约（纯组合）：每个 lane 内独立归约，产出 `row` 位守卫向量。
+
+**operands**:
+- `oper[0]` (data): 输入数据（位宽 `row × W`）
+
+**results**:
+- `res[0]` (guard): 逐 lane 归约结果（位宽 `row`）
+
+**attrs**:
+- `elemWidth` (int64_t): lane 宽度 `W`
+
+**语义**（以 Or 为例，And/Xor 同理）:
+```
+∀i ∈ [0, row): res[0][i] = OR_{b ∈ [0, W)} data[i*W + b]
+```
+
+**示例**: `row=4, W=8`，`data` 的 lane 0 为 `8'h03`、lane 2 为 `8'h80`、其余全 0 → `kArrayReduceLanesOr` 得 `4'b0101`，`kArrayReduceLanesAnd` 得 `4'b0000`，`kArrayReduceLanesXor` 得 `4'b0101`（lane 0 有 2 个置位、lane 2 有 1 个置位）。
+
+注：与 kArrayReduce*（全数组归约成 1 bit）的区分在于结果形态——本 op 保留逐 lane 结构，是 lane-aggregate array 模式加宽 per-lane 归约 cone（如 `kReduceOr(kConcat(...))`）时的物化产物；`row=1` 时与对应 kArrayReduce* 等价。
+
+
+
+### kArrayBroadcast
+
+标量广播到全部 lane（纯组合）。语义同 kReplicate，但携带数组语义并登记 array 统计桶。
+
+**operands**:
+- `oper[0]` (scalar): 输入标量（位宽 `W`）
+
+**results**:
+- `res[0]` (data): 位宽 `row × W`
+
+**attrs**:
+- `rows` (int64_t): lane 数 `row`
+
+**语义**:
+```
+∀i ∈ [0, row): res[0][i*W +: W] = scalar
+```
+
+**示例**: `scalar = 8'hAB`，`rows = 4` → `res[0] = 32'hABABABAB`。
+
+
+
+### kArrayLaneConst
+
+逐 lane 常量表（纯组合/声明性）。
+
+**operands**: 无
+
+**results**:
+- `res[0]` (data): 位宽 `row × W`
+
+**attrs**:
+- `elemWidth` (int64_t): lane 宽度 `W`
+- `rows` (int64_t): lane 数 `row`
+- `values` (int64_t[]): 长度 `row`，`values[i]` 为 lane `i` 的常量值
+
+**语义**:
+```
+∀i ∈ [0, row): res[0][i*W +: W] = values[i]
+```
+
+**示例**: `W=8, rows=4, values=[1, 2, 3, 4]` → `res[0] = 32'h04030201`。
+
+
+
+### kArrayOnehot
+
+索引译码为 one-hot 向量（纯组合）。
+
+**operands**:
+- `oper[0]` (x): 索引（任意位宽）
+
+**results**:
+- `res[0]` (onehot): 位宽 `row`
+
+**attrs**:
+- `rows` (int64_t): lane 数 `row`
+
+**语义**:
+```
+∀i ∈ [0, row): res[0][i] = (x == i)    -- 即 (1 << x) 截 row 位
+```
+
+**示例**: `rows = 4`，`x = 2` → `res[0] = 4'b0100`。
+
+
+
+### 降解为标准形态（array-lower）
+
+本节 12 个数组 op 均可经 transform pass `array-lower` 逐位等价地展开回宽标量形态（`kMemoryReadPort`/`kMemoryWritePort`/`kConcat`/`kSliceStatic`/`kReplicate`/位运算/全宽与逐 lane 归约/`kShl`/打包 `kConstant`），展开产物与不支持数组 op 的消费方（SystemVerilog emit、旧工具链）所需格式完全一致；该 pass 同时充当双形态 difftest 的语义等价证明工具。逐 op 展开规则见 [docs/transform/array-lower.md](../transform/array-lower.md)。

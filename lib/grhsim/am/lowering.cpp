@@ -389,9 +389,10 @@ namespace wolvrix::lib::grhsim::am
                     }
                     if (memoryGroup || memoryPriority)
                     {
-                        if (op.kind() != OperationKind::kMemoryWritePort)
+                        if (op.kind() != OperationKind::kMemoryWritePort &&
+                            op.kind() != OperationKind::kArrayWritePort)
                         {
-                            error("memory write priority attributes are only valid on kMemoryWritePort",
+                            error("memory write priority attributes are only valid on kMemoryWritePort/kArrayWritePort",
                                   opContext(op));
                             continue;
                         }
@@ -415,9 +416,12 @@ namespace wolvrix::lib::grhsim::am
                         group.memoryPriority = true;
                         group.members.emplace_back(static_cast<uint32_t>(*memoryPriority), operation);
                         const auto operands = op.operands();
-                        if (operands.size() >= 4)
+                        const std::size_t eventStart =
+                            op.kind() == OperationKind::kArrayWritePort ? 2 : 4;
+                        if (operands.size() >= eventStart)
                         {
-                            std::vector<ValueId> events(operands.begin() + 4, operands.end());
+                            std::vector<ValueId> events(operands.begin() + eventStart,
+                                                        operands.end());
                             if (group.members.size() == 1)
                             {
                                 group.referenceEvents = std::move(events);
@@ -516,6 +520,7 @@ namespace wolvrix::lib::grhsim::am
                         stringBytes += op.symbolText().size();
                     }
                     if (op.kind() != OperationKind::kConstant &&
+                        op.kind() != OperationKind::kArrayLaneConst &&
                         op.kind() != OperationKind::kRegister &&
                         op.kind() != OperationKind::kRegisterReadPort &&
                         op.kind() != OperationKind::kLatch &&
@@ -840,6 +845,65 @@ namespace wolvrix::lib::grhsim::am
                     error("GRH constant cannot have Array type", opContext(op));
                     return std::nullopt;
                 }
+                return builder_.addConstantInit(literalId);
+            }
+
+            std::optional<InitId> arrayLaneConstInit(const Operation &op, ValueId result,
+                                                     TypeId typeId)
+            {
+                const auto elemWidth = requiredAttr<int64_t>(op, "elemWidth");
+                const auto rows = requiredAttr<int64_t>(op, "rows");
+                const auto values = requiredAttr<std::vector<int64_t>>(op, "values");
+                if (!elemWidth || !rows || !values)
+                {
+                    return std::nullopt;
+                }
+                if (*elemWidth <= 0 || *rows <= 0 ||
+                    static_cast<uint64_t>(*elemWidth) >
+                        std::numeric_limits<uint32_t>::max() ||
+                    static_cast<uint64_t>(*rows) >
+                        std::numeric_limits<uint32_t>::max() ||
+                    values->size() != static_cast<std::size_t>(*rows))
+                {
+                    error("kArrayLaneConst attributes are invalid", opContext(op));
+                    return std::nullopt;
+                }
+                const uint64_t laneWidth = static_cast<uint64_t>(*elemWidth);
+                const uint64_t laneCount = static_cast<uint64_t>(*rows);
+                const uint64_t packedWidth = laneWidth * laneCount;
+                const Type type = typeForValue(result);
+                if (type.kind != TypeKind::BitVector || packedWidth == 0 ||
+                    packedWidth != type.bitWidth)
+                {
+                    error("kArrayLaneConst result width does not equal elemWidth * rows",
+                          opContext(op));
+                    return std::nullopt;
+                }
+                std::vector<uint64_t> words(
+                    static_cast<std::size_t>((packedWidth + 63U) / 64U), 0);
+                for (uint64_t lane = 0; lane < laneCount; ++lane)
+                {
+                    const int64_t laneValue = (*values)[static_cast<std::size_t>(lane)];
+                    if (laneValue < 0 ||
+                        (laneWidth < 64 &&
+                         (static_cast<uint64_t>(laneValue) >> laneWidth) != 0))
+                    {
+                        error("kArrayLaneConst lane value does not fit elemWidth",
+                              opContext(op));
+                        return std::nullopt;
+                    }
+                    const uint64_t bits = static_cast<uint64_t>(laneValue);
+                    for (uint64_t bit = 0; bit < laneWidth; ++bit)
+                    {
+                        if (((bits >> bit) & 1U) != 0)
+                        {
+                            const uint64_t position = lane * laneWidth + bit;
+                            words[static_cast<std::size_t>(position / 64U)] |=
+                                UINT64_C(1) << (position % 64U);
+                        }
+                    }
+                }
+                const LiteralId literalId = builder_.addBitLiteral(typeId, words);
                 return builder_.addConstantInit(literalId);
             }
 
@@ -1308,6 +1372,17 @@ namespace wolvrix::lib::grhsim::am
                         }
                         init = *parsed;
                     }
+                    else if (definition.valid() &&
+                             graph_.opKind(definition) == OperationKind::kArrayLaneConst)
+                    {
+                        const Operation laneConst = graph_.getOperation(definition);
+                        const auto parsed = arrayLaneConstInit(laneConst, value, typeId);
+                        if (!parsed)
+                        {
+                            continue;
+                        }
+                        init = *parsed;
+                    }
                     std::optional<StringId> label;
                     if (exposedValues_.contains(value.index))
                     {
@@ -1644,6 +1719,20 @@ namespace wolvrix::lib::grhsim::am
                 case OperationKind::kSliceDynamic:
                 case OperationKind::kSliceArray:
                     return Type::bitVector(resultType.bitWidth, Signedness::Unsigned);
+                case OperationKind::kArrayMux:
+                    return Type::bitVector(resultType.bitWidth,
+                                           commonSign(operands[1], operands[2]));
+                case OperationKind::kArrayReduceOr:
+                case OperationKind::kArrayReduceAnd:
+                case OperationKind::kArrayReduceXor:
+                    return Type::bitVector(1, Signedness::Unsigned);
+                case OperationKind::kArrayReduceLanesOr:
+                case OperationKind::kArrayReduceLanesAnd:
+                case OperationKind::kArrayReduceLanesXor:
+                    return Type::bitVector(resultType.bitWidth, Signedness::Unsigned);
+                case OperationKind::kArrayBroadcast:
+                case OperationKind::kArrayOnehot:
+                    return resultType;
                 default:
                     return std::nullopt;
                 }
@@ -1692,6 +1781,15 @@ namespace wolvrix::lib::grhsim::am
                 case OperationKind::kSliceStatic: return Opcode::SliceStatic;
                 case OperationKind::kSliceDynamic: return Opcode::SliceDynamic;
                 case OperationKind::kSliceArray: return Opcode::SliceArray;
+                case OperationKind::kArrayMux: return Opcode::ArrayMux;
+                case OperationKind::kArrayReduceOr: return Opcode::ArrayReduceOr;
+                case OperationKind::kArrayReduceAnd: return Opcode::ArrayReduceAnd;
+                case OperationKind::kArrayReduceXor: return Opcode::ArrayReduceXor;
+                case OperationKind::kArrayBroadcast: return Opcode::ArrayBroadcast;
+                case OperationKind::kArrayOnehot: return Opcode::ArrayOnehot;
+                case OperationKind::kArrayReduceLanesOr: return Opcode::ArrayReduceLanesOr;
+                case OperationKind::kArrayReduceLanesAnd: return Opcode::ArrayReduceLanesAnd;
+                case OperationKind::kArrayReduceLanesXor: return Opcode::ArrayReduceLanesXor;
                 default: return std::nullopt;
                 }
             }
@@ -1715,9 +1813,18 @@ namespace wolvrix::lib::grhsim::am
                 case Opcode::Assign:
                 case Opcode::Replicate:
                 case Opcode::SliceStatic:
+                case Opcode::ArrayReduceOr:
+                case Opcode::ArrayReduceAnd:
+                case Opcode::ArrayReduceXor:
+                case Opcode::ArrayBroadcast:
+                case Opcode::ArrayOnehot:
+                case Opcode::ArrayReduceLanesOr:
+                case Opcode::ArrayReduceLanesAnd:
+                case Opcode::ArrayReduceLanesXor:
                     expectedOperands = 1;
                     break;
                 case Opcode::Mux:
+                case Opcode::ArrayMux:
                     expectedOperands = 3;
                     break;
                 case Opcode::Concat:
@@ -1809,6 +1916,74 @@ namespace wolvrix::lib::grhsim::am
                     error("kSliceArray element width does not divide its base width",
                           opContext(op));
                     return;
+                }
+                if (opcode == Opcode::ArrayMux)
+                {
+                    const uint64_t selectWidth =
+                        static_cast<uint32_t>(graph_.valueWidth(operands[0]));
+                    const uint64_t dataWidth =
+                        static_cast<uint32_t>(graph_.valueWidth(operands[1]));
+                    if (selectWidth == 0 ||
+                        dataWidth !=
+                            static_cast<uint32_t>(graph_.valueWidth(operands[2])) ||
+                        dataWidth != resultType.bitWidth ||
+                        dataWidth % selectWidth != 0)
+                    {
+                        error("kArrayMux lane width does not match its select vector",
+                              opContext(op));
+                        return;
+                    }
+                }
+                if (opcode == Opcode::ArrayReduceOr || opcode == Opcode::ArrayReduceAnd ||
+                    opcode == Opcode::ArrayReduceXor)
+                {
+                    const auto elemWidth = requiredAttr<int64_t>(op, "elemWidth");
+                    if (!elemWidth || *elemWidth <= 0 ||
+                        static_cast<uint32_t>(graph_.valueWidth(operands.front())) %
+                                static_cast<uint64_t>(*elemWidth) !=
+                            0)
+                    {
+                        error("kArrayReduce elemWidth does not divide its data width",
+                              opContext(op));
+                        return;
+                    }
+                }
+                if (opcode == Opcode::ArrayReduceLanesOr || opcode == Opcode::ArrayReduceLanesAnd ||
+                    opcode == Opcode::ArrayReduceLanesXor)
+                {
+                    const auto elemWidth = requiredAttr<int64_t>(op, "elemWidth");
+                    if (!elemWidth || *elemWidth <= 0 ||
+                        resultType.bitWidth * static_cast<uint64_t>(*elemWidth) !=
+                            static_cast<uint32_t>(graph_.valueWidth(operands.front())))
+                    {
+                        error("kArrayReduceLanes result width times elemWidth does not equal its data width",
+                              opContext(op));
+                        return;
+                    }
+                }
+                if (opcode == Opcode::ArrayBroadcast)
+                {
+                    const auto rows = requiredAttr<int64_t>(op, "rows");
+                    const uint64_t sourceWidth =
+                        static_cast<uint32_t>(graph_.valueWidth(operands.front()));
+                    if (!rows || *rows <= 0 ||
+                        sourceWidth * static_cast<uint64_t>(*rows) != resultType.bitWidth)
+                    {
+                        error("kArrayBroadcast rows does not match its result width",
+                              opContext(op));
+                        return;
+                    }
+                }
+                if (opcode == Opcode::ArrayOnehot)
+                {
+                    const auto rows = requiredAttr<int64_t>(op, "rows");
+                    if (!rows || *rows <= 0 ||
+                        static_cast<uint64_t>(*rows) != resultType.bitWidth)
+                    {
+                        error("kArrayOnehot rows does not match its result width",
+                              opContext(op));
+                        return;
+                    }
                 }
 
                 std::vector<VariableId> loweredOperands;
@@ -2209,6 +2384,89 @@ namespace wolvrix::lib::grhsim::am
                 }
                 const InstructionId instruction =
                     addInstruction(Opcode::MemoryWrite, {}, operands);
+                addOrderedEffect(op, instruction, *target);
+            }
+
+            void lowerArrayReadAll(const Operation &op)
+            {
+                if (!op.operands().empty() || op.results().size() != 1)
+                {
+                    error("kArrayReadAllPort has invalid arity", opContext(op));
+                    return;
+                }
+                const auto target = stateTarget(op, "memSymbol", OperationKind::kMemory);
+                if (!target || !requireLogic(op.results()[0], op))
+                {
+                    return;
+                }
+                const Type targetType = builder_.view().type(
+                    builder_.view().variable(*target).type);
+                const Type resultType = typeForValue(op.results()[0]);
+                const uint64_t packedWidth =
+                    static_cast<uint64_t>(targetType.elementCount) * targetType.bitWidth;
+                if (resultType.kind != TypeKind::BitVector ||
+                    resultType.bitWidth != packedWidth ||
+                    packedWidth > std::numeric_limits<uint32_t>::max())
+                {
+                    error("array read-all result width does not equal rows * element width",
+                          opContext(op));
+                    return;
+                }
+                const std::array<VariableId, 1> results{mappedValue(op.results()[0], op)};
+                const std::array<VariableId, 1> operands{*target};
+                if (!results[0].valid())
+                {
+                    return;
+                }
+                addInstruction(Opcode::ArrayReadAll, results, operands);
+            }
+
+            void lowerArrayWrite(const Operation &op)
+            {
+                if (!op.results().empty() || op.operands().size() < 3)
+                {
+                    error("kArrayWritePort has invalid arity", opContext(op));
+                    return;
+                }
+                const auto target = stateTarget(op, "memSymbol", OperationKind::kMemory);
+                const auto edges = requiredAttr<std::vector<std::string>>(op, "eventEdge");
+                if (!target || !edges)
+                {
+                    return;
+                }
+                const Type targetType = builder_.view().type(
+                    builder_.view().variable(*target).type);
+                const uint64_t packedWidth =
+                    static_cast<uint64_t>(targetType.elementCount) * targetType.bitWidth;
+                if (packedWidth > std::numeric_limits<uint32_t>::max() ||
+                    !requireLogic(op.operands()[0], op, targetType.elementCount) ||
+                    !requireLogic(op.operands()[1], op,
+                                  static_cast<uint32_t>(packedWidth)))
+                {
+                    return;
+                }
+                const auto events = lowerEvents(op, 2, *edges);
+                if (!events || events->empty())
+                {
+                    if (events)
+                    {
+                        error("array write requires at least one event", opContext(op));
+                    }
+                    return;
+                }
+                std::vector<VariableId> operands{
+                    preCommitValue(op.operands()[0], mappedValue(op.operands()[0], op), op),
+                    preCommitValue(op.operands()[1], mappedValue(op.operands()[1], op), op),
+                    *target,
+                };
+                operands.insert(operands.end(), events->begin(), events->end());
+                if (std::any_of(operands.begin(), operands.end(),
+                                [](VariableId value) { return !value.valid(); }))
+                {
+                    return;
+                }
+                const InstructionId instruction =
+                    addInstruction(Opcode::ArrayWrite, {}, operands);
                 addOrderedEffect(op, instruction, *target);
             }
 
@@ -2650,6 +2908,12 @@ namespace wolvrix::lib::grhsim::am
                             error("kConstant has invalid arity", opContext(op));
                         }
                         break;
+                    case OperationKind::kArrayLaneConst:
+                        if (!op.operands().empty() || op.results().size() != 1)
+                        {
+                            error("kArrayLaneConst has invalid arity", opContext(op));
+                        }
+                        break;
                     case OperationKind::kRegister:
                     case OperationKind::kLatch:
                     case OperationKind::kMemory:
@@ -2676,6 +2940,12 @@ namespace wolvrix::lib::grhsim::am
                         break;
                     case OperationKind::kMemoryFillPort:
                         lowerMemoryFill(op);
+                        break;
+                    case OperationKind::kArrayReadAllPort:
+                        lowerArrayReadAll(op);
+                        break;
+                    case OperationKind::kArrayWritePort:
+                        lowerArrayWrite(op);
                         break;
                     case OperationKind::kSystemFunction:
                         lowerSystemFunction(op);

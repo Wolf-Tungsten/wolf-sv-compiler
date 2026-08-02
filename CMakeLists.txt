@@ -127,6 +127,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/core/ingest.cpp
     lib/core/transform.cpp
     lib/transform/activity_schedule.cpp
+    lib/transform/array_lower.cpp
     lib/transform/array_select_recovery.cpp
     lib/transform/demo_stats.cpp
     lib/transform/const_fold.cpp
@@ -396,6 +397,17 @@ target_compile_definitions(store-json-ir
 )
 
 register_test_exe(store-json-ir)
+
+add_executable(store-json-array-ops
+    tests/store/test_store_json_array_ops.cpp
+)
+
+target_link_libraries(store-json-array-ops
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(store-json-array-ops)
 
 add_executable(emit-sv-readmem
     tests/emit/test_emit_sv_readmem.cpp
@@ -688,6 +700,17 @@ target_link_libraries(transform-array-select-recovery
 )
 
 register_test_exe(transform-array-select-recovery)
+
+add_executable(transform-array-lower
+    tests/transform/test_array_lower.cpp
+)
+
+target_link_libraries(transform-array-lower
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-array-lower)
 
 add_executable(transform-onehot-to-mux
     tests/transform/test_onehot_to_mux.cpp

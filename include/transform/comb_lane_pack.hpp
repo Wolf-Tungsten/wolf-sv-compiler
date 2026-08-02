@@ -10,6 +10,17 @@
 namespace wolvrix::lib::transform
 {
 
+    // Output mode of the pack rewrite. Wide keeps the historical shape (one
+    // wide pointwise tree; kMux lanes rebuild as (t & m) | (f & ~m) with a
+    // per-lane replicated mask); Array emits array-value forms for the packed
+    // products: mux lanes become one kArrayMux over the per-lane guard
+    // kConcat, and shared-scalar replicate shapes become kArrayBroadcast.
+    enum class CombLanePackOutputMode
+    {
+        Wide,
+        Array,
+    };
+
     struct CombLanePackReport
     {
         std::string graphName;
@@ -40,6 +51,7 @@ namespace wolvrix::lib::transform
         bool enableDeclaredRoots = true;
         bool enableStorageDataRoots = true;
         bool enableMux = true;
+        CombLanePackOutputMode outputMode = CombLanePackOutputMode::Wide;
         std::string outputKey;
     };
 

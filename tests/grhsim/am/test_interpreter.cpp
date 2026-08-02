@@ -333,6 +333,303 @@ namespace {
         return 0;
     }
 
+    struct ArrayLoopbackFixture {
+        ExecutableModel model;
+        VariableId clock;
+        VariableId laneMask;
+        VariableId data;
+        VariableId scalar;
+        VariableId index;
+        VariableId memory;
+        VariableId all;
+        VariableId muxed;
+        VariableId broadcast;
+        VariableId onehot;
+        VariableId redOr;
+        VariableId redAnd;
+        VariableId redXor;
+    };
+
+    // 8-lane x 8-bit array: a clocked array.write scatters packed lanes into
+    // the memory, its tail changed.any reactivates the reader Block, which
+    // packs the whole array back with array.read_all and applies the pure
+    // array ops.
+    ArrayLoopbackFixture makeArrayLoopbackModel() {
+        LinearProgramBuilder linear;
+        const TypeId u1Type = linear.addType(Type::bitVector(1));
+        const TypeId u4Type = linear.addType(Type::bitVector(4));
+        const TypeId u8Type = linear.addType(Type::bitVector(8));
+        const TypeId u64Type = linear.addType(Type::bitVector(64));
+        const TypeId arrayType = linear.addType(Type::array(8, 8));
+        const VariableId clock = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId clockOld =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId posedge =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId laneMask = linear.addVariable(u8Type, linear.zeroInit());
+        const VariableId data = linear.addVariable(u64Type, linear.zeroInit());
+        const VariableId scalar = linear.addVariable(u8Type, linear.zeroInit());
+        const VariableId index = linear.addVariable(u4Type, linear.zeroInit());
+        const VariableId memory =
+            linear.addVariable(arrayType, linear.zeroInit());
+        const VariableId memoryOld =
+            linear.addVariable(arrayType, linear.undefInit());
+        const VariableId memoryEvent =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId all = linear.addVariable(u64Type, linear.zeroInit());
+        const VariableId muxed = linear.addVariable(u64Type, linear.zeroInit());
+        const VariableId broadcast =
+            linear.addVariable(u64Type, linear.zeroInit());
+        const VariableId onehot = linear.addVariable(u8Type, linear.zeroInit());
+        const VariableId redOr = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId redAnd = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId redXor = linear.addVariable(u1Type, linear.zeroInit());
+
+        const InstructionId detect = addInstruction(
+            linear, Opcode::ChangedPos, {posedge}, {clock, clockOld});
+        const InstructionId write = addInstruction(
+            linear, Opcode::ArrayWrite, {}, {laneMask, data, memory, posedge});
+        const InstructionId changed = addInstruction(
+            linear, Opcode::ChangedAny, {memoryEvent}, {memory, memoryOld});
+        const InstructionId readAll = addInstruction(
+            linear, Opcode::ArrayReadAll, {all}, {memory});
+        const InstructionId bcast = addInstruction(
+            linear, Opcode::ArrayBroadcast, {broadcast}, {scalar});
+        const InstructionId one = addInstruction(
+            linear, Opcode::ArrayOnehot, {onehot}, {index});
+        const InstructionId mux = addInstruction(
+            linear, Opcode::ArrayMux, {muxed}, {onehot, broadcast, all});
+        const InstructionId orReduce = addInstruction(
+            linear, Opcode::ArrayReduceOr, {redOr}, {all});
+        const InstructionId andReduce = addInstruction(
+            linear, Opcode::ArrayReduceAnd, {redAnd}, {all});
+        const InstructionId xorReduce = addInstruction(
+            linear, Opcode::ArrayReduceXor, {redXor}, {all});
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        const InstructionId activate =
+            addInstruction(scheduled, Opcode::ActBackward, {}, {memoryEvent});
+        setTargets(scheduled, activate, {BlockId{1}});
+        addBlock(scheduled, {detect});
+        addBlock(scheduled,
+                 {readAll, bcast, one, mux, orReduce, andReduce, xorReduce});
+        addBlock(scheduled, {write, changed, activate});
+        return ArrayLoopbackFixture{
+            .model =
+                ExecutableModel{
+                    .program = scheduled.finish(),
+                    .interface = {},
+                    .commitBlockBegin = 2,
+                    .commitBlockEnd = 3,
+                },
+            .clock = clock,
+            .laneMask = laneMask,
+            .data = data,
+            .scalar = scalar,
+            .index = index,
+            .memory = memory,
+            .all = all,
+            .muxed = muxed,
+            .broadcast = broadcast,
+            .onehot = onehot,
+            .redOr = redOr,
+            .redAnd = redAnd,
+            .redXor = redXor,
+        };
+    }
+
+    InterpreterValue u64(uint64_t value) {
+        const std::array<uint64_t, 1> words = {value};
+        return InterpreterValue::bitVector(64, Signedness::Unsigned, words);
+    }
+
+    int testArrayReadAllWriteLoopback() {
+        ArrayLoopbackFixture fixture = makeArrayLoopbackModel();
+        Interpreter interpreter(fixture.model);
+        if (!interpreter.ready() || !interpreter.eval().success()) {
+            return fail("array loopback model failed its initial eval");
+        }
+        const InterpreterValue initialAll = interpreter.value(fixture.all);
+        if (initialAll.lowWord() != 0 ||
+            interpreter.value(fixture.onehot).lowWord() != 1 ||
+            interpreter.value(fixture.redOr).lowWord() != 0 ||
+            interpreter.value(fixture.redAnd).lowWord() != 0 ||
+            interpreter.value(fixture.redXor).lowWord() != 0) {
+            return fail("array loopback initial state is wrong");
+        }
+
+        // Scatter lanes 0/2/5/7 of a packed 8x8 value into the memory on a
+        // posedge; the read side must observe the packed layout.
+        const std::array<uint64_t, 1> laneMaskWords = {0xa5};
+        if (!interpreter
+                 .write(fixture.laneMask,
+                        InterpreterValue::bitVector(8, Signedness::Unsigned,
+                                                    laneMaskWords))
+                 .success() ||
+            !interpreter.write(fixture.data, u64(UINT64_C(0x1122314455667788)))
+                 .success() ||
+            !interpreter.write(fixture.scalar, u8(0x5c)).success() ||
+            !interpreter.write(fixture.index,
+                               InterpreterValue::bitVector(
+                                   4, Signedness::Unsigned,
+                                   std::array<uint64_t, 1>{3}))
+                 .success() ||
+            !interpreter.write(fixture.clock, u1(1)).success() ||
+            !interpreter.eval().success()) {
+            return fail("clocked array transaction failed");
+        }
+        if (interpreter.value(fixture.all).lowWord() !=
+                UINT64_C(0x1100310000660088) ||
+            interpreter.value(fixture.broadcast).lowWord() !=
+                UINT64_C(0x5c5c5c5c5c5c5c5c) ||
+            interpreter.value(fixture.onehot).lowWord() != 0x08 ||
+            interpreter.value(fixture.muxed).lowWord() !=
+                UINT64_C(0x110031005c660088) ||
+            interpreter.value(fixture.redOr).lowWord() != 1 ||
+            interpreter.value(fixture.redAnd).lowWord() != 0 ||
+            interpreter.value(fixture.redXor).lowWord() != 1 ||
+            interpreter.value(fixture.memory).arrayElementWords(5).front() !=
+                0x31) {
+            return fail("array write/read-all loopback produced wrong values");
+        }
+
+        // A quiet round (clock back low, no posedge) must not touch the
+        // memory or the reader outputs.
+        if (!interpreter.write(fixture.clock, u1(0)).success() ||
+            !interpreter.eval().success() ||
+            interpreter.value(fixture.all).lowWord() !=
+                UINT64_C(0x1100310000660088)) {
+            return fail("quiet array round unexpectedly changed state");
+        }
+
+        // Full mask writes every lane; reduce-and sees an all-ones array.
+        const std::array<uint64_t, 1> fullMaskWords = {0xff};
+        if (!interpreter
+                 .write(fixture.laneMask,
+                        InterpreterValue::bitVector(8, Signedness::Unsigned,
+                                                    fullMaskWords))
+                 .success() ||
+            !interpreter.write(fixture.data, u64(UINT64_MAX)).success() ||
+            !interpreter.write(fixture.clock, u1(1)).success() ||
+            !interpreter.eval().success()) {
+            return fail("full-mask array transaction failed");
+        }
+        if (interpreter.value(fixture.all).lowWord() != UINT64_MAX ||
+            interpreter.value(fixture.muxed).lowWord() !=
+                UINT64_C(0xffffffff5cffffff) ||
+            interpreter.value(fixture.redOr).lowWord() != 1 ||
+            interpreter.value(fixture.redAnd).lowWord() != 1 ||
+            interpreter.value(fixture.redXor).lowWord() != 0) {
+            return fail("full-mask array write produced wrong values");
+        }
+        return 0;
+    }
+
+    int testArrayPureOperations() {
+        LinearProgramBuilder linear;
+        const TypeId u1Type = linear.addType(Type::bitVector(1));
+        const TypeId u5Type = linear.addType(Type::bitVector(5));
+        const TypeId u13Type = linear.addType(Type::bitVector(13));
+        const TypeId u65Type = linear.addType(Type::bitVector(65));
+        // 5 lanes x 13 bits = 65 bits, so the packed layout crosses a word
+        // boundary in both the interpreter and the emitter word helpers.
+        const std::array<uint64_t, 2> tWords = {UINT64_C(0x0100040010004001),
+                                                UINT64_C(0x1)};
+        const std::array<uint64_t, 2> fWords = {UINT64_C(0x7fbc3e001fff),
+                                                UINT64_C(0x0)};
+        const VariableId t = addConstant(linear, u65Type, tWords);
+        const VariableId f = addConstant(linear, u65Type, fWords);
+        const VariableId sel = addConstant(linear, u5Type, 0x16);
+        const VariableId scalar = addConstant(linear, u13Type, 0x0abc);
+        const VariableId index = addConstant(linear, u5Type, 2);
+        const VariableId outOfRange = addConstant(linear, u5Type, 5);
+        const VariableId muxed = linear.addVariable(u65Type, linear.zeroInit());
+        const VariableId broadcast =
+            linear.addVariable(u65Type, linear.zeroInit());
+        const VariableId onehot = linear.addVariable(u5Type, linear.zeroInit());
+        const VariableId empty = linear.addVariable(u5Type, linear.zeroInit());
+        const VariableId redOr = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId redAnd = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId redXorT =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId redXorB =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId lanesOrT = linear.addVariable(u5Type, linear.zeroInit());
+        const VariableId lanesAndT = linear.addVariable(u5Type, linear.zeroInit());
+        const VariableId lanesXorT = linear.addVariable(u5Type, linear.zeroInit());
+        const VariableId lanesOrB = linear.addVariable(u5Type, linear.zeroInit());
+        const VariableId lanesAndB = linear.addVariable(u5Type, linear.zeroInit());
+        const VariableId lanesXorB = linear.addVariable(u5Type, linear.zeroInit());
+
+        const InstructionId mux = addInstruction(
+            linear, Opcode::ArrayMux, {muxed}, {sel, t, f});
+        const InstructionId bcast = addInstruction(
+            linear, Opcode::ArrayBroadcast, {broadcast}, {scalar});
+        const InstructionId one = addInstruction(
+            linear, Opcode::ArrayOnehot, {onehot}, {index});
+        const InstructionId none = addInstruction(
+            linear, Opcode::ArrayOnehot, {empty}, {outOfRange});
+        const InstructionId orReduce = addInstruction(
+            linear, Opcode::ArrayReduceOr, {redOr}, {t});
+        const InstructionId andReduce = addInstruction(
+            linear, Opcode::ArrayReduceAnd, {redAnd}, {t});
+        const InstructionId xorReduceT = addInstruction(
+            linear, Opcode::ArrayReduceXor, {redXorT}, {t});
+        const InstructionId xorReduceB = addInstruction(
+            linear, Opcode::ArrayReduceXor, {redXorB}, {broadcast});
+        const InstructionId orLanesT = addInstruction(
+            linear, Opcode::ArrayReduceLanesOr, {lanesOrT}, {t});
+        const InstructionId andLanesT = addInstruction(
+            linear, Opcode::ArrayReduceLanesAnd, {lanesAndT}, {t});
+        const InstructionId xorLanesT = addInstruction(
+            linear, Opcode::ArrayReduceLanesXor, {lanesXorT}, {t});
+        const InstructionId orLanesB = addInstruction(
+            linear, Opcode::ArrayReduceLanesOr, {lanesOrB}, {broadcast});
+        const InstructionId andLanesB = addInstruction(
+            linear, Opcode::ArrayReduceLanesAnd, {lanesAndB}, {broadcast});
+        const InstructionId xorLanesB = addInstruction(
+            linear, Opcode::ArrayReduceLanesXor, {lanesXorB}, {broadcast});
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        addBlock(scheduled, {});
+        addBlock(scheduled, {mux, bcast, one, none, orReduce, andReduce,
+                             xorReduceT, xorReduceB, orLanesT, andLanesT,
+                             xorLanesT, orLanesB, andLanesB, xorLanesB});
+        ExecutableModel model{
+            .program = scheduled.finish(),
+            .interface = {},
+        };
+        Interpreter interpreter(model);
+        if (!interpreter.ready() || !interpreter.eval().success()) {
+            return fail("array pure model failed its initial eval");
+        }
+        const auto muxedWords = interpreter.value(muxed).words();
+        const auto broadcastWords = interpreter.value(broadcast).words();
+        if (muxedWords.size() != 2 ||
+            muxedWords[0] != UINT64_C(0x01007f8010005fff) ||
+            muxedWords[1] != 1 || broadcastWords.size() != 2 ||
+            broadcastWords[0] != UINT64_C(0xabc55e2af1578abc) ||
+            broadcastWords[1] != 0 ||
+            interpreter.value(onehot).lowWord() != 0x04 ||
+            interpreter.value(empty).lowWord() != 0 ||
+            interpreter.value(redOr).lowWord() != 1 ||
+            interpreter.value(redAnd).lowWord() != 0 ||
+            interpreter.value(redXorT).lowWord() != 0 ||
+            interpreter.value(redXorB).lowWord() != 1 ||
+            // t lanes are [0x1, 0x2, 0x4, 0x8, 0x1010]; broadcast lanes are
+            // all 0x0abc (parity 1).
+            interpreter.value(lanesOrT).lowWord() != 0x1f ||
+            interpreter.value(lanesAndT).lowWord() != 0x00 ||
+            interpreter.value(lanesXorT).lowWord() != 0x0f ||
+            interpreter.value(lanesOrB).lowWord() != 0x1f ||
+            interpreter.value(lanesAndB).lowWord() != 0x00 ||
+            interpreter.value(lanesXorB).lowWord() != 0x1f) {
+            return fail("one or more array pure operations produced the "
+                        "wrong value");
+        }
+        return 0;
+    }
+
     int testPureBitVectorOperations() {
         LinearProgramBuilder linear;
         const TypeId u1Type = linear.addType(Type::bitVector(1));
@@ -1036,6 +1333,10 @@ int main() {
     if (testEventDrivenRegister() != 0)
         return 1;
     if (testMemoryWriteRead() != 0)
+        return 1;
+    if (testArrayReadAllWriteLoopback() != 0)
+        return 1;
+    if (testArrayPureOperations() != 0)
         return 1;
     if (testPureBitVectorOperations() != 0)
         return 1;

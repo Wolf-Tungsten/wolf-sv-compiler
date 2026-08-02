@@ -1377,6 +1377,84 @@ namespace
         return 0;
     }
 
+    // array.write (operands [laneMask, data, mem, events...]) must schedule
+    // like mem.write: ordered writers on the same array target share one
+    // commit Block, one ChangedAny watch, and reactivate the array.read_all
+    // reader through ActBackward.
+    int testMergedArrayWritersShareOneWatchAndReactivateReader()
+    {
+        LinearProgramBuilder builder;
+        const TypeId eventType = builder.addType(Type::bitVector(1));
+        const TypeId maskType = builder.addType(Type::bitVector(4));
+        const TypeId dataType = builder.addType(Type::bitVector(32));
+        const TypeId memoryType = builder.addType(Type::array(4, 8));
+        const VariableId laneMask = builder.addVariable(maskType, builder.zeroInit());
+        const VariableId data = builder.addVariable(dataType, builder.zeroInit());
+        const VariableId memory = builder.addVariable(memoryType, builder.zeroInit());
+        const VariableId event = builder.addVariable(eventType, builder.zeroInit());
+        const VariableId all = builder.addVariable(dataType, builder.undefInit());
+
+        const std::array<VariableId, 1> readResults = {all};
+        const std::array<VariableId, 1> readOperands = {memory};
+        const InstructionId reader =
+            builder.addInstruction(Opcode::ArrayReadAll, readResults, readOperands);
+        const std::array<VariableId, 4> writeOperands = {
+            laneMask, data, memory, event,
+        };
+        const InstructionId firstWrite =
+            builder.addInstruction(Opcode::ArrayWrite, {}, writeOperands);
+        const InstructionId finalWrite =
+            builder.addInstruction(Opcode::ArrayWrite, {}, writeOperands);
+
+        SchedulingFacts facts;
+        facts.variableRoles = {
+            VariableRole::None, VariableRole::None, VariableRole::State,
+            VariableRole::None, VariableRole::None,
+        };
+        facts.instructionEffects = {
+            InstructionEffect::StateRead,
+            InstructionEffect::StateReadWrite,
+            InstructionEffect::StateReadWrite,
+        };
+        facts.orderedEffects = {
+            OrderedEffect{.instruction = finalWrite, .group = 31, .ordinal = 0},
+            OrderedEffect{.instruction = firstWrite, .group = 31, .ordinal = 1},
+        };
+        LinearProgramArtifact linear{
+            .program = builder.finish(),
+            .schedulingFacts = std::move(facts),
+        };
+
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        std::optional<ExecutableModel> model = schedule(
+            std::move(linear),
+            ActivityScheduleOptions{
+                .maxInstructionsPerBlock = 1,
+                .enableCoarsening = false,
+            },
+            diagnostics);
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 3) {
+            return fail("array reader and writers did not form a deterministic schedule");
+        }
+        const std::optional<BlockId> readerBlock = findInstructionBlock(*model, reader);
+        const std::optional<BlockId> firstWriterBlock =
+            findInstructionBlock(*model, firstWrite);
+        const std::optional<BlockId> finalWriterBlock =
+            findInstructionBlock(*model, finalWrite);
+        if (!readerBlock || !firstWriterBlock || !finalWriterBlock ||
+            *readerBlock != BlockId{1} || *finalWriterBlock != BlockId{2} ||
+            *firstWriterBlock != BlockId{2} ||
+            model->program.blockInstruction(BlockId{2}, 0) != finalWrite ||
+            model->program.blockInstruction(BlockId{2}, 1) != firstWrite ||
+            countChangedWatches(*model, memory) != 1 ||
+            !watchActivatesTarget(*model, *finalWriterBlock, memory, Opcode::ActBackward,
+                                  *readerBlock) ||
+            !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
+            return fail("merged array writers did not share one watch that reactivates the reader");
+        }
+        return 0;
+    }
+
     int testSplitCommitBlocksEachWatchAndReactivateReader()
     {
         LinearProgramBuilder builder;
@@ -2702,6 +2780,9 @@ int main()
         return result;
     }
     if (const int result = testMergedMemoryWritersShareOneWatchAndReactivateReader(); result != 0) {
+        return result;
+    }
+    if (const int result = testMergedArrayWritersShareOneWatchAndReactivateReader(); result != 0) {
         return result;
     }
     if (const int result = testSplitCommitBlocksEachWatchAndReactivateReader(); result != 0) {

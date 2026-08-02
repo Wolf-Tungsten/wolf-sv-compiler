@@ -1031,6 +1031,306 @@ namespace
         }
         return 0;
     }
+    int testArrayOperationLowering()
+    {
+        grh::Design design;
+        grh::Graph &graph = design.createGraph("array_ops");
+        design.markAsTop(graph.symbol());
+
+        const auto clock = logic(graph, "clock", 1);
+        const auto laneMask = logic(graph, "lane_mask", 8);
+        const auto scalar = logic(graph, "scalar", 8);
+        const auto index = logic(graph, "index", 3);
+        const auto allFalse = logic(graph, "all_false", 64);
+        graph.bindInputPort("clock", clock);
+        graph.bindInputPort("lane_mask", laneMask);
+        graph.bindInputPort("scalar", scalar);
+        graph.bindInputPort("index", index);
+        graph.bindInputPort("all_false", allFalse);
+
+        const auto memory = graph.createOperation(grh::OperationKind::kMemory,
+                                                  graph.internSymbol("arr"));
+        graph.setAttr(memory, "width", int64_t{8});
+        graph.setAttr(memory, "row", int64_t{8});
+        graph.setAttr(memory, "isSigned", false);
+        graph.setAttr(memory, "initKind", std::vector<std::string>{"literal"});
+        graph.setAttr(memory, "initFile", std::vector<std::string>{""});
+        graph.setAttr(memory, "initValue", std::vector<std::string>{"8'h00"});
+        graph.setAttr(memory, "initStart", std::vector<int64_t>{0});
+        graph.setAttr(memory, "initLen", std::vector<int64_t>{8});
+
+        const auto all = logic(graph, "all", 64);
+        const auto readAll = graph.createOperation(grh::OperationKind::kArrayReadAllPort,
+                                                   graph.internSymbol("read_all"));
+        graph.addResult(readAll, all);
+        graph.setAttr(readAll, "memSymbol", std::string("arr"));
+
+        const auto muxed = logic(graph, "muxed", 64);
+        const auto mux = graph.createOperation(grh::OperationKind::kArrayMux,
+                                               graph.internSymbol("lane_mux"));
+        graph.addOperand(mux, laneMask);
+        graph.addOperand(mux, all);
+        graph.addOperand(mux, allFalse);
+        graph.addResult(mux, muxed);
+
+        // Mixed-signedness lane mux: t unsigned, f signed, result unsigned.
+        // Lane selection is bitwise (kMux convention), so this must lower and
+        // validate; the b1 XiangShan pipeline hits it via comb-lane-pack.
+        const auto signedConst = constant(graph, "signed_const_op", "signed_const",
+                                          64, "64'h8877665544332211", true);
+        const auto muxedMixed = logic(graph, "muxed_mixed", 64);
+        const auto muxMixed = graph.createOperation(grh::OperationKind::kArrayMux,
+                                                    graph.internSymbol("lane_mux_mixed"));
+        graph.addOperand(muxMixed, laneMask);
+        graph.addOperand(muxMixed, all);
+        graph.addOperand(muxMixed, signedConst);
+        graph.addResult(muxMixed, muxedMixed);
+
+        const auto redOr = logic(graph, "red_or", 1);
+        const auto reduceOr = graph.createOperation(grh::OperationKind::kArrayReduceOr,
+                                                    graph.internSymbol("red_or_op"));
+        graph.addOperand(reduceOr, muxed);
+        graph.addResult(reduceOr, redOr);
+        graph.setAttr(reduceOr, "elemWidth", int64_t{8});
+
+        const auto redAnd = logic(graph, "red_and", 1);
+        const auto reduceAnd = graph.createOperation(grh::OperationKind::kArrayReduceAnd,
+                                                     graph.internSymbol("red_and_op"));
+        graph.addOperand(reduceAnd, muxed);
+        graph.addResult(reduceAnd, redAnd);
+        graph.setAttr(reduceAnd, "elemWidth", int64_t{8});
+
+        const auto redXor = logic(graph, "red_xor", 1);
+        const auto reduceXor = graph.createOperation(grh::OperationKind::kArrayReduceXor,
+                                                     graph.internSymbol("red_xor_op"));
+        graph.addOperand(reduceXor, muxed);
+        graph.addResult(reduceXor, redXor);
+        graph.setAttr(reduceXor, "elemWidth", int64_t{8});
+
+        const auto broadcast = logic(graph, "broadcast", 64);
+        const auto broadcastOp = graph.createOperation(grh::OperationKind::kArrayBroadcast,
+                                                       graph.internSymbol("broadcast_op"));
+        graph.addOperand(broadcastOp, scalar);
+        graph.addResult(broadcastOp, broadcast);
+        graph.setAttr(broadcastOp, "rows", int64_t{8});
+
+        const auto onehot = logic(graph, "onehot", 8);
+        const auto onehotOp = graph.createOperation(grh::OperationKind::kArrayOnehot,
+                                                    graph.internSymbol("onehot_op"));
+        graph.addOperand(onehotOp, index);
+        graph.addResult(onehotOp, onehot);
+        graph.setAttr(onehotOp, "rows", int64_t{8});
+
+        const auto lanesOr = logic(graph, "lanes_or", 8);
+        const auto reduceLanesOr = graph.createOperation(grh::OperationKind::kArrayReduceLanesOr,
+                                                         graph.internSymbol("lanes_or_op"));
+        graph.addOperand(reduceLanesOr, muxed);
+        graph.addResult(reduceLanesOr, lanesOr);
+        graph.setAttr(reduceLanesOr, "elemWidth", int64_t{8});
+
+        const auto lanesAnd = logic(graph, "lanes_and", 8);
+        const auto reduceLanesAnd = graph.createOperation(grh::OperationKind::kArrayReduceLanesAnd,
+                                                          graph.internSymbol("lanes_and_op"));
+        graph.addOperand(reduceLanesAnd, muxed);
+        graph.addResult(reduceLanesAnd, lanesAnd);
+        graph.setAttr(reduceLanesAnd, "elemWidth", int64_t{8});
+
+        const auto lanesXor = logic(graph, "lanes_xor", 8);
+        const auto reduceLanesXor = graph.createOperation(grh::OperationKind::kArrayReduceLanesXor,
+                                                          graph.internSymbol("lanes_xor_op"));
+        graph.addOperand(reduceLanesXor, muxed);
+        graph.addResult(reduceLanesXor, lanesXor);
+        graph.setAttr(reduceLanesXor, "elemWidth", int64_t{8});
+
+        const auto laneConst = logic(graph, "lane_const", 64);
+        const auto laneConstOp = graph.createOperation(grh::OperationKind::kArrayLaneConst,
+                                                       graph.internSymbol("lane_const_op"));
+        graph.addResult(laneConstOp, laneConst);
+        graph.setAttr(laneConstOp, "elemWidth", int64_t{8});
+        graph.setAttr(laneConstOp, "rows", int64_t{8});
+        graph.setAttr(laneConstOp, "values",
+                      std::vector<int64_t>{0x11, 0x22, 0x33, 0x44,
+                                           0x55, 0x66, 0x77, 0x88});
+
+        const auto write = graph.createOperation(grh::OperationKind::kArrayWritePort,
+                                                 graph.internSymbol("lane_write"));
+        graph.addOperand(write, laneMask);
+        graph.addOperand(write, muxed);
+        graph.addOperand(write, clock);
+        graph.setAttr(write, "memSymbol", std::string("arr"));
+        graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        graph.setAttr(write, grh::kMemoryWritePriorityGroupAttr, std::string("arr_writes"));
+        graph.setAttr(write, grh::kMemoryWritePriorityAttr, int64_t{0});
+
+        graph.bindOutputPort("all", all);
+        graph.bindOutputPort("muxed", muxed);
+        graph.bindOutputPort("red_or", redOr);
+        graph.bindOutputPort("red_and", redAnd);
+        graph.bindOutputPort("red_xor", redXor);
+        graph.bindOutputPort("broadcast", broadcast);
+        graph.bindOutputPort("onehot", onehot);
+        graph.bindOutputPort("lane_const", laneConst);
+        graph.bindOutputPort("lanes_or", lanesOr);
+        graph.bindOutputPort("lanes_and", lanesAnd);
+        graph.bindOutputPort("lanes_xor", lanesXor);
+
+        graph.freeze();
+        diag::Diagnostics diagnostics;
+        GrhToAmLowering lowering;
+        auto artifact = lowering.lower(graph, diagnostics);
+        if (!artifact || diagnostics.hasError())
+        {
+            for (const auto &message : diagnostics.messages())
+            {
+                std::cerr << message.message << " [" << message.context << "]\n";
+            }
+            return fail("array operation graph did not lower");
+        }
+        const ValidationResult validation =
+            validate(*artifact, ValidationOptions{.level = ValidationLevel::Semantic});
+        if (!validation.success())
+        {
+            return fail(validation.errors.front());
+        }
+
+        const ProgramView program = artifact->program.view();
+        if (countOpcode(program, Opcode::ArrayReadAll) != 1 ||
+            countOpcode(program, Opcode::ArrayWrite) != 1 ||
+            countOpcode(program, Opcode::ArrayMux) != 2 ||
+            countOpcode(program, Opcode::ArrayReduceOr) != 1 ||
+            countOpcode(program, Opcode::ArrayReduceAnd) != 1 ||
+            countOpcode(program, Opcode::ArrayReduceXor) != 1 ||
+            countOpcode(program, Opcode::ArrayBroadcast) != 1 ||
+            countOpcode(program, Opcode::ArrayOnehot) != 1 ||
+            countOpcode(program, Opcode::ArrayReduceLanesOr) != 1 ||
+            countOpcode(program, Opcode::ArrayReduceLanesAnd) != 1 ||
+            countOpcode(program, Opcode::ArrayReduceLanesXor) != 1)
+        {
+            return fail("lowered array opcode inventory is incomplete");
+        }
+
+        // array.write operands are [laneMask, data, target, events...] and
+        // array.read_all operands are [target]; both share the array state.
+        VariableId arrayTarget;
+        bool checkedWriteShape = false;
+        bool checkedReadShape = false;
+        bool checkedMixedMux = false;
+        VariableId sharedPosedge;
+        for (uint32_t index = 0; index < program.instructionCount(); ++index)
+        {
+            const InstructionId instruction{index};
+            const Opcode opcode = program.opcode(instruction);
+            if (opcode == Opcode::ChangedPos)
+            {
+                sharedPosedge = program.results(instruction).front();
+                continue;
+            }
+            if (opcode == Opcode::ArrayWrite)
+            {
+                const auto operands = program.operands(instruction);
+                const Type targetType =
+                    program.type(program.variable(operands[2]).type);
+                const Type laneMaskType =
+                    program.type(program.variable(operands[0]).type);
+                const Type dataType =
+                    program.type(program.variable(operands[1]).type);
+                if (operands.size() != 4 || targetType.kind != TypeKind::Array ||
+                    targetType.elementCount != 8 || targetType.bitWidth != 8 ||
+                    laneMaskType.bitWidth != 8 || dataType.bitWidth != 64 ||
+                    operands[3] != sharedPosedge)
+                {
+                    return fail("array.write operand layout is not [laneMask, data, mem, events...]");
+                }
+                arrayTarget = operands[2];
+                checkedWriteShape = true;
+                continue;
+            }
+            if (opcode == Opcode::ArrayReadAll)
+            {
+                const auto operands = program.operands(instruction);
+                const Type resultType =
+                    program.type(program.variable(program.results(instruction).front()).type);
+                if (operands.size() != 1 || resultType.bitWidth != 64)
+                {
+                    return fail("array.read_all operand layout is not [mem] -> packed");
+                }
+                arrayTarget = operands[0];
+                checkedReadShape = true;
+                continue;
+            }
+            if (opcode == Opcode::ArrayMux)
+            {
+                const auto operands = program.operands(instruction);
+                const auto typeOf = [&](VariableId variable) {
+                    return program.type(program.variable(variable).type);
+                };
+                const bool hasSignedData =
+                    typeOf(operands[1]).signedness == Signedness::Signed ||
+                    typeOf(operands[2]).signedness == Signedness::Signed;
+                if (hasSignedData)
+                {
+                    // The mixed-signedness mux keeps the unsigned result and
+                    // the signed operand (bitwise select, kMux convention).
+                    const Type resultType = typeOf(program.results(instruction).front());
+                    if (resultType.bitWidth != 64 ||
+                        resultType.signedness != Signedness::Unsigned)
+                    {
+                        return fail("mixed-signedness array.mux lost its type signature");
+                    }
+                    checkedMixedMux = true;
+                }
+            }
+        }
+        if (!checkedWriteShape || !checkedReadShape || !arrayTarget.valid())
+        {
+            return fail("array state read/write instructions are missing");
+        }
+        if (!checkedMixedMux)
+        {
+            return fail("mixed-signedness array.mux was not lowered");
+        }
+
+        // kArrayLaneConst materializes as a packed compile-time constant, no
+        // dedicated instruction.
+        bool checkedLaneConst = false;
+        const uint64_t expectedLaneConst = UINT64_C(0x8877665544332211);
+        for (uint32_t index = 0; index < program.variableCount(); ++index)
+        {
+            const VariableId variable{index};
+            const InitDescriptor &init = program.init(program.variable(variable).init);
+            if (init.kind != InitKind::Constant)
+            {
+                continue;
+            }
+            const LiteralView literal = program.literal(LiteralId{init.payload});
+            const Type type = program.type(program.variable(variable).type);
+            if (type.kind == TypeKind::BitVector && type.bitWidth == 64 &&
+                literal.words.size() == 1 && literal.words.front() == expectedLaneConst)
+            {
+                checkedLaneConst = true;
+            }
+        }
+        if (!checkedLaneConst)
+        {
+            return fail("kArrayLaneConst did not materialize as a packed constant");
+        }
+
+        // The priority attribute is accepted on kArrayWritePort and recorded
+        // as a state ordered effect.
+        bool checkedOrderedEffect = false;
+        for (const OrderedEffect &effect : artifact->schedulingFacts.orderedEffects)
+        {
+            if (program.opcode(effect.instruction) == Opcode::ArrayWrite)
+            {
+                checkedOrderedEffect = true;
+            }
+        }
+        if (!checkedOrderedEffect)
+        {
+            return fail("array.write priority was not recorded as an ordered effect");
+        }
+        return 0;
+    }
 } // namespace
 
 int main()
@@ -1052,6 +1352,10 @@ int main()
         return result;
     }
     if (const int result = testShiftWidensOperandBeforeExecution(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testArrayOperationLowering(); result != 0)
     {
         return result;
     }

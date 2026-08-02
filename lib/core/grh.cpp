@@ -2645,7 +2645,19 @@ namespace wolvrix::lib::grh
             "kDpicImport",
             "kDpicCall",
             "kXMRRead",
-            "kXMRWrite"};
+            "kXMRWrite",
+            "kArrayReadAllPort",
+            "kArrayWritePort",
+            "kArrayMux",
+            "kArrayReduceOr",
+            "kArrayReduceAnd",
+            "kArrayReduceXor",
+            "kArrayBroadcast",
+            "kArrayLaneConst",
+            "kArrayOnehot",
+            "kArrayReduceLanesOr",
+            "kArrayReduceLanesAnd",
+            "kArrayReduceLanesXor"};
 
         void writeAttributeValue(slang::JsonWriter &writer, const AttributeValue &value)
         {

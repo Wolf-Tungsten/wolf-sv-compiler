@@ -106,6 +106,8 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kDpicCall:
             case wolvrix::lib::grh::OperationKind::kXMRRead:
             case wolvrix::lib::grh::OperationKind::kXMRWrite:
+            case wolvrix::lib::grh::OperationKind::kArrayReadAllPort:
+            case wolvrix::lib::grh::OperationKind::kArrayWritePort:
                 return false;
             default:
                 return true;
@@ -119,6 +121,7 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
             case wolvrix::lib::grh::OperationKind::kMemoryWritePort:
             case wolvrix::lib::grh::OperationKind::kMemoryFillPort:
+            case wolvrix::lib::grh::OperationKind::kArrayWritePort:
                 return true;
             default:
                 return false;

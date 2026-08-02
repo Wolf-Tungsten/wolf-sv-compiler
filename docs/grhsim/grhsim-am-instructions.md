@@ -11,7 +11,10 @@ system/DPI 的宿主接口见 [HostEnvironment 参考定义](grhsim-host-environ
 形态：`kConstant` 直接成为 constant Variable，其余 39 种在 operand/result 均为
 Logic 时产生本稿指令；Real/String constant 遵循同一规则。本文还定义
 `changed.any/changed.pos/changed.neg`、`reg.write`、`mem.read/mem.write/mem.fill` 和
-`latch.write`、`system.function/system.task`、`dpi.call` 和 `act.f/act.b`。层次结构和 XMR
+`latch.write`、数组视图指令 `array.read_all/array.write` 与纯组合
+`array.mux/array.reduce_*/array.broadcast/array.onehot`（`kArrayLaneConst` 与
+`kConstant` 一样直接成为 constant Variable）、`system.function/system.task`、
+`dpi.call` 和 `act.f/act.b`。层次结构和 XMR
 不是 GRHSIM-AM 指令，必须在 lower 前消解。Real/String 专用组合指令仍待后续定义；
 constant、`changed.any`、系统调用和 DPI 已按本文定义覆盖 Real/String。
 
@@ -717,6 +720,182 @@ act.b %qchanged {targets = [5]}
 `%q` 的位模式实际变化时 `%qchanged` 才为 1，`act.b` 激发并在下一轮激活 reader
 compute Block B5。
 
+### 12.4 数组视图（Array View）
+
+数组视图把一个 `Array<N, BV<W, Sign>>` state 视为 `N` 个等宽 lane 的整体：packed
+视图值宽 `N*W`，lane `i` 占连续位 `[i*W +: W]`，lane 0 位于最低 W bit；宽 `N` 的
+BV 用作守卫/选择向量，每 lane 1 bit。数组的存储仍是第 12.2 节的 memory
+Variable；注意 memory 按 word-stride 行平铺存储（每行 `ceil(W/64)` 个 u64），与
+packed 视图的连续位布局不同，`array.read_all/array.write` 在两种布局之间逐 lane
+pack/unpack，语义上只按 `[i*W +: W]` 定义。数组视图 opcode 的 Signedness 只来自
+对应 Variable Type，不改变位级语义。
+
+#### 12.4.1 `array.read_all`
+
+GRH `kArrayReadAllPort` lower 为全数组读：
+
+```text
+%res = array.read_all %target
+```
+
+| Operand/Result | Type | 含义 |
+| --- | --- | --- |
+| `%target` | `Array<N, BV<W, Sign>>` | 被读取的 memory Variable。 |
+| `%res` | `BV<N*W, SignR>` | 全数组 packed 视图值。 |
+
+指令读取 `%target`，并对每个 `i in [0, N)` 令 `res[i*W +: W] = target[i]`。
+`N*W` 使用数学整数计算。`array.read_all` 不修改 `%target`，`%res` 不能是 constant
+Variable；它按实际执行顺序观察状态，与同一 target 的 `mem.read` 等价。
+
+#### 12.4.2 `array.write`
+
+GRH `kArrayWritePort` lower 为：
+
+```text
+array.write %laneMask, %data, %target, %event0, ..., %eventE-1
+```
+
+| Operand | Type | 含义 |
+| --- | --- | --- |
+| `%laneMask` | `BV<N, SignM>` | 逐 lane 写使能；Signedness 被忽略。 |
+| `%data` | `BV<N*W, SignD>` | packed 写数据；Signedness 被忽略。 |
+| `%target` | `Array<N, BV<W, Sign>>` | 被写入的 memory Variable。 |
+| `%event0...E-1` | `BV<1, unsigned>` | 已完成边沿检测的触发事件；`E >= 1`。 |
+
+指令先同时读取全部 operand 的原值，再令：
+
+```text
+fire = exists i in [0, E): U(event_i) = 1
+```
+
+若 `fire = false`，整个 `%target` 保持不变。若 `fire = true`，对每个
+`r in [0, N)`：
+
+```text
+laneMask[r] = 1 → target'[r] = data[r * W + W - 1 : r * W]
+laneMask[r] = 0 → target'[r] = target[r]
+```
+
+lane 内整写，没有逐 bit mask；lane 内部分写由上游在生成 `%data` 时并入（例如用
+`array.mux` 合并保持值）。`array.write` 不产生 result，也不隐式激活 reader；它只
+位于 commit Block，实际 Array Value 的变化由同块共享 `changed.any` 检测并经
+`act.b` 传播。event 的 OR 语义、eventEdge lowering、priority 写组
+（GRH `memoryWrite.priorityGroup/priority`，同组按 priority 从大到小执行、`0` 最后
+写入）以及多写按实际执行顺序生效的规则都与 `mem.write` 相同。
+
+例如，`%mem` 为 `Array<4, BV<8, unsigned>>`：
+
+```text
+array.write %lane_mask, %packed, %mem, %clkpos
+```
+
+`%lane_mask = 4'b0101` 且 `%clkpos = 1` 时，`%mem[0] ← packed[7:0]`、
+`%mem[2] ← packed[23:16]`，其余 lane 保持。
+
+#### 12.4.3 `array.mux`
+
+GRH `kArrayMux` lower 为逐 lane 选择：
+
+```text
+%res = array.mux %sel, %t, %f
+```
+
+| Operand/Result | Type | 含义 |
+| --- | --- | --- |
+| `%sel` | `BV<N, SignS>` | 选择向量，每 lane 1 bit；Signedness 被忽略。 |
+| `%t` | `BV<N*W, SignT>` | 真值数据。 |
+| `%f` | `BV<N*W, SignF>` | 假值数据。 |
+| `%res` | `BV<N*W, Sign>` | 逐 lane 选择结果。 |
+
+对每个 `i in [0, N)`：`res[i*W +: W] = sel[i] ? t[i*W +: W] : f[i*W +: W]`。
+lane 选择是位级语义（与 `mux` 相同），因此 `%t/%f/%res` 只要求位宽一致且是
+`%sel` 宽度的整数倍；Signedness 遵循 `mux` 的共同约定，即
+`Sign = commonS(SignT, SignF)`（仅两者均为 `signed` 时结果为 `signed`）。
+
+#### 12.4.4 `array.reduce_or / array.reduce_and / array.reduce_xor`
+
+GRH `kArrayReduceOr/kArrayReduceAnd/kArrayReduceXor` lower 为数组归约：
+
+```text
+%res = array.reduce_or  %data
+%res = array.reduce_and %data
+%res = array.reduce_xor %data
+```
+
+| Operand/Result | Type | 含义 |
+| --- | --- | --- |
+| `%data` | `BV<N*W, SignD>` | packed 输入数据。 |
+| `%res` | `BV<1, unsigned>` | 归约结果。 |
+
+语义为先逐 lane 内归约、再跨 lane 归约，例如
+`res = OR_{i in [0, N)} (OR_{b in [0, W)} data[i*W + b])`。归约满足结合律，因此
+结果与对 `%data` 全宽执行 `reduce_or/reduce_and/reduce_xor` 完全相同；lane 划分
+只存在于 GRH `elemWidth` Attribute 的形状校验（`width(data) % elemWidth = 0`），不
+作为 AM 指令 Attribute 保留。
+
+#### 12.4.5 `array.broadcast`
+
+GRH `kArrayBroadcast` lower 为标量广播：
+
+```text
+%res = array.broadcast %scalar
+```
+
+| Operand/Result | Type | 含义 |
+| --- | --- | --- |
+| `%scalar` | `BV<W, SignS>` | 输入标量。 |
+| `%res` | `BV<N*W, SignR>` | 广播结果。 |
+
+对每个 `i in [0, N)`：`res[i*W +: W] = scalar`，即 `%res` 是 `%scalar` 的
+`N = width(res) / width(scalar)` 次复制，与 `replicate` 的位级语义相同。结果宽度
+必须是源宽度的整数倍。
+
+#### 12.4.6 `array.onehot`
+
+GRH `kArrayOnehot` lower 为索引译码：
+
+```text
+%res = array.onehot %x
+```
+
+| Operand/Result | Type | 含义 |
+| --- | --- | --- |
+| `%x` | `BV<A, SignX>` | 索引；`A >= 1`，Signedness 被忽略。 |
+| `%res` | `BV<N, SignR>` | one-hot 向量。 |
+
+对每个 `i in [0, N)`：`res[i] = (U(x) = i)`，即 `(1 << U(x))` 截 `N` 位；
+`U(x) >= N` 时 `%res` 为全 0。
+
+#### 12.4.7 `array.reduce_lanes_or / array.reduce_lanes_and / array.reduce_lanes_xor`
+
+GRH `kArrayReduceLanesOr/kArrayReduceLanesAnd/kArrayReduceLanesXor` lower 为逐 lane
+归约：
+
+```text
+%res = array.reduce_lanes_or  %data
+%res = array.reduce_lanes_and %data
+%res = array.reduce_lanes_xor %data
+```
+
+| Operand/Result | Type | 含义 |
+| --- | --- | --- |
+| `%data` | `BV<N*W, SignD>` | packed 输入数据。 |
+| `%res` | `BV<N, unsigned>` | 逐 lane 归约出的守卫向量。 |
+
+对每个 `i in [0, N)`：`res[i] = OR/AND/XOR_{b in [0, W)} data[i*W + b]`，即每个
+lane 内独立归约、结果保留逐 lane 结构（与 `array.reduce_*` 的全数组 1-bit 归约
+互补）。lane 宽度 `W = width(data) / width(res)` 由 Type 推出，`width(data)` 必须
+是 `width(res)` 的整数倍；GRH `elemWidth` Attribute 的形状校验为
+`width(res) * elemWidth = width(data)`。
+
+#### 12.4.8 非指令：`kArrayLaneConst`
+
+`kArrayLaneConst` 与 `kConstant` 一样不生成指令：lower 时按
+`elemWidth/rows/values` Attribute 把 lane 常量表打包为 `rows*elemWidth` 位的
+compile-time literal，`res[i*elemWidth +: elemWidth] = values[i]`，结果 Value 映射为
+`Init = constant(packed)` 的 Variable。`values` 的长度必须等于 `rows`，每个
+`values[i]` 必须非负且能用 `elemWidth` 位表示。
+
 ## 13. 非指令：层次与跨层引用
 
 `kInstance` 描述电路实例关系，`kXMRRead/kXMRWrite` 描述通过层次路径定位的连接或状态
@@ -1082,6 +1261,11 @@ Backward 依赖。
   第 12.2.2 节，target 不是 constant；带 priority 的写组完整且按规定顺序 lower；
 - `mem.fill` 的 cond、data、target 和 event 数量及 Type 满足第 12.2.3 节；data 宽度
   等于 W 或数学整数 `N*W`，target 不是 constant；
+- `array.read_all` 的 target/res Type 满足第 12.4.1 节，res 不是 constant；
+- `array.write` 的 laneMask、data、target 和 event 数量及 Type 满足第 12.4.2 节，
+  target 不是 constant；带 priority 的写组完整且按规定顺序 lower；
+- `array.mux/array.broadcast/array.onehot` 的 operand/result 宽度整除关系满足
+  第 12.4 节；`array.reduce_*` 的 result 是 `BV<1, unsigned>`；
 - `latch.write` 的 cond、mask、nextValue 和 target Type 满足第 12.3 节，target 不是
   constant；若未运行 `latch-transparent-read`，每个 latch read 的透明旁路已由其他
   等价 GRH 组合逻辑显式表达；
@@ -1101,8 +1285,8 @@ Backward 依赖。
 - `slice_static.lsb` 是满足第 10 节范围约束的 Nat，且该指令没有其他 Attribute；
 - `targets` 是静态非空 BlockId set Attribute，且 act 没有其他 Attribute；commit Block
   构成 Block 空间的连续后缀 `[CommitBegin, BlockCount)`；state write
-  （`reg.write/latch.write/mem.write/mem.fill`）只位于 commit Block；`act.f` 只位于
-  B0 和 compute Block，对所在 Block B 其每个 Target 满足
+  （`reg.write/latch.write/mem.write/mem.fill/array.write`）只位于 commit
+  Block；`act.f` 只位于 B0 和 compute Block，对所在 Block B 其每个 Target 满足
   `B.BlockId < Target < CommitBegin`；`act.b` 只位于 commit Block，其每个 Target
   满足 `1 <= Target < CommitBegin`；
 - EntryBlock 只包含 `changed`、event 派生所需的组合指令和 `act.f`；其中 `changed`

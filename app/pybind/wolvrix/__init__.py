@@ -507,6 +507,9 @@ def _compile_comb_lane_pack_kwargs(named: dict[str, Any]) -> list[str]:
     enable_mux = _pop_named(local, "enable_mux", None)
     if enable_mux is not None:
         out.extend(["-enable-mux", "true" if enable_mux else "false"])
+    output_mode = _pop_named(local, "output_mode", None)
+    if output_mode is not None:
+        out.extend(["-output-mode", str(output_mode)])
     output_key = _pop_named(local, "out_comb_lane_pack_report", None)
     if output_key is not None:
         out.extend(["-output-key", str(output_key)])
@@ -543,6 +546,19 @@ def _compile_lane_aggregate_kwargs(named: dict[str, Any]) -> list[str]:
         out.append("-read-select")
     elif read_select is False:
         out.append("-no-read-select")
+    output_mode = _pop_named(local, "output_mode", None)
+    if output_mode is not None:
+        out.extend(["-output-mode", str(output_mode)])
+    exact_fallback = _pop_named(local, "exact_fallback", None)
+    if exact_fallback is True:
+        out.append("-exact-fallback")
+    elif exact_fallback is False:
+        out.append("-no-exact-fallback")
+    lane_param_leaves = _pop_named(local, "lane_param_leaves", None)
+    if lane_param_leaves is True:
+        out.append("-lane-param-leaves")
+    elif lane_param_leaves is False:
+        out.append("-no-lane-param-leaves")
     output_key = _pop_named(local, "out_lane_aggregate_report", None)
     if output_key is not None:
         out.extend(["-output-key", str(output_key)])

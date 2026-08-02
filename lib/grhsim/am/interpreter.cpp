@@ -903,10 +903,14 @@ namespace wolvrix::lib::grhsim::am {
             case Opcode::ReduceOr:
             case Opcode::ReduceNor:
             case Opcode::ReduceXor:
-            case Opcode::ReduceXnor: {
+            case Opcode::ReduceXnor:
+            case Opcode::ArrayReduceOr:
+            case Opcode::ArrayReduceAnd:
+            case Opcode::ArrayReduceXor: {
                 bool reduced = false;
                 if (opcode == Opcode::ReduceAnd ||
-                    opcode == Opcode::ReduceNand) {
+                    opcode == Opcode::ReduceNand ||
+                    opcode == Opcode::ArrayReduceAnd) {
                     reduced = true;
                     for (uint64_t bit = 0; bit < operands[0].type().bitWidth;
                          ++bit) {
@@ -915,7 +919,8 @@ namespace wolvrix::lib::grhsim::am {
                     if (opcode == Opcode::ReduceNand)
                         reduced = !reduced;
                 } else if (opcode == Opcode::ReduceOr ||
-                           opcode == Opcode::ReduceNor) {
+                           opcode == Opcode::ReduceNor ||
+                           opcode == Opcode::ArrayReduceOr) {
                     reduced = truth(operands[0]);
                     if (opcode == Opcode::ReduceNor)
                         reduced = !reduced;
@@ -987,6 +992,69 @@ namespace wolvrix::lib::grhsim::am {
                          ++bit) {
                         setBit(resultWords, destination + bit,
                                getBit(operands[0].words(), bit));
+                    }
+                }
+                break;
+            }
+            case Opcode::ArrayMux: {
+                const uint32_t lanes = operands[0].type().bitWidth;
+                const uint32_t elemWidth =
+                    lanes == 0 ? 0 : resultType.bitWidth / lanes;
+                resultWords.assign(wordCount(resultType.bitWidth), 0);
+                for (uint64_t bit = 0; bit < resultType.bitWidth; ++bit) {
+                    const uint64_t lane = bit / elemWidth;
+                    const bool pick = getBit(operands[0].words(), lane);
+                    setBit(resultWords, bit,
+                           getBit(pick ? operands[1].words()
+                                       : operands[2].words(),
+                                  bit));
+                }
+                break;
+            }
+            case Opcode::ArrayBroadcast: {
+                resultWords.assign(wordCount(resultType.bitWidth), 0);
+                for (uint64_t destination = 0;
+                     destination < resultType.bitWidth;
+                     destination += operands[0].type().bitWidth) {
+                    for (uint64_t bit = 0; bit < operands[0].type().bitWidth;
+                         ++bit) {
+                        setBit(resultWords, destination + bit,
+                               getBit(operands[0].words(), bit));
+                    }
+                }
+                break;
+            }
+            case Opcode::ArrayOnehot: {
+                const uint64_t index =
+                    shiftAmount(operands[0], resultType.bitWidth);
+                resultWords.assign(wordCount(resultType.bitWidth), 0);
+                if (index < resultType.bitWidth) {
+                    setBit(resultWords, index);
+                }
+                break;
+            }
+            case Opcode::ArrayReduceLanesOr:
+            case Opcode::ArrayReduceLanesAnd:
+            case Opcode::ArrayReduceLanesXor: {
+                const uint64_t rows = resultType.bitWidth;
+                const uint64_t elemWidth =
+                    rows == 0 ? 0 : operands[0].type().bitWidth / rows;
+                resultWords.assign(wordCount(resultType.bitWidth), 0);
+                for (uint64_t lane = 0; lane < rows; ++lane) {
+                    bool reduced = opcode == Opcode::ArrayReduceLanesAnd;
+                    for (uint64_t bit = 0; bit < elemWidth; ++bit) {
+                        const bool value = getBit(operands[0].words(),
+                                                  lane * elemWidth + bit);
+                        if (opcode == Opcode::ArrayReduceLanesAnd) {
+                            reduced = reduced && value;
+                        } else if (opcode == Opcode::ArrayReduceLanesOr) {
+                            reduced = reduced || value;
+                        } else {
+                            reduced = reduced != value;
+                        }
+                    }
+                    if (reduced) {
+                        setBit(resultWords, lane);
                     }
                 }
                 break;
@@ -1170,7 +1238,8 @@ namespace wolvrix::lib::grhsim::am {
             const auto results = program.results(instruction);
             const std::vector<InterpreterValue> operands = snapshot(operandIds);
 
-            if (opcode <= Opcode::SliceArray) {
+            if (opcode <= Opcode::SliceArray ||
+                (opcode >= Opcode::ArrayMux && opcode <= Opcode::ArrayReduceLanesXor)) {
                 return executePure(block, instruction, opcode, results,
                                    operands);
             }
@@ -1222,6 +1291,51 @@ namespace wolvrix::lib::grhsim::am {
                 } else {
                     values[results[0].value] =
                         InterpreterValue::zero(variableType(results[0]));
+                }
+                return {};
+            }
+            if (opcode == Opcode::ArrayReadAll) {
+                const Type &memoryType = operands[0].type();
+                const Type &resultType = variableType(results[0]);
+                const std::size_t stride = wordCount(memoryType.bitWidth);
+                std::vector<uint64_t> resultWords(wordCount(resultType.bitWidth),
+                                                  0);
+                for (uint64_t row = 0; row < memoryType.elementCount; ++row) {
+                    for (uint64_t bit = 0; bit < memoryType.bitWidth; ++bit) {
+                        setBit(resultWords, row * memoryType.bitWidth + bit,
+                               getBit(operands[0].words(),
+                                      row * static_cast<uint64_t>(stride) * 64U +
+                                          bit));
+                    }
+                }
+                values[results[0].value] =
+                    makeBitValue(resultType, std::move(resultWords));
+                return {};
+            }
+            if (opcode == Opcode::ArrayWrite) {
+                const std::size_t targetIndex = 2;
+                const Type &memoryType = operands[targetIndex].type();
+                bool eventHit = false;
+                for (std::size_t index = 3; index < operands.size(); ++index) {
+                    eventHit = eventHit || truth(operands[index]);
+                }
+                if (eventHit) {
+                    InterpreterValue next = operands[targetIndex];
+                    const std::size_t stride = wordCount(memoryType.bitWidth);
+                    for (uint64_t row = 0; row < memoryType.elementCount; ++row) {
+                        if (!getBit(operands[0].words(), row)) {
+                            continue;
+                        }
+                        for (uint64_t bit = 0; bit < memoryType.bitWidth;
+                             ++bit) {
+                            setBit(next.words_,
+                                   row * static_cast<uint64_t>(stride) * 64U +
+                                       bit,
+                                   getBit(operands[1].words(),
+                                          row * memoryType.bitWidth + bit));
+                        }
+                    }
+                    values[operandIds[targetIndex].value] = std::move(next);
                 }
                 return {};
             }

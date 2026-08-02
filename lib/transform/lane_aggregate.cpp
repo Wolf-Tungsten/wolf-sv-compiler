@@ -14,6 +14,24 @@
 // rewrites select trees over those slices (mux chains / one-hot and-or trees)
 // into kSliceDynamic(wide_read, ptr*W, W). See docs/transform/lane-aggregate.md.
 //
+// Output modes (-output-mode, default wide):
+//   wide  - the shape described above (unchanged default).
+//   array - array-value shape: the merged storage is a kMemory (width = W,
+//           row = span) with one kArrayReadAllPort as the packed read; the
+//           write side is a single kArrayWritePort (laneMask = condVec &
+//           presentLanes, data = the merged data cone); cone positions
+//           materialize as kArrayBroadcast / kArrayLaneConst / kArrayOnehot /
+//           kArrayMux (lane-pointwise bitwise ops widen unchanged; lane
+//           parameters keep the per-lane kConcat); per-lane reductions
+//           (kReduce{Or,And,Xor} over a multi-bit per-lane operand, including
+//           the normalize-produced kArrayReduce* form) materialize as
+//           kArrayReduceLanes{Or,And,Xor} over the packed rows, yielding the
+//           per-lane guard vector; lane reads become
+//           kMemoryReadPort at a constant address and phase 2 select trees
+//           become one kMemoryReadPort at the dynamic pointer; the pre-pass
+//           rewrites kReduce{Or,And,Xor}(kConcat(...)) to kArrayReduce* when
+//           the concat elements have uniform width.
+//
 // Merge criteria (all must hold for a group, see docs/transform/lane-aggregate.md):
 //   - name grouping, dense indices (few holes allowed), uniform lane width,
 //     exactly one write port per lane, full-width (all-ones) write masks,
@@ -40,15 +58,43 @@
 //       internal node - lane-pointwise op (kAnd/kOr/kXor/kXnor/kNot/kAssign/
 //                       kMux), widened to span*width. kMux is rebuilt as
 //                       (t & m) | (f & ~m) with a per-lane broadcast select.
-//     Any other lane-varying position (non-pointwise ops such as kEq/kAdd/
-//     kConcat, inputs that differ per lane, cross-lane reads of another
-//     lane's register) rejects the group.
+//                       Array mode additionally accepts per-lane reductions
+//                       (kReduce{Or,And,Xor} over a multi-bit per-lane
+//                       operand, or the normalize-produced kArrayReduce* form),
+//                       materialized as kArrayReduceLanes{Or,And,Xor} over the
+//                       packed rows, and treats a per-lane kConcat as a
+//                       lane-parameter leaf (its materialized per-lane kConcat
+//                       is already the packed-row form).
+//       lane-param leaf - (-lane-param-leaves, on by default) any other
+//                       lane-varying position whose per-lane values are
+//                       produced by the same op kind with the same arity,
+//                       attrs, and width across lanes (e.g. per-lane kEq wide
+//                       compares, kSliceStatic/kSliceDynamic, kSub): the
+//                       per-lane subgraphs are kept verbatim and packed by
+//                       one per-lane kConcat (same materialization as the
+//                       other lane-parameter leaves; register reads inside
+//                       are retargeted by phase C3).
+//       affine gather   - (R-level) per-lane kSliceStatic of ONE shared
+//                       base X with offsets affine in the lane index (lane i
+//                       reads X[base0 + i*W +: W]): the packed per-lane
+//                       slices are exactly X[base0 +: span*W], so
+//                       materialization is zero-cost (X itself on an exact
+//                       fit, else one kSliceStatic). Non-affine offsets or
+//                       mixed bases stay rejected.
+//     Any other lane-varying position (mixed defined/undefined per-lane
+//     leaves, cross-lane reads of another lane's register, or - with
+//     -no-lane-param-leaves - non-pointwise ops such as kEq/kAdd) rejects
+//     the group.
 //
-// Groups whose signature majority bucket is smaller than min_lanes, and
-// lanes whose cones differ from the majority (e.g. lane 0 reset
-// specialization), stay scalar untouched. Dead per-lane cone ops are left
-// for dead-code-elim / simplify; this pass only removes the merged lane
-// registers, their write ports, and the replaced read ports.
+// Groups whose signature majority bucket is smaller than min_lanes normally
+// stay scalar untouched; with -exact-fallback (on by default) the exact
+// N-wise cone check then runs over ALL candidate lanes directly (one shot,
+// then an incremental rescue-style bucket build capped at 32 attempts),
+// because the signature is only a bucketing accelerator while the exact
+// check is the ground truth. Lanes whose cones differ from the majority
+// (e.g. lane 0 reset specialization) stay scalar untouched. Dead per-lane
+// cone ops are left for dead-code-elim / simplify; this pass only removes
+// the merged lane registers, their write ports, and the replaced read ports.
 
 #include "transform/lane_aggregate.hpp"
 
@@ -242,7 +288,59 @@ namespace wolvrix::lib::transform
             }
         }
 
-        bool normalizeReduceConcat(Graph &graph)
+        OperationKind arrayReduceKindForReduce(OperationKind kind)
+        {
+            switch (kind)
+            {
+            case OperationKind::kReduceOr:
+                return OperationKind::kArrayReduceOr;
+            case OperationKind::kReduceAnd:
+                return OperationKind::kArrayReduceAnd;
+            case OperationKind::kReduceXor:
+            default:
+                return OperationKind::kArrayReduceXor;
+            }
+        }
+
+        bool isReduceLikeKind(OperationKind kind)
+        {
+            switch (kind)
+            {
+            case OperationKind::kReduceOr:
+            case OperationKind::kReduceAnd:
+            case OperationKind::kReduceXor:
+            case OperationKind::kArrayReduceOr:
+            case OperationKind::kArrayReduceAnd:
+            case OperationKind::kArrayReduceXor:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        // Per-lane widening of a reduction: kReduce{Or,And,Xor} over a
+        // multi-bit per-lane operand (and its normalize-produced
+        // kArrayReduce{Or,And,Xor} form, whose operand is still the per-lane
+        // value at analysis time) becomes a per-lane reduction over the
+        // packed rows.
+        OperationKind arrayReduceLanesKindForReduce(OperationKind kind)
+        {
+            switch (kind)
+            {
+            case OperationKind::kReduceOr:
+            case OperationKind::kArrayReduceOr:
+                return OperationKind::kArrayReduceLanesOr;
+            case OperationKind::kReduceAnd:
+            case OperationKind::kArrayReduceAnd:
+                return OperationKind::kArrayReduceLanesAnd;
+            case OperationKind::kReduceXor:
+            case OperationKind::kArrayReduceXor:
+            default:
+                return OperationKind::kArrayReduceLanesXor;
+            }
+        }
+
+        bool normalizeReduceConcat(Graph &graph, bool arrayMode)
         {
             bool changed = false;
             const std::vector<OperationId> ops(graph.operations().begin(), graph.operations().end());
@@ -267,6 +365,53 @@ namespace wolvrix::lib::transform
                 const OperationKind elementKind = elementwiseKindForReduce(op.kind());
                 const ValueId oldResult = op.results().front();
                 const SrcLoc srcLoc = makeTransformSrcLoc(std::string(kPassId), "reduce-concat-normalize");
+                if (arrayMode)
+                {
+                    // Array mode: kReduce{Or,And,Xor}(kConcat(e0..em)) over
+                    // uniform-width elements is exactly one kArrayReduce* of
+                    // the packed concat value (rows = operand count,
+                    // elemWidth = element width). Non-uniform concats keep
+                    // the tree expansion below.
+                    int32_t elemWidth = 0;
+                    bool uniform = !concatOp.operands().empty();
+                    for (const ValueId element : concatOp.operands())
+                    {
+                        const int32_t width = graph.valueWidth(element);
+                        if (elemWidth == 0)
+                        {
+                            elemWidth = width;
+                        }
+                        else if (width != elemWidth)
+                        {
+                            uniform = false;
+                            break;
+                        }
+                    }
+                    if (uniform && elemWidth > 0)
+                    {
+                        const ValueId out = graph.createValue(graph.makeInternalValSym(), 1, false,
+                                                              graph.valueType(oldResult));
+                        const OperationId arrayOp = graph.createOperation(
+                            arrayReduceKindForReduce(op.kind()), graph.makeInternalOpSym());
+                        graph.addOperand(arrayOp, op.operands().front());
+                        graph.addResult(arrayOp, out);
+                        graph.setAttr(arrayOp, "elemWidth", static_cast<int64_t>(elemWidth));
+                        graph.setOpSrcLoc(arrayOp, srcLoc);
+                        graph.setValueSrcLoc(out, srcLoc);
+                        for (const auto &port : graph.outputPorts())
+                        {
+                            if (port.value == oldResult)
+                            {
+                                graph.bindOutputPort(port.name, out);
+                            }
+                        }
+                        graph.replaceAllUses(oldResult, out);
+                        changed = true;
+                        // The old reduce stays behind dead; the concat stays
+                        // live as the kArrayReduce* data operand.
+                        continue;
+                    }
+                }
                 ValueId root;
                 for (const ValueId element : concatOp.operands())
                 {
@@ -768,6 +913,7 @@ namespace wolvrix::lib::transform
             kSharedRegRead,
             kLaneParam,
             kEqOnehot,
+            kAffineGather,
             kInternal,
         };
 
@@ -786,6 +932,10 @@ namespace wolvrix::lib::transform
             std::string refRegSymbol;
             // kEqOnehot: the shared compared value x (result bit i = (x == i)).
             ValueId sharedX;
+            // kAffineGather: the shared gathered base X and the offset of
+            // lane 0's segment (lane i reads X[gatherBase + i*W +: W]).
+            ValueId gatherX;
+            uint64_t gatherBase = 0;
             // kInternal.
             OperationKind opKind = OperationKind::kAssign;
             std::vector<int32_t> children;
@@ -848,11 +998,20 @@ namespace wolvrix::lib::transform
             // kReplicate of a per-lane 1-bit value is a per-lane broadcast
             // (materialized via broadcastLaneBits); kReduce{Or,And,Xor} of a
             // 1-bit operand is the identity. Both shapes are verified in
-            // classifyInternal.
+            // classifyInternal. A multi-bit reduction is a per-lane
+            // reduction, materialized as kArrayReduceLanes* in array mode
+            // (also verified in classifyInternal).
             case OperationKind::kReplicate:
             case OperationKind::kReduceOr:
             case OperationKind::kReduceAnd:
             case OperationKind::kReduceXor:
+            // kArrayReduce{Or,And,Xor} reaches cones as the array-mode
+            // normalize product of kReduce{Or,And,Xor}(kConcat(...)); its
+            // operand is still the per-lane value here, so it is a per-lane
+            // reduction with the same widening rules as kReduce*.
+            case OperationKind::kArrayReduceOr:
+            case OperationKind::kArrayReduceAnd:
+            case OperationKind::kArrayReduceXor:
                 return true;
             default:
                 return false;
@@ -881,12 +1040,16 @@ namespace wolvrix::lib::transform
                          std::string selfGroupKey,
                          const std::vector<uint64_t> &laneIndices,
                          const std::vector<std::string> &laneNames,
-                         const RegLaneMap &regLane)
+                         const RegLaneMap &regLane,
+                         bool arrayMode,
+                         bool laneParamLeaves)
                 : graph_(graph),
                   selfGroupKey_(std::move(selfGroupKey)),
                   laneIndices_(laneIndices),
                   laneNames_(laneNames),
-                  regLane_(regLane)
+                  regLane_(regLane),
+                  arrayMode_(arrayMode),
+                  laneParamLeaves_(laneParamLeaves)
             {
             }
 
@@ -1149,6 +1312,70 @@ namespace wolvrix::lib::transform
                 return emitPosition(std::move(pos));
             }
 
+            // R-level affine-gather leaf: every lane's value is a kSliceStatic
+            // of the SAME shared base X with the offset affine in the lane
+            // index (lane i reads X[base0 + i*W +: W], W = lane width). The
+            // packed per-lane concatenation of such slices is exactly
+            // X[base0 +: span*W] (segments of hole lanes carry X's bits,
+            // which are don't-care: the present-lanes cond mask clears them
+            // like any other shared leaf), so materialization is zero-cost.
+            // Runs before the attrs check because sliceStart/sliceEnd
+            // legitimately differ per lane. Mixed bases, non-affine offsets,
+            // negative bases, and out-of-range segments fall through to the
+            // normal (rejecting) path.
+            bool classifyAffineGather(ConePosition &pos)
+            {
+                const OperationId t0DefId = graph_.valueDef(pos.templateValue);
+                const Operation t0Def = graph_.getOperation(t0DefId);
+                if (t0Def.kind() != OperationKind::kSliceStatic || t0Def.operands().size() != 1)
+                {
+                    return false;
+                }
+                const ValueId base = t0Def.operands().front();
+                const int64_t baseWidth = std::max<int32_t>(graph_.valueWidth(base), 0);
+                std::optional<__int128> gatherBase;
+                for (std::size_t k = 0; k < pos.tuple.size(); ++k)
+                {
+                    const OperationId defId = graph_.valueDef(pos.tuple[k]);
+                    if (!defId.valid())
+                    {
+                        return false;
+                    }
+                    const Operation def = graph_.getOperation(defId);
+                    if (def.kind() != OperationKind::kSliceStatic || def.operands().size() != 1 ||
+                        def.operands().front() != base)
+                    {
+                        return false;
+                    }
+                    const auto sliceStart = getAttr<int64_t>(def, "sliceStart");
+                    const auto sliceEnd = getAttr<int64_t>(def, "sliceEnd");
+                    if (!sliceStart || !sliceEnd || *sliceStart < 0 || *sliceEnd < *sliceStart ||
+                        *sliceEnd - *sliceStart + 1 != pos.laneWidth || *sliceEnd >= baseWidth)
+                    {
+                        return false;
+                    }
+                    const __int128 offset = static_cast<__int128>(*sliceStart) -
+                                            static_cast<__int128>(laneIndices_[k]) *
+                                                static_cast<__int128>(pos.laneWidth);
+                    if (!gatherBase)
+                    {
+                        gatherBase = offset;
+                    }
+                    else if (*gatherBase != offset)
+                    {
+                        return false;
+                    }
+                }
+                if (!gatherBase || *gatherBase < 0)
+                {
+                    return false;
+                }
+                pos.kind = PosKind::kAffineGather;
+                pos.gatherX = base;
+                pos.gatherBase = static_cast<uint64_t>(*gatherBase);
+                return true;
+            }
+
             int32_t classifyInternal(ConePosition pos)
             {
                 const OperationId t0DefId = graph_.valueDef(pos.templateValue);
@@ -1177,6 +1404,113 @@ namespace wolvrix::lib::transform
                 const Operation t0Def = graph_.getOperation(t0DefId);
                 const OperationKind kind = t0Def.kind();
                 const std::size_t operandCount = t0Def.operands().size();
+                if ((kind == OperationKind::kSliceStatic || kind == OperationKind::kSliceDynamic) &&
+                    pos.laneWidth == 1)
+                {
+                    // shl-onehot cone: per lane k, bit laneIndices_[k] of a
+                    // shared (1 << x) decode, written as kSliceStatic(X, i, i)
+                    // or kSliceDynamic(X, const i, 1) with
+                    // X = kShl(kConstant 1, x). This is the DataModule-family
+                    // write/read one-hot decode; bit i of (1 << x) is
+                    // (x == i) in 2-state semantics (same equivalence class
+                    // as onehot-to-mux's x-prop note), so the position
+                    // classifies exactly like the kEq onehot below. The two
+                    // slice forms (and mixed tuples of them) are accepted;
+                    // kSliceStatic sliceStart/sliceEnd legitimately differ
+                    // per lane, so this runs before the attrs check.
+                    ValueId sharedBase;
+                    bool onehot = true;
+                    for (std::size_t k = 0; k < pos.tuple.size(); ++k)
+                    {
+                        const OperationId defId = graph_.valueDef(pos.tuple[k]);
+                        if (!defId.valid())
+                        {
+                            onehot = false;
+                            break;
+                        }
+                        const Operation def = graph_.getOperation(defId);
+                        uint64_t bitIndex = 0;
+                        ValueId base;
+                        if (def.kind() == OperationKind::kSliceStatic && def.operands().size() == 1)
+                        {
+                            const auto sliceStart = getAttr<int64_t>(def, "sliceStart");
+                            const auto sliceEnd = getAttr<int64_t>(def, "sliceEnd");
+                            if (!sliceStart || !sliceEnd || *sliceStart != *sliceEnd || *sliceStart < 0)
+                            {
+                                onehot = false;
+                                break;
+                            }
+                            bitIndex = static_cast<uint64_t>(*sliceStart);
+                            base = def.operands().front();
+                        }
+                        else if (def.kind() == OperationKind::kSliceDynamic && def.operands().size() == 2)
+                        {
+                            const auto sliceWidth = getAttr<int64_t>(def, "sliceWidth");
+                            if (!sliceWidth || *sliceWidth != 1)
+                            {
+                                onehot = false;
+                                break;
+                            }
+                            const auto offset = getConstantUInt64(graph_, def.operands()[1], nullptr);
+                            if (!offset)
+                            {
+                                onehot = false;
+                                break;
+                            }
+                            bitIndex = *offset;
+                            base = def.operands()[0];
+                        }
+                        else
+                        {
+                            onehot = false;
+                            break;
+                        }
+                        // The equivalence bit i of (1 << x) == (x == i) needs
+                        // i < width(X); an out-of-range bit select is not a
+                        // onehot decode.
+                        if (bitIndex != laneIndices_[k] ||
+                            bitIndex >= static_cast<uint64_t>(std::max<int32_t>(graph_.valueWidth(base), 0)))
+                        {
+                            onehot = false;
+                            break;
+                        }
+                        if (k == 0)
+                        {
+                            sharedBase = base;
+                        }
+                        else if (base != sharedBase)
+                        {
+                            onehot = false;
+                            break;
+                        }
+                    }
+                    if (onehot && sharedBase.valid())
+                    {
+                        const OperationId baseDefId = graph_.valueDef(sharedBase);
+                        if (baseDefId.valid())
+                        {
+                            const Operation baseDef = graph_.getOperation(baseDefId);
+                            if (baseDef.kind() == OperationKind::kShl && baseDef.operands().size() == 2)
+                            {
+                                const auto one = getConstantUInt64(graph_, baseDef.operands()[0], nullptr);
+                                if (one && *one == 1 &&
+                                    !getConstantUInt64(graph_, baseDef.operands()[1], nullptr))
+                                {
+                                    pos.kind = PosKind::kEqOnehot;
+                                    pos.sharedX = baseDef.operands()[1];
+                                    return emitPosition(std::move(pos));
+                                }
+                            }
+                        }
+                    }
+                }
+                if (kind == OperationKind::kSliceStatic && classifyAffineGather(pos))
+                {
+                    // R-level affine gather: the packed per-lane slices are
+                    // exactly X[gatherBase +: span*W]; materialization is
+                    // zero-cost (see the kAffineGather case).
+                    return emitPosition(std::move(pos));
+                }
                 bool kindsMatch = true;
                 for (const ValueId value : pos.tuple)
                 {
@@ -1247,8 +1581,36 @@ namespace wolvrix::lib::transform
                         return emitPosition(std::move(pos));
                     }
                 }
+                if (kind == OperationKind::kConcat && arrayMode_)
+                {
+                    // Array mode: a per-lane concat is a lane-parameter leaf.
+                    // The materialized per-lane kConcat keeps lane i's
+                    // original concat value in segment i, which is exactly the
+                    // packed-row form packed-row consumers (kArrayReduceLanes*,
+                    // kArrayMux, widened bitwise ops) expect. In wide mode a
+                    // per-lane concat only merges via the C-level
+                    // lane-parameter leaf below (-lane-param-leaves).
+                    pos.kind = PosKind::kLaneParam;
+                    return emitPosition(std::move(pos));
+                }
                 if (!isPointwiseKind(kind))
                 {
+                    if (laneParamLeaves_)
+                    {
+                        // C-level lane-parameter leaf: a non-pointwise op that
+                        // is uniform across lanes (kind/arity/attrs/width
+                        // verified above). The per-lane subgraphs are kept
+                        // verbatim and packed by one per-lane kConcat (the
+                        // same materialization as every other lane-parameter
+                        // leaf); register reads inside them are retargeted by
+                        // phase C3 like any other lane read. Attrs-varying
+                        // shapes already failed the attrs check above; the
+                        // kSliceStatic affine-gather form among them is
+                        // recognized separately (R level, see
+                        // classifyAffineGather), the rest stays rejected.
+                        pos.kind = PosKind::kLaneParam;
+                        return emitPosition(std::move(pos));
+                    }
                     reject("unsupported_op",
                            std::string(wolvrix::lib::grh::toString(kind)) + " is not lane-pointwise");
                     return -1;
@@ -1277,12 +1639,18 @@ namespace wolvrix::lib::transform
                         return -1;
                     }
                 }
-                else if (kind == OperationKind::kReduceOr || kind == OperationKind::kReduceAnd ||
-                         kind == OperationKind::kReduceXor)
+                else if (isReduceLikeKind(kind))
                 {
-                    // A reduction of a 1-bit operand is the identity; wider
-                    // reductions are per-lane reductions GRH cannot express.
-                    if (operandCount != 1 || graph_.valueWidth(t0Operands[0]) != 1)
+                    // A reduction of a 1-bit operand is the identity. A wider
+                    // reduction is a per-lane reduction: lane i reduces its
+                    // own W-bit operand down to guard bit i. Array mode
+                    // materializes it as kArrayReduceLanes* over the packed
+                    // rows; wide mode has no per-lane guard vector and keeps
+                    // the rejection. kArrayReduce{Or,And,Xor} reaches here as
+                    // the normalize product whose operand is still the
+                    // per-lane value, so the same rule applies.
+                    if (operandCount != 1 ||
+                        (graph_.valueWidth(t0Operands[0]) != 1 && !arrayMode_))
                     {
                         reject("unsupported_op",
                                std::string(wolvrix::lib::grh::toString(kind)) +
@@ -1338,6 +1706,8 @@ namespace wolvrix::lib::transform
             const std::vector<uint64_t> &laneIndices_;
             const std::vector<std::string> &laneNames_;
             const RegLaneMap &regLane_;
+            bool arrayMode_ = false;
+            bool laneParamLeaves_ = false;
             ConeAnalysis *out_ = nullptr;
             bool failed_ = false;
             std::unordered_map<ValueId, int32_t, ValueIdHash> memo_;
@@ -1373,6 +1743,9 @@ namespace wolvrix::lib::transform
             std::string outcome = "skipped";
             std::string rejectReason;
             std::string rejectDetail;
+            // Set when the bucket was built by the exact-all fallback instead
+            // of a signature majority (reported as no_majority_exact).
+            bool exactFallbackUsed = false;
             std::vector<std::string> siblingDeps;
             // Per-lane constant init values (lanes whose initValue parses as a
             // constant); initValues is parallel to bucket after evaluation.
@@ -1392,6 +1765,7 @@ namespace wolvrix::lib::transform
             std::string discovery;
             std::string group;
             std::string module;
+            std::string outputMode;
             int32_t elementWidth = 0;
             std::size_t elementCount = 0;
             std::size_t laneCount = 0;
@@ -1604,15 +1978,6 @@ namespace wolvrix::lib::transform
                     }
                 }
             }
-            if (majority == nullptr || majority->size() < options.minLanes)
-            {
-                skip("no_majority",
-                     "largest_signature_bucket=" +
-                         std::to_string(majority == nullptr ? 0 : majority->size()));
-                return;
-            }
-            group.bucket = *majority; // ascending: candidates were visited in order
-
             // Exact structural analysis of (updateCond, data) cones for one
             // bucket. Returned sibling deps merge into the group's set.
             auto analyzeBucket = [&](const std::vector<uint64_t> &bucket,
@@ -1630,54 +1995,133 @@ namespace wolvrix::lib::transform
                     condTuple.push_back(write.updateCond);
                     dataTuple.push_back(write.nextValue);
                 }
-                ConeAnalyzer analyzer(graph, group.key, bucket, laneNames, regLane);
+                ConeAnalyzer analyzer(graph, group.key, bucket, laneNames, regLane,
+                                      options.outputMode == LaneAggregateOutputMode::Array,
+                                      options.laneParamLeaves);
                 return analyzer.analyze(condTuple, dataTuple, out);
             };
 
             ConeAnalysis analysis;
-            if (!analyzeBucket(group.bucket, analysis))
+            std::vector<std::string> mergedDeps;
+            if (majority == nullptr || majority->size() < options.minLanes)
             {
-                reject(analysis.rejectReason.empty() ? "structure_mismatch" : analysis.rejectReason,
-                       analysis.rejectDetail);
-                return;
+                if (!options.exactFallback)
+                {
+                    skip("no_majority",
+                         "largest_signature_bucket=" +
+                             std::to_string(majority == nullptr ? 0 : majority->size()));
+                    return;
+                }
+                // Exact-all fallback: the signature is only a bucketing
+                // accelerator; cone analysis is the ground truth. Groups whose
+                // signatures over-split (a shared cone leaf hashing 53 vs 52
+                // for the lane matching its absolute index, or a per-lane
+                // full-range sibling reduction mixing 53/52 per element) run
+                // the exact N-wise check over ALL candidates directly. One
+                // shot first; on failure build the bucket incrementally like
+                // the minority-lane rescue (keep a lane when the exact check
+                // still passes and its event set matches the first kept
+                // lane), capped at 32 attempts to bound evaluation cost.
+                if (analyzeBucket(group.candidates, analysis))
+                {
+                    group.bucket = group.candidates; // ascending already
+                    mergedDeps = analysis.siblingDeps;
+                }
+                else
+                {
+                    std::vector<uint64_t> built;
+                    ConeAnalysis builtAnalysis;
+                    const WritePortInfo *referenceWrite = nullptr;
+                    std::size_t attempts = 0;
+                    for (const uint64_t idx : group.candidates)
+                    {
+                        if (attempts++ >= 32)
+                        {
+                            break;
+                        }
+                        const WritePortInfo &laneWrite =
+                            index.writesByReg.at(group.members.at(idx)).front();
+                        if (referenceWrite != nullptr && !eventsEqual(*referenceWrite, laneWrite))
+                        {
+                            continue;
+                        }
+                        std::vector<uint64_t> trial = built;
+                        trial.insert(std::lower_bound(trial.begin(), trial.end(), idx), idx);
+                        ConeAnalysis trialAnalysis;
+                        if (!analyzeBucket(trial, trialAnalysis))
+                        {
+                            continue;
+                        }
+                        built = std::move(trial);
+                        referenceWrite = &laneWrite;
+                        // Collect the sibling deps BEFORE moving the analysis:
+                        // reading trialAnalysis after the move would see an
+                        // emptied siblingDeps and bypass resolveSiblingDeps.
+                        mergedDeps.insert(mergedDeps.end(), trialAnalysis.siblingDeps.begin(),
+                                          trialAnalysis.siblingDeps.end());
+                        builtAnalysis = std::move(trialAnalysis);
+                    }
+                    if (built.size() < options.minLanes)
+                    {
+                        skip("no_majority_exact",
+                             "largest_signature_bucket=" +
+                                 std::to_string(majority == nullptr ? 0 : majority->size()) +
+                                 ",largest_exact_bucket=" + std::to_string(built.size()));
+                        return;
+                    }
+                    group.bucket = std::move(built);
+                    analysis = std::move(builtAnalysis);
+                }
+                group.exactFallbackUsed = true;
             }
-
-            // Minority-lane rescue: signature bucketing over-splits lanes that
-            // read a dispatch port at their own index (marker 53 vs 52); those
-            // cones are usually identical to the majority. Try appending every
-            // remaining candidate lane once; keep it when the exact check
-            // still passes AND its write-port event set matches the majority.
-            // Lanes failing the basic per-lane checks are not candidates and
-            // never reach here.
-            const WritePortInfo &majorityReferenceWrite =
-                index.writesByReg.at(group.members.at(group.bucket.front())).front();
-            std::vector<std::string> mergedDeps = analysis.siblingDeps;
-            std::size_t rescueAttempts = 0;
-            for (const uint64_t idx : group.candidates)
+            else
             {
-                if (std::binary_search(group.bucket.begin(), group.bucket.end(), idx))
+                group.bucket = *majority; // ascending: candidates were visited in order
+
+                if (!analyzeBucket(group.bucket, analysis))
                 {
-                    continue;
+                    reject(analysis.rejectReason.empty() ? "structure_mismatch" : analysis.rejectReason,
+                           analysis.rejectDetail);
+                    return;
                 }
-                if (rescueAttempts++ >= 32)
+
+                // Minority-lane rescue: signature bucketing over-splits lanes that
+                // read a dispatch port at their own index (marker 53 vs 52); those
+                // cones are usually identical to the majority. Try appending every
+                // remaining candidate lane once; keep it when the exact check
+                // still passes AND its write-port event set matches the majority.
+                // Lanes failing the basic per-lane checks are not candidates and
+                // never reach here.
+                const WritePortInfo &majorityReferenceWrite =
+                    index.writesByReg.at(group.members.at(group.bucket.front())).front();
+                mergedDeps = analysis.siblingDeps;
+                std::size_t rescueAttempts = 0;
+                for (const uint64_t idx : group.candidates)
                 {
-                    break;
+                    if (std::binary_search(group.bucket.begin(), group.bucket.end(), idx))
+                    {
+                        continue;
+                    }
+                    if (rescueAttempts++ >= 32)
+                    {
+                        break;
+                    }
+                    const WritePortInfo &laneWrite = index.writesByReg.at(group.members.at(idx)).front();
+                    if (!eventsEqual(majorityReferenceWrite, laneWrite))
+                    {
+                        continue;
+                    }
+                    std::vector<uint64_t> trial = group.bucket;
+                    trial.insert(std::lower_bound(trial.begin(), trial.end(), idx), idx);
+                    ConeAnalysis trialAnalysis;
+                    if (!analyzeBucket(trial, trialAnalysis))
+                    {
+                        continue;
+                    }
+                    group.bucket = std::move(trial);
+                    mergedDeps.insert(mergedDeps.end(), trialAnalysis.siblingDeps.begin(),
+                                      trialAnalysis.siblingDeps.end());
                 }
-                const WritePortInfo &laneWrite = index.writesByReg.at(group.members.at(idx)).front();
-                if (!eventsEqual(majorityReferenceWrite, laneWrite))
-                {
-                    continue;
-                }
-                std::vector<uint64_t> trial = group.bucket;
-                trial.insert(std::lower_bound(trial.begin(), trial.end(), idx), idx);
-                ConeAnalysis trialAnalysis;
-                if (!analyzeBucket(trial, trialAnalysis))
-                {
-                    continue;
-                }
-                group.bucket = std::move(trial);
-                mergedDeps.insert(mergedDeps.end(), trialAnalysis.siblingDeps.begin(),
-                                  trialAnalysis.siblingDeps.end());
             }
 
             // Density of the final bucket.
@@ -1900,6 +2344,117 @@ namespace wolvrix::lib::transform
             return out;
         }
 
+        // Address width of a kMemory with the given row count (reg-to-mem
+        // convention): ceil(log2(rows)), at least 1.
+        int32_t addressWidthForRows(uint64_t rows)
+        {
+            int32_t addrWidth = 1;
+            uint64_t addressSpace = 2;
+            while (addressSpace < rows)
+            {
+                ++addrWidth;
+                addressSpace <<= 1;
+            }
+            return addrWidth;
+        }
+
+        ValueId createMemoryReadOp(Graph &graph, const std::string &memSymbol, ValueId addr,
+                                   int32_t width, bool isSigned, ValueType type, std::string_view note)
+        {
+            const ValueId out = graph.createValue(graph.makeInternalValSym(),
+                                                  width > 0 ? width : 1, isSigned, type);
+            const OperationId op = graph.createOperation(OperationKind::kMemoryReadPort, graph.makeInternalOpSym());
+            graph.addOperand(op, addr);
+            graph.addResult(op, out);
+            graph.setAttr(op, "memSymbol", memSymbol);
+            const SrcLoc srcLoc = makeTransformSrcLoc(std::string(kPassId), note);
+            graph.setOpSrcLoc(op, srcLoc);
+            graph.setValueSrcLoc(out, srcLoc);
+            return out;
+        }
+
+        ValueId createArrayBroadcastOp(Graph &graph, ValueId operand, uint64_t rows, std::string_view note)
+        {
+            const int64_t width = static_cast<int64_t>(graph.valueWidth(operand)) * static_cast<int64_t>(rows);
+            const ValueId out = graph.createValue(graph.makeInternalValSym(),
+                                                  static_cast<int32_t>(width),
+                                                  graph.valueSigned(operand), graph.valueType(operand));
+            const OperationId op = graph.createOperation(OperationKind::kArrayBroadcast, graph.makeInternalOpSym());
+            graph.addOperand(op, operand);
+            graph.addResult(op, out);
+            graph.setAttr(op, "rows", static_cast<int64_t>(rows));
+            const SrcLoc srcLoc = makeTransformSrcLoc(std::string(kPassId), note);
+            graph.setOpSrcLoc(op, srcLoc);
+            graph.setValueSrcLoc(out, srcLoc);
+            return out;
+        }
+
+        // values has one entry per row (holes already zeroed by the caller).
+        ValueId createArrayLaneConstOp(Graph &graph, uint64_t rows, int32_t elemWidth,
+                                       std::vector<int64_t> values, bool isSigned, ValueType type,
+                                       std::string_view note)
+        {
+            const int64_t width = static_cast<int64_t>(elemWidth) * static_cast<int64_t>(rows);
+            const ValueId out = graph.createValue(graph.makeInternalValSym(),
+                                                  static_cast<int32_t>(width), isSigned, type);
+            const OperationId op = graph.createOperation(OperationKind::kArrayLaneConst, graph.makeInternalOpSym());
+            graph.addResult(op, out);
+            graph.setAttr(op, "elemWidth", static_cast<int64_t>(elemWidth));
+            graph.setAttr(op, "rows", static_cast<int64_t>(rows));
+            graph.setAttr(op, "values", std::move(values));
+            const SrcLoc srcLoc = makeTransformSrcLoc(std::string(kPassId), note);
+            graph.setOpSrcLoc(op, srcLoc);
+            graph.setValueSrcLoc(out, srcLoc);
+            return out;
+        }
+
+        ValueId createArrayOnehotOp(Graph &graph, ValueId x, uint64_t rows, std::string_view note)
+        {
+            const ValueId out = graph.createValue(graph.makeInternalValSym(),
+                                                  static_cast<int32_t>(rows), false, ValueType::Logic);
+            const OperationId op = graph.createOperation(OperationKind::kArrayOnehot, graph.makeInternalOpSym());
+            graph.addOperand(op, x);
+            graph.addResult(op, out);
+            graph.setAttr(op, "rows", static_cast<int64_t>(rows));
+            const SrcLoc srcLoc = makeTransformSrcLoc(std::string(kPassId), note);
+            graph.setOpSrcLoc(op, srcLoc);
+            graph.setValueSrcLoc(out, srcLoc);
+            return out;
+        }
+
+        ValueId createArrayMuxOp(Graph &graph, ValueId sel, ValueId whenTrue, ValueId whenFalse,
+                                 int32_t width, bool isSigned, ValueType type, std::string_view note)
+        {
+            const ValueId out = graph.createValue(graph.makeInternalValSym(),
+                                                  width > 0 ? width : 1, isSigned, type);
+            const OperationId op = graph.createOperation(OperationKind::kArrayMux, graph.makeInternalOpSym());
+            graph.addOperand(op, sel);
+            graph.addOperand(op, whenTrue);
+            graph.addOperand(op, whenFalse);
+            graph.addResult(op, out);
+            const SrcLoc srcLoc = makeTransformSrcLoc(std::string(kPassId), note);
+            graph.setOpSrcLoc(op, srcLoc);
+            graph.setValueSrcLoc(out, srcLoc);
+            return out;
+        }
+
+        // Per-lane reduction over packed rows: data is rows*elemWidth bits,
+        // result is the rows-bit guard vector (bit i = reduce of lane i).
+        ValueId createArrayReduceLanesOp(Graph &graph, OperationKind kind, ValueId data,
+                                         uint64_t rows, int32_t elemWidth, std::string_view note)
+        {
+            const ValueId out = graph.createValue(graph.makeInternalValSym(),
+                                                  static_cast<int32_t>(rows), false, ValueType::Logic);
+            const OperationId op = graph.createOperation(kind, graph.makeInternalOpSym());
+            graph.addOperand(op, data);
+            graph.addResult(op, out);
+            graph.setAttr(op, "elemWidth", static_cast<int64_t>(elemWidth));
+            const SrcLoc srcLoc = makeTransformSrcLoc(std::string(kPassId), note);
+            graph.setOpSrcLoc(op, srcLoc);
+            graph.setValueSrcLoc(out, srcLoc);
+            return out;
+        }
+
         slang::SVInt packedConstantTable(uint64_t span, int32_t laneWidth,
                                          const std::vector<uint64_t> &laneIndices,
                                          const std::vector<uint64_t> &values)
@@ -1921,6 +2476,8 @@ namespace wolvrix::lib::transform
                                const GraphIndexes &index,
                                const RegLaneMap &regLane,
                                const LaneGroupEval &group,
+                               bool arrayMode,
+                               bool laneParamLeaves,
                                ConeAnalysis &out)
         {
             std::vector<std::string> laneNames;
@@ -1936,7 +2493,8 @@ namespace wolvrix::lib::transform
                 condTuple.push_back(write.updateCond);
                 dataTuple.push_back(write.nextValue);
             }
-            ConeAnalyzer analyzer(graph, group.key, group.bucket, laneNames, regLane);
+            ConeAnalyzer analyzer(graph, group.key, group.bucket, laneNames, regLane, arrayMode,
+                                  laneParamLeaves);
             return analyzer.analyze(condTuple, dataTuple, out);
         }
 
@@ -1967,10 +2525,13 @@ namespace wolvrix::lib::transform
                               const std::unordered_map<std::string, std::size_t> &groupByKey,
                               const RegLaneMap &regLane,
                               LaneGroupEval &group,
+                              bool arrayMode,
+                              bool laneParamLeaves,
                               std::string &errorOut)
         {
             ConeAnalysis analysis;
-            if (!analyzeGroupCones(graph, index, regLane, group, analysis))
+            if (!analyzeGroupCones(graph, index, regLane, group, arrayMode, laneParamLeaves,
+                                   analysis))
             {
                 errorOut = "re-analysis failed: " + analysis.rejectReason;
                 return false;
@@ -2010,7 +2571,10 @@ namespace wolvrix::lib::transform
                     {
                         it = sharedCache
                                  .emplace(pos.templateValue,
-                                          createReplicateOp(graph, pos.templateValue, span, "shared-leaf"))
+                                          arrayMode
+                                              ? createArrayBroadcastOp(graph, pos.templateValue, span,
+                                                                       "array-broadcast")
+                                              : createReplicateOp(graph, pos.templateValue, span, "shared-leaf"))
                                  .first;
                     }
                     value = it->second;
@@ -2018,6 +2582,18 @@ namespace wolvrix::lib::transform
                 }
                 case PosKind::kConstant:
                 {
+                    if (arrayMode)
+                    {
+                        // Per-lane constant table, hole lanes zeroed.
+                        std::vector<int64_t> laneValues(span, 0);
+                        for (std::size_t k = 0; k < group.bucket.size(); ++k)
+                        {
+                            laneValues[group.bucket[k]] = static_cast<int64_t>(pos.constValues[k]);
+                        }
+                        value = createArrayLaneConstOp(graph, span, pos.laneWidth, std::move(laneValues),
+                                                       pos.isSigned, pos.valueType, "array-lane-const");
+                        break;
+                    }
                     const slang::SVInt table =
                         packedConstantTable(span, pos.laneWidth, group.bucket, pos.constValues);
                     value = createConstantValue(graph, outWidth, makeHexLiteral(outWidth, table),
@@ -2058,13 +2634,35 @@ namespace wolvrix::lib::transform
                 case PosKind::kEqOnehot:
                 {
                     // Result bit i = (x == i) for i in [0, span); x >= span
-                    // naturally yields 0 under fixed-width shl.
+                    // naturally yields 0 under fixed-width shl / kArrayOnehot.
+                    if (arrayMode)
+                    {
+                        value = createArrayOnehotOp(graph, pos.sharedX, span, "array-onehot");
+                        break;
+                    }
                     const ValueId one = createConstantValue(graph, static_cast<int32_t>(span),
                                                             std::to_string(span) + "'d1",
                                                             "eq-onehot-one");
                     value = createBinaryOp(graph, OperationKind::kShl, one, pos.sharedX,
                                            static_cast<int32_t>(span), false, ValueType::Logic,
                                            "eq-onehot-shl");
+                    break;
+                }
+                case PosKind::kAffineGather:
+                {
+                    // Zero-cost: the packed per-lane slices are exactly
+                    // X[gatherBase +: span*W]. Use X directly when it exactly
+                    // fits, else one kSliceStatic. Identical in both output
+                    // modes (the packed-row layout is the same).
+                    if (pos.gatherBase == 0 &&
+                        graph.valueWidth(pos.gatherX) == outWidth)
+                    {
+                        value = pos.gatherX;
+                        break;
+                    }
+                    value = createSliceOp(graph, pos.gatherX, pos.gatherBase,
+                                          pos.gatherBase + static_cast<uint64_t>(outWidth) - 1,
+                                          pos.isSigned, pos.valueType, "affine-gather-slice");
                     break;
                 }
                 case PosKind::kSelfRead:
@@ -2098,10 +2696,23 @@ namespace wolvrix::lib::transform
                                                    laneIt->second.second))
                             {
                                 const LaneGroupEval &source = groups[gIt->second];
-                                const uint64_t low = laneIt->second.second * static_cast<uint64_t>(pos.laneWidth);
-                                base = createSliceOp(graph, source.wideReadValue, low,
-                                                     low + static_cast<uint64_t>(pos.laneWidth) - 1,
-                                                     pos.isSigned, pos.valueType, "shared-lane-slice");
+                                if (arrayMode)
+                                {
+                                    const int32_t addrWidth = addressWidthForRows(source.span);
+                                    const ValueId addr = createConstantValue(
+                                        graph, addrWidth,
+                                        std::to_string(addrWidth) + "'d" + std::to_string(laneIt->second.second),
+                                        "shared-lane-addr");
+                                    base = createMemoryReadOp(graph, source.wideName, addr, pos.laneWidth,
+                                                              pos.isSigned, pos.valueType, "shared-lane-row");
+                                }
+                                else
+                                {
+                                    const uint64_t low = laneIt->second.second * static_cast<uint64_t>(pos.laneWidth);
+                                    base = createSliceOp(graph, source.wideReadValue, low,
+                                                         low + static_cast<uint64_t>(pos.laneWidth) - 1,
+                                                         pos.isSigned, pos.valueType, "shared-lane-slice");
+                                }
                                 resolved = true;
                             }
                         }
@@ -2130,7 +2741,9 @@ namespace wolvrix::lib::transform
                         }
                         it = sharedRegCache
                                  .emplace(pos.refRegSymbol,
-                                          createReplicateOp(graph, base, span, "shared-reg-broadcast"))
+                                          arrayMode
+                                              ? createArrayBroadcastOp(graph, base, span, "shared-reg-broadcast")
+                                              : createReplicateOp(graph, base, span, "shared-reg-broadcast"))
                                  .first;
                     }
                     value = it->second;
@@ -2151,16 +2764,39 @@ namespace wolvrix::lib::transform
                         value = broadcastLaneBits(graph, operands[0], span, pos.laneWidth,
                                                   "replicate-broadcast");
                     }
-                    else if (pos.opKind == OperationKind::kReduceOr ||
-                             pos.opKind == OperationKind::kReduceAnd ||
-                             pos.opKind == OperationKind::kReduceXor)
+                    else if (isReduceLikeKind(pos.opKind))
                     {
-                        // A reduction of a 1-bit operand is the identity.
-                        value = operands[0];
+                        // A reduction of a 1-bit operand is the identity. A
+                        // reduction of a wider per-lane operand (accepted
+                        // only in array mode) becomes a per-lane reduction
+                        // over the packed rows: kArrayReduceLanes* takes the
+                        // span*W child and yields the span-bit guard vector.
+                        // Keeping the global kArrayReduce* kind here would
+                        // instead collapse ALL lanes into one bit.
+                        const int32_t childWidth =
+                            analysis.positions[static_cast<std::size_t>(pos.children.front())].laneWidth;
+                        if (childWidth <= 1)
+                        {
+                            value = operands[0];
+                        }
+                        else
+                        {
+                            value = createArrayReduceLanesOp(
+                                graph, arrayReduceLanesKindForReduce(pos.opKind), operands[0],
+                                span, childWidth, "array-reduce-lanes");
+                        }
                     }
                     else if (pos.opKind == OperationKind::kMux)
                     {
                         const ValueId select = operands[0];
+                        if (arrayMode)
+                        {
+                            // The merged select is already the span-wide
+                            // per-lane guard vector kArrayMux expects.
+                            value = createArrayMuxOp(graph, select, operands[1], operands[2],
+                                                     outWidth, pos.isSigned, pos.valueType, "array-mux");
+                            break;
+                        }
                         const ValueId mask = broadcastLaneBits(graph, select, span, pos.laneWidth, "mux-select-broadcast");
                         const ValueId invMask = createUnaryOp(graph, OperationKind::kNot, mask,
                                                               outWidth, pos.isSigned, pos.valueType, "mux-mask-not");
@@ -2196,17 +2832,54 @@ namespace wolvrix::lib::transform
             const ValueId condVec = merged[static_cast<std::size_t>(analysis.condRoot)];
             const ValueId dataVec = merged[static_cast<std::size_t>(analysis.dataRoot)];
 
-            // updateCond = reduceOr(condVec & presentLanes)
-            const auto spanWidth = static_cast<slang::bitwidth_t>(span);
-            slang::SVInt present(spanWidth, 0, false);
-            for (const uint64_t idx : group.bucket)
+            // laneMask/updateCond base: condVec & presentLanes (hole lanes
+            // never write). Array mode uses a kArrayLaneConst guard constant.
+            ValueId presentConst;
+            if (arrayMode)
             {
-                present = present | slang::SVInt(spanWidth, 1, false).shl(static_cast<slang::bitwidth_t>(idx));
+                std::vector<int64_t> presentValues(span, 0);
+                for (const uint64_t idx : group.bucket)
+                {
+                    presentValues[idx] = 1;
+                }
+                presentConst = createArrayLaneConstOp(graph, span, 1, std::move(presentValues),
+                                                      false, ValueType::Logic, "present-lanes");
             }
-            const ValueId presentConst =
-                createConstantValue(graph, static_cast<int32_t>(span), makeHexLiteral(static_cast<int32_t>(span), present), "present-lanes");
+            else
+            {
+                const auto spanWidth = static_cast<slang::bitwidth_t>(span);
+                slang::SVInt present(spanWidth, 0, false);
+                for (const uint64_t idx : group.bucket)
+                {
+                    present = present | slang::SVInt(spanWidth, 1, false).shl(static_cast<slang::bitwidth_t>(idx));
+                }
+                presentConst =
+                    createConstantValue(graph, static_cast<int32_t>(span), makeHexLiteral(static_cast<int32_t>(span), present), "present-lanes");
+            }
             const ValueId condMasked = createBinaryOp(graph, OperationKind::kAnd, condVec, presentConst,
                                                       static_cast<int32_t>(span), false, ValueType::Logic, "cond-present");
+
+            const WritePortInfo &referenceWrite =
+                index.writesByReg.at(group.members.at(group.bucket.front())).front();
+            if (arrayMode)
+            {
+                // One kArrayWritePort: laneMask is the per-lane enable, the
+                // whole packed data cone is the write data.
+                const OperationId writeOp =
+                    graph.createOperation(OperationKind::kArrayWritePort, graph.makeInternalOpSym());
+                graph.addOperand(writeOp, condMasked);
+                graph.addOperand(writeOp, dataVec);
+                for (const ValueId event : referenceWrite.events)
+                {
+                    graph.addOperand(writeOp, event);
+                }
+                graph.setAttr(writeOp, "memSymbol", group.wideName);
+                graph.setAttr(writeOp, "eventEdge", referenceWrite.eventEdges);
+                const SrcLoc writeLoc = makeTransformSrcLoc(std::string(kPassId), "array-write");
+                graph.setOpSrcLoc(writeOp, writeLoc);
+                return true;
+            }
+
             const ValueId updateCond = createUnaryOp(graph, OperationKind::kReduceOr, condMasked,
                                                      1, false, ValueType::Logic, "update-cond");
 
@@ -2226,8 +2899,6 @@ namespace wolvrix::lib::transform
             allOnes = ~allOnes;
             const ValueId maskAll = createConstantValue(graph, wideWidth, makeHexLiteral(wideWidth, allOnes), "write-mask-all");
 
-            const WritePortInfo &referenceWrite =
-                index.writesByReg.at(group.members.at(group.bucket.front())).front();
             const OperationId writeOp =
                 graph.createOperation(OperationKind::kRegisterWritePort, graph.makeInternalOpSym());
             graph.addOperand(writeOp, updateCond);
@@ -2252,11 +2923,13 @@ namespace wolvrix::lib::transform
         bool eraseGroupLanes(Graph &graph,
                              const GraphIndexes &index,
                              LaneGroupEval &group,
+                             bool arrayMode,
                              std::string &errorOut)
         {
             const int32_t width = group.width;
             // Read side: every read of a merged lane register becomes
-            // kSliceStatic(wide_read, idx*W +: W).
+            // kSliceStatic(wide_read, idx*W +: W) in wide mode, or one
+            // kMemoryReadPort at constant address idx in array mode.
             for (const uint64_t idx : group.bucket)
             {
                 const std::string &laneName = group.members.at(idx);
@@ -2272,29 +2945,43 @@ namespace wolvrix::lib::transform
                             return false;
                         }
                         const ValueId oldResult = readOp.results().front();
-                        const uint64_t low = idx * static_cast<uint64_t>(width);
-                        const ValueId slice =
-                            createSliceOp(graph, group.wideReadValue, low, low + static_cast<uint64_t>(width) - 1,
-                                          graph.valueSigned(oldResult), graph.valueType(oldResult), "lane-read-slice");
+                        ValueId replacement;
+                        if (arrayMode)
+                        {
+                            const int32_t addrWidth = addressWidthForRows(group.span);
+                            const ValueId addr = createConstantValue(
+                                graph, addrWidth,
+                                std::to_string(addrWidth) + "'d" + std::to_string(idx), "lane-read-addr");
+                            replacement = createMemoryReadOp(graph, group.wideName, addr, width,
+                                                             graph.valueSigned(oldResult),
+                                                             graph.valueType(oldResult), "lane-read-row");
+                        }
+                        else
+                        {
+                            const uint64_t low = idx * static_cast<uint64_t>(width);
+                            replacement =
+                                createSliceOp(graph, group.wideReadValue, low, low + static_cast<uint64_t>(width) - 1,
+                                              graph.valueSigned(oldResult), graph.valueType(oldResult), "lane-read-slice");
+                        }
                         if (const auto loc = graph.valueSrcLoc(oldResult))
                         {
-                            graph.setValueSrcLoc(slice, *loc);
+                            graph.setValueSrcLoc(replacement, *loc);
                         }
                         const Value oldValue = graph.getValue(oldResult);
                         if (oldValue.symbol().valid())
                         {
                             const auto oldSymbol = oldValue.symbol();
                             graph.setValueSymbol(oldResult, graph.makeInternalValSym());
-                            graph.setValueSymbol(slice, oldSymbol);
+                            graph.setValueSymbol(replacement, oldSymbol);
                         }
                         for (const auto &port : graph.outputPorts())
                         {
                             if (port.value == oldResult)
                             {
-                                graph.bindOutputPort(port.name, slice);
+                                graph.bindOutputPort(port.name, replacement);
                             }
                         }
-                        if (!graph.eraseOp(readOpId, std::array<ValueId, 1>{slice}))
+                        if (!graph.eraseOp(readOpId, std::array<ValueId, 1>{replacement}))
                         {
                             errorOut = "failed to replace read port of " + laneName;
                             return false;
@@ -2318,19 +3005,26 @@ namespace wolvrix::lib::transform
 
         // ------------------------------------------------------------------
         // Phase 2 (read side): select trees over lane slices become one
-        // kSliceDynamic over the wide read.
+        // kSliceDynamic over the wide read (wide mode) or one kMemoryReadPort
+        // at the select pointer (array mode).
         //
-        // Matched forms (leaves are kSliceStatic(wideRead, i*W, W) produced by
-        // phase 1, optionally through kAssign chains):
+        // Matched forms (leaves are kSliceStatic(wideRead, i*W, W) /
+        // kMemoryReadPort(mem, const i) produced by phase 1, optionally
+        // through kAssign chains):
         //   mux chain: kMux(kEq(ptr, C_i), slice_i, rest), recursing on the
         //     false branch; constants may be in any order but must cover all
         //     span indices; the final default must be a zero constant
         //     (2-state kSliceDynamic out-of-range reads yield 0).
         //   and/or onehot tree: kOr over mutually exclusive terms
-        //     kAnd(kReplicate(kEq(ptr, i), W), slice_i) or
-        //     kMux(kEq(ptr, i), slice_i, 0).
-        // Every eq shares the same ptr ValueId; every leaf slice belongs to
-        // the same merged group; a tree that touches any other value is
+        //     kAnd(kReplicate(sel_i, W), slice_i) or kMux(sel_i, slice_i, 0)
+        //     (bare kAnd(sel_i, slice_i) at W == 1), where sel_i is either
+        //     kEq(ptr, i) or a shl-onehot bit select
+        //     kSlice{kStatic,Dynamic}(kShl(1, ptr), const i) (the DataModule
+        //     `addr_dec = 1 << raddr` decode). The shl-onehot form additionally
+        //     requires ptrWidth == log2(span) so the pointer can never go out
+        //     of range.
+        // Every select shares the same ptr ValueId; every leaf slice belongs
+        // to the same merged group; a tree that touches any other value is
         // skipped.
         // ------------------------------------------------------------------
         struct ReadSelectStats
@@ -2351,6 +3045,10 @@ namespace wolvrix::lib::transform
         {
             ValueId ptr;
             uint64_t constant = 0;
+            // true when the select was matched as a shl-onehot bit select
+            // (kSlice{kStatic,Dynamic}(kShl(1, ptr), const)) instead of
+            // kEq(ptr, const).
+            bool shlOnehot = false;
         };
 
         std::optional<ValueId> unwrapAssignValue(const Graph &graph, ValueId value)
@@ -2408,12 +3106,111 @@ namespace wolvrix::lib::transform
             return match;
         }
 
+        // Shl-onehot bit select: bit `c` of `(1 << ptr)`, written as
+        // kSliceStatic(X, c, c) or kSliceDynamic(X, <const c>, sliceWidth = 1)
+        // with X = kShl(kConstant 1, ptr). This is the DataModule-family
+        // read-port decode (`addr_dec = 64'h1 << raddr; addr_dec[i] ? ...`).
+        //
+        // Equivalence (2-state): bit c of (1 << ptr) is (ptr == c) — for
+        // ptr < width(X) the shift lands exactly on bit ptr, and for
+        // ptr >= width(X) the 2-state shift result is 0, which agrees with
+        // (ptr == c) because c < width(X). Under 4-state simulation
+        // X-propagation may differ (same caveat class as onehot-to-mux);
+        // the rewrite only claims 2-state equivalence.
+        std::optional<EqConstMatch> matchShlOnehotBit(const Graph &graph, ValueId value)
+        {
+            if (graph.valueWidth(value) != 1)
+            {
+                return std::nullopt;
+            }
+            const OperationId defOpId = graph.valueDef(value);
+            if (!defOpId.valid())
+            {
+                return std::nullopt;
+            }
+            const Operation defOp = graph.getOperation(defOpId);
+            uint64_t bitIndex = 0;
+            ValueId base;
+            if (defOp.kind() == OperationKind::kSliceStatic && defOp.operands().size() == 1)
+            {
+                const auto sliceStart = getAttr<int64_t>(defOp, "sliceStart");
+                const auto sliceEnd = getAttr<int64_t>(defOp, "sliceEnd");
+                if (!sliceStart || !sliceEnd || *sliceStart != *sliceEnd || *sliceStart < 0)
+                {
+                    return std::nullopt;
+                }
+                bitIndex = static_cast<uint64_t>(*sliceStart);
+                base = defOp.operands().front();
+            }
+            else if (defOp.kind() == OperationKind::kSliceDynamic && defOp.operands().size() == 2)
+            {
+                const auto sliceWidth = getAttr<int64_t>(defOp, "sliceWidth");
+                if (!sliceWidth || *sliceWidth != 1)
+                {
+                    return std::nullopt;
+                }
+                const auto offset = getConstantUInt64(graph, defOp.operands()[1], nullptr);
+                if (!offset)
+                {
+                    return std::nullopt;
+                }
+                bitIndex = *offset;
+                base = defOp.operands()[0];
+            }
+            else
+            {
+                return std::nullopt;
+            }
+            const OperationId baseDefId = graph.valueDef(base);
+            if (!baseDefId.valid())
+            {
+                return std::nullopt;
+            }
+            const Operation baseDef = graph.getOperation(baseDefId);
+            if (baseDef.kind() != OperationKind::kShl || baseDef.operands().size() != 2)
+            {
+                return std::nullopt;
+            }
+            // The equivalence bit c of (1 << ptr) == (ptr == c) needs
+            // c < width(X); an out-of-range bit select is not a select.
+            if (bitIndex >= static_cast<uint64_t>(std::max<int32_t>(graph.valueWidth(base), 0)))
+            {
+                return std::nullopt;
+            }
+            // kShl(kConstant 1, ptr): operands[0] is the shifted value,
+            // operands[1] the shift amount. A constant shift amount makes
+            // this a constant fold, not a select.
+            const auto one = getConstantUInt64(graph, baseDef.operands()[0], nullptr);
+            if (!one || *one != 1)
+            {
+                return std::nullopt;
+            }
+            if (getConstantUInt64(graph, baseDef.operands()[1], nullptr))
+            {
+                return std::nullopt;
+            }
+            return EqConstMatch{baseDef.operands()[1], bitIndex, true};
+        }
+
+        // Select condition of a read-select tree term: either kEq(ptr, c) or
+        // the shl-onehot bit select above.
+        std::optional<EqConstMatch> matchSelectCondition(const Graph &graph, ValueId value)
+        {
+            if (const auto eq = matchEqConstant(graph, value))
+            {
+                return eq;
+            }
+            return matchShlOnehotBit(graph, value);
+        }
+
         class ReadSelectRewriter
         {
         public:
             ReadSelectRewriter(Graph &graph,
-                               const std::unordered_map<ValueId, const LaneGroupEval *, ValueIdHash> &wideReads)
-                : graph_(graph), wideReads_(wideReads)
+                               const std::unordered_map<ValueId, const LaneGroupEval *, ValueIdHash> &wideReads,
+                               const std::unordered_map<std::string, const LaneGroupEval *> &memGroups,
+                               bool arrayMode)
+                : graph_(graph), wideReads_(wideReads), memGroups_(memGroups), arrayMode_(arrayMode)
             {
             }
 
@@ -2472,6 +3269,37 @@ namespace wolvrix::lib::transform
                     return std::nullopt;
                 }
                 const Operation defOp = graph_.getOperation(defOpId);
+                if (arrayMode_)
+                {
+                    // Array-mode leaf: kMemoryReadPort(mem, constant address)
+                    // produced by phase 1 lane-read replacement.
+                    if (defOp.kind() != OperationKind::kMemoryReadPort || defOp.operands().size() != 1)
+                    {
+                        return std::nullopt;
+                    }
+                    const auto memSymbol = getStringAttr(defOp, "memSymbol");
+                    if (!memSymbol)
+                    {
+                        return std::nullopt;
+                    }
+                    const auto it = memGroups_.find(*memSymbol);
+                    if (it == memGroups_.end())
+                    {
+                        return std::nullopt;
+                    }
+                    const LaneGroupEval *group = it->second;
+                    const int32_t width = graph_.valueWidth(*unwrapped);
+                    if (width != group->width)
+                    {
+                        return std::nullopt;
+                    }
+                    const auto addr = getConstantUInt64(graph_, defOp.operands().front(), nullptr);
+                    if (!addr || !std::binary_search(group->bucket.begin(), group->bucket.end(), *addr))
+                    {
+                        return std::nullopt;
+                    }
+                    return LaneSliceMatch{group, *addr, width};
+                }
                 if (defOp.kind() != OperationKind::kSliceStatic || defOp.operands().size() != 1)
                 {
                     return std::nullopt;
@@ -2534,6 +3362,35 @@ namespace wolvrix::lib::transform
                              std::size_t retiredOps,
                              ReadSelectStats &stats)
             {
+                const ValueId rootValue = rootOp.results().front();
+                if (arrayMode_)
+                {
+                    // One kMemoryReadPort with the select pointer as the
+                    // (dynamic) row address; no offset scaling.
+                    const ValueId read = graph_.createValue(graph_.makeInternalValSym(), width,
+                                                            graph_.valueSigned(rootValue),
+                                                            graph_.valueType(rootValue));
+                    const OperationId readOp =
+                        graph_.createOperation(OperationKind::kMemoryReadPort, graph_.makeInternalOpSym());
+                    graph_.addOperand(readOp, ptr);
+                    graph_.addResult(readOp, read);
+                    graph_.setAttr(readOp, "memSymbol", group->wideName);
+                    const SrcLoc srcLoc = makeTransformSrcLoc(std::string(kPassId), "read-select-row");
+                    graph_.setOpSrcLoc(readOp, srcLoc);
+                    graph_.setValueSrcLoc(read, srcLoc);
+                    for (const auto &port : graph_.outputPorts())
+                    {
+                        if (port.value == rootValue)
+                        {
+                            graph_.bindOutputPort(port.name, read);
+                        }
+                    }
+                    graph_.replaceAllUses(rootValue, read);
+                    ++stats.trees;
+                    stats.opsRetired += retiredOps;
+                    stats.opsCreated += 1;
+                    return;
+                }
                 // offset = ptr * width (shift for powers of two).
                 ValueId offset = ptr;
                 std::size_t created = 1;
@@ -2568,7 +3425,6 @@ namespace wolvrix::lib::transform
                         created += 2;
                     }
                 }
-                const ValueId rootValue = rootOp.results().front();
                 const ValueId sliced = graph_.createValue(graph_.makeInternalValSym(), width,
                                                           graph_.valueSigned(rootValue),
                                                           graph_.valueType(rootValue));
@@ -2705,6 +3561,7 @@ namespace wolvrix::lib::transform
                 const LaneGroupEval *group = nullptr;
                 ValueId ptr;
                 std::size_t treeOps = 0;
+                bool sawShlOnehot = false;
                 bool ok = true;
                 for (const ValueId term : terms)
                 {
@@ -2721,7 +3578,7 @@ namespace wolvrix::lib::transform
                     const auto operands = termDef.operands();
                     if (termDef.kind() == OperationKind::kMux && operands.size() == 3)
                     {
-                        const auto eq = matchEqConstant(graph_, operands[0]);
+                        const auto eq = matchSelectCondition(graph_, operands[0]);
                         if (!eq || !isZeroConstant(operands[2], graph_.valueWidth(operands[1])))
                         {
                             ok = false;
@@ -2730,13 +3587,14 @@ namespace wolvrix::lib::transform
                         constant = eq->constant;
                         eqValue = operands[0];
                         sliceValue = operands[1];
-                        treeOps += 2; // mux + eq
+                        treeOps += 2; // mux + select (eq or bit slice)
                     }
                     else if (termDef.kind() == OperationKind::kAnd && operands.size() == 2)
                     {
-                        // kAnd(kReplicate(kEq(ptr, i)), slice_i) in either
-                        // order; at W == 1 the bare kAnd(kEq(ptr, i), slice_i)
-                        // form appears (no replicate needed).
+                        // kAnd(kReplicate(sel_i), slice_i) in either order;
+                        // at W == 1 the bare kAnd(sel_i, slice_i) form
+                        // appears (no replicate needed). sel_i is either
+                        // kEq(ptr, i) or a shl-onehot bit select.
                         for (std::size_t side = 0; side < 2 && eqValue == ValueId{}; ++side)
                         {
                             const OperationId repDefId = graph_.valueDef(operands[side]);
@@ -2748,7 +3606,7 @@ namespace wolvrix::lib::transform
                             if (repDef.kind() == OperationKind::kReplicate &&
                                 repDef.operands().size() == 1)
                             {
-                                const auto eq = matchEqConstant(graph_, repDef.operands().front());
+                                const auto eq = matchSelectCondition(graph_, repDef.operands().front());
                                 if (!eq)
                                 {
                                     continue;
@@ -2756,14 +3614,14 @@ namespace wolvrix::lib::transform
                                 constant = eq->constant;
                                 eqValue = repDef.operands().front();
                                 sliceValue = operands[1 - side];
-                                treeOps += 3; // and + replicate + eq
+                                treeOps += 3; // and + replicate + select
                                 continue;
                             }
                             if (graph_.valueWidth(operands[1 - side]) != 1)
                             {
                                 continue;
                             }
-                            const auto eq = matchEqConstant(graph_, operands[side]);
+                            const auto eq = matchSelectCondition(graph_, operands[side]);
                             if (!eq)
                             {
                                 continue;
@@ -2771,7 +3629,7 @@ namespace wolvrix::lib::transform
                             constant = eq->constant;
                             eqValue = operands[side];
                             sliceValue = operands[1 - side];
-                            treeOps += 2; // and + eq
+                            treeOps += 2; // and + select
                         }
                         if (!eqValue.valid())
                         {
@@ -2784,13 +3642,14 @@ namespace wolvrix::lib::transform
                         ok = false;
                         break;
                     }
-                    const auto eq = matchEqConstant(graph_, eqValue);
+                    const auto eq = matchSelectCondition(graph_, eqValue);
                     if (!eq || (ptr.valid() && eq->ptr != ptr))
                     {
                         ok = false;
                         break;
                     }
                     ptr = eq->ptr;
+                    sawShlOnehot = sawShlOnehot || eq->shlOnehot;
                     const auto slice = matchLaneSlice(sliceValue);
                     if (!slice || (group != nullptr && slice->group != group))
                     {
@@ -2819,12 +3678,26 @@ namespace wolvrix::lib::transform
                 {
                     return;
                 }
+                if (sawShlOnehot)
+                {
+                    // The shl-onehot bit select is rewritten only when the
+                    // pointer exactly covers the span (ptrWidth == log2(span),
+                    // so the dynamic address can never go out of range).
+                    const int32_t ptrWidth = graph_.valueWidth(ptr);
+                    if (ptrWidth <= 0 || ptrWidth >= 64 ||
+                        (UINT64_C(1) << ptrWidth) != group->span)
+                    {
+                        return;
+                    }
+                }
                 treeOps += terms.size() - 1; // the kOr ops
                 replaceRoot(rootOp, group, ptr, group->width, treeOps, stats);
             }
 
             Graph &graph_;
             const std::unordered_map<ValueId, const LaneGroupEval *, ValueIdHash> &wideReads_;
+            const std::unordered_map<std::string, const LaneGroupEval *> &memGroups_;
+            bool arrayMode_ = false;
             std::unordered_set<OperationId, OperationIdHash> consumed_;
         };
 
@@ -2900,6 +3773,8 @@ namespace wolvrix::lib::transform
                 appendJsonString(out, record.group);
                 out << ",\"module\":";
                 appendJsonString(out, record.module);
+                out << ",\"output_mode\":";
+                appendJsonString(out, record.outputMode);
                 out << ",\"element_width\":" << record.elementWidth;
                 out << ",\"element_count\":" << record.elementCount;
                 out << ",\"lane_count\":" << record.laneCount;
@@ -2972,6 +3847,7 @@ namespace wolvrix::lib::transform
             result.failed = true;
             return result;
         }
+        const bool arrayMode = options_.outputMode == LaneAggregateOutputMode::Array;
 
         std::vector<GroupReportRecord> reports;
         std::size_t totalMergedGroups = 0;
@@ -2988,8 +3864,9 @@ namespace wolvrix::lib::transform
 
             // Pre-pass: expand kReduce{Or,And,Xor}(kConcat(...)) into
             // element-wise trees (semantics-preserving) so that packed
-            // reductions do not block signature bucketing.
-            if (normalizeReduceConcat(graph))
+            // reductions do not block signature bucketing. Array mode
+            // rewrites uniform-width matches to kArrayReduce* instead.
+            if (normalizeReduceConcat(graph, arrayMode))
             {
                 result.changed = true;
             }
@@ -3145,10 +4022,34 @@ namespace wolvrix::lib::transform
                 }
                 evaluateGroup(graph, index, regLane, options_, keepDeclaredSymbols(), group);
             }
+            if (arrayMode)
+            {
+                // init_unmappable must be decided BEFORE resolveSiblingDeps:
+                // flipping a group to rejected after the fixpoint would let a
+                // dependent group reach materialization with an unmerged
+                // sibling (the same failure class as a missing sibling dep).
+                for (LaneGroupEval &group : groups)
+                {
+                    if (group.merge && !group.initValues.empty() && group.width > 64)
+                    {
+                        // Defensive: per-lane init values are parsed as uint64
+                        // in evaluateGroup, so lanes wider than 64 bits can
+                        // never reach here with an init; guard the kMemory
+                        // literal mapping anyway.
+                        group.merge = false;
+                        group.outcome = "rejected";
+                        group.rejectReason = "init_unmappable";
+                        group.rejectDetail =
+                            "lane width > 64 cannot map initValue to kMemory literal init";
+                    }
+                }
+            }
             resolveSiblingDeps(groups, groupByKey);
 
-            // Phase C1: create the wide register + one wide read port per
-            // merged group (sibling references resolve against these).
+            // Phase C1: create the merged storage + one whole-array read per
+            // merged group (sibling references resolve against these). Wide
+            // mode creates a wide kRegister + kRegisterReadPort; array mode
+            // creates a kMemory (width = W, row = span) + kArrayReadAllPort.
             for (LaneGroupEval &group : groups)
             {
                 if (!group.merge)
@@ -3181,6 +4082,67 @@ namespace wolvrix::lib::transform
                     name = base + "_" + std::to_string(suffix);
                 }
                 group.wideName = name;
+                if (arrayMode)
+                {
+                    const SrcLoc memLoc = makeTransformSrcLoc(std::string(kPassId), "array-storage");
+                    group.wideRegOp =
+                        graph.createOperation(OperationKind::kMemory, graph.internSymbol(name));
+                    graph.setAttr(group.wideRegOp, "width", static_cast<int64_t>(group.width));
+                    graph.setAttr(group.wideRegOp, "row", static_cast<int64_t>(group.span));
+                    graph.setAttr(group.wideRegOp, "isSigned", group.isSigned);
+                    graph.setOpSrcLoc(group.wideRegOp, memLoc);
+                    if (!group.initValues.empty())
+                    {
+                        // One literal init entry per row: bucket lanes get
+                        // their value, hole rows get zero (exactly mirrors
+                        // the wide packed init table).
+                        std::vector<std::string> initKinds;
+                        std::vector<std::string> initFiles;
+                        std::vector<std::string> initValues;
+                        std::vector<int64_t> initStarts;
+                        std::vector<int64_t> initLens;
+                        initKinds.reserve(group.span);
+                        initFiles.reserve(group.span);
+                        initValues.reserve(group.span);
+                        initStarts.reserve(group.span);
+                        initLens.reserve(group.span);
+                        for (uint64_t row = 0; row < group.span; ++row)
+                        {
+                            uint64_t rowInit = 0;
+                            const auto bucketIt =
+                                std::lower_bound(group.bucket.begin(), group.bucket.end(), row);
+                            if (bucketIt != group.bucket.end() && *bucketIt == row)
+                            {
+                                rowInit = group.initValues[static_cast<std::size_t>(
+                                    bucketIt - group.bucket.begin())];
+                            }
+                            initKinds.push_back("literal");
+                            initFiles.emplace_back();
+                            initValues.push_back(makeHexLiteral(
+                                group.width,
+                                slang::SVInt(static_cast<slang::bitwidth_t>(group.width), rowInit, false)));
+                            initStarts.push_back(static_cast<int64_t>(row));
+                            initLens.push_back(1);
+                        }
+                        graph.setAttr(group.wideRegOp, "initKind", std::move(initKinds));
+                        graph.setAttr(group.wideRegOp, "initFile", std::move(initFiles));
+                        graph.setAttr(group.wideRegOp, "initValue", std::move(initValues));
+                        graph.setAttr(group.wideRegOp, "initStart", std::move(initStarts));
+                        graph.setAttr(group.wideRegOp, "initLen", std::move(initLens));
+                    }
+
+                    group.wideReadValue = graph.createValue(graph.makeInternalValSym(),
+                                                            static_cast<int32_t>(wideWidth),
+                                                            group.isSigned, ValueType::Logic);
+                    group.wideReadOp =
+                        graph.createOperation(OperationKind::kArrayReadAllPort, graph.makeInternalOpSym());
+                    graph.addResult(group.wideReadOp, group.wideReadValue);
+                    graph.setAttr(group.wideReadOp, "memSymbol", name);
+                    const SrcLoc readLoc = makeTransformSrcLoc(std::string(kPassId), "array-read-all");
+                    graph.setOpSrcLoc(group.wideReadOp, readLoc);
+                    graph.setValueSrcLoc(group.wideReadValue, readLoc);
+                    continue;
+                }
                 const SrcLoc regLoc = makeTransformSrcLoc(std::string(kPassId), "wide-register");
                 group.wideRegOp =
                     graph.createOperation(OperationKind::kRegister, graph.internSymbol(name));
@@ -3219,7 +4181,8 @@ namespace wolvrix::lib::transform
                     continue;
                 }
                 std::string materializeError;
-                if (!materializeGroup(graph, index, groups, groupByKey, regLane, group, materializeError))
+                if (!materializeGroup(graph, index, groups, groupByKey, regLane, group, arrayMode,
+                                      options_.laneParamLeaves, materializeError))
                 {
                     error(graph, "lane-aggregate failed to materialize group " +
                                      group.maskedKey + ": " + materializeError);
@@ -3240,7 +4203,7 @@ namespace wolvrix::lib::transform
                     continue;
                 }
                 std::string eraseError;
-                if (!eraseGroupLanes(graph, index, group, eraseError))
+                if (!eraseGroupLanes(graph, index, group, arrayMode, eraseError))
                 {
                     error(graph, "lane-aggregate failed to erase lanes of group " +
                                      group.maskedKey + ": " + eraseError);
@@ -3256,22 +4219,36 @@ namespace wolvrix::lib::transform
             }
 
             // Phase 2 (read side): rewrite select trees over the lane slices
-            // into kSliceDynamic reads of the wide registers. Runs after C3 so
-            // every merged lane read exists as a kSliceStatic leaf; trees that
+            // into kSliceDynamic reads of the wide registers (wide mode) or
+            // into single kMemoryReadPort dynamic-row reads (array mode).
+            // Runs after C3 so every merged lane read exists as a
+            // kSliceStatic / kMemoryReadPort(const addr) leaf; trees that
             // touch unmerged lanes (scalar read ports) simply do not match.
             if (options_.readSelect)
             {
                 std::unordered_map<ValueId, const LaneGroupEval *, ValueIdHash> wideReads;
+                std::unordered_map<std::string, const LaneGroupEval *> memGroups;
                 for (const LaneGroupEval &group : groups)
                 {
-                    if (group.merge && group.wideReadValue.valid())
+                    if (!group.merge)
+                    {
+                        continue;
+                    }
+                    if (arrayMode)
+                    {
+                        if (!group.wideName.empty())
+                        {
+                            memGroups.emplace(group.wideName, &group);
+                        }
+                    }
+                    else if (group.wideReadValue.valid())
                     {
                         wideReads.emplace(group.wideReadValue, &group);
                     }
                 }
-                if (!wideReads.empty())
+                if (!wideReads.empty() || !memGroups.empty())
                 {
-                    ReadSelectRewriter rewriter(graph, wideReads);
+                    ReadSelectRewriter rewriter(graph, wideReads, memGroups, arrayMode);
                     rewriter.run(readSelectStats);
                     if (readSelectStats.trees != 0)
                     {
@@ -3289,11 +4266,19 @@ namespace wolvrix::lib::transform
                 record.discovery = "name_pattern";
                 record.group = group.maskedKey;
                 record.module = groupModuleName(graph, group);
+                record.outputMode = arrayMode ? "array" : "wide";
                 record.elementWidth = group.width;
                 record.elementCount = group.members.size();
                 record.laneCount = group.bucket.size();
                 record.outcome = group.outcome;
                 record.rejectReason = group.rejectReason;
+                if (group.merge && group.exactFallbackUsed)
+                {
+                    // Rescued by the exact-all fallback: distinguish from a
+                    // signature-majority merge (a group the fallback could
+                    // not save reports skipped/no_majority_exact instead).
+                    record.rejectReason = "no_majority_exact";
+                }
                 record.rejectDetail = group.rejectDetail;
                 reports.push_back(std::move(record));
             }
@@ -3302,6 +4287,7 @@ namespace wolvrix::lib::transform
         const std::string summary = "lane-aggregate summary merged_groups=" +
                                     std::to_string(totalMergedGroups) +
                                     " merged_lanes=" + std::to_string(totalMergedLanes) +
+                                    " output_mode=" + std::string(arrayMode ? "array" : "wide") +
                                     " read_select_trees=" + std::to_string(readSelectStats.trees) +
                                     " read_select_ops_retired=" + std::to_string(readSelectStats.opsRetired);
         info(summary);

@@ -829,6 +829,490 @@ namespace
         return 0;
     }
 
+    struct ArrayEmitterFixture
+    {
+        ExecutableModel model;
+        VariableId laneMask;
+        VariableId data;
+        VariableId scalar;
+        VariableId index;
+        VariableId clock;
+        VariableId sel1;
+        VariableId t1;
+        VariableId f1;
+        VariableId sel5;
+        VariableId t13;
+        VariableId f13;
+        VariableId scalar13;
+        VariableId bit1;
+        VariableId all;
+        VariableId muxed;
+        VariableId broadcast;
+        VariableId onehot;
+        VariableId redOr;
+        VariableId redAnd;
+        VariableId redXor;
+        VariableId lanesOr;
+        VariableId lanesAnd;
+        VariableId lanesXor;
+        VariableId muxed1;
+        VariableId muxed13;
+        VariableId bcast13;
+        VariableId bcast1;
+    };
+
+    // 8-lane x 8-bit array loopback: a clocked array.write scatters packed
+    // lanes into the memory, the commit Block's tail changed.any reactivates
+    // the reader Block, which packs the array with array.read_all and applies
+    // the pure array ops.
+    ArrayEmitterFixture makeArrayEmitterFixture()
+    {
+        LinearProgramBuilder linear;
+        ProgramInterface interface;
+        const TypeId u1Type = linear.addType(Type::bitVector(1));
+        const TypeId u4Type = linear.addType(Type::bitVector(4));
+        const TypeId u5Type = linear.addType(Type::bitVector(5));
+        const TypeId u8Type = linear.addType(Type::bitVector(8));
+        const TypeId u13Type = linear.addType(Type::bitVector(13));
+        const TypeId u16Type = linear.addType(Type::bitVector(16));
+        const TypeId u64Type = linear.addType(Type::bitVector(64));
+        const TypeId u65Type = linear.addType(Type::bitVector(65));
+        const TypeId arrayType = linear.addType(Type::array(8, 8));
+        const auto addInput = [&](TypeId type, std::string_view name) {
+            const VariableId variable = linear.addVariable(type, linear.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Input,
+                .input = variable,
+            });
+            return variable;
+        };
+        const auto addOutput = [&](TypeId type, std::string_view name) {
+            const VariableId variable = linear.addVariable(type, linear.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Output,
+                .output = variable,
+            });
+            return variable;
+        };
+        const auto addInstruction = [&](Opcode opcode,
+                                        std::initializer_list<VariableId> results,
+                                        std::initializer_list<VariableId> operands) {
+            return linear.addInstruction(
+                opcode,
+                std::span<const VariableId>(results.begin(), results.size()),
+                std::span<const VariableId>(operands.begin(), operands.size()));
+        };
+
+        const VariableId laneMask = addInput(u8Type, "lane_mask");
+        const VariableId data = addInput(u64Type, "data");
+        const VariableId scalar = addInput(u8Type, "scalar");
+        const VariableId index = addInput(u4Type, "index");
+        const VariableId clock = addInput(u1Type, "clock");
+        // Width-class coverage for the array word helpers: elemWidth 1, a
+        // power of two (8 above), and a non-power-of-two width whose lanes
+        // cross word boundaries (13).
+        const VariableId sel1 = addInput(u16Type, "sel1");
+        const VariableId t1 = addInput(u16Type, "t1");
+        const VariableId f1 = addInput(u16Type, "f1");
+        const VariableId sel5 = addInput(u5Type, "sel5");
+        const VariableId t13 = addInput(u65Type, "t13");
+        const VariableId f13 = addInput(u65Type, "f13");
+        const VariableId scalar13 = addInput(u13Type, "scalar13");
+        const VariableId bit1 = addInput(u1Type, "bit1");
+        const VariableId all = addOutput(u64Type, "all");
+        const VariableId muxed = addOutput(u64Type, "muxed");
+        const VariableId broadcast = addOutput(u64Type, "broadcast");
+        const VariableId onehot = addOutput(u8Type, "onehot");
+        const VariableId redOr = addOutput(u1Type, "red_or");
+        const VariableId redAnd = addOutput(u1Type, "red_and");
+        const VariableId redXor = addOutput(u1Type, "red_xor");
+        const VariableId lanesOr = addOutput(u8Type, "lanes_or");
+        const VariableId lanesAnd = addOutput(u8Type, "lanes_and");
+        const VariableId lanesXor = addOutput(u8Type, "lanes_xor");
+        const VariableId muxed1 = addOutput(u16Type, "muxed1");
+        const VariableId muxed13 = addOutput(u65Type, "muxed13");
+        const VariableId bcast13 = addOutput(u65Type, "bcast13");
+        const VariableId bcast1 = addOutput(u64Type, "bcast1");
+
+        const VariableId clockOld = linear.addVariable(u1Type, linear.undefInit());
+        const VariableId clockPos = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId memory = linear.addVariable(arrayType, linear.zeroInit());
+        const VariableId memoryOld =
+            linear.addVariable(arrayType, linear.undefInit());
+        const VariableId memoryEvent =
+            linear.addVariable(u1Type, linear.zeroInit());
+
+        const InstructionId detectClock = addInstruction(
+            Opcode::ChangedPos, {clockPos}, {clock, clockOld});
+        const InstructionId write = addInstruction(
+            Opcode::ArrayWrite, {}, {laneMask, data, memory, clockPos});
+        const InstructionId readAll = addInstruction(
+            Opcode::ArrayReadAll, {all}, {memory});
+        const InstructionId bcast = addInstruction(
+            Opcode::ArrayBroadcast, {broadcast}, {scalar});
+        const InstructionId one = addInstruction(
+            Opcode::ArrayOnehot, {onehot}, {index});
+        const InstructionId mux = addInstruction(
+            Opcode::ArrayMux, {muxed}, {onehot, broadcast, all});
+        const InstructionId orReduce = addInstruction(
+            Opcode::ArrayReduceOr, {redOr}, {all});
+        const InstructionId andReduce = addInstruction(
+            Opcode::ArrayReduceAnd, {redAnd}, {all});
+        const InstructionId xorReduce = addInstruction(
+            Opcode::ArrayReduceXor, {redXor}, {all});
+        const InstructionId orLanes = addInstruction(
+            Opcode::ArrayReduceLanesOr, {lanesOr}, {muxed});
+        const InstructionId andLanes = addInstruction(
+            Opcode::ArrayReduceLanesAnd, {lanesAnd}, {muxed});
+        const InstructionId xorLanes = addInstruction(
+            Opcode::ArrayReduceLanesXor, {lanesXor}, {muxed});
+        const InstructionId muxOne = addInstruction(
+            Opcode::ArrayMux, {muxed1}, {sel1, t1, f1});
+        const InstructionId muxThirteen = addInstruction(
+            Opcode::ArrayMux, {muxed13}, {sel5, t13, f13});
+        const InstructionId bcastThirteen = addInstruction(
+            Opcode::ArrayBroadcast, {bcast13}, {scalar13});
+        const InstructionId bcastOne = addInstruction(
+            Opcode::ArrayBroadcast, {bcast1}, {bit1});
+        const InstructionId changed = addInstruction(
+            Opcode::ChangedAny, {memoryEvent}, {memory, memoryOld});
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        std::vector<InstructionId> entry{detectClock};
+        const std::array<VariableId, 13> computeInputs = {
+            laneMask, data, scalar, index, clock, sel1, t1,
+            f1, sel5, t13, f13, scalar13, bit1,
+        };
+        for (VariableId input : computeInputs)
+        {
+            const TypeId type = scheduled.view().variable(input).type;
+            const VariableId oldValue = scheduled.addVariable(type, scheduled.undefInit());
+            const VariableId inputChanged =
+                scheduled.addVariable(u1Type, scheduled.zeroInit());
+            const std::array<VariableId, 1> changedResults = {inputChanged};
+            const std::array<VariableId, 2> changedOperands = {input, oldValue};
+            const InstructionId detect = scheduled.addInstruction(
+                Opcode::ChangedAny, changedResults, changedOperands);
+            const std::array<VariableId, 1> activateOperands = {inputChanged};
+            const InstructionId activate = scheduled.addInstruction(
+                Opcode::ActForward, {}, activateOperands);
+            const std::array<BlockId, 1> targets = {BlockId{1}};
+            scheduled.setActivationTargets(activate, targets);
+            entry.push_back(detect);
+            entry.push_back(activate);
+        }
+        scheduled.addBlock(entry);
+        const std::array<InstructionId, 14> readers = {
+            readAll, bcast, one, mux, orReduce, andReduce, xorReduce,
+            orLanes, andLanes, xorLanes, muxOne, muxThirteen, bcastThirteen,
+            bcastOne,
+        };
+        scheduled.addBlock(readers);
+        const InstructionId activateReaders = scheduled.addInstruction(
+            Opcode::ActBackward, {}, std::array{memoryEvent});
+        scheduled.setActivationTargets(activateReaders, std::array{BlockId{1}});
+        const std::array<InstructionId, 3> commit = {
+            write, changed, activateReaders,
+        };
+        scheduled.addBlock(commit);
+
+        return ArrayEmitterFixture{
+            .model = ExecutableModel{
+                .program = scheduled.finish(),
+                .interface = std::move(interface),
+                .commitBlockBegin = 2,
+                .commitBlockEnd = 3,
+            },
+            .laneMask = laneMask,
+            .data = data,
+            .scalar = scalar,
+            .index = index,
+            .clock = clock,
+            .sel1 = sel1,
+            .t1 = t1,
+            .f1 = f1,
+            .sel5 = sel5,
+            .t13 = t13,
+            .f13 = f13,
+            .scalar13 = scalar13,
+            .bit1 = bit1,
+            .all = all,
+            .muxed = muxed,
+            .broadcast = broadcast,
+            .onehot = onehot,
+            .redOr = redOr,
+            .redAnd = redAnd,
+            .redXor = redXor,
+            .lanesOr = lanesOr,
+            .lanesAnd = lanesAnd,
+            .lanesXor = lanesXor,
+            .muxed1 = muxed1,
+            .muxed13 = muxed13,
+            .bcast13 = bcast13,
+            .bcast1 = bcast1,
+        };
+    }
+
+    struct ArrayTransaction
+    {
+        uint64_t laneMask;
+        uint64_t data;
+        uint64_t scalar;
+        uint64_t index;
+        uint64_t clock;
+        uint64_t sel1;
+        uint64_t t1;
+        uint64_t f1;
+        uint64_t sel5;
+        std::array<uint64_t, 2> t13;
+        std::array<uint64_t, 2> f13;
+        uint64_t scalar13;
+        uint64_t bit1;
+    };
+
+    int testArrayOperations(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        ArrayEmitterFixture fixture = makeArrayEmitterFixture();
+        Interpreter reference(fixture.model);
+        if (!reference.ready() || !reference.eval().success())
+        {
+            return fail("failed to build the AM array reference fixture");
+        }
+
+        const std::array<ArrayTransaction, 5> transactions = {
+            ArrayTransaction{0xa5, UINT64_C(0x1122314455667788), 0x5c, 3, 1,
+                             0xa5a5, 0x1234, 0xabcd, 0x16,
+                             {UINT64_C(0x0100040010004001), 1},
+                             {UINT64_C(0x7fbc3e001fff), 0}, 0x0abc, 1},
+            ArrayTransaction{0xa5, UINT64_C(0x1122314455667788), 0x5c, 3, 0,
+                             0xa5a5, 0x1234, 0xabcd, 0x16,
+                             {UINT64_C(0x0100040010004001), 1},
+                             {UINT64_C(0x7fbc3e001fff), 0}, 0x0abc, 1},
+            ArrayTransaction{0xff, UINT64_MAX, 0x5c, 3, 1,
+                             0x5a5a, 0xcdef, 0x4321, 0x0b,
+                             {UINT64_C(0x0100040010004001), 1},
+                             {UINT64_C(0x7fbc3e001fff), 0}, 0x1357, 0},
+            ArrayTransaction{0x00, UINT64_C(0), 0x31, 5, 0,
+                             0x5a5a, 0xcdef, 0x4321, 0x0b,
+                             {UINT64_C(0x0100040010004001), 1},
+                             {UINT64_C(0x7fbc3e001fff), 0}, 0x1357, 0},
+            ArrayTransaction{0x03, UINT64_C(0x1122314455667788), 0x31, 5, 1,
+                             0x5a5a, 0xcdef, 0x4321, 0x0b,
+                             {UINT64_C(0x0100040010004001), 1},
+                             {UINT64_C(0x7fbc3e001fff), 0}, 0x1357, 0},
+        };
+        std::vector<std::array<uint64_t, 16>> oracle;
+        oracle.reserve(transactions.size());
+        const auto writeValue = [&](VariableId variable, uint32_t width, uint64_t value) {
+            const std::array<uint64_t, 1> words = {value};
+            return reference
+                .write(variable,
+                       InterpreterValue::bitVector(width, Signedness::Unsigned, words))
+                .success();
+        };
+        const auto writeWide = [&](VariableId variable, uint32_t width,
+                                   std::array<uint64_t, 2> words) {
+            return reference
+                .write(variable,
+                       InterpreterValue::bitVector(width, Signedness::Unsigned, words))
+                .success();
+        };
+        for (const ArrayTransaction &transaction : transactions)
+        {
+            if (!writeValue(fixture.laneMask, 8, transaction.laneMask) ||
+                !writeValue(fixture.data, 64, transaction.data) ||
+                !writeValue(fixture.scalar, 8, transaction.scalar) ||
+                !writeValue(fixture.index, 4, transaction.index) ||
+                !writeValue(fixture.clock, 1, transaction.clock) ||
+                !writeValue(fixture.sel1, 16, transaction.sel1) ||
+                !writeValue(fixture.t1, 16, transaction.t1) ||
+                !writeValue(fixture.f1, 16, transaction.f1) ||
+                !writeValue(fixture.sel5, 5, transaction.sel5) ||
+                !writeWide(fixture.t13, 65, transaction.t13) ||
+                !writeWide(fixture.f13, 65, transaction.f13) ||
+                !writeValue(fixture.scalar13, 13, transaction.scalar13) ||
+                !writeValue(fixture.bit1, 1, transaction.bit1) ||
+                !reference.eval().success())
+            {
+                return fail("AM Interpreter failed an array transaction");
+            }
+            oracle.push_back({reference.value(fixture.all).lowWord(),
+                              reference.value(fixture.muxed).lowWord(),
+                              reference.value(fixture.broadcast).lowWord(),
+                              reference.value(fixture.onehot).lowWord(),
+                              reference.value(fixture.redOr).lowWord(),
+                              reference.value(fixture.redAnd).lowWord(),
+                              reference.value(fixture.redXor).lowWord(),
+                              reference.value(fixture.lanesOr).lowWord(),
+                              reference.value(fixture.lanesAnd).lowWord(),
+                              reference.value(fixture.lanesXor).lowWord(),
+                              reference.value(fixture.muxed1).lowWord(),
+                              reference.value(fixture.muxed13).words()[0],
+                              reference.value(fixture.muxed13).words()[1],
+                              reference.value(fixture.bcast13).words()[0],
+                              reference.value(fixture.bcast13).words()[1],
+                              reference.value(fixture.bcast1).lowWord()});
+        }
+        // Hand-computed expectations for the first scatter round: lanes
+        // 0/2/5/7 take the packed data lanes, the rest stay zero; the
+        // per-lane reduces see muxed = 0x110031005c660088 (lane 3 picked
+        // from the broadcast by the onehot select). The width-class ops
+        // check elemWidth 1 (muxed1), a non-power-of-two 13 (muxed13,
+        // bcast13) and a one-bit broadcast (bcast1).
+        if (oracle[0] != std::array<uint64_t, 16>{UINT64_C(0x1100310000660088),
+                                                  UINT64_C(0x110031005c660088),
+                                                  UINT64_C(0x5c5c5c5c5c5c5c5c),
+                                                  0x08, 1, 0, 1,
+                                                  0xad, 0x00, 0x20,
+                                                  0x0a6c,
+                                                  UINT64_C(0x01007f8010005fff), 1,
+                                                  UINT64_C(0xabc55e2af1578abc), 0,
+                                                  UINT64_MAX})
+        {
+            return fail("AM Interpreter disagreed with the array transaction oracle");
+        }
+
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "ArrayTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the array model");
+        }
+
+        // ST00011: the commit Block's tail changed.any on the memory is
+        // replaced by the array.write site's lane-granular change detection.
+        const std::optional<std::string> arrayBlocksText =
+            readTextFile(outputDirectory / "grhsim_ArrayTop_blocks_0.cpp");
+        if (!arrayBlocksText ||
+            countOccurrences(*arrayBlocksText, "array_write_scatter_detect(") != 1 ||
+            countOccurrences(*arrayBlocksText, "array_readall_pack(") != 1 ||
+            countOccurrences(*arrayBlocksText, "array_mux_words(") != 3 ||
+            countOccurrences(*arrayBlocksText, "array_broadcast_words(") != 3 ||
+            countOccurrences(*arrayBlocksText, "array_onehot_words(") != 1 ||
+            countOccurrences(*arrayBlocksText, "array_reduce_lanes_words(") != 3 ||
+            countOccurrences(*arrayBlocksText, "bool arrChg_0 = false;") != 1 ||
+            countOccurrences(*arrayBlocksText, "= (arrChg_0);") != 1)
+        {
+            return fail("AM C++ emitter did not lower the array ops to their "
+                        "word helpers with write-point detection (ST00011)");
+        }
+
+        // The mux helper must not build its lane mask bit by bit (the
+        // historical per-bit loop with a division per bit); the power-of-two
+        // spread and the per-lane field loop have replaced it.
+        const std::optional<std::string> arrayRuntimeText =
+            readTextFile(outputDirectory / "grhsim_ArrayTop_runtime.cpp");
+        if (!arrayRuntimeText ||
+            countOccurrences(*arrayRuntimeText, "(index * 64U + bit) / elemWidth") != 0 ||
+            countOccurrences(*arrayRuntimeText, "UINT64_C(0x5555555555555555)") < 1)
+        {
+            return fail("AM C++ emitter still emits the per-bit array_mux_words "
+                        "lane-mask loop");
+        }
+
+        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << "#include \"grhsim_ArrayTop.hpp\"\n"
+                   "#include <array>\n"
+                   "#include <cstdint>\n\n"
+                   "int main()\n"
+                   "{\n"
+                   "    GrhSIM_ArrayTop model;\n"
+                   "    model.init();\n";
+        int returnCode = 1;
+        for (std::size_t index = 0; index < transactions.size(); ++index)
+        {
+            const ArrayTransaction &transaction = transactions[index];
+            harness << "    model.lane_mask = " << transaction.laneMask << ";\n"
+                    << "    model.data = UINT64_C(" << transaction.data << ");\n"
+                    << "    model.scalar = " << transaction.scalar << ";\n"
+                    << "    model.index = " << transaction.index << ";\n"
+                    << "    model.clock = " << transaction.clock << ";\n"
+                    << "    model.sel1 = " << transaction.sel1 << ";\n"
+                    << "    model.t1 = " << transaction.t1 << ";\n"
+                    << "    model.f1 = " << transaction.f1 << ";\n"
+                    << "    model.sel5 = " << transaction.sel5 << ";\n"
+                    << "    model.t13 = std::array<std::uint64_t, 2>{UINT64_C("
+                    << transaction.t13[0] << "), UINT64_C(" << transaction.t13[1] << ")};\n"
+                    << "    model.f13 = std::array<std::uint64_t, 2>{UINT64_C("
+                    << transaction.f13[0] << "), UINT64_C(" << transaction.f13[1] << ")};\n"
+                    << "    model.scalar13 = " << transaction.scalar13 << ";\n"
+                    << "    model.bit1 = " << transaction.bit1 << ";\n"
+                    << "    model.eval();\n"
+                    << "    if (static_cast<std::uint64_t>(model.all) != UINT64_C("
+                    << oracle[index][0] << ")) return " << returnCode++ << ";\n"
+                    << "    if (static_cast<std::uint64_t>(model.muxed) != UINT64_C("
+                    << oracle[index][1] << ")) return " << returnCode++ << ";\n"
+                    << "    if (static_cast<std::uint64_t>(model.broadcast) != UINT64_C("
+                    << oracle[index][2] << ")) return " << returnCode++ << ";\n"
+                    << "    if (static_cast<std::uint64_t>(model.onehot) != UINT64_C("
+                    << oracle[index][3] << ")) return " << returnCode++ << ";\n"
+                    << "    if (static_cast<std::uint64_t>(model.red_or) != UINT64_C("
+                    << oracle[index][4] << ")) return " << returnCode++ << ";\n"
+                    << "    if (static_cast<std::uint64_t>(model.red_and) != UINT64_C("
+                    << oracle[index][5] << ")) return " << returnCode++ << ";\n"
+                    << "    if (static_cast<std::uint64_t>(model.red_xor) != UINT64_C("
+                    << oracle[index][6] << ")) return " << returnCode++ << ";\n"
+                    << "    if (static_cast<std::uint64_t>(model.lanes_or) != UINT64_C("
+                    << oracle[index][7] << ")) return " << returnCode++ << ";\n"
+                    << "    if (static_cast<std::uint64_t>(model.lanes_and) != UINT64_C("
+                    << oracle[index][8] << ")) return " << returnCode++ << ";\n"
+                    << "    if (static_cast<std::uint64_t>(model.lanes_xor) != UINT64_C("
+                    << oracle[index][9] << ")) return " << returnCode++ << ";\n"
+                    << "    if (static_cast<std::uint64_t>(model.muxed1) != UINT64_C("
+                    << oracle[index][10] << ")) return " << returnCode++ << ";\n"
+                    << "    if (model.muxed13 != std::array<std::uint64_t, 2>{UINT64_C("
+                    << oracle[index][11] << "), UINT64_C(" << oracle[index][12]
+                    << ")}) return " << returnCode++ << ";\n"
+                    << "    if (model.bcast13 != std::array<std::uint64_t, 2>{UINT64_C("
+                    << oracle[index][13] << "), UINT64_C(" << oracle[index][14]
+                    << ")}) return " << returnCode++ << ";\n"
+                    << "    if (static_cast<std::uint64_t>(model.bcast1) != UINT64_C("
+                    << oracle[index][15] << ")) return " << returnCode++ << ";\n";
+        }
+        harness << "    return 0;\n}\n";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the generated array model harness");
+        }
+
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated array AM model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (outputDirectory / "libgrhsim_ArrayTop.a").string() + "' -o '" +
+            harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated array AM model harness failed to compile");
+        }
+        const std::string runCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(runCommand.c_str()) != 0)
+        {
+            return fail("generated array AM model disagreed with the Interpreter");
+        }
+        return 0;
+    }
+
     struct ArrayInitFixture
     {
         LinearProgramArtifact artifact;
@@ -2509,6 +2993,13 @@ int main()
     if (const int result = testMemoryOperations(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-memory");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testArrayOperations(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-array-ops");
         result != 0)
     {
         return result;

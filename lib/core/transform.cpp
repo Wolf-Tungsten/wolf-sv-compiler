@@ -1,6 +1,7 @@
 #include "core/transform.hpp"
 
 #include "transform/activity_schedule.hpp"
+#include "transform/array_lower.hpp"
 #include "transform/array_select_recovery.hpp"
 #include "transform/blackbox_guard.hpp"
 #include "transform/comb_lane_pack.hpp"
@@ -418,6 +419,7 @@ namespace wolvrix::lib::transform
             "comb-loop-elim",
             "dead-code-elim",
             "activity-schedule",
+            "array-lower",
             "array-select-recovery",
             "latch-transparent-read",
             "lane-aggregate",
@@ -530,6 +532,15 @@ namespace wolvrix::lib::transform
             }
             return std::make_unique<LogicNormalizePass>();
         }
+        if (normalized == "array-lower")
+        {
+            if (!args.empty())
+            {
+                error = "array-lower does not accept arguments";
+                return nullptr;
+            }
+            return std::make_unique<ArrayLowerPass>();
+        }
         if (normalized == "lane-aggregate")
         {
             LaneAggregateOptions options;
@@ -601,6 +612,61 @@ namespace wolvrix::lib::transform
                 else if (arg == "-no-read-select")
                 {
                     options.readSelect = false;
+                }
+                else if (arg == "-exact-fallback")
+                {
+                    options.exactFallback = true;
+                }
+                else if (arg == "-no-exact-fallback")
+                {
+                    options.exactFallback = false;
+                }
+                else if (arg == "-lane-param-leaves")
+                {
+                    options.laneParamLeaves = true;
+                }
+                else if (arg == "-no-lane-param-leaves")
+                {
+                    options.laneParamLeaves = false;
+                }
+                else if (arg == "-output-mode")
+                {
+                    if (i + 1 >= args.size())
+                    {
+                        error = "-output-mode expects a value";
+                        return nullptr;
+                    }
+                    const std::string_view value = args[++i];
+                    if (value == "wide")
+                    {
+                        options.outputMode = LaneAggregateOutputMode::Wide;
+                    }
+                    else if (value == "array")
+                    {
+                        options.outputMode = LaneAggregateOutputMode::Array;
+                    }
+                    else
+                    {
+                        error = "invalid -output-mode value";
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-output-mode="))
+                {
+                    const std::string_view value = arg.substr(std::string_view("-output-mode=").size());
+                    if (value == "wide")
+                    {
+                        options.outputMode = LaneAggregateOutputMode::Wide;
+                    }
+                    else if (value == "array")
+                    {
+                        options.outputMode = LaneAggregateOutputMode::Array;
+                    }
+                    else
+                    {
+                        error = "invalid -output-mode value";
+                        return nullptr;
+                    }
                 }
                 else if (arg == "-output-key")
                 {
@@ -906,6 +972,45 @@ namespace wolvrix::lib::transform
                     else
                     {
                         error = "invalid -enable-mux value";
+                        return nullptr;
+                    }
+                }
+                else if (arg == "-output-mode")
+                {
+                    if (i + 1 >= args.size())
+                    {
+                        error = "-output-mode expects a value";
+                        return nullptr;
+                    }
+                    const std::string_view value = args[++i];
+                    if (value == "wide")
+                    {
+                        options.outputMode = CombLanePackOutputMode::Wide;
+                    }
+                    else if (value == "array")
+                    {
+                        options.outputMode = CombLanePackOutputMode::Array;
+                    }
+                    else
+                    {
+                        error = "invalid -output-mode value";
+                        return nullptr;
+                    }
+                }
+                else if (arg.starts_with("-output-mode="))
+                {
+                    const std::string_view value = arg.substr(std::string_view("-output-mode=").size());
+                    if (value == "wide")
+                    {
+                        options.outputMode = CombLanePackOutputMode::Wide;
+                    }
+                    else if (value == "array")
+                    {
+                        options.outputMode = CombLanePackOutputMode::Array;
+                    }
+                    else
+                    {
+                        error = "invalid -output-mode value";
                         return nullptr;
                     }
                 }

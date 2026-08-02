@@ -762,6 +762,9 @@ namespace wolvrix::lib::grhsim::am
             case Opcode::MemoryFill:
                 eventBegin = 3;
                 break;
+            case Opcode::ArrayWrite:
+                eventBegin = 3;
+                break;
             case Opcode::LatchWrite:
                 break;
             default:

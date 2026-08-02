@@ -44,7 +44,8 @@ namespace wolvrix::lib::grhsim::am
 
         bool isPureCombinational(Opcode opcode) noexcept
         {
-            return opcode >= Opcode::Assign && opcode <= Opcode::SliceArray;
+            return (opcode >= Opcode::Assign && opcode <= Opcode::SliceArray) ||
+                   (opcode >= Opcode::ArrayMux && opcode <= Opcode::ArrayReduceLanesXor);
         }
 
         bool isChanged(Opcode opcode) noexcept
@@ -60,7 +61,7 @@ namespace wolvrix::lib::grhsim::am
 
         bool validOpcode(Opcode opcode) noexcept
         {
-            return opcode <= Opcode::ActBackward;
+            return opcode <= Opcode::ArrayReduceLanesXor;
         }
 
         bool validString(ProgramView view, StringId id)
@@ -481,6 +482,25 @@ namespace wolvrix::lib::grhsim::am
                 case Opcode::Mux:
                     shapeValid = resultCount == 1 && operandCount == 3;
                     break;
+                case Opcode::ArrayMux:
+                    shapeValid = resultCount == 1 && operandCount == 3;
+                    break;
+                case Opcode::ArrayReduceOr:
+                case Opcode::ArrayReduceAnd:
+                case Opcode::ArrayReduceXor:
+                case Opcode::ArrayBroadcast:
+                case Opcode::ArrayOnehot:
+                case Opcode::ArrayReduceLanesOr:
+                case Opcode::ArrayReduceLanesAnd:
+                case Opcode::ArrayReduceLanesXor:
+                    shapeValid = resultCount == 1 && operandCount == 1;
+                    break;
+                case Opcode::ArrayReadAll:
+                    shapeValid = resultCount == 1 && operandCount == 1;
+                    break;
+                case Opcode::ArrayWrite:
+                    shapeValid = resultCount == 0 && operandCount >= 4;
+                    break;
                 case Opcode::Concat:
                     shapeValid = resultCount == 1 && operandCount >= 1;
                     break;
@@ -789,12 +809,89 @@ namespace wolvrix::lib::grhsim::am
                 valid = result->signedness == Signedness::Unsigned && result->bitWidth != 0 &&
                         base->bitWidth % result->bitWidth == 0;
             }
+            else if (opcode == Opcode::ArrayMux)
+            {
+                if (operands.size() != 3)
+                {
+                    return;
+                }
+                const Type *sel = variableType(view, operands[0]);
+                const Type *trueValue = variableType(view, operands[1]);
+                const Type *falseValue = variableType(view, operands[2]);
+                // Lane selection is bitwise (like mux), so only the lane
+                // widths are structural: t/f must cover the full packed
+                // width; signedness follows the common mux convention.
+                valid = sel->bitWidth != 0 &&
+                        result->bitWidth % sel->bitWidth == 0 &&
+                        trueValue->bitWidth == result->bitWidth &&
+                        falseValue->bitWidth == result->bitWidth &&
+                        result->signedness == commonSignedness(*trueValue, *falseValue);
+            }
+            else if (opcode == Opcode::ArrayReduceOr ||
+                     opcode == Opcode::ArrayReduceAnd ||
+                     opcode == Opcode::ArrayReduceXor)
+            {
+                valid = operands.size() == 1 && isUnsignedBitVector1(result);
+            }
+            else if (opcode == Opcode::ArrayReduceLanesOr ||
+                     opcode == Opcode::ArrayReduceLanesAnd ||
+                     opcode == Opcode::ArrayReduceLanesXor)
+            {
+                if (operands.size() != 1)
+                {
+                    return;
+                }
+                const Type *data = variableType(view, operands.front());
+                valid = result->signedness == Signedness::Unsigned && result->bitWidth != 0 &&
+                        data->bitWidth % result->bitWidth == 0;
+            }
+            else if (opcode == Opcode::ArrayBroadcast)
+            {
+                if (operands.size() != 1)
+                {
+                    return;
+                }
+                const Type *source = variableType(view, operands.front());
+                valid = source->bitWidth != 0 &&
+                        result->bitWidth % source->bitWidth == 0;
+            }
+            else if (opcode == Opcode::ArrayOnehot)
+            {
+                valid = operands.size() == 1;
+            }
 
             if (!valid)
             {
+                const auto describeType = [](const Type *type) {
+                    if (!type)
+                    {
+                        return std::string("<null>");
+                    }
+                    std::string text =
+                        type->kind == TypeKind::Array ? "array<" : "bv<";
+                    text += std::to_string(type->bitWidth);
+                    if (type->kind == TypeKind::Array)
+                    {
+                        text += " x " + std::to_string(type->elementCount);
+                    }
+                    text += type->signedness == Signedness::Signed ? ",s>" : ",u>";
+                    return text;
+                };
+                std::string detail = " opcode=" + std::string(toString(opcode)) +
+                                     " result=" + describeType(result) + " operands=[";
+                for (std::size_t index = 0; index < operands.size(); ++index)
+                {
+                    if (index != 0)
+                    {
+                        detail += ", ";
+                    }
+                    detail += describeType(variableType(view, operands[index]));
+                }
+                detail += "]";
                 semanticInstructionError(
                     validator, instruction,
-                    "AM combinational instruction has an invalid Type signature");
+                    "AM combinational instruction has an invalid Type signature" +
+                        detail);
             }
         }
 
@@ -945,6 +1042,40 @@ namespace wolvrix::lib::grhsim::am
                             maskType->bitWidth == targetType->bitWidth &&
                             sameType(variableType(view, operands[2]), targetType) &&
                             isMutable(view, target);
+                }
+                break;
+            case Opcode::ArrayReadAll:
+                if (results.size() != 1 || operands.size() != 1)
+                {
+                    return;
+                }
+                {
+                    const Type *targetType = variableType(view, operands[0]);
+                    const Type *resultType = variableType(view, results.front());
+                    valid = targetType && targetType->kind == TypeKind::Array &&
+                            isBitVector(resultType) &&
+                            resultType->bitWidth == static_cast<uint64_t>(targetType->elementCount) *
+                                                        targetType->bitWidth;
+                }
+                break;
+            case Opcode::ArrayWrite:
+                if (!results.empty() || operands.size() < 4)
+                {
+                    return;
+                }
+                {
+                    const VariableId target = operands[2];
+                    const Type *targetType = variableType(view, target);
+                    const Type *laneMaskType = variableType(view, operands[0]);
+                    const Type *dataType = variableType(view, operands[1]);
+                    valid = targetType && targetType->kind == TypeKind::Array &&
+                            isBitVector(laneMaskType) &&
+                            laneMaskType->bitWidth == targetType->elementCount &&
+                            isBitVector(dataType) &&
+                            dataType->bitWidth == static_cast<uint64_t>(targetType->elementCount) *
+                                                      targetType->bitWidth &&
+                            isMutable(view, target) &&
+                            validateEventRange(view, operands, 3, target);
                 }
                 break;
             default:
@@ -1152,6 +1283,10 @@ namespace wolvrix::lib::grhsim::am
                 validateChangedSemantics(view, instruction, validator);
             }
             else if (opcode >= Opcode::RegisterWrite && opcode <= Opcode::LatchWrite)
+            {
+                validateStateSemantics(view, instruction, validator);
+            }
+            else if (opcode == Opcode::ArrayReadAll || opcode == Opcode::ArrayWrite)
             {
                 validateStateSemantics(view, instruction, validator);
             }

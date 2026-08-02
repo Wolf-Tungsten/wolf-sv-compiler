@@ -232,6 +232,17 @@ namespace wolvrix::lib::grhsim::am
         DpiCall,
         ActForward,
         ActBackward,
+        ArrayReadAll,
+        ArrayWrite,
+        ArrayMux,
+        ArrayReduceOr,
+        ArrayReduceAnd,
+        ArrayReduceXor,
+        ArrayBroadcast,
+        ArrayOnehot,
+        ArrayReduceLanesOr,
+        ArrayReduceLanesAnd,
+        ArrayReduceLanesXor,
     };
 
     static_assert(sizeof(Opcode) == sizeof(uint8_t));

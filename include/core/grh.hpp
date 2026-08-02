@@ -80,7 +80,19 @@ enum class OperationKind {
     kDpicImport,
     kDpicCall,
     kXMRRead,
-    kXMRWrite
+    kXMRWrite,
+    kArrayReadAllPort,
+    kArrayWritePort,
+    kArrayMux,
+    kArrayReduceOr,
+    kArrayReduceAnd,
+    kArrayReduceXor,
+    kArrayBroadcast,
+    kArrayLaneConst,
+    kArrayOnehot,
+    kArrayReduceLanesOr,
+    kArrayReduceLanesAnd,
+    kArrayReduceLanesXor
 };
 
 std::string_view toString(OperationKind kind) noexcept;

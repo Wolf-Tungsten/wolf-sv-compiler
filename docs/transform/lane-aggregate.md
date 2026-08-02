@@ -6,7 +6,7 @@ one wide `kRegister` plus a single write port, and rewrites every read of a merg
 register into a static slice of the wide register.
 
 The pass is **opt-in**: it is not part of any production pipeline. Run it explicitly
-after `hier-flatten` and before `reg-to-mem` / `comb-lane-pack`.
+after `hier-flatten` and `reg-to-mem`, before `simplify` / `comb-lane-pack`.
 
 ## Pre-pass Normalization
 
@@ -73,7 +73,12 @@ All of the following must hold for a group (or its majority bucket) to be merged
    lane, `53` = sibling group at the same index (index not mixed in, so
    same-index families bucket together), `52` = any group at an absolute index
    (so all lanes reading the same dispatch port bucket together; a lane whose
-   own index coincides with that port hashes as `53` and simply stays scalar);
+   own index coincides with that port hashes as `53` and simply stays scalar).
+   When no bucket reaches `min_lanes`, the **exact-all fallback**
+   (`-exact-fallback`, on by default) runs the exact N-wise cone check over
+   **all** candidate lanes directly — one shot first, then an incremental
+   rescue-style bucket build capped at 32 attempts — because the exact check,
+   not the signature, is the ground truth (see "Exact-all fallback" below);
 5. the bucket's indices must be dense: at most `max_index_holes` missing indices
    inside `[minIdx, maxIdx]` (`not_dense` reject otherwise);
 6. all bucket lanes have **identical event sets** (`eventEdge` strings and event
@@ -89,18 +94,22 @@ All of the following must hold for a group (or its majority bucket) to be merged
    | sibling read | lane `i` reads a sibling group's lane `i` register | the sibling's wide read; the sibling group must merge with a lane set that is a superset of this bucket and the same span, otherwise this group is rejected (`sibling_not_merged` / `sibling_lane_mismatch`) |
    | shared register | every lane reads the same register `R` | one read of `R` (or a slice of `R`'s wide read when `R` is itself a merged lane), replicated by `span` |
    | lane parameter | per-lane distinct `kRegisterReadPort`s (any targets, including undeclared registers), or per-lane bare values with no defining op (`_GEN_N` wires, input ports) | one `kConcat` of the per-lane values: operand 0 = value of the highest segment, last operand = segment 0 (hole segments get a zero constant); `res[i*w +: w]` = lane `i`'s own value — exact, not a guess |
-   | eq-onehot | per-lane `kEq(x, c_i)` with the same shared `x` and `c_i == i` exactly (both operand orders, no ambiguous both-constant case) | `kShl(kConstant(span'd1), x)` — result bit `i` = `(x == i)`, zero when `x >= span`; other affine slopes stay rejected |
+   | lane-param op leaf (C level) | any other lane-varying position whose per-lane values are produced by the **same op kind with the same arity, attrs, and width** across lanes (`-lane-param-leaves`, on by default; e.g. per-lane wide `kEq` compares, `kSliceStatic`/`kSliceDynamic`, `kSub`) | the per-lane subgraphs are kept **verbatim** and packed by one per-lane `kConcat` (same materialization as every other lane-parameter leaf); register reads inside them are retargeted by the read-side rewrite (phase C3) like any other lane read. Positions whose attrs differ across lanes fail the uniform-attrs check and stay rejected (`structure_mismatch`) — except the affine gather below |
+   | affine gather (R level) | every lane's value is a `kSliceStatic` of the **same shared base `X`** with the offset affine in the lane index: lane `i` reads `X[base0 + i*W +: W]` (`W` = lane width, `base0 ≥ 0` may be non-zero, every segment in range) | **zero-cost**: the packed per-lane slices are exactly `X[base0 +: span*W]` — materialized as `X` itself when `base0 == 0` and `width(X) == span*W`, otherwise one `kSliceStatic(X, base0, base0 + span*W - 1)` (never a per-lane `kConcat`). Segments of hole lanes carry `X`'s bits (don't-care: the present-lanes cond mask clears them, same argument as any shared leaf). Non-affine offsets (overlap/crossing included: with a fixed slope `W` and distinct lane indices an overlap is always non-affine), mixed bases, and out-of-range segments keep the `structure_mismatch` rejection. `kSliceDynamic` with a constant offset is *not* recognized (no observed shape) |
+   | eq-onehot | per-lane `kEq(x, c_i)` with the same shared `x` and `c_i == i` exactly (both operand orders, no ambiguous both-constant case); also the shl-onehot decode form — per-lane bit `i` of a shared `X = kShl(kConstant 1, x)`, written as `kSliceStatic(X, i, i)` and/or `kSliceDynamic(X, <const i>, 1)` (mixed slice forms across lanes accepted; bit `i` of `(1 << x)` is `(x == i)` in 2-state semantics, same caveat class as `onehot-to-mux`) — this is the DataModule-family decoded-write/read enable | `kShl(kConstant(span'd1), x)` — result bit `i` = `(x == i)`, zero when `x >= span`; other affine slopes stay rejected |
    | internal node | lane-pointwise op (`kAnd`/`kOr`/`kXor`/`kXnor`/`kNot`/`kAssign`/`kMux`, plus `kLogicAnd`/`kLogicOr`/`kLogicNot` with all operands 1-bit), same kind/arity/attrs/result type across lanes | widened to `span*w`; `kMux` is rebuilt as `(t & m) \| (f & ~m)` with the merged select broadcast per lane; `kLogicAnd`/`kLogicOr`/`kLogicNot` materialize as `kAnd`/`kOr`/`kNot` (identical at 1-bit operands) |
    | replicate | `kReplicate(v_i, W)` with a per-lane 1-bit operand and `rep == lane width` | per-lane broadcast: the merged operand (span bits) is expanded lane-wise, `res[i*W + j] = mergedOperand[i]` (same broadcast used for mux masks) |
    | 1-bit reduce | `kReduceOr`/`kReduceAnd`/`kReduceXor` with a 1-bit operand | the identity: the merged operand is used directly (a 1-bit reduce is a no-op) |
 
-   Anything else rejects the group: other non-pointwise ops (`kAdd`, `kConcat`,
-   reductions with multi-bit operands, `kReplicate` with a multi-bit operand,
-   slices, `kNe`/other comparators) as lane-varying positions
-   (`unsupported_op`), mixed defined/undefined lane-varying leaves
-   (`lane_varying_leaf`), reads of a *different* lane of the same group
-   (`cross_lane_read`), non-affine constants (`non_affine_constant`), divergent
-   shared subtrees (`shared_subtree_divergence`).
+   Anything else rejects the group: mixed defined/undefined lane-varying
+   leaves (`lane_varying_leaf`), reads of a *different* lane of the same
+   group (`cross_lane_read`), non-affine constants (`non_affine_constant`),
+   divergent shared subtrees (`shared_subtree_divergence`), and — only with
+   `-no-lane-param-leaves` — lane-varying non-pointwise ops
+   (`unsupported_op`). The pointwise-internal shape checks still apply to
+   pointwise kinds, so reductions with multi-bit operands in wide mode and
+   `kReplicate` with a multi-bit operand keep their `unsupported_op`
+   rejection either way.
 
 ### initValue packing
 
@@ -179,14 +188,27 @@ kSliceDynamic(wideRead, ptr * W, W)
   in any order; the chain must cover **every** span index `0..span-1`, and the
   final default must be a zero constant (see semantics below).
 - **and/or one-hot tree**: `kOr` over mutually exclusive terms
-  `kAnd(kReplicate(kEq(ptr, i), W), slice_i)` or `kMux(kEq(ptr, i), slice_i, 0)`
-  (replicate in either operand position; `kAnd(kEq(ptr,i), slice_i)` at `W==1`).
+  `kAnd(kReplicate(sel_i, W), slice_i)` or `kMux(sel_i, slice_i, 0)`
+  (replicate in either operand position; `kAnd(sel_i, slice_i)` at `W==1`).
+  The per-lane select `sel_i` is either `kEq(ptr, i)` or a **shl-onehot bit
+  select** (the DataModule-family decode
+  `addr_dec = onehotWidth'd1 << raddr; addr_dec[i] ? data_i : 0`):
+  `kSliceStatic(kShl(kConstant 1, ptr), i, i)` or
+  `kSliceDynamic(kShl(kConstant 1, ptr), <constant i>, sliceWidth = 1)`.
+  Bit `i` of `(1 << ptr)` is `(ptr == i)` in 2-state semantics (for
+  `ptr >= onehotWidth` the 2-state shift yields 0, agreeing with `ptr == i`
+  because `i < onehotWidth`); 4-state X-propagation may differ — same caveat
+  class as `onehot-to-mux`. The shl-onehot form additionally requires
+  `ptrWidth == log2(span)`, so the rewritten dynamic address can never go out
+  of range.
 
-Requirements for both forms: all `kEq` share the same `ptr` `ValueId` (either
-operand position, never both-constant); every leaf slice has
+Requirements for both forms: all selects share the same `ptr` `ValueId` (for
+`kEq`, either operand position, never both-constant); every leaf slice has
 `sliceStart == i*W`, `sliceEnd == i*W + W - 1` on the **same** merged group's
-wide read; a tree that touches any other value (another group, a scalar
-register read of an unmerged lane, arbitrary logic) is skipped.
+wide read (wide mode) or is a `kMemoryReadPort` of the same merged `kMemory`
+at constant address `i` (array mode); a tree that touches any other value
+(another group, a scalar register read of an unmerged lane, arbitrary logic)
+is skipped.
 
 ### Semantics and out-of-range behavior
 
@@ -208,6 +230,37 @@ remaining candidate lane is tried once: it joins the bucket when the exact
 structural check still passes **and** its write-port event set matches the
 majority. Rescue is what lets `robEntries`-style families reach full span,
 which in turn makes their read-side select trees convertible.
+
+### Exact-all fallback (`-exact-fallback`, on by default)
+
+The signature is only a bucketing accelerator; the exact N-wise cone check is
+the ground truth. When **no** signature bucket reaches `min_lanes` (reported as
+`no_majority` when the fallback is disabled), the fallback runs the exact check
+over **all** candidate lanes directly:
+
+- first in one shot over the whole candidate set — this recovers the two
+  observed over-split shapes: a shared cone leaf that hashes `53` for the one
+  lane matching its absolute index and `52` for the rest (e.g. a shared reset
+  cone whose leaf is a single-member register), and a per-lane full-range
+  sibling reduction whose concat element `j` hashes `53`/`52` alternately per
+  lane (e.g. `kReduceOr`/`kArrayReduceOr(kConcat(valid[0..15]))`);
+- if that fails, an incremental rescue-style build: seed empty, try every
+  candidate once (capped at 32 attempts, mirroring the minority-lane rescue),
+  keep it when the exact check still passes and its event set matches the
+  first kept lane.
+
+The merged bucket then goes through the usual gates (density, event-set
+equality, initValue packing), and its sibling deps flow through the same
+`resolveSiblingDeps` fixpoint as signature-majority groups: a rescued group
+whose referenced sibling group does not merge (or merges with an
+incompatible lane set) is rejected with `sibling_not_merged` /
+`sibling_lane_mismatch` before any graph rewrite. A group rescued this way
+is reported with
+`outcome = merged` and `reject_reason = no_majority_exact`; a group the
+fallback cannot bring to `min_lanes` is reported `skipped` with
+`reject_reason = no_majority_exact` (and `largest_signature_bucket` /
+`largest_exact_bucket` details). The fallback only fires for groups that would
+otherwise be rejected, so signature-majority merges are unaffected.
 
 ### Example
 
@@ -284,13 +337,55 @@ CLI equivalent:
 wolvrix --pass=hier-flatten --pass=lane-aggregate:-min-lanes=8:-output-key=laneagg.report top.sv
 ```
 
+## Array Output Mode (`-output-mode=array`)
+
+The default `wide` mode is unchanged. With `-output-mode=array` the same
+analysis (grouping, bucketing, cone check) emits the array-value shape of
+`docs/grh/grh-ir.md` §6.10 instead of the wide-register shape:
+
+| wide-mode artifact | array-mode artifact |
+| --- | --- |
+| wide `kRegister` (`width = span*W`) | `kMemory` (`width = W`, `row = span`); per-lane constant inits map to one `literal` init entry per row (holes zeroed) |
+| wide `kRegisterReadPort` | `kArrayReadAllPort` (`memSymbol`), result width `span*W` |
+| `updateCond` / lane-mask broadcast / `(data & m) \| (hold & ~m)` / all-ones mask + `kRegisterWritePort` | one `kArrayWritePort`: `oper[0]` = laneMask = `kAnd(condVec, presentLanes)` (the `span`-wide guard vector, hole lanes cleared), `oper[1]` = merged data cone, events unchanged; attrs `memSymbol` + `eventEdge` |
+| shared-leaf `kReplicate` | `kArrayBroadcast` |
+| constant-leaf packed `kConstant` | `kArrayLaneConst` (`values` per lane, holes zeroed) |
+| lane-parameter per-lane `kConcat` | unchanged `kConcat` (per-lane distinct *values* have no constant-table form; `kArrayLaneConst` only covers constant leaves) |
+| eq-onehot `kShl(span'd1, x)` | `kArrayOnehot(x, rows = span)` |
+| internal `kMux` → `(t & m) \| (f & ~m)` + select broadcast | one `kArrayMux(sel, t, f)` with `sel` the merged `span`-wide guard vector |
+| internal lane-pointwise `kAnd/kOr/kXor/kXnor/kNot/kAssign` | widened unchanged (lane-aligned bitwise ops need no array variant) |
+| internal per-lane 1-bit `kReplicate` | unchanged bit-broadcast (no array variant exists) |
+| internal per-lane reduction (`kReduce{Or,And,Xor}` over a multi-bit per-lane operand, or the normalize-produced `kArrayReduce{Or,And,Xor}` whose operand is still the per-lane value) | `kArrayReduceLanes{Or,And,Xor}` over the packed rows with `elemWidth` = per-lane operand width, yielding the `span`-wide guard vector (a 1-bit operand stays the identity pass-through); wide mode has no per-lane guard vector and keeps rejecting the multi-bit form |
+| lane read → `kSliceStatic(wideRead, i*W, W)` | `kMemoryReadPort` at constant address `i` (`memSymbol`), result width `W` |
+| phase 2 select tree → `kSliceDynamic(wideRead, ptr*W, W)` | one `kMemoryReadPort` at the dynamic address `ptr` (no offset scaling; same zero-default / full-coverage requirements and the same 2-state out-of-range caveat) |
+| `kReduce{Or,And,Xor}(kConcat(...))` → element-wise tree | `kArrayReduce{Or,And,Xor}` with `elemWidth` = element width (only when all concat elements have uniform width; non-uniform concats keep the tree expansion) |
+
+Naming is identical to wide mode (masked group key + `__laneagg`, now the
+`kMemory` symbol). Reject reasons gain `init_unmappable` for init values that
+cannot be mapped to `kMemory` literal init rows (currently unreachable: lanes
+whose init does not parse as a constant are excluded before grouping).
+
+Coverage note: a *per-lane* `kReduce(kConcat)` inside the write cones
+tree-expands in wide mode and can merge; in array mode the pre-pass rewrites
+it to a per-lane `kArrayReduce*` (correct there: its operand is still the
+per-lane value, so global and per-lane reduction coincide), and the cone
+materialization widens it to `kArrayReduceLanes*` over the packed rows — a
+global `kArrayReduce*` over the packed value would instead collapse all lanes
+into one bit. The shared packed-reduction form firtool actually emits is
+unaffected (it classifies as a shared leaf either way).
+
+The JSON group report gains an `output_mode` field (`"wide"` / `"array"`).
+
 ## Key Options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `-min-lanes` | `8` | minimum majority-bucket size required to merge (must be ≥ 2) |
 | `-max-index-holes` | `2` | maximum missing indices allowed inside the bucket span |
-| `-read-select` / `-no-read-select` | on | phase 2: rewrite read-side select trees to `kSliceDynamic` |
+| `-read-select` / `-no-read-select` | on | phase 2: rewrite read-side select trees to `kSliceDynamic` (wide) / `kMemoryReadPort` (array) |
+| `-exact-fallback` / `-no-exact-fallback` | on | when no signature bucket reaches `-min-lanes`, run the exact cone check over all candidates directly (see "Exact-all fallback") |
+| `-lane-param-leaves` / `-no-lane-param-leaves` | on | accept uniform non-pointwise ops (same kind/arity/attrs/width across lanes) as C-level lane-parameter leaves packed by a per-lane `kConcat` |
+| `-output-mode` | `wide` | `wide`: historical wide-register shape; `array`: array-value shape (see above) |
 | `-output-key` | empty | session key for the per-group JSON report |
 
 ## Session Output
@@ -302,7 +397,7 @@ With `-output-key=<key>`, the pass stores a JSON string (kind
 {"groups": [{
     "graph": "...", "group_id": 1, "discovery": "name_pattern",
     "group": "robEntries_*_wflags",
-    "module": "Rob.sv", "element_width": 1, "element_count": 352,
+    "module": "Rob.sv", "output_mode": "wide", "element_width": 1, "element_count": 352,
     "lane_count": 351, "outcome": "merged",
     "reject_reason": "", "reject_detail": ""
   }],
@@ -316,19 +411,31 @@ With `-output-key=<key>`, the pass stores a JSON string (kind
 - `element_count`: registers in the name group
 - `lane_count`: lanes in the merged bucket (0 when rejected before bucketing)
 - `outcome`: `merged` / `rejected` / `skipped`
-- `reject_reason`: e.g. `too_few_lanes`, `no_majority`, `multi_varying_segment`,
+- `reject_reason`: e.g. `too_few_lanes`, `no_majority`, `no_majority_exact`,
+  `multi_varying_segment`,
   `width_mismatch`, `not_dense`, `event_mismatch`, `structure_mismatch`,
   `unsupported_op`, `non_affine_constant`, `lane_varying_leaf`, `cross_lane_read`,
   `sibling_not_merged`, `sibling_lane_mismatch`, `shared_subtree_divergence`,
-  `rewrite_failed`
+  `init_unmappable` (array mode), `rewrite_failed`. `no_majority_exact` marks
+  both outcomes of the exact-all fallback: `merged` when the exact check
+  rescued the group, `skipped` when it still could not reach `min_lanes`.
 
 ## Notes
 
-- Only lane-pointwise logic is widened. Cones containing lane-varying
-  non-pointwise ops (`kAdd`, `kConcat`, reductions, slices, comparators other
-  than the eq-onehot form) are rejected; the `enqPtr == i` decode merges via
+- Only lane-pointwise logic is widened. Lane-varying non-pointwise ops whose
+  kind/arity/attrs/width are uniform across lanes (`kEq` wide compares,
+  `kSliceStatic`/`kSliceDynamic`, `kSub`, `kAdd`, ...) merge as C-level
+  lane-parameter leaves: the per-lane subgraphs are preserved verbatim and
+  packed by one per-lane `kConcat`, so the rewrite stays exact. Per-lane
+  slices of one shared vector at lane-affine offsets (the `writeReqValid`
+  shape) merge as the R-level affine-gather leaf at zero cost (the packed
+  slices *are* the base vector); other attrs-varying shapes stay rejected.
+  Per-lane
+  reductions merge in array mode via
+  `kArrayReduceLanes*` (wide mode only handles the 1-bit identity form); the
+  `enqPtr == i` decode merges via
   the eq-onehot branch, while wider patterns (e.g. `x < i`, range compares)
-  still report `unsupported_op` and are left to follow-up pattern matchers.
+  merge only as frozen lane-parameter leaves (they are not widened).
 - Per-lane distinct external values are no longer blockers: dispatch-port
   reads at a fixed absolute index are shared leaves, and per-lane distinct
   register reads / bare wires become lane-parameter `kConcat`s. This is what

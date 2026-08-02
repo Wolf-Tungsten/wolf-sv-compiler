@@ -407,6 +407,12 @@ namespace wolvrix::lib::transform
             return out;
         }
 
+        bool allLanesShared(std::span<const ValueId> lanes)
+        {
+            return std::all_of(lanes.begin() + 1, lanes.end(),
+                               [&](ValueId lane) { return lane == lanes.front(); });
+        }
+
         ValueId createUnary(Graph &graph,
                             OperationKind kind,
                             ValueId operand,
@@ -485,6 +491,46 @@ namespace wolvrix::lib::transform
             return out;
         }
 
+        ValueId createArrayMux(Graph &graph,
+                               ValueId sel,
+                               ValueId whenTrue,
+                               ValueId whenFalse,
+                               int32_t width,
+                               bool isSigned,
+                               ValueType type,
+                               std::string_view note)
+        {
+            const auto out = graph.createValue(width, isSigned, type);
+            const auto op = graph.createOperation(OperationKind::kArrayMux);
+            graph.addOperand(op, sel);
+            graph.addOperand(op, whenTrue);
+            graph.addOperand(op, whenFalse);
+            graph.addResult(op, out);
+            const SrcLoc srcLoc = makeTransformSrcLoc("comb-lane-pack", note);
+            graph.setOpSrcLoc(op, srcLoc);
+            graph.setValueSrcLoc(out, srcLoc);
+            return out;
+        }
+
+        ValueId createArrayBroadcast(Graph &graph,
+                                     ValueId scalar,
+                                     std::size_t rows,
+                                     std::string_view note)
+        {
+            const Value value = graph.getValue(scalar);
+            const auto out = graph.createValue(static_cast<int32_t>(value.width() * rows),
+                                               value.isSigned(),
+                                               value.type());
+            const auto op = graph.createOperation(OperationKind::kArrayBroadcast);
+            graph.addOperand(op, scalar);
+            graph.addResult(op, out);
+            graph.setAttr(op, "rows", static_cast<int64_t>(rows));
+            const SrcLoc srcLoc = makeTransformSrcLoc("comb-lane-pack", note);
+            graph.setOpSrcLoc(op, srcLoc);
+            graph.setValueSrcLoc(out, srcLoc);
+            return out;
+        }
+
         void rebindOutputPorts(Graph &graph, ValueId from, ValueId to)
         {
             std::vector<std::string> names;
@@ -525,6 +571,13 @@ namespace wolvrix::lib::transform
                 const Value firstValue = graph_.getValue(lanes.front());
                 if (!firstAnalysis.internal)
                 {
+                    if (arrayMode() && lanes.size() > 1 && allLanesShared(lanes))
+                    {
+                        // A pack of the same shared scalar in every lane is a
+                        // replicate; array mode emits one kArrayBroadcast.
+                        return createArrayBroadcast(graph_, lanes.front(), lanes.size(),
+                                                    "pack-array-broadcast");
+                    }
                     return createConcat(graph_, lanes, "pack-leaf");
                 }
 
@@ -571,6 +624,31 @@ namespace wolvrix::lib::transform
                     if (!packedTrue || !packedFalse)
                     {
                         return std::nullopt;
+                    }
+                    if (arrayMode())
+                    {
+                        // Array mode: one kArrayMux. sel is the per-lane guard
+                        // vector (lane 0 at LSB) — one kConcat of the per-lane
+                        // conds; when every lane selects on the same scalar the
+                        // shared cond is reused via one kArrayBroadcast.
+                        ValueId sel;
+                        if (allLanesShared(conds))
+                        {
+                            sel = createArrayBroadcast(graph_, conds.front(), conds.size(),
+                                                       "pack-array-broadcast");
+                        }
+                        else
+                        {
+                            sel = createConcat(graph_, conds, "pack-array-mux-sel");
+                        }
+                        return createArrayMux(graph_,
+                                              sel,
+                                              *packedTrue,
+                                              *packedFalse,
+                                              static_cast<int32_t>(packedWidth),
+                                              firstValue.isSigned(),
+                                              firstValue.type(),
+                                              "pack-array-mux");
                     }
                     std::vector<ValueId> masks;
                     masks.reserve(conds.size());
@@ -665,6 +743,11 @@ namespace wolvrix::lib::transform
             }
 
         private:
+            bool arrayMode() const
+            {
+                return options_.outputMode == CombLanePackOutputMode::Array;
+            }
+
             Graph &graph_;
             const CombLanePackOptions &options_;
         };

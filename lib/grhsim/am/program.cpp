@@ -110,7 +110,7 @@ namespace wolvrix::lib::grhsim::am
 
     std::string_view toString(Opcode opcode) noexcept
     {
-        static constexpr std::array<std::string_view, 48> names = {
+        static constexpr std::array<std::string_view, 59> names = {
             "assign",
             "add",
             "sub",
@@ -159,6 +159,17 @@ namespace wolvrix::lib::grhsim::am
             "dpi.call",
             "act.f",
             "act.b",
+            "array.read_all",
+            "array.write",
+            "array.mux",
+            "array.reduce_or",
+            "array.reduce_and",
+            "array.reduce_xor",
+            "array.broadcast",
+            "array.onehot",
+            "array.reduce_lanes_or",
+            "array.reduce_lanes_and",
+            "array.reduce_lanes_xor",
         };
         const std::size_t index = static_cast<std::size_t>(opcode);
         return index < names.size() ? names[index] : std::string_view("unknown");

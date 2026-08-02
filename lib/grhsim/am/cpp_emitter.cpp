@@ -1354,6 +1354,81 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
+        std::optional<std::string> emitArrayPureInstruction(const EmitState &state,
+                                                            InstructionId instruction,
+                                                            std::string &error)
+        {
+            const Opcode opcode = state.program.opcode(instruction);
+            const auto operands = state.program.operands(instruction);
+            const auto results = state.program.results(instruction);
+            const Type &resultType = variableType(state, results.front());
+            switch (opcode)
+            {
+                case Opcode::ArrayMux:
+                {
+                    const uint32_t rows = variableType(state, operands[0]).bitWidth;
+                    return "array_mux_words(" + wordDataExpr(state, results.front()) + ", " +
+                           std::to_string(resultType.bitWidth) + ", " +
+                           wordDataExpr(state, operands[0]) + ", " +
+                           wordDataExpr(state, operands[1]) + ", " +
+                           wordDataExpr(state, operands[2]) + ", " +
+                           std::to_string(resultType.bitWidth / rows) + ");\n";
+                }
+                case Opcode::ArrayReduceOr:
+                case Opcode::ArrayReduceAnd:
+                case Opcode::ArrayReduceXor:
+                {
+                    // Per-lane then cross-lane reduction is the plain
+                    // full-width reduction (associativity), so reduce_words
+                    // with the And/Or/Xor operation code is exact.
+                    const Type &dataType = variableType(state, operands.front());
+                    const uint32_t operation = opcode == Opcode::ArrayReduceAnd
+                                                   ? 0
+                                                   : opcode == Opcode::ArrayReduceOr ? 2 : 4;
+                    return valueExpr(state, results.front()) + " = (reduce_words(" +
+                           wordDataExpr(state, operands.front()) + ", " +
+                           std::to_string(dataType.bitWidth) + ", " +
+                           std::to_string(operation) + ")) ? 1 : 0;\n";
+                }
+                case Opcode::ArrayBroadcast:
+                {
+                    const Type &sourceType = variableType(state, operands.front());
+                    return "array_broadcast_words(" + wordDataExpr(state, results.front()) +
+                           ", " + std::to_string(resultType.bitWidth) + ", " +
+                           wordDataExpr(state, operands.front()) + ", " +
+                           std::to_string(sourceType.bitWidth) + ");\n";
+                }
+                case Opcode::ArrayOnehot:
+                {
+                    const Type &indexType = variableType(state, operands.front());
+                    return "array_onehot_words(" + wordDataExpr(state, results.front()) +
+                           ", " + std::to_string(resultType.bitWidth) + ", " +
+                           wordDataExpr(state, operands.front()) + ", " +
+                           std::to_string(indexType.bitWidth) + ");\n";
+                }
+                case Opcode::ArrayReduceLanesOr:
+                case Opcode::ArrayReduceLanesAnd:
+                case Opcode::ArrayReduceLanesXor:
+                {
+                    // Per-lane reduction into the rows-bit guard vector;
+                    // elemWidth is implicit as dataWidth / rows.
+                    const Type &dataType = variableType(state, operands.front());
+                    const uint32_t operation = opcode == Opcode::ArrayReduceLanesAnd
+                                                   ? 0
+                                                   : opcode == Opcode::ArrayReduceLanesOr ? 2 : 4;
+                    return "array_reduce_lanes_words(" + wordDataExpr(state, results.front()) +
+                           ", " + std::to_string(resultType.bitWidth) + ", " +
+                           wordDataExpr(state, operands.front()) + ", " +
+                           std::to_string(dataType.bitWidth / resultType.bitWidth) + ", " +
+                           std::to_string(operation) + ");\n";
+                }
+                default:
+                    error = "unsupported array opcode in the AM C++ emitter: " +
+                            std::string(toString(opcode));
+                    return std::nullopt;
+            }
+        }
+
         std::optional<std::string> emitInstruction(const EmitState &state,
                                                    InstructionId instruction,
                                                    std::string &error)
@@ -1528,9 +1603,19 @@ namespace wolvrix::lib::grhsim::am
                 return "if (" + boolExpr(state, operands[0]) + ") { " + body + " }\n";
             }
 
+            if (opcode == Opcode::ArrayMux || opcode == Opcode::ArrayReduceOr ||
+                opcode == Opcode::ArrayReduceAnd || opcode == Opcode::ArrayReduceXor ||
+                opcode == Opcode::ArrayBroadcast || opcode == Opcode::ArrayOnehot ||
+                opcode == Opcode::ArrayReduceLanesOr || opcode == Opcode::ArrayReduceLanesAnd ||
+                opcode == Opcode::ArrayReduceLanesXor)
+            {
+                return emitArrayPureInstruction(state, instruction, error);
+            }
+
             const bool deferredUnsupported =
                 opcode == Opcode::MemoryRead || opcode == Opcode::MemoryWrite ||
-                opcode == Opcode::MemoryFill || opcode == Opcode::SystemFunction ||
+                opcode == Opcode::MemoryFill || opcode == Opcode::ArrayReadAll ||
+                opcode == Opcode::ArrayWrite || opcode == Opcode::SystemFunction ||
                 opcode == Opcode::SystemTask || opcode == Opcode::DpiCall;
             if (!deferredUnsupported)
             {
@@ -1844,6 +1929,43 @@ namespace wolvrix::lib::grhsim::am
                     }
                     code += emitEventfulStateWrite(5, condition, body) + "}\n";
                     return code;
+                }
+                case Opcode::ArrayReadAll:
+                {
+                    const Type &memoryType = variableType(state, operands[0]);
+                    const Type &resultType = variableType(state, results.front());
+                    return "array_readall_pack(" + wordDataExpr(state, results.front()) +
+                           ", " + std::to_string(resultType.bitWidth) + ", " +
+                           wordDataExpr(state, operands[0]) + ", " +
+                           std::to_string(memoryType.bitWidth) + ", " +
+                           std::to_string(memoryType.elementCount) + ");\n";
+                }
+                case Opcode::ArrayWrite:
+                {
+                    const Type &memoryType = variableType(state, operands[2]);
+                    const Type &laneMaskType = variableType(state, operands[0]);
+                    const std::string scatterArgs =
+                        wordDataExpr(state, operands[2]) + ", " +
+                        wordDataExpr(state, operands[0]) + ", " +
+                        wordDataExpr(state, operands[1]) + ", " +
+                        std::to_string(memoryType.bitWidth) + ", " +
+                        std::to_string(memoryType.elementCount) + ")";
+                    std::string body;
+                    if (state.arrayWriteAccum >= 0)
+                    {
+                        // ST00011: same write-point change fusion as
+                        // mem.write, at whole-lane granularity.
+                        body = "arrChg_" + std::to_string(state.arrayWriteAccum) +
+                               " |= array_write_scatter_detect(" + scatterArgs + ";";
+                    }
+                    else
+                    {
+                        body = "array_write_scatter(" + scatterArgs + ";";
+                    }
+                    const std::string condition =
+                        "any_words(" + wordDataExpr(state, operands[0]) + ", " +
+                        std::to_string(laneMaskType.bitWidth) + ")";
+                    return emitEventfulStateWrite(3, condition, body);
                 }
                 case Opcode::MemoryFill:
                 {
@@ -3318,8 +3440,9 @@ namespace wolvrix::lib::grhsim::am
                 };
                 // Operand use positions within the block, in ascending order.
                 std::unordered_map<uint32_t, std::vector<uint32_t>> uses;
-                // Write positions per array target: mem.write / mem.fill are
-                // the only opcodes that write an Array variable.
+                // Write positions per array target: mem.write / mem.fill /
+                // array.write are the only opcodes that write an Array
+                // variable.
                 std::unordered_map<uint32_t, std::vector<uint32_t>> arrayWrites;
                 for (std::size_t position = 0; position < blockSize; ++position)
                 {
@@ -3333,6 +3456,11 @@ namespace wolvrix::lib::grhsim::am
                             static_cast<uint32_t>(position));
                     }
                     else if (opcode == Opcode::MemoryFill)
+                    {
+                        arrayWrites[operands[2].value].push_back(
+                            static_cast<uint32_t>(position));
+                    }
+                    else if (opcode == Opcode::ArrayWrite)
                     {
                         arrayWrites[operands[2].value].push_back(
                             static_cast<uint32_t>(position));
@@ -3471,6 +3599,7 @@ namespace wolvrix::lib::grhsim::am
                     case Opcode::RegisterWrite: eventBegin = 4; break;
                     case Opcode::MemoryWrite: eventBegin = 5; break;
                     case Opcode::MemoryFill: eventBegin = 3; break;
+                    case Opcode::ArrayWrite: eventBegin = 3; break;
                     case Opcode::LatchWrite:
                         // Latch writes are event-less (guard-only), so the
                         // Block can never be event-gated as a whole.
@@ -3921,7 +4050,7 @@ namespace wolvrix::lib::grhsim::am
         if (statsAttribute != options.attributes.end() && statsAttribute->second == "true")
         {
             constexpr std::size_t opcodeCount =
-                static_cast<std::size_t>(Opcode::ActBackward) + 1U;
+                static_cast<std::size_t>(Opcode::ArrayReduceLanesXor) + 1U;
             std::array<uint64_t, opcodeCount> nonScalarOpcodes{};
             for (uint32_t index = 0; index < program.instructionCount(); ++index)
             {
@@ -4061,11 +4190,13 @@ namespace wolvrix::lib::grhsim::am
                     case Opcode::LatchWrite:
                     case Opcode::MemoryWrite:
                     case Opcode::MemoryFill:
+                    case Opcode::ArrayWrite:
                         // State writes keep persistent slots for every operand
                         // (targets are state read again on later rounds).
                         escapeOperands();
                         break;
                     case Opcode::MemoryRead:
+                    case Opcode::ArrayReadAll:
                         escapeOperands();
                         break;
                     case Opcode::SystemFunction:
@@ -4358,6 +4489,13 @@ namespace wolvrix::lib::grhsim::am
                << "    static void slice_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, std::uint64_t start);\n"
                << "    static void slice_dynamic_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, const std::uint64_t *index, std::uint32_t indexWidth);\n"
                << "    static void slice_array_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, const std::uint64_t *index, std::uint32_t indexWidth);\n"
+               << "    static void array_readall_pack(std::uint64_t *target, std::uint32_t packedWidth, const std::uint64_t *source, std::uint32_t elemWidth, std::uint32_t rows);\n"
+               << "    static void array_write_scatter(std::uint64_t *target, const std::uint64_t *laneMask, const std::uint64_t *data, std::uint32_t elemWidth, std::uint32_t rows);\n"
+               << "    static bool array_write_scatter_detect(std::uint64_t *target, const std::uint64_t *laneMask, const std::uint64_t *data, std::uint32_t elemWidth, std::uint32_t rows);\n"
+               << "    static void array_mux_words(std::uint64_t *target, std::uint32_t packedWidth, const std::uint64_t *sel, const std::uint64_t *t, const std::uint64_t *f, std::uint32_t elemWidth);\n"
+               << "    static void array_broadcast_words(std::uint64_t *target, std::uint32_t packedWidth, const std::uint64_t *source, std::uint32_t sourceWidth);\n"
+               << "    static void array_onehot_words(std::uint64_t *target, std::uint32_t rows, const std::uint64_t *index, std::uint32_t indexWidth);\n"
+               << "    static void array_reduce_lanes_words(std::uint64_t *target, std::uint32_t rows, const std::uint64_t *source, std::uint32_t elemWidth, std::uint32_t operation);\n"
                << "    static void shift_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, bool sourceSigned, const std::uint64_t *amount, std::uint32_t amountWidth, std::uint32_t operation);\n"
                << "    static std::uint64_t split_mix64(std::uint64_t &state);\n"
                << "    static constexpr std::uint64_t resize_value(std::uint64_t value, std::uint32_t sourceWidth, bool signExtend, std::uint32_t targetWidth) {\n"
@@ -5213,6 +5351,144 @@ namespace
                << "    const std::size_t count = (sourceWidth + targetWidth - 1U) / targetWidth;\n"
                << "    const std::size_t element = index_words(index, indexWidth, count);\n"
                << "    slice_words(target, targetWidth, source, sourceWidth, element == count ? sourceWidth : element * static_cast<std::size_t>(targetWidth));\n"
+               << "}\n"
+               << "void " << className
+               << "::array_readall_pack(std::uint64_t *target, std::uint32_t packedWidth, const std::uint64_t *source, std::uint32_t elemWidth, std::uint32_t rows) {\n"
+               << "    zero_words(target, packedWidth);\n"
+               << "    const std::size_t stride = word_count(elemWidth);\n"
+               << "    for (std::uint32_t row = 0; row < rows; ++row) {\n"
+               << "        insert_words(target, packedWidth, static_cast<std::uint64_t>(row) * elemWidth, source + static_cast<std::size_t>(row) * stride, elemWidth);\n"
+               << "    }\n"
+               << "}\n"
+               << "void " << className
+               << "::array_write_scatter(std::uint64_t *target, const std::uint64_t *laneMask, const std::uint64_t *data, std::uint32_t elemWidth, std::uint32_t rows) {\n"
+               << "    const std::size_t stride = word_count(elemWidth);\n"
+               << "    const std::uint32_t dataWidth = elemWidth * rows;\n"
+               << "    for (std::uint32_t row = 0; row < rows; ++row) {\n"
+               << "        if (((laneMask[row / 64U] >> (row % 64U)) & 1U) == 0) continue;\n"
+               << "        slice_words(target + static_cast<std::size_t>(row) * stride, elemWidth, data, dataWidth, static_cast<std::uint64_t>(row) * elemWidth);\n"
+               << "    }\n"
+               << "}\n"
+               << "bool " << className
+               << "::array_write_scatter_detect(std::uint64_t *target, const std::uint64_t *laneMask, const std::uint64_t *data, std::uint32_t elemWidth, std::uint32_t rows) {\n"
+               << "    const std::size_t stride = word_count(elemWidth);\n"
+               << "    const std::uint32_t dataWidth = elemWidth * rows;\n"
+               << "    bool changed = false;\n"
+               << "    for (std::uint32_t row = 0; row < rows; ++row) {\n"
+               << "        if (((laneMask[row / 64U] >> (row % 64U)) & 1U) == 0) continue;\n"
+               << "        changed = slice_words_detect(target + static_cast<std::size_t>(row) * stride, elemWidth, data, dataWidth, static_cast<std::uint64_t>(row) * elemWidth) || changed;\n"
+               << "    }\n"
+               << "    return changed;\n"
+               << "}\n"
+               << "void " << className
+               << "::array_mux_words(std::uint64_t *target, std::uint32_t packedWidth, const std::uint64_t *sel, const std::uint64_t *t, const std::uint64_t *f, std::uint32_t elemWidth) {\n"
+               << "    const std::size_t words = word_count(packedWidth);\n"
+               << "    if (elemWidth == 1U) {\n"
+               << "        for (std::size_t index = 0; index < words; ++index) {\n"
+               << "            const std::uint32_t bits = index + 1U == words ? packedWidth - static_cast<std::uint32_t>(index * 64U) : 64U;\n"
+               << "            const std::uint64_t liveMask = bit_mask(bits);\n"
+               << "            const std::uint64_t select = sel[index] & liveMask;\n"
+               << "            target[index] = (t[index] & select) | (f[index] & ~select & liveMask);\n"
+               << "        }\n"
+               << "        return;\n"
+               << "    }\n"
+               << "    if ((elemWidth & (elemWidth - 1U)) == 0 && elemWidth < 32U) {\n"
+               << "        const std::uint32_t lanesPerWord = 64U / elemWidth;\n"
+               << "        const std::uint64_t field = (UINT64_C(1) << elemWidth) - 1U;\n"
+               << "        for (std::size_t index = 0; index < words; ++index) {\n"
+               << "            const std::uint32_t bits = index + 1U == words ? packedWidth - static_cast<std::uint32_t>(index * 64U) : 64U;\n"
+               << "            const std::uint64_t liveMask = bit_mask(bits);\n"
+               << "            const std::uint64_t firstLane = static_cast<std::uint64_t>(index) * lanesPerWord;\n"
+               << "            std::uint64_t spread = (sel[firstLane / 64U] >> (firstLane % 64U)) & ((UINT64_C(1) << lanesPerWord) - 1U);\n"
+               << "            for (std::uint32_t spacing = 1U; spacing < elemWidth; spacing <<= 1U) {\n"
+               << "                spread = (spread | (spread << 16U)) & UINT64_C(0x0000FFFF0000FFFF);\n"
+               << "                spread = (spread | (spread << 8U)) & UINT64_C(0x00FF00FF00FF00FF);\n"
+               << "                spread = (spread | (spread << 4U)) & UINT64_C(0x0F0F0F0F0F0F0F0F);\n"
+               << "                spread = (spread | (spread << 2U)) & UINT64_C(0x3333333333333333);\n"
+               << "                spread = (spread | (spread << 1U)) & UINT64_C(0x5555555555555555);\n"
+               << "            }\n"
+               << "            const std::uint64_t mask = (spread * field) & liveMask;\n"
+               << "            target[index] = (t[index] & mask) | (f[index] & ~mask & liveMask);\n"
+               << "        }\n"
+               << "        return;\n"
+               << "    }\n"
+               << "    for (std::size_t index = 0; index < words; ++index) {\n"
+               << "        const std::uint32_t bits = index + 1U == words ? packedWidth - static_cast<std::uint32_t>(index * 64U) : 64U;\n"
+               << "        const std::uint64_t liveMask = bit_mask(bits);\n"
+               << "        const std::uint64_t wordStart = static_cast<std::uint64_t>(index) * 64U;\n"
+               << "        std::uint64_t mask = UINT64_C(0);\n"
+               << "        std::uint32_t lane = static_cast<std::uint32_t>(wordStart / elemWidth);\n"
+               << "        for (;;) {\n"
+               << "            const std::uint64_t laneStart = static_cast<std::uint64_t>(lane) * elemWidth;\n"
+               << "            if (laneStart >= wordStart + bits) break;\n"
+               << "            if (((sel[lane / 64U] >> (lane % 64U)) & 1U) != 0) {\n"
+               << "                const std::uint32_t lo = laneStart > wordStart ? static_cast<std::uint32_t>(laneStart - wordStart) : 0U;\n"
+               << "                const std::uint64_t end = laneStart + elemWidth - wordStart;\n"
+               << "                const std::uint32_t hi = end >= bits ? bits : static_cast<std::uint32_t>(end);\n"
+               << "                mask |= (hi == 64U ? UINT64_MAX : ((UINT64_C(1) << hi) - 1U)) & (UINT64_MAX << lo);\n"
+               << "            }\n"
+               << "            ++lane;\n"
+               << "        }\n"
+               << "        target[index] = (t[index] & mask) | (f[index] & ~mask & liveMask);\n"
+               << "    }\n"
+               << "}\n"
+               << "void " << className
+               << "::array_broadcast_words(std::uint64_t *target, std::uint32_t packedWidth, const std::uint64_t *source, std::uint32_t sourceWidth) {\n"
+               << "    const std::size_t words = word_count(packedWidth);\n"
+               << "    if (sourceWidth == 1U) {\n"
+               << "        const std::uint64_t fill = (source[0] & 1U) != 0 ? UINT64_MAX : UINT64_C(0);\n"
+               << "        for (std::size_t index = 0; index < words; ++index) {\n"
+               << "            const std::uint32_t bits = index + 1U == words ? packedWidth - static_cast<std::uint32_t>(index * 64U) : 64U;\n"
+               << "            target[index] = fill & bit_mask(bits);\n"
+               << "        }\n"
+               << "        return;\n"
+               << "    }\n"
+               << "    if (sourceWidth == 64U) {\n"
+               << "        for (std::size_t index = 0; index < words; ++index) {\n"
+               << "            const std::uint32_t bits = index + 1U == words ? packedWidth - static_cast<std::uint32_t>(index * 64U) : 64U;\n"
+               << "            target[index] = source[0] & bit_mask(bits);\n"
+               << "        }\n"
+               << "        return;\n"
+               << "    }\n"
+               << "    if ((sourceWidth & (sourceWidth - 1U)) == 0) {\n"
+               << "        std::uint64_t word = source[0] & bit_mask(sourceWidth);\n"
+               << "        for (std::uint32_t shift = sourceWidth; shift < 64U; shift <<= 1U) word |= word << shift;\n"
+               << "        for (std::size_t index = 0; index < words; ++index) {\n"
+               << "            const std::uint32_t bits = index + 1U == words ? packedWidth - static_cast<std::uint32_t>(index * 64U) : 64U;\n"
+               << "            target[index] = word & bit_mask(bits);\n"
+               << "        }\n"
+               << "        return;\n"
+               << "    }\n"
+               << "    zero_words(target, packedWidth);\n"
+               << "    for (std::uint64_t lsb = 0; lsb < packedWidth; lsb += sourceWidth) {\n"
+               << "        insert_words(target, packedWidth, lsb, source, sourceWidth);\n"
+               << "    }\n"
+               << "}\n"
+               << "void " << className
+               << "::array_onehot_words(std::uint64_t *target, std::uint32_t rows, const std::uint64_t *index, std::uint32_t indexWidth) {\n"
+               << "    zero_words(target, rows);\n"
+               << "    const std::size_t lane = index_words(index, indexWidth, rows);\n"
+               << "    if (lane != rows) target[lane / 64U] |= UINT64_C(1) << (lane % 64U);\n"
+               << "}\n"
+               << "void " << className
+               << "::array_reduce_lanes_words(std::uint64_t *target, std::uint32_t rows, const std::uint64_t *source, std::uint32_t elemWidth, std::uint32_t operation) {\n"
+               << "    zero_words(target, rows);\n"
+               << "    const std::uint32_t sourceWidth = rows * elemWidth;\n"
+               << "    for (std::uint32_t lane = 0; lane < rows; ++lane) {\n"
+               << "        std::uint64_t offset = static_cast<std::uint64_t>(lane) * elemWidth;\n"
+               << "        std::uint32_t remaining = elemWidth;\n"
+               << "        bool reduced = operation == 0;\n"
+               << "        while (remaining != 0U) {\n"
+               << "            const std::uint32_t chunk = remaining > 64U ? 64U : remaining;\n"
+               << "            const std::uint64_t value = extract_word(source, sourceWidth, offset) & bit_mask(chunk);\n"
+               << "            if (operation == 0) reduced = reduced && (value == bit_mask(chunk));\n"
+               << "            else if (operation == 2) reduced = reduced || (value != 0);\n"
+               << "            else reduced = reduced != (static_cast<unsigned>(std::popcount(value) & 1U) != 0U);\n"
+               << "            remaining -= chunk;\n"
+               << "            offset += chunk;\n"
+               << "        }\n"
+               << "        if (reduced) target[lane / 64U] |= UINT64_C(1) << (lane % 64U);\n"
+               << "    }\n"
                << "}\n"
                << "void " << className
                << "::shift_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, bool sourceSigned, const std::uint64_t *amount, std::uint32_t amountWidth, std::uint32_t operation) {\n"
