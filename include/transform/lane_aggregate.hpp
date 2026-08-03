@@ -11,8 +11,8 @@ namespace wolvrix::lib::transform
 
     // Output mode of the merge rewrite. Wide keeps the historical shape (one
     // wide kRegister + masked kRegisterWritePort + kSliceStatic reads); Array
-    // emits the array-value shape (kMemory + kArrayReadAllPort +
-    // kArrayWritePort + kMemoryReadPort reads).
+    // emits the array-value shape (kMemory + kMemoryReadAllPort +
+    // kMemoryWriteLanesPort + kMemoryReadPort reads).
     enum class LaneAggregateOutputMode
     {
         Wide,

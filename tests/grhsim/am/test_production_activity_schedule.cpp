@@ -1377,11 +1377,11 @@ namespace
         return 0;
     }
 
-    // array.write (operands [laneMask, data, mem, events...]) must schedule
+    // mem.write_lanes (operands [laneMask, data, mem, events...]) must schedule
     // like mem.write: ordered writers on the same array target share one
-    // commit Block, one ChangedAny watch, and reactivate the array.read_all
+    // commit Block, one ChangedAny watch, and reactivate the mem.read_all
     // reader through ActBackward.
-    int testMergedArrayWritersShareOneWatchAndReactivateReader()
+    int testMergedMemoryWriteLanesShareOneWatchAndReactivateReader()
     {
         LinearProgramBuilder builder;
         const TypeId eventType = builder.addType(Type::bitVector(1));
@@ -1397,14 +1397,14 @@ namespace
         const std::array<VariableId, 1> readResults = {all};
         const std::array<VariableId, 1> readOperands = {memory};
         const InstructionId reader =
-            builder.addInstruction(Opcode::ArrayReadAll, readResults, readOperands);
+            builder.addInstruction(Opcode::MemoryReadAll, readResults, readOperands);
         const std::array<VariableId, 4> writeOperands = {
             laneMask, data, memory, event,
         };
         const InstructionId firstWrite =
-            builder.addInstruction(Opcode::ArrayWrite, {}, writeOperands);
+            builder.addInstruction(Opcode::MemoryWriteLanes, {}, writeOperands);
         const InstructionId finalWrite =
-            builder.addInstruction(Opcode::ArrayWrite, {}, writeOperands);
+            builder.addInstruction(Opcode::MemoryWriteLanes, {}, writeOperands);
 
         SchedulingFacts facts;
         facts.variableRoles = {
@@ -2782,7 +2782,7 @@ int main()
     if (const int result = testMergedMemoryWritersShareOneWatchAndReactivateReader(); result != 0) {
         return result;
     }
-    if (const int result = testMergedArrayWritersShareOneWatchAndReactivateReader(); result != 0) {
+    if (const int result = testMergedMemoryWriteLanesShareOneWatchAndReactivateReader(); result != 0) {
         return result;
     }
     if (const int result = testSplitCommitBlocksEachWatchAndReactivateReader(); result != 0) {

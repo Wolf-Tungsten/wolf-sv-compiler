@@ -127,7 +127,7 @@ namespace wolvrix::lib::transform
             case OperationKind::kRegisterReadPort:
             case OperationKind::kLatchReadPort:
             case OperationKind::kMemoryReadPort:
-            case OperationKind::kArrayReadAllPort:
+            case OperationKind::kMemoryReadAllPort:
                 return true;
             default:
                 return false;
@@ -142,7 +142,7 @@ namespace wolvrix::lib::transform
             case OperationKind::kLatchWritePort:
             case OperationKind::kMemoryWritePort:
             case OperationKind::kMemoryFillPort:
-            case OperationKind::kArrayWritePort:
+            case OperationKind::kMemoryWriteLanesPort:
                 return true;
             default:
                 return false;
@@ -195,8 +195,8 @@ namespace wolvrix::lib::transform
             case OperationKind::kMemoryReadPort:
             case OperationKind::kMemoryWritePort:
             case OperationKind::kMemoryFillPort:
-            case OperationKind::kArrayReadAllPort:
-            case OperationKind::kArrayWritePort:
+            case OperationKind::kMemoryReadAllPort:
+            case OperationKind::kMemoryWriteLanesPort:
                 return &memInfos;
             default:
                 return nullptr;
@@ -224,8 +224,8 @@ namespace wolvrix::lib::transform
             case OperationKind::kMemoryReadPort:
             case OperationKind::kMemoryWritePort:
             case OperationKind::kMemoryFillPort:
-            case OperationKind::kArrayReadAllPort:
-            case OperationKind::kArrayWritePort:
+            case OperationKind::kMemoryReadAllPort:
+            case OperationKind::kMemoryWriteLanesPort:
                 return getAttrString(op, "memSymbol");
             default:
                 return std::nullopt;
@@ -481,13 +481,13 @@ namespace wolvrix::lib::transform
                 case OperationKind::kRegisterReadPort:
                 case OperationKind::kLatchReadPort:
                 case OperationKind::kMemoryReadPort:
-                case OperationKind::kArrayReadAllPort:
+                case OperationKind::kMemoryReadAllPort:
                     break;
                 case OperationKind::kRegisterWritePort:
                 case OperationKind::kLatchWritePort:
                 case OperationKind::kMemoryWritePort:
                 case OperationKind::kMemoryFillPort:
-                case OperationKind::kArrayWritePort: {
+                case OperationKind::kMemoryWriteLanesPort: {
                     auto sym = getStorageSymbol(op);
                     auto *map = storageMapForKind(info.kind, regInfos, latchInfos, memInfos);
                     if (sym && map)

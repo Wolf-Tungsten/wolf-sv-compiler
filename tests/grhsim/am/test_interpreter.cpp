@@ -350,9 +350,9 @@ namespace {
         VariableId redXor;
     };
 
-    // 8-lane x 8-bit array: a clocked array.write scatters packed lanes into
+    // 8-lane x 8-bit array: a clocked mem.write_lanes scatters packed lanes into
     // the memory, its tail changed.any reactivates the reader Block, which
-    // packs the whole array back with array.read_all and applies the pure
+    // packs the whole array back with mem.read_all and applies the pure
     // array ops.
     ArrayLoopbackFixture makeArrayLoopbackModel() {
         LinearProgramBuilder linear;
@@ -388,11 +388,11 @@ namespace {
         const InstructionId detect = addInstruction(
             linear, Opcode::ChangedPos, {posedge}, {clock, clockOld});
         const InstructionId write = addInstruction(
-            linear, Opcode::ArrayWrite, {}, {laneMask, data, memory, posedge});
+            linear, Opcode::MemoryWriteLanes, {}, {laneMask, data, memory, posedge});
         const InstructionId changed = addInstruction(
             linear, Opcode::ChangedAny, {memoryEvent}, {memory, memoryOld});
         const InstructionId readAll = addInstruction(
-            linear, Opcode::ArrayReadAll, {all}, {memory});
+            linear, Opcode::MemoryReadAll, {all}, {memory});
         const InstructionId bcast = addInstruction(
             linear, Opcode::ArrayBroadcast, {broadcast}, {scalar});
         const InstructionId one = addInstruction(
@@ -443,7 +443,7 @@ namespace {
         return InterpreterValue::bitVector(64, Signedness::Unsigned, words);
     }
 
-    int testArrayReadAllWriteLoopback() {
+    int testMemoryReadAllWriteLanesLoopback() {
         ArrayLoopbackFixture fixture = makeArrayLoopbackModel();
         Interpreter interpreter(fixture.model);
         if (!interpreter.ready() || !interpreter.eval().success()) {
@@ -1334,7 +1334,7 @@ int main() {
         return 1;
     if (testMemoryWriteRead() != 0)
         return 1;
-    if (testArrayReadAllWriteLoopback() != 0)
+    if (testMemoryReadAllWriteLanesLoopback() != 0)
         return 1;
     if (testArrayPureOperations() != 0)
         return 1;

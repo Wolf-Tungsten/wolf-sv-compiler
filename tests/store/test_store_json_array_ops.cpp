@@ -115,18 +115,18 @@ int main()
         std::vector<OpExpectation> expectations;
 
         const OperationId readAll =
-            graph.createOperation(OperationKind::kArrayReadAllPort, graph.internSymbol("array_read0"));
+            graph.createOperation(OperationKind::kMemoryReadAllPort, graph.internSymbol("array_read0"));
         const ValueId readAllOut = graph.createValue(graph.internSymbol("read_all"), kPackedWidth, false);
         graph.addResult(readAll, readAllOut);
         graph.setAttr(readAll, "memSymbol", AttributeValue(std::string("mem")));
         expectations.push_back(OpExpectation{"array_read0",
-                                             OperationKind::kArrayReadAllPort,
+                                             OperationKind::kMemoryReadAllPort,
                                              {},
                                              {kPackedWidth},
                                              {{"memSymbol", AttributeValue(std::string("mem"))}}});
 
         const OperationId write =
-            graph.createOperation(OperationKind::kArrayWritePort, graph.internSymbol("array_write0"));
+            graph.createOperation(OperationKind::kMemoryWriteLanesPort, graph.internSymbol("array_write0"));
         graph.addOperand(write, laneMask);
         graph.addOperand(write, dataIn);
         graph.addOperand(write, clk);
@@ -138,7 +138,7 @@ int main()
         graph.setAttr(write, std::string(kMemoryWritePriorityAttr), AttributeValue(int64_t(0)));
         expectations.push_back(
             OpExpectation{"array_write0",
-                          OperationKind::kArrayWritePort,
+                          OperationKind::kMemoryWriteLanesPort,
                           {kRows, kPackedWidth, 1},
                           {},
                           {{"memSymbol", AttributeValue(std::string("mem"))},
@@ -265,7 +265,7 @@ int main()
         {
             return fail("storeToString failed");
         }
-        if (jsonText->find("\"kArrayWritePort\"") == std::string::npos ||
+        if (jsonText->find("\"kMemoryWriteLanesPort\"") == std::string::npos ||
             jsonText->find("\"kArrayLaneConst\"") == std::string::npos)
         {
             return fail("array op kinds missing in JSON output");

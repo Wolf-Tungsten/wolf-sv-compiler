@@ -1,7 +1,7 @@
 # array-lower
 
 `array-lower` expands the twelve array-value ops (see
-[grh-ir.md §6.10](../grh/grh-ir.md)) back into plain wide-scalar form. It is the
+[grh-ir.md §2.4](../grh/grh-ir.md)) back into plain wide-scalar form. It is the
 semantic inverse of `lane-aggregate -output-mode=array`: every expansion is
 bit-exact, so the lowered graph is interchangeable with the array form.
 
@@ -25,8 +25,8 @@ Notation: `W = elemWidth`, `row = rows`; lane `i` of a packed value occupies
 
 | Source op | Expansion |
 | --- | --- |
-| `kArrayReadAllPort` | One `kMemoryReadPort` per row (constant address `i`, same `memSymbol`) + one `kConcat` with row `row-1` in the MSBs and row 0 in the LSBs. With `row == 1` the single read-port result replaces the array result directly (no concat). |
-| `kArrayWritePort` | One `kMemoryWritePort` per row: `updateCond = kSliceStatic(laneMask, i, i)`, `addr = kConstant(i)`, `data = kSliceStatic(data, i*W, i*W+W-1)`, `mask =` all-ones constant (`W` bits); `events` operands and the `eventEdge` attr are forwarded verbatim. |
+| `kMemoryReadAllPort` | One `kMemoryReadPort` per row (constant address `i`, same `memSymbol`) + one `kConcat` with row `row-1` in the MSBs and row 0 in the LSBs. With `row == 1` the single read-port result replaces the array result directly (no concat). |
+| `kMemoryWriteLanesPort` | One `kMemoryWritePort` per row: `updateCond = kSliceStatic(laneMask, i, i)`, `addr = kConstant(i)`, `data = kSliceStatic(data, i*W, i*W+W-1)`, `mask =` all-ones constant (`W` bits); `events` operands and the `eventEdge` attr are forwarded verbatim. |
 | `kArrayMux` | Per-lane select broadcast `m = kConcat(kReplicate(kSliceStatic(sel, i, i), W) ...)`, then `res = kOr(kAnd(t, m), kAnd(f, kNot(m)))`. |
 | `kArrayReduceOr/And/Xor` | Single `kReduceOr/kReduceAnd/kReduceXor` over the full packed operand. Per-lane-then-cross-lane reduction equals full-width reduction by associativity. |
 | `kArrayReduceLanesOr/And/Xor` | Per lane `kReduceOr/kReduceAnd/kReduceXor` over `kSliceStatic(data, i*W, i*W+W-1)`, plus one `kConcat` of the per-lane bits with lane `row-1` in the MSBs and lane 0 in the LSBs. With `row == 1` the single per-lane bit replaces the result directly (no concat). |
@@ -34,7 +34,7 @@ Notation: `W = elemWidth`, `row = rows`; lane `i` of a packed value occupies
 | `kArrayLaneConst` | One packed `kConstant` with `values[i]` in segment `[i*elemWidth +: elemWidth]`. |
 | `kArrayOnehot` | `kShl(kConstant(rows'd1), x)` at result width `rows`; `x >= rows` naturally yields 0 under fixed-width shift, matching the out-of-range semantics. |
 
-## Priority Attrs on `kArrayWritePort`
+## Priority Attrs on `kMemoryWriteLanesPort`
 
 `memoryWrite.priorityGroup` / `memoryWrite.priority` are **dropped** on
 expansion, with a warning per source op and a counter in the pass summary.

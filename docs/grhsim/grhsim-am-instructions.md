@@ -11,7 +11,7 @@ system/DPI 的宿主接口见 [HostEnvironment 参考定义](grhsim-host-environ
 形态：`kConstant` 直接成为 constant Variable，其余 39 种在 operand/result 均为
 Logic 时产生本稿指令；Real/String constant 遵循同一规则。本文还定义
 `changed.any/changed.pos/changed.neg`、`reg.write`、`mem.read/mem.write/mem.fill` 和
-`latch.write`、数组视图指令 `array.read_all/array.write` 与纯组合
+`latch.write`、数组视图指令 `mem.read_all/mem.write_lanes` 与纯组合
 `array.mux/array.reduce_*/array.broadcast/array.onehot`（`kArrayLaneConst` 与
 `kConstant` 一样直接成为 constant Variable）、`system.function/system.task`、
 `dpi.call` 和 `act.f/act.b`。层次结构和 XMR
@@ -726,16 +726,18 @@ compute Block B5。
 视图值宽 `N*W`，lane `i` 占连续位 `[i*W +: W]`，lane 0 位于最低 W bit；宽 `N` 的
 BV 用作守卫/选择向量，每 lane 1 bit。数组的存储仍是第 12.2 节的 memory
 Variable；注意 memory 按 word-stride 行平铺存储（每行 `ceil(W/64)` 个 u64），与
-packed 视图的连续位布局不同，`array.read_all/array.write` 在两种布局之间逐 lane
-pack/unpack，语义上只按 `[i*W +: W]` 定义。数组视图 opcode 的 Signedness 只来自
+packed 视图的连续位布局不同，`mem.read_all/mem.write_lanes` 在两种布局之间逐 lane
+pack/unpack，语义上只按 `[i*W +: W]` 定义。`mem.read_all/mem.write_lanes` 的 state
+target 是 memory Variable，按状态访问对象归入 `mem.*` 命名家族；其余 `array.*`
+opcode 均为纯组合。数组视图 opcode 的 Signedness 只来自
 对应 Variable Type，不改变位级语义。
 
-#### 12.4.1 `array.read_all`
+#### 12.4.1 `mem.read_all`
 
-GRH `kArrayReadAllPort` lower 为全数组读：
+GRH `kMemoryReadAllPort` lower 为全数组读指令 `mem.read_all`：
 
 ```text
-%res = array.read_all %target
+%res = mem.read_all %target
 ```
 
 | Operand/Result | Type | 含义 |
@@ -744,15 +746,15 @@ GRH `kArrayReadAllPort` lower 为全数组读：
 | `%res` | `BV<N*W, SignR>` | 全数组 packed 视图值。 |
 
 指令读取 `%target`，并对每个 `i in [0, N)` 令 `res[i*W +: W] = target[i]`。
-`N*W` 使用数学整数计算。`array.read_all` 不修改 `%target`，`%res` 不能是 constant
+`N*W` 使用数学整数计算。`mem.read_all` 不修改 `%target`，`%res` 不能是 constant
 Variable；它按实际执行顺序观察状态，与同一 target 的 `mem.read` 等价。
 
-#### 12.4.2 `array.write`
+#### 12.4.2 `mem.write_lanes`
 
-GRH `kArrayWritePort` lower 为：
+GRH `kMemoryWriteLanesPort` lower 为 `mem.write_lanes`：
 
 ```text
-array.write %laneMask, %data, %target, %event0, ..., %eventE-1
+mem.write_lanes %laneMask, %data, %target, %event0, ..., %eventE-1
 ```
 
 | Operand | Type | 含义 |
@@ -777,7 +779,7 @@ laneMask[r] = 0 → target'[r] = target[r]
 ```
 
 lane 内整写，没有逐 bit mask；lane 内部分写由上游在生成 `%data` 时并入（例如用
-`array.mux` 合并保持值）。`array.write` 不产生 result，也不隐式激活 reader；它只
+`array.mux` 合并保持值）。`mem.write_lanes` 不产生 result，也不隐式激活 reader；它只
 位于 commit Block，实际 Array Value 的变化由同块共享 `changed.any` 检测并经
 `act.b` 传播。event 的 OR 语义、eventEdge lowering、priority 写组
 （GRH `memoryWrite.priorityGroup/priority`，同组按 priority 从大到小执行、`0` 最后
@@ -786,7 +788,7 @@ lane 内整写，没有逐 bit mask；lane 内部分写由上游在生成 `%data
 例如，`%mem` 为 `Array<4, BV<8, unsigned>>`：
 
 ```text
-array.write %lane_mask, %packed, %mem, %clkpos
+mem.write_lanes %lane_mask, %packed, %mem, %clkpos
 ```
 
 `%lane_mask = 4'b0101` 且 `%clkpos = 1` 时，`%mem[0] ← packed[7:0]`、
@@ -1261,8 +1263,8 @@ Backward 依赖。
   第 12.2.2 节，target 不是 constant；带 priority 的写组完整且按规定顺序 lower；
 - `mem.fill` 的 cond、data、target 和 event 数量及 Type 满足第 12.2.3 节；data 宽度
   等于 W 或数学整数 `N*W`，target 不是 constant；
-- `array.read_all` 的 target/res Type 满足第 12.4.1 节，res 不是 constant；
-- `array.write` 的 laneMask、data、target 和 event 数量及 Type 满足第 12.4.2 节，
+- `mem.read_all` 的 target/res Type 满足第 12.4.1 节，res 不是 constant；
+- `mem.write_lanes` 的 laneMask、data、target 和 event 数量及 Type 满足第 12.4.2 节，
   target 不是 constant；带 priority 的写组完整且按规定顺序 lower；
 - `array.mux/array.broadcast/array.onehot` 的 operand/result 宽度整除关系满足
   第 12.4 节；`array.reduce_*` 的 result 是 `BV<1, unsigned>`；
@@ -1285,7 +1287,7 @@ Backward 依赖。
 - `slice_static.lsb` 是满足第 10 节范围约束的 Nat，且该指令没有其他 Attribute；
 - `targets` 是静态非空 BlockId set Attribute，且 act 没有其他 Attribute；commit Block
   构成 Block 空间的连续后缀 `[CommitBegin, BlockCount)`；state write
-  （`reg.write/latch.write/mem.write/mem.fill/array.write`）只位于 commit
+  （`reg.write/latch.write/mem.write/mem.fill/mem.write_lanes`）只位于 commit
   Block；`act.f` 只位于 B0 和 compute Block，对所在 Block B 其每个 Target 满足
   `B.BlockId < Target < CommitBegin`；`act.b` 只位于 commit Block，其每个 Target
   满足 `1 <= Target < CommitBegin`；

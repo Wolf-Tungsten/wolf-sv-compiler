@@ -1614,8 +1614,8 @@ namespace wolvrix::lib::grhsim::am
 
             const bool deferredUnsupported =
                 opcode == Opcode::MemoryRead || opcode == Opcode::MemoryWrite ||
-                opcode == Opcode::MemoryFill || opcode == Opcode::ArrayReadAll ||
-                opcode == Opcode::ArrayWrite || opcode == Opcode::SystemFunction ||
+                opcode == Opcode::MemoryFill || opcode == Opcode::MemoryReadAll ||
+                opcode == Opcode::MemoryWriteLanes || opcode == Opcode::SystemFunction ||
                 opcode == Opcode::SystemTask || opcode == Opcode::DpiCall;
             if (!deferredUnsupported)
             {
@@ -1930,7 +1930,7 @@ namespace wolvrix::lib::grhsim::am
                     code += emitEventfulStateWrite(5, condition, body) + "}\n";
                     return code;
                 }
-                case Opcode::ArrayReadAll:
+                case Opcode::MemoryReadAll:
                 {
                     const Type &memoryType = variableType(state, operands[0]);
                     const Type &resultType = variableType(state, results.front());
@@ -1940,7 +1940,7 @@ namespace wolvrix::lib::grhsim::am
                            std::to_string(memoryType.bitWidth) + ", " +
                            std::to_string(memoryType.elementCount) + ");\n";
                 }
-                case Opcode::ArrayWrite:
+                case Opcode::MemoryWriteLanes:
                 {
                     const Type &memoryType = variableType(state, operands[2]);
                     const Type &laneMaskType = variableType(state, operands[0]);
@@ -3441,7 +3441,7 @@ namespace wolvrix::lib::grhsim::am
                 // Operand use positions within the block, in ascending order.
                 std::unordered_map<uint32_t, std::vector<uint32_t>> uses;
                 // Write positions per array target: mem.write / mem.fill /
-                // array.write are the only opcodes that write an Array
+                // mem.write_lanes are the only opcodes that write an Array
                 // variable.
                 std::unordered_map<uint32_t, std::vector<uint32_t>> arrayWrites;
                 for (std::size_t position = 0; position < blockSize; ++position)
@@ -3460,7 +3460,7 @@ namespace wolvrix::lib::grhsim::am
                         arrayWrites[operands[2].value].push_back(
                             static_cast<uint32_t>(position));
                     }
-                    else if (opcode == Opcode::ArrayWrite)
+                    else if (opcode == Opcode::MemoryWriteLanes)
                     {
                         arrayWrites[operands[2].value].push_back(
                             static_cast<uint32_t>(position));
@@ -3599,7 +3599,7 @@ namespace wolvrix::lib::grhsim::am
                     case Opcode::RegisterWrite: eventBegin = 4; break;
                     case Opcode::MemoryWrite: eventBegin = 5; break;
                     case Opcode::MemoryFill: eventBegin = 3; break;
-                    case Opcode::ArrayWrite: eventBegin = 3; break;
+                    case Opcode::MemoryWriteLanes: eventBegin = 3; break;
                     case Opcode::LatchWrite:
                         // Latch writes are event-less (guard-only), so the
                         // Block can never be event-gated as a whole.
@@ -4190,13 +4190,13 @@ namespace wolvrix::lib::grhsim::am
                     case Opcode::LatchWrite:
                     case Opcode::MemoryWrite:
                     case Opcode::MemoryFill:
-                    case Opcode::ArrayWrite:
+                    case Opcode::MemoryWriteLanes:
                         // State writes keep persistent slots for every operand
                         // (targets are state read again on later rounds).
                         escapeOperands();
                         break;
                     case Opcode::MemoryRead:
-                    case Opcode::ArrayReadAll:
+                    case Opcode::MemoryReadAll:
                         escapeOperands();
                         break;
                     case Opcode::SystemFunction:

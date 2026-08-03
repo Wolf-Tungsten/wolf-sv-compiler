@@ -17,8 +17,8 @@
 // Output modes (-output-mode, default wide):
 //   wide  - the shape described above (unchanged default).
 //   array - array-value shape: the merged storage is a kMemory (width = W,
-//           row = span) with one kArrayReadAllPort as the packed read; the
-//           write side is a single kArrayWritePort (laneMask = condVec &
+//           row = span) with one kMemoryReadAllPort as the packed read; the
+//           write side is a single kMemoryWriteLanesPort (laneMask = condVec &
 //           presentLanes, data = the merged data cone); cone positions
 //           materialize as kArrayBroadcast / kArrayLaneConst / kArrayOnehot /
 //           kArrayMux (lane-pointwise bitwise ops widen unchanged; lane
@@ -2863,10 +2863,10 @@ namespace wolvrix::lib::transform
                 index.writesByReg.at(group.members.at(group.bucket.front())).front();
             if (arrayMode)
             {
-                // One kArrayWritePort: laneMask is the per-lane enable, the
+                // One kMemoryWriteLanesPort: laneMask is the per-lane enable, the
                 // whole packed data cone is the write data.
                 const OperationId writeOp =
-                    graph.createOperation(OperationKind::kArrayWritePort, graph.makeInternalOpSym());
+                    graph.createOperation(OperationKind::kMemoryWriteLanesPort, graph.makeInternalOpSym());
                 graph.addOperand(writeOp, condMasked);
                 graph.addOperand(writeOp, dataVec);
                 for (const ValueId event : referenceWrite.events)
@@ -4049,7 +4049,7 @@ namespace wolvrix::lib::transform
             // Phase C1: create the merged storage + one whole-array read per
             // merged group (sibling references resolve against these). Wide
             // mode creates a wide kRegister + kRegisterReadPort; array mode
-            // creates a kMemory (width = W, row = span) + kArrayReadAllPort.
+            // creates a kMemory (width = W, row = span) + kMemoryReadAllPort.
             for (LaneGroupEval &group : groups)
             {
                 if (!group.merge)
@@ -4135,7 +4135,7 @@ namespace wolvrix::lib::transform
                                                             static_cast<int32_t>(wideWidth),
                                                             group.isSigned, ValueType::Logic);
                     group.wideReadOp =
-                        graph.createOperation(OperationKind::kArrayReadAllPort, graph.makeInternalOpSym());
+                        graph.createOperation(OperationKind::kMemoryReadAllPort, graph.makeInternalOpSym());
                     graph.addResult(group.wideReadOp, group.wideReadValue);
                     graph.setAttr(group.wideReadOp, "memSymbol", name);
                     const SrcLoc readLoc = makeTransformSrcLoc(std::string(kPassId), "array-read-all");

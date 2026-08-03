@@ -101,13 +101,13 @@ namespace wolvrix::lib::grhsim::am
         case Opcode::ActForward:
         case Opcode::ActBackward:
             return OpcodeTraits{.effect = OpcodeEffect::Activation};
-        case Opcode::ArrayReadAll:
+        case Opcode::MemoryReadAll:
             return OpcodeTraits{
                 .effect = OpcodeEffect::StateRead,
                 .stateTargetOperand = 0,
                 .memoryAccess = true,
             };
-        case Opcode::ArrayWrite:
+        case Opcode::MemoryWriteLanes:
             return OpcodeTraits{
                 .effect = OpcodeEffect::StateReadWrite,
                 .stateTargetOperand = 2,

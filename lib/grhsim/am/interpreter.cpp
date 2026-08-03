@@ -1294,7 +1294,7 @@ namespace wolvrix::lib::grhsim::am {
                 }
                 return {};
             }
-            if (opcode == Opcode::ArrayReadAll) {
+            if (opcode == Opcode::MemoryReadAll) {
                 const Type &memoryType = operands[0].type();
                 const Type &resultType = variableType(results[0]);
                 const std::size_t stride = wordCount(memoryType.bitWidth);
@@ -1312,7 +1312,7 @@ namespace wolvrix::lib::grhsim::am {
                     makeBitValue(resultType, std::move(resultWords));
                 return {};
             }
-            if (opcode == Opcode::ArrayWrite) {
+            if (opcode == Opcode::MemoryWriteLanes) {
                 const std::size_t targetIndex = 2;
                 const Type &memoryType = operands[targetIndex].type();
                 bool eventHit = false;

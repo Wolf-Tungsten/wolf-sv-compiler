@@ -390,9 +390,9 @@ namespace wolvrix::lib::grhsim::am
                     if (memoryGroup || memoryPriority)
                     {
                         if (op.kind() != OperationKind::kMemoryWritePort &&
-                            op.kind() != OperationKind::kArrayWritePort)
+                            op.kind() != OperationKind::kMemoryWriteLanesPort)
                         {
-                            error("memory write priority attributes are only valid on kMemoryWritePort/kArrayWritePort",
+                            error("memory write priority attributes are only valid on kMemoryWritePort/kMemoryWriteLanesPort",
                                   opContext(op));
                             continue;
                         }
@@ -417,7 +417,7 @@ namespace wolvrix::lib::grhsim::am
                         group.members.emplace_back(static_cast<uint32_t>(*memoryPriority), operation);
                         const auto operands = op.operands();
                         const std::size_t eventStart =
-                            op.kind() == OperationKind::kArrayWritePort ? 2 : 4;
+                            op.kind() == OperationKind::kMemoryWriteLanesPort ? 2 : 4;
                         if (operands.size() >= eventStart)
                         {
                             std::vector<ValueId> events(operands.begin() + eventStart,
@@ -2387,11 +2387,11 @@ namespace wolvrix::lib::grhsim::am
                 addOrderedEffect(op, instruction, *target);
             }
 
-            void lowerArrayReadAll(const Operation &op)
+            void lowerMemoryReadAll(const Operation &op)
             {
                 if (!op.operands().empty() || op.results().size() != 1)
                 {
-                    error("kArrayReadAllPort has invalid arity", opContext(op));
+                    error("kMemoryReadAllPort has invalid arity", opContext(op));
                     return;
                 }
                 const auto target = stateTarget(op, "memSymbol", OperationKind::kMemory);
@@ -2418,14 +2418,14 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return;
                 }
-                addInstruction(Opcode::ArrayReadAll, results, operands);
+                addInstruction(Opcode::MemoryReadAll, results, operands);
             }
 
-            void lowerArrayWrite(const Operation &op)
+            void lowerMemoryWriteLanes(const Operation &op)
             {
                 if (!op.results().empty() || op.operands().size() < 3)
                 {
-                    error("kArrayWritePort has invalid arity", opContext(op));
+                    error("kMemoryWriteLanesPort has invalid arity", opContext(op));
                     return;
                 }
                 const auto target = stateTarget(op, "memSymbol", OperationKind::kMemory);
@@ -2466,7 +2466,7 @@ namespace wolvrix::lib::grhsim::am
                     return;
                 }
                 const InstructionId instruction =
-                    addInstruction(Opcode::ArrayWrite, {}, operands);
+                    addInstruction(Opcode::MemoryWriteLanes, {}, operands);
                 addOrderedEffect(op, instruction, *target);
             }
 
@@ -2941,11 +2941,11 @@ namespace wolvrix::lib::grhsim::am
                     case OperationKind::kMemoryFillPort:
                         lowerMemoryFill(op);
                         break;
-                    case OperationKind::kArrayReadAllPort:
-                        lowerArrayReadAll(op);
+                    case OperationKind::kMemoryReadAllPort:
+                        lowerMemoryReadAll(op);
                         break;
-                    case OperationKind::kArrayWritePort:
-                        lowerArrayWrite(op);
+                    case OperationKind::kMemoryWriteLanesPort:
+                        lowerMemoryWriteLanes(op);
                         break;
                     case OperationKind::kSystemFunction:
                         lowerSystemFunction(op);

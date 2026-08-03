@@ -1,4 +1,4 @@
-// array-lower: expand the twelve array-value ops (grh-ir.md section 6.10) back
+// array-lower: expand the twelve array-value ops (grh-ir.md §2.4) back
 // into plain wide-scalar form. This is the semantic inverse of lane-aggregate's
 // array output mode, used (a) as a degradation step in front of consumers that
 // do not support the array ops (SystemVerilog emit, legacy toolchains) and
@@ -7,10 +7,10 @@
 // docs/transform/array-lower.md.
 //
 // Expansion rules (bit-exact, lane i occupies [i*W +: W], lane 0 in the LSBs):
-//   kArrayReadAllPort  -> one kMemoryReadPort per row (constant address) +
+//   kMemoryReadAllPort    -> one kMemoryReadPort per row (constant address) +
 //                         one kConcat (row R-1 in the MSBs, row 0 in the LSBs;
 //                         row == 1 uses the read port result directly).
-//   kArrayWritePort    -> one kMemoryWritePort per row: updateCond =
+//   kMemoryWriteLanesPort -> one kMemoryWritePort per row: updateCond =
 //                         kSliceStatic(laneMask, i, i), addr = kConstant(i),
 //                         data = kSliceStatic(data, i*W, i*W+W-1), mask =
 //                         all-ones constant (W bits); events and eventEdge are
@@ -85,8 +85,8 @@ namespace wolvrix::lib::transform
         {
             switch (kind)
             {
-            case OperationKind::kArrayReadAllPort:
-            case OperationKind::kArrayWritePort:
+            case OperationKind::kMemoryReadAllPort:
+            case OperationKind::kMemoryWriteLanesPort:
             case OperationKind::kArrayMux:
             case OperationKind::kArrayReduceOr:
             case OperationKind::kArrayReduceAnd:
@@ -379,12 +379,12 @@ namespace wolvrix::lib::transform
             const auto memSymbol = getStringAttr(op, "memSymbol");
             if (!memSymbol)
             {
-                errorOut = "kArrayReadAllPort missing memSymbol attr";
+                errorOut = "kMemoryReadAllPort missing memSymbol attr";
                 return false;
             }
             if (op.results().size() != 1)
             {
-                errorOut = "kArrayReadAllPort with unexpected results";
+                errorOut = "kMemoryReadAllPort with unexpected results";
                 return false;
             }
             MemoryShape shape;
@@ -396,7 +396,7 @@ namespace wolvrix::lib::transform
             const int64_t totalWidth = shape.width * shape.rows;
             if (graph.valueWidth(result) != totalWidth)
             {
-                errorOut = "kArrayReadAllPort result width != row * width of " + *memSymbol;
+                errorOut = "kMemoryReadAllPort result width != row * width of " + *memSymbol;
                 return false;
             }
             const int32_t addrWidth = addressWidthForRows(static_cast<uint64_t>(shape.rows));
@@ -429,12 +429,12 @@ namespace wolvrix::lib::transform
             const auto memSymbol = getStringAttr(op, "memSymbol");
             if (!memSymbol)
             {
-                errorOut = "kArrayWritePort missing memSymbol attr";
+                errorOut = "kMemoryWriteLanesPort missing memSymbol attr";
                 return false;
             }
             if (op.operands().size() < 2)
             {
-                errorOut = "kArrayWritePort with fewer than 2 operands";
+                errorOut = "kMemoryWriteLanesPort with fewer than 2 operands";
                 return false;
             }
             MemoryShape shape;
@@ -446,12 +446,12 @@ namespace wolvrix::lib::transform
             const ValueId data = op.operands()[1];
             if (graph.valueWidth(laneMask) != shape.rows)
             {
-                errorOut = "kArrayWritePort laneMask width != row of " + *memSymbol;
+                errorOut = "kMemoryWriteLanesPort laneMask width != row of " + *memSymbol;
                 return false;
             }
             if (graph.valueWidth(data) != shape.width * shape.rows)
             {
-                errorOut = "kArrayWritePort data width != row * width of " + *memSymbol;
+                errorOut = "kMemoryWriteLanesPort data width != row * width of " + *memSymbol;
                 return false;
             }
             droppedPriority = op.attr("memoryWrite.priorityGroup").has_value() ||
@@ -817,10 +817,10 @@ namespace wolvrix::lib::transform
                 bool ok = true;
                 switch (op.kind())
                 {
-                case OperationKind::kArrayReadAllPort:
+                case OperationKind::kMemoryReadAllPort:
                     ok = expandReadAll(graph, op, memo, replacement, errorOut);
                     break;
-                case OperationKind::kArrayWritePort:
+                case OperationKind::kMemoryWriteLanesPort:
                     ok = expandWrite(graph, op, memo, writeDroppedPriority, errorOut);
                     break;
                 case OperationKind::kArrayMux:
@@ -857,7 +857,7 @@ namespace wolvrix::lib::transform
                     ++skipped;
                     continue;
                 }
-                if (op.kind() == OperationKind::kArrayWritePort)
+                if (op.kind() == OperationKind::kMemoryWriteLanesPort)
                 {
                     if (writeDroppedPriority)
                     {

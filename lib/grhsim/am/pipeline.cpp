@@ -153,10 +153,10 @@ namespace wolvrix::lib::grhsim::am
             case Opcode::MemoryRead:
                 target = 0;
                 break;
-            case Opcode::ArrayReadAll:
+            case Opcode::MemoryReadAll:
                 target = 0;
                 break;
-            case Opcode::ArrayWrite:
+            case Opcode::MemoryWriteLanes:
                 target = 2;
                 break;
             case Opcode::MemoryWrite:
@@ -702,7 +702,7 @@ namespace wolvrix::lib::grhsim::am
             const auto isStateWrite = [](Opcode opcode) {
                 return opcode == Opcode::RegisterWrite || opcode == Opcode::LatchWrite ||
                        opcode == Opcode::MemoryWrite || opcode == Opcode::MemoryFill ||
-                       opcode == Opcode::ArrayWrite;
+                       opcode == Opcode::MemoryWriteLanes;
             };
             std::vector<uint32_t> changedBlocks(program.variableCount(), UINT32_MAX);
             for (uint32_t block = 0; block < blockCount; ++block)

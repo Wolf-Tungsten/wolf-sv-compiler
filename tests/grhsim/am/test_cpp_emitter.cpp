@@ -861,9 +861,9 @@ namespace
         VariableId bcast1;
     };
 
-    // 8-lane x 8-bit array loopback: a clocked array.write scatters packed
+    // 8-lane x 8-bit array loopback: a clocked mem.write_lanes scatters packed
     // lanes into the memory, the commit Block's tail changed.any reactivates
-    // the reader Block, which packs the array with array.read_all and applies
+    // the reader Block, which packs the array with mem.read_all and applies
     // the pure array ops.
     ArrayEmitterFixture makeArrayEmitterFixture()
     {
@@ -947,9 +947,9 @@ namespace
         const InstructionId detectClock = addInstruction(
             Opcode::ChangedPos, {clockPos}, {clock, clockOld});
         const InstructionId write = addInstruction(
-            Opcode::ArrayWrite, {}, {laneMask, data, memory, clockPos});
+            Opcode::MemoryWriteLanes, {}, {laneMask, data, memory, clockPos});
         const InstructionId readAll = addInstruction(
-            Opcode::ArrayReadAll, {all}, {memory});
+            Opcode::MemoryReadAll, {all}, {memory});
         const InstructionId bcast = addInstruction(
             Opcode::ArrayBroadcast, {broadcast}, {scalar});
         const InstructionId one = addInstruction(
@@ -1191,7 +1191,7 @@ namespace
         }
 
         // ST00011: the commit Block's tail changed.any on the memory is
-        // replaced by the array.write site's lane-granular change detection.
+        // replaced by the mem.write_lanes site's lane-granular change detection.
         const std::optional<std::string> arrayBlocksText =
             readTextFile(outputDirectory / "grhsim_ArrayTop_blocks_0.cpp");
         if (!arrayBlocksText ||

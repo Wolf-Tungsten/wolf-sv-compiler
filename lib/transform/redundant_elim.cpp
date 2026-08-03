@@ -188,8 +188,8 @@ namespace wolvrix::lib::transform
             case wolvrix::lib::grh::OperationKind::kLatch:
             case wolvrix::lib::grh::OperationKind::kLatchReadPort:
             case wolvrix::lib::grh::OperationKind::kLatchWritePort:
-            case wolvrix::lib::grh::OperationKind::kArrayReadAllPort:
-            case wolvrix::lib::grh::OperationKind::kArrayWritePort:
+            case wolvrix::lib::grh::OperationKind::kMemoryReadAllPort:
+            case wolvrix::lib::grh::OperationKind::kMemoryWriteLanesPort:
             case wolvrix::lib::grh::OperationKind::kInstance:
             case wolvrix::lib::grh::OperationKind::kBlackbox:
             case wolvrix::lib::grh::OperationKind::kSystemFunction:

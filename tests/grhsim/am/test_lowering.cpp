@@ -1060,7 +1060,7 @@ namespace
         graph.setAttr(memory, "initLen", std::vector<int64_t>{8});
 
         const auto all = logic(graph, "all", 64);
-        const auto readAll = graph.createOperation(grh::OperationKind::kArrayReadAllPort,
+        const auto readAll = graph.createOperation(grh::OperationKind::kMemoryReadAllPort,
                                                    graph.internSymbol("read_all"));
         graph.addResult(readAll, all);
         graph.setAttr(readAll, "memSymbol", std::string("arr"));
@@ -1152,7 +1152,7 @@ namespace
                       std::vector<int64_t>{0x11, 0x22, 0x33, 0x44,
                                            0x55, 0x66, 0x77, 0x88});
 
-        const auto write = graph.createOperation(grh::OperationKind::kArrayWritePort,
+        const auto write = graph.createOperation(grh::OperationKind::kMemoryWriteLanesPort,
                                                  graph.internSymbol("lane_write"));
         graph.addOperand(write, laneMask);
         graph.addOperand(write, muxed);
@@ -1194,8 +1194,8 @@ namespace
         }
 
         const ProgramView program = artifact->program.view();
-        if (countOpcode(program, Opcode::ArrayReadAll) != 1 ||
-            countOpcode(program, Opcode::ArrayWrite) != 1 ||
+        if (countOpcode(program, Opcode::MemoryReadAll) != 1 ||
+            countOpcode(program, Opcode::MemoryWriteLanes) != 1 ||
             countOpcode(program, Opcode::ArrayMux) != 2 ||
             countOpcode(program, Opcode::ArrayReduceOr) != 1 ||
             countOpcode(program, Opcode::ArrayReduceAnd) != 1 ||
@@ -1209,8 +1209,8 @@ namespace
             return fail("lowered array opcode inventory is incomplete");
         }
 
-        // array.write operands are [laneMask, data, target, events...] and
-        // array.read_all operands are [target]; both share the array state.
+        // mem.write_lanes operands are [laneMask, data, target, events...] and
+        // mem.read_all operands are [target]; both share the array state.
         VariableId arrayTarget;
         bool checkedWriteShape = false;
         bool checkedReadShape = false;
@@ -1225,7 +1225,7 @@ namespace
                 sharedPosedge = program.results(instruction).front();
                 continue;
             }
-            if (opcode == Opcode::ArrayWrite)
+            if (opcode == Opcode::MemoryWriteLanes)
             {
                 const auto operands = program.operands(instruction);
                 const Type targetType =
@@ -1239,20 +1239,20 @@ namespace
                     laneMaskType.bitWidth != 8 || dataType.bitWidth != 64 ||
                     operands[3] != sharedPosedge)
                 {
-                    return fail("array.write operand layout is not [laneMask, data, mem, events...]");
+                    return fail("mem.write_lanes operand layout is not [laneMask, data, mem, events...]");
                 }
                 arrayTarget = operands[2];
                 checkedWriteShape = true;
                 continue;
             }
-            if (opcode == Opcode::ArrayReadAll)
+            if (opcode == Opcode::MemoryReadAll)
             {
                 const auto operands = program.operands(instruction);
                 const Type resultType =
                     program.type(program.variable(program.results(instruction).front()).type);
                 if (operands.size() != 1 || resultType.bitWidth != 64)
                 {
-                    return fail("array.read_all operand layout is not [mem] -> packed");
+                    return fail("mem.read_all operand layout is not [mem] -> packed");
                 }
                 arrayTarget = operands[0];
                 checkedReadShape = true;
@@ -1315,19 +1315,19 @@ namespace
             return fail("kArrayLaneConst did not materialize as a packed constant");
         }
 
-        // The priority attribute is accepted on kArrayWritePort and recorded
+        // The priority attribute is accepted on kMemoryWriteLanesPort and recorded
         // as a state ordered effect.
         bool checkedOrderedEffect = false;
         for (const OrderedEffect &effect : artifact->schedulingFacts.orderedEffects)
         {
-            if (program.opcode(effect.instruction) == Opcode::ArrayWrite)
+            if (program.opcode(effect.instruction) == Opcode::MemoryWriteLanes)
             {
                 checkedOrderedEffect = true;
             }
         }
         if (!checkedOrderedEffect)
         {
-            return fail("array.write priority was not recorded as an ordered effect");
+            return fail("mem.write_lanes priority was not recorded as an ordered effect");
         }
         return 0;
     }

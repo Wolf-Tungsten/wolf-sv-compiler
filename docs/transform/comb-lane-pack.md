@@ -41,7 +41,7 @@ The historical shape, unchanged by the array-mode addition:
 ## Array Output Mode (`-output-mode=array`)
 
 Off by default; `wide` output is bit-identical to previous behavior. Array
-mode emits the array-value ops of [grh-ir.md §6.10](../grh/grh-ir.md) for the
+mode emits the array-value ops of [grh-ir.md §2.4](../grh/grh-ir.md) for the
 packed products, moving them out of the plain compute shape (the
 `pack-mux-mask` tree in particular). Differences from wide mode:
 

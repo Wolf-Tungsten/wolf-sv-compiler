@@ -79,7 +79,7 @@ namespace
 
         const grh::ValueId all = addLogicValue(graph, "all", 64);
         const grh::OperationId readAll = graph.createOperation(
-            grh::OperationKind::kArrayReadAllPort, graph.internSymbol("read_all"));
+            grh::OperationKind::kMemoryReadAllPort, graph.internSymbol("read_all"));
         graph.addResult(readAll, all);
         graph.setAttr(readAll, "memSymbol", std::string("arr"));
 
@@ -144,7 +144,7 @@ namespace
         graph.setAttr(lanesXorOp, "elemWidth", int64_t{8});
 
         const grh::OperationId write = graph.createOperation(
-            grh::OperationKind::kArrayWritePort, graph.internSymbol("lane_write"));
+            grh::OperationKind::kMemoryWriteLanesPort, graph.internSymbol("lane_write"));
         graph.addOperand(write, laneMask);
         graph.addOperand(write, data);
         graph.addOperand(write, clock);

@@ -341,13 +341,13 @@ wolvrix --pass=hier-flatten --pass=lane-aggregate:-min-lanes=8:-output-key=lanea
 
 The default `wide` mode is unchanged. With `-output-mode=array` the same
 analysis (grouping, bucketing, cone check) emits the array-value shape of
-`docs/grh/grh-ir.md` §6.10 instead of the wide-register shape:
+`docs/grh/grh-ir.md` §2.4 instead of the wide-register shape:
 
 | wide-mode artifact | array-mode artifact |
 | --- | --- |
 | wide `kRegister` (`width = span*W`) | `kMemory` (`width = W`, `row = span`); per-lane constant inits map to one `literal` init entry per row (holes zeroed) |
-| wide `kRegisterReadPort` | `kArrayReadAllPort` (`memSymbol`), result width `span*W` |
-| `updateCond` / lane-mask broadcast / `(data & m) \| (hold & ~m)` / all-ones mask + `kRegisterWritePort` | one `kArrayWritePort`: `oper[0]` = laneMask = `kAnd(condVec, presentLanes)` (the `span`-wide guard vector, hole lanes cleared), `oper[1]` = merged data cone, events unchanged; attrs `memSymbol` + `eventEdge` |
+| wide `kRegisterReadPort` | `kMemoryReadAllPort` (`memSymbol`), result width `span*W` |
+| `updateCond` / lane-mask broadcast / `(data & m) \| (hold & ~m)` / all-ones mask + `kRegisterWritePort` | one `kMemoryWriteLanesPort`: `oper[0]` = laneMask = `kAnd(condVec, presentLanes)` (the `span`-wide guard vector, hole lanes cleared), `oper[1]` = merged data cone, events unchanged; attrs `memSymbol` + `eventEdge` |
 | shared-leaf `kReplicate` | `kArrayBroadcast` |
 | constant-leaf packed `kConstant` | `kArrayLaneConst` (`values` per lane, holes zeroed) |
 | lane-parameter per-lane `kConcat` | unchanged `kConcat` (per-lane distinct *values* have no constant-table form; `kArrayLaneConst` only covers constant leaves) |

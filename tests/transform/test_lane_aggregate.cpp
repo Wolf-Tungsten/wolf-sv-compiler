@@ -3821,7 +3821,7 @@ namespace
         return grh::OperationId::invalid();
     }
 
-    // Array-mode basic group: kMemory + kArrayReadAllPort + kArrayWritePort,
+    // Array-mode basic group: kMemory + kMemoryReadAllPort + kMemoryWriteLanesPort,
     // kArrayBroadcast shared leaves, kArrayLaneConst tables, kArrayMux, and
     // kMemoryReadPort(constant address) lane reads.
     int testArrayBasicGroup()
@@ -3881,8 +3881,8 @@ namespace
         {
             return fail("array basic: wide-mode artifacts must not appear");
         }
-        if (countOpsOfKind(graph, grh::OperationKind::kArrayReadAllPort) != 1 ||
-            countOpsOfKind(graph, grh::OperationKind::kArrayWritePort) != 1 ||
+        if (countOpsOfKind(graph, grh::OperationKind::kMemoryReadAllPort) != 1 ||
+            countOpsOfKind(graph, grh::OperationKind::kMemoryWriteLanesPort) != 1 ||
             countOpsOfKind(graph, grh::OperationKind::kArrayMux) != 1 ||
             countOpsOfKind(graph, grh::OperationKind::kArrayLaneConst) != 2 ||
             countOpsOfKind(graph, grh::OperationKind::kArrayBroadcast) != 2 ||
@@ -3893,36 +3893,36 @@ namespace
 
         // Whole-array read port.
         const grh::OperationId readAllId =
-            findPortOp(graph, grh::OperationKind::kArrayReadAllPort, "memSymbol", memName);
+            findPortOp(graph, grh::OperationKind::kMemoryReadAllPort, "memSymbol", memName);
         if (!readAllId.valid())
         {
-            return fail("array basic: kArrayReadAllPort missing");
+            return fail("array basic: kMemoryReadAllPort missing");
         }
         const grh::Operation readAllOp = graph.getOperation(readAllId);
         if (readAllOp.results().size() != 1 || graph.getValue(readAllOp.results().front()).width() != 32)
         {
-            return fail("array basic: kArrayReadAllPort result must be 32 bits");
+            return fail("array basic: kMemoryReadAllPort result must be 32 bits");
         }
         const grh::ValueId readAllValue = readAllOp.results().front();
 
         // Write port: [laneMask, data, clk], eventEdge=[posedge].
         const grh::OperationId writeId =
-            findPortOp(graph, grh::OperationKind::kArrayWritePort, "memSymbol", memName);
+            findPortOp(graph, grh::OperationKind::kMemoryWriteLanesPort, "memSymbol", memName);
         if (!writeId.valid())
         {
-            return fail("array basic: kArrayWritePort missing");
+            return fail("array basic: kMemoryWriteLanesPort missing");
         }
         const grh::Operation writeOp = graph.getOperation(writeId);
         const auto writeOperands = writeOp.operands();
         if (writeOperands.size() != 3 || writeOperands[2] != clk)
         {
-            return fail("array basic: kArrayWritePort must be [laneMask, data, clk]");
+            return fail("array basic: kMemoryWriteLanesPort must be [laneMask, data, clk]");
         }
         const auto edges = writeOp.attr("eventEdge");
         const auto *edgeList = edges ? std::get_if<std::vector<std::string>>(&*edges) : nullptr;
         if (!edgeList || edgeList->size() != 1 || edgeList->front() != "posedge")
         {
-            return fail("array basic: kArrayWritePort must keep eventEdge=[posedge]");
+            return fail("array basic: kMemoryWriteLanesPort must keep eventEdge=[posedge]");
         }
         // laneMask = kAnd(condVec, present): condVec = kArrayBroadcast(en1),
         // present = kArrayLaneConst(elemWidth=1, rows=8, values all 1).
@@ -4248,10 +4248,10 @@ namespace
         }
         // The write data must be the onehot vector directly.
         const grh::OperationId writeId =
-            findPortOp(graph, grh::OperationKind::kArrayWritePort, "memSymbol", "lane_q__laneagg");
+            findPortOp(graph, grh::OperationKind::kMemoryWriteLanesPort, "memSymbol", "lane_q__laneagg");
         if (!writeId.valid())
         {
-            return fail("array eq-onehot: kArrayWritePort missing");
+            return fail("array eq-onehot: kMemoryWriteLanesPort missing");
         }
         const grh::OperationId dataDef =
             graph.getValue(graph.getOperation(writeId).operands()[1]).definingOp();
@@ -4640,7 +4640,7 @@ namespace
                     return fail("array per-lane reduce: kArrayReduceLanesOr operand must be the packed 24-bit rows");
                 }
             }
-            if (op.kind() == grh::OperationKind::kArrayWritePort &&
+            if (op.kind() == grh::OperationKind::kMemoryWriteLanesPort &&
                 getStringAttr(op, "memSymbol") == "lane_q__laneagg")
             {
                 writeChecked = true;
@@ -4659,7 +4659,7 @@ namespace
         }
         if (!writeChecked)
         {
-            return fail("array per-lane reduce: merged kArrayWritePort missing");
+            return fail("array per-lane reduce: merged kMemoryWriteLanesPort missing");
         }
         if (!roundTripJson(design))
         {
@@ -4818,17 +4818,17 @@ namespace
             return fail("array simplify: pass run failed");
         }
         if (countOpsOfKind(graph, grh::OperationKind::kMemory) != 1 ||
-            countOpsOfKind(graph, grh::OperationKind::kArrayWritePort) != 1 ||
-            countOpsOfKind(graph, grh::OperationKind::kArrayReadAllPort) != 1 ||
+            countOpsOfKind(graph, grh::OperationKind::kMemoryWriteLanesPort) != 1 ||
+            countOpsOfKind(graph, grh::OperationKind::kMemoryReadAllPort) != 1 ||
             countOpsOfKind(graph, grh::OperationKind::kArrayMux) != 1)
         {
             return fail("array simplify: array shapes must survive simplify");
         }
         const grh::OperationId writeId =
-            findPortOp(graph, grh::OperationKind::kArrayWritePort, "memSymbol", "lane_q__laneagg");
+            findPortOp(graph, grh::OperationKind::kMemoryWriteLanesPort, "memSymbol", "lane_q__laneagg");
         if (!writeId.valid())
         {
-            return fail("array simplify: kArrayWritePort missing");
+            return fail("array simplify: kMemoryWriteLanesPort missing");
         }
         const grh::Operation writeOp = graph.getOperation(writeId);
         const grh::OperationId laneMaskDef = graph.getValue(writeOp.operands()[0]).definingOp();
@@ -4890,9 +4890,9 @@ namespace
         {
             return fail("array exact-fallback shared-leaf: solo_0_q must stay scalar");
         }
-        if (countOpsOfKind(graph, grh::OperationKind::kArrayWritePort) != 1)
+        if (countOpsOfKind(graph, grh::OperationKind::kMemoryWriteLanesPort) != 1)
         {
-            return fail("array exact-fallback shared-leaf: expected one kArrayWritePort");
+            return fail("array exact-fallback shared-leaf: expected one kMemoryWriteLanesPort");
         }
         if (report.find("\"reject_reason\":\"no_majority_exact\"") == std::string::npos)
         {
@@ -4950,7 +4950,7 @@ namespace
     }
 
     // Array-mode C-level lane-parameter leaf: the per-lane wide kEq cond
-    // packs into one per-lane kConcat feeding the kArrayWritePort laneMask.
+    // packs into one per-lane kConcat feeding the kMemoryWriteLanesPort laneMask.
     int testArrayLaneParamLeafNonPointwise()
     {
         grh::Design design;
@@ -4970,9 +4970,9 @@ namespace
         {
             return fail("array lane-param leaf: expected per-lane kConcat of the kEq leaves");
         }
-        if (countOpsOfKind(graph, grh::OperationKind::kArrayWritePort) != 1)
+        if (countOpsOfKind(graph, grh::OperationKind::kMemoryWriteLanesPort) != 1)
         {
-            return fail("array lane-param leaf: expected one kArrayWritePort");
+            return fail("array lane-param leaf: expected one kMemoryWriteLanesPort");
         }
         // The frozen per-lane kEq ops survive and read kMemoryReadPort rows.
         for (const grh::ValueId eq : eqs)
@@ -5031,7 +5031,7 @@ namespace
         return 0;
     }
 
-    // Array-mode R-level affine gather: the kArrayWritePort's data is the
+    // Array-mode R-level affine gather: the kMemoryWriteLanesPort's data is the
     // shared base vector X itself (zero-cost, no per-lane kConcat).
     int testArrayAffineGatherLeaf()
     {
@@ -5062,10 +5062,10 @@ namespace
             return fail("array affine-gather: kMemory missing");
         }
         const grh::OperationId writeId =
-            findPortOp(graph, grh::OperationKind::kArrayWritePort, "memSymbol", "lane_q__laneagg");
+            findPortOp(graph, grh::OperationKind::kMemoryWriteLanesPort, "memSymbol", "lane_q__laneagg");
         if (!writeId.valid())
         {
-            return fail("array affine-gather: kArrayWritePort missing");
+            return fail("array affine-gather: kMemoryWriteLanesPort missing");
         }
         const grh::Operation writeOp = graph.getOperation(writeId);
         if (writeOp.operands().size() < 2 || writeOp.operands()[1] != xvec)

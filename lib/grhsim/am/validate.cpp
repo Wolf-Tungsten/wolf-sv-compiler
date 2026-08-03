@@ -495,10 +495,10 @@ namespace wolvrix::lib::grhsim::am
                 case Opcode::ArrayReduceLanesXor:
                     shapeValid = resultCount == 1 && operandCount == 1;
                     break;
-                case Opcode::ArrayReadAll:
+                case Opcode::MemoryReadAll:
                     shapeValid = resultCount == 1 && operandCount == 1;
                     break;
-                case Opcode::ArrayWrite:
+                case Opcode::MemoryWriteLanes:
                     shapeValid = resultCount == 0 && operandCount >= 4;
                     break;
                 case Opcode::Concat:
@@ -1044,7 +1044,7 @@ namespace wolvrix::lib::grhsim::am
                             isMutable(view, target);
                 }
                 break;
-            case Opcode::ArrayReadAll:
+            case Opcode::MemoryReadAll:
                 if (results.size() != 1 || operands.size() != 1)
                 {
                     return;
@@ -1058,7 +1058,7 @@ namespace wolvrix::lib::grhsim::am
                                                         targetType->bitWidth;
                 }
                 break;
-            case Opcode::ArrayWrite:
+            case Opcode::MemoryWriteLanes:
                 if (!results.empty() || operands.size() < 4)
                 {
                     return;
@@ -1286,7 +1286,7 @@ namespace wolvrix::lib::grhsim::am
             {
                 validateStateSemantics(view, instruction, validator);
             }
-            else if (opcode == Opcode::ArrayReadAll || opcode == Opcode::ArrayWrite)
+            else if (opcode == Opcode::MemoryReadAll || opcode == Opcode::MemoryWriteLanes)
             {
                 validateStateSemantics(view, instruction, validator);
             }

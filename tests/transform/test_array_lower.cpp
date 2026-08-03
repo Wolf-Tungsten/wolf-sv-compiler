@@ -50,11 +50,11 @@ namespace
         return graph.createValue(graph.internSymbol(name), width, false);
     }
 
-    grh::ValueId makeArrayReadAll(grh::Graph &graph, const std::string &name,
+    grh::ValueId makeMemoryReadAll(grh::Graph &graph, const std::string &name,
                                   const std::string &memSymbol, int32_t width)
     {
         const grh::ValueId out = makeNamedValue(graph, name, width);
-        const grh::OperationId op = graph.createOperation(grh::OperationKind::kArrayReadAllPort);
+        const grh::OperationId op = graph.createOperation(grh::OperationKind::kMemoryReadAllPort);
         graph.addResult(op, out);
         graph.setAttr(op, "memSymbol", memSymbol);
         return out;
@@ -129,11 +129,11 @@ namespace
         return out;
     }
 
-    grh::OperationId makeArrayWrite(grh::Graph &graph, const std::string &memSymbol,
+    grh::OperationId makeMemoryWriteLanes(grh::Graph &graph, const std::string &memSymbol,
                                     grh::ValueId laneMask, grh::ValueId data,
                                     std::vector<grh::ValueId> events, bool withPriority)
     {
-        const grh::OperationId op = graph.createOperation(grh::OperationKind::kArrayWritePort);
+        const grh::OperationId op = graph.createOperation(grh::OperationKind::kMemoryWriteLanesPort);
         graph.addOperand(op, laneMask);
         graph.addOperand(op, data);
         for (const grh::ValueId event : events)
@@ -323,7 +323,7 @@ namespace
     bool noArrayOpsRemain(const grh::Graph &graph)
     {
         static constexpr grh::OperationKind kKinds[] = {
-            grh::OperationKind::kArrayReadAllPort, grh::OperationKind::kArrayWritePort,
+            grh::OperationKind::kMemoryReadAllPort, grh::OperationKind::kMemoryWriteLanesPort,
             grh::OperationKind::kArrayMux,         grh::OperationKind::kArrayReduceOr,
             grh::OperationKind::kArrayReduceAnd,   grh::OperationKind::kArrayReduceXor,
             grh::OperationKind::kArrayBroadcast,   grh::OperationKind::kArrayLaneConst,
@@ -360,7 +360,7 @@ namespace
         makeMemory(graph, "mem", kLaneWidth, kRows);
         makeMemory(graph, "mem1", kLaneWidth, 1);
 
-        const grh::ValueId readAll = makeArrayReadAll(graph, "read_all", "mem", kPacked);
+        const grh::ValueId readAll = makeMemoryReadAll(graph, "read_all", "mem", kPacked);
         const grh::ValueId bcast =
             makeArrayBroadcast(graph, "bcast_out", scalar, kRows, kPacked);
         const grh::ValueId laneConst =
@@ -374,8 +374,8 @@ namespace
             makeArrayReduce(graph, "red_and", grh::OperationKind::kArrayReduceAnd, mux);
         const grh::ValueId redXor =
             makeArrayReduce(graph, "red_xor", grh::OperationKind::kArrayReduceXor, laneConst);
-        makeArrayWrite(graph, "mem", onehot, mux, {clk}, /*withPriority=*/true);
-        const grh::ValueId readAll1 = makeArrayReadAll(graph, "read_all_1", "mem1", kLaneWidth);
+        makeMemoryWriteLanes(graph, "mem", onehot, mux, {clk}, /*withPriority=*/true);
+        const grh::ValueId readAll1 = makeMemoryReadAll(graph, "read_all_1", "mem1", kLaneWidth);
 
         graph.bindOutputPort("out_m", mux);
         graph.bindOutputPort("out_ro", redOr);
@@ -442,7 +442,7 @@ namespace
             }
         }
 
-        // kArrayReadAllPort -> 8 kMemoryReadPort + kConcat (row 7 in MSBs).
+        // kMemoryReadAllPort -> 8 kMemoryReadPort + kConcat (row 7 in MSBs).
         if (!isDefinedBy(graph, concatResult, grh::OperationKind::kConcat))
         {
             return fail("readall must expand to a kConcat of row reads");
@@ -584,7 +584,7 @@ namespace
             }
         }
 
-        // kArrayWritePort -> 8 kMemoryWritePort, priority attrs dropped.
+        // kMemoryWriteLanesPort -> 8 kMemoryWritePort, priority attrs dropped.
         {
             std::vector<grh::OperationId> writePorts;
             for (const auto opId : graph.operations())
