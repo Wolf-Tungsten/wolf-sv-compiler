@@ -454,14 +454,12 @@ namespace
             LinearProgramBuilder builder;
             const TypeId eventType = builder.addType(Type::bitVector(1));
             const TypeId valueType = builder.addType(Type::bitVector(8));
-            const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
-            const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
             const VariableId nextValue = builder.addVariable(valueType, builder.zeroInit());
             const VariableId target = builder.addVariable(valueType, builder.zeroInit());
             const VariableId event = builder.addVariable(eventType, builder.zeroInit());
-            const std::array<VariableId, 5> operands = {
-                condition,
-                mask,
+            // reg.write [nextValue, target, events...]: the write reaches
+            // `target`, which lacks the State scheduling role.
+            const std::array<VariableId, 3> operands = {
                 nextValue,
                 target,
                 event,
@@ -469,7 +467,7 @@ namespace
             const InstructionId write =
                 builder.addInstruction(Opcode::RegisterWrite, {}, operands);
             SchedulingFacts facts;
-            facts.variableRoles.assign(5, VariableRole::None);
+            facts.variableRoles.assign(3, VariableRole::None);
             facts.instructionEffects = {InstructionEffect::StateReadWrite};
             facts.orderedEffects = {
                 OrderedEffect{.instruction = write, .group = 0, .ordinal = 0},
@@ -478,7 +476,11 @@ namespace
                 .program = builder.finish(),
                 .schedulingFacts = std::move(facts),
             };
-            if (validate(artifact, ValidationOptions{.level = ValidationLevel::Semantic}).success())
+            const ValidationResult validation = validate(
+                artifact,
+                ValidationOptions{.level = ValidationLevel::Semantic});
+            if (validation.success() ||
+                !containsError(validation, "missing the State variable role"))
             {
                 return fail("state instruction targets must carry the State scheduling role");
             }
@@ -1095,10 +1097,18 @@ namespace
     {
         const OpcodeTraits readTraits = opcodeTraits(Opcode::MemoryRead);
         const OpcodeTraits writeTraits = opcodeTraits(Opcode::MemoryWrite);
+        const OpcodeTraits registerTraits = opcodeTraits(Opcode::RegisterWrite);
+        const OpcodeTraits fillTraits = opcodeTraits(Opcode::MemoryFill);
+        const OpcodeTraits lanesTraits = opcodeTraits(Opcode::MemoryWriteLanes);
+        // Write operand layout is [addr?, nextValue, target, events...]: the
+        // state target sits at 1 for reg/fill, at 2 for mem.writeLanes, and
+        // at 4 for mem.write ([cond, addr, mask, data, target, events...]).
         if (!readTraits.memoryAccess || readTraits.effect != OpcodeEffect::StateRead ||
             readTraits.stateTargetOperand != 0 || !writeTraits.memoryAccess ||
             writeTraits.effect != OpcodeEffect::StateReadWrite ||
-            writeTraits.stateTargetOperand != 4 || !writeTraits.hasOrderedEffect)
+            writeTraits.stateTargetOperand != 4 || !writeTraits.hasOrderedEffect ||
+            registerTraits.stateTargetOperand != 1 ||
+            fillTraits.stateTargetOperand != 1 || lanesTraits.stateTargetOperand != 2)
         {
             return fail("opcode traits must expose memory access and ordering semantics");
         }
@@ -1110,16 +1120,19 @@ namespace
         None,
         NonContiguousCommitRange,
         StateWriteOutsideCommit,
-        ActForwardInsideCommit,
-        ActForwardTargetsCommit,
-        ActBackwardOutsideCommit,
-        ActBackwardTargetsCommit,
+        MissingGateDetector,
+        ActForwardTargetsEarlierBlock,
+        ActBackwardTargetsEntry,
         ChangedResultFlowsBackward,
     };
 
     // B0 watches a source event, B1 reads the state, B2 commits the state
-    // write and reactivates the reader: the one commit/act layout the round
-    // model allows. Each violation breaks exactly one structural rule.
+    // write. A commit Block is [head gate detector] + [state writes] +
+    // [tail watch + act]: the head changed.* clone gates the whole Block and
+    // the write's event operand points at the clone's result. act.f/act.b
+    // may live inside commit Blocks and may target other commit Blocks; only
+    // the forward/entry target rules remain. Each violation breaks exactly
+    // one structural rule.
     ExecutableModel makeCommitStructureModel(CommitStructureViolation violation)
     {
         LinearProgramBuilder linear;
@@ -1130,20 +1143,38 @@ namespace
         const VariableId state = linear.addVariable(type, linear.zeroInit());
         const VariableId stateOld = linear.addVariable(type, linear.undefInit());
         const VariableId stateEvent = linear.addVariable(type, linear.zeroInit());
+        const VariableId gateOld = linear.addVariable(type, linear.undefInit());
+        const VariableId gateEvent = linear.addVariable(type, linear.zeroInit());
         const VariableId reader = linear.addVariable(type, linear.zeroInit());
         const std::array<VariableId, 1> changedResults = {event};
         const std::array<VariableId, 2> changedOperands = {source, oldValue};
         const InstructionId inputChanged =
             linear.addInstruction(Opcode::ChangedAny, changedResults, changedOperands);
-        const std::array<VariableId, 5> writeOperands = {
-            source,
-            source,
-            source,
-            state,
-            event,
-        };
-        const InstructionId write =
-            linear.addInstruction(Opcode::RegisterWrite, {}, writeOperands);
+        const bool missingGate =
+            violation == CommitStructureViolation::MissingGateDetector;
+        const bool writeOutside =
+            violation == CommitStructureViolation::StateWriteOutsideCommit;
+        InstructionId gateChanged = InstructionId::invalid();
+        if (!missingGate)
+        {
+            const std::array<VariableId, 1> gateResults = {gateEvent};
+            const std::array<VariableId, 2> gateOperands = {source, gateOld};
+            gateChanged =
+                linear.addInstruction(Opcode::ChangedAny, gateResults, gateOperands);
+        }
+        // reg.write [nextValue, target, events...]: the event operand is
+        // re-pointed at the Block-local gate detector result.
+        InstructionId write = InstructionId::invalid();
+        if (!missingGate && !writeOutside)
+        {
+            const std::array<VariableId, 3> writeOperands = {source, state, gateEvent};
+            write = linear.addInstruction(Opcode::RegisterWrite, {}, writeOperands);
+        }
+        else
+        {
+            const std::array<VariableId, 2> writeOperands = {source, state};
+            write = linear.addInstruction(Opcode::RegisterWrite, {}, writeOperands);
+        }
         const std::array<VariableId, 1> stateChangedResults = {stateEvent};
         const std::array<VariableId, 2> stateChangedOperands = {state, stateOld};
         const InstructionId stateChanged = linear.addInstruction(
@@ -1156,55 +1187,32 @@ namespace
             linear.addInstruction(Opcode::Assign, readerResults, readerOperands);
 
         ScheduledProgramBuilder scheduled(linear.finish());
-        const std::array<VariableId, 1> stateEventOperands = {stateEvent};
-        const InstructionId reactivate =
-            scheduled.addInstruction(Opcode::ActBackward, {}, stateEventOperands);
-        const std::array<BlockId, 1> reactivateTargets = {
-            violation == CommitStructureViolation::ActBackwardTargetsCommit ? BlockId{2}
-                                                                          : BlockId{1},
-        };
-        scheduled.setActivationTargets(reactivate, reactivateTargets);
-
-        InstructionId forward = InstructionId::invalid();
-        if (violation == CommitStructureViolation::ActForwardInsideCommit ||
-            violation == CommitStructureViolation::ActForwardTargetsCommit)
+        InstructionId reactivate = InstructionId::invalid();
+        if (violation != CommitStructureViolation::ActForwardTargetsEarlierBlock)
         {
-            const bool insideCommit =
-                violation == CommitStructureViolation::ActForwardInsideCommit;
-            const std::array<VariableId, 1> forwardOperands = {
-                insideCommit ? stateEvent : reader,
+            const std::array<VariableId, 1> stateEventOperands = {stateEvent};
+            reactivate =
+                scheduled.addInstruction(Opcode::ActBackward, {}, stateEventOperands);
+            const std::array<BlockId, 1> reactivateTargets = {
+                violation == CommitStructureViolation::ActBackwardTargetsEntry ? BlockId{0}
+                                                                             : BlockId{1},
             };
-            forward = scheduled.addInstruction(Opcode::ActForward, {}, forwardOperands);
-            const std::array<BlockId, 1> forwardTargets = {
-                insideCommit ? BlockId{1} : BlockId{2},
-            };
-            scheduled.setActivationTargets(forward, forwardTargets);
+            scheduled.setActivationTargets(reactivate, reactivateTargets);
         }
-        InstructionId backward = InstructionId::invalid();
-        if (violation == CommitStructureViolation::ActBackwardOutsideCommit)
+        InstructionId forward = InstructionId::invalid();
+        if (violation == CommitStructureViolation::ActForwardTargetsEarlierBlock)
         {
-            const std::array<VariableId, 1> readerEventOperands = {reader};
-            backward =
-                scheduled.addInstruction(Opcode::ActBackward, {}, readerEventOperands);
-            const std::array<BlockId, 1> backwardTargets = {BlockId{1}};
-            scheduled.setActivationTargets(backward, backwardTargets);
+            const std::array<VariableId, 1> forwardOperands = {stateEvent};
+            forward = scheduled.addInstruction(Opcode::ActForward, {}, forwardOperands);
+            const std::array<BlockId, 1> forwardTargets = {BlockId{1}};
+            scheduled.setActivationTargets(forward, forwardTargets);
         }
 
         const std::array<InstructionId, 1> entry = {inputChanged};
         scheduled.addBlock(entry);
-        if (violation == CommitStructureViolation::StateWriteOutsideCommit)
+        if (writeOutside)
         {
             const std::array<InstructionId, 2> compute = {write, read};
-            scheduled.addBlock(compute);
-        }
-        else if (violation == CommitStructureViolation::ActForwardTargetsCommit)
-        {
-            const std::array<InstructionId, 2> compute = {read, forward};
-            scheduled.addBlock(compute);
-        }
-        else if (violation == CommitStructureViolation::ActBackwardOutsideCommit)
-        {
-            const std::array<InstructionId, 2> compute = {read, backward};
             scheduled.addBlock(compute);
         }
         else
@@ -1212,24 +1220,38 @@ namespace
             const std::array<InstructionId, 1> compute = {read};
             scheduled.addBlock(compute);
         }
-        if (violation == CommitStructureViolation::StateWriteOutsideCommit)
+        if (writeOutside)
         {
-            const std::array<InstructionId, 2> commit = {stateChanged, reactivate};
-            scheduled.addBlock(commit);
-        }
-        else if (violation == CommitStructureViolation::ActForwardInsideCommit)
-        {
-            const std::array<InstructionId, 4> commit = {
-                write,
+            const std::array<InstructionId, 3> commit = {
+                gateChanged,
                 stateChanged,
                 reactivate,
+            };
+            scheduled.addBlock(commit);
+        }
+        else if (missingGate)
+        {
+            const std::array<InstructionId, 3> commit = {write, stateChanged, reactivate};
+            scheduled.addBlock(commit);
+        }
+        else if (violation == CommitStructureViolation::ActForwardTargetsEarlierBlock)
+        {
+            const std::array<InstructionId, 4> commit = {
+                gateChanged,
+                write,
+                stateChanged,
                 forward,
             };
             scheduled.addBlock(commit);
         }
         else
         {
-            const std::array<InstructionId, 3> commit = {write, stateChanged, reactivate};
+            const std::array<InstructionId, 4> commit = {
+                gateChanged,
+                write,
+                stateChanged,
+                reactivate,
+            };
             scheduled.addBlock(commit);
         }
 
@@ -1243,6 +1265,86 @@ namespace
         };
     }
 
+    // Two commit Blocks chained through their tail watches: B2 ends with an
+    // act.f into the later commit Block B3 (same round), B3 ends with an
+    // act.b back into B2 (next round). Both directions are legal now.
+    ExecutableModel makeCommitChainModel()
+    {
+        LinearProgramBuilder linear;
+        const TypeId type = linear.addType(Type::bitVector(1));
+        const VariableId source = linear.addVariable(type, linear.zeroInit());
+        const VariableId sourceOld = linear.addVariable(type, linear.undefInit());
+        const VariableId sourceEvent = linear.addVariable(type, linear.zeroInit());
+        const VariableId stateA = linear.addVariable(type, linear.zeroInit());
+        const VariableId gateOldA = linear.addVariable(type, linear.undefInit());
+        const VariableId gateEventA = linear.addVariable(type, linear.zeroInit());
+        const VariableId stateOldA = linear.addVariable(type, linear.undefInit());
+        const VariableId stateEventA = linear.addVariable(type, linear.zeroInit());
+        const VariableId stateB = linear.addVariable(type, linear.zeroInit());
+        const VariableId gateOldB = linear.addVariable(type, linear.undefInit());
+        const VariableId gateEventB = linear.addVariable(type, linear.zeroInit());
+        const VariableId stateOldB = linear.addVariable(type, linear.undefInit());
+        const VariableId stateEventB = linear.addVariable(type, linear.zeroInit());
+        const VariableId reader = linear.addVariable(type, linear.zeroInit());
+        const std::array<VariableId, 1> inputResults = {sourceEvent};
+        const std::array<VariableId, 2> inputOperands = {source, sourceOld};
+        const InstructionId inputChanged =
+            linear.addInstruction(Opcode::ChangedAny, inputResults, inputOperands);
+        const std::array<VariableId, 1> gateResultsA = {gateEventA};
+        const std::array<VariableId, 2> gateOperandsA = {source, gateOldA};
+        const InstructionId gateA =
+            linear.addInstruction(Opcode::ChangedAny, gateResultsA, gateOperandsA);
+        const std::array<VariableId, 3> writeOperandsA = {source, stateA, gateEventA};
+        const InstructionId writeA =
+            linear.addInstruction(Opcode::RegisterWrite, {}, writeOperandsA);
+        const std::array<VariableId, 1> tailResultsA = {stateEventA};
+        const std::array<VariableId, 2> tailOperandsA = {stateA, stateOldA};
+        const InstructionId tailA =
+            linear.addInstruction(Opcode::ChangedAny, tailResultsA, tailOperandsA);
+        const std::array<VariableId, 1> gateResultsB = {gateEventB};
+        const std::array<VariableId, 2> gateOperandsB = {source, gateOldB};
+        const InstructionId gateB =
+            linear.addInstruction(Opcode::ChangedAny, gateResultsB, gateOperandsB);
+        const std::array<VariableId, 3> writeOperandsB = {source, stateB, gateEventB};
+        const InstructionId writeB =
+            linear.addInstruction(Opcode::RegisterWrite, {}, writeOperandsB);
+        const std::array<VariableId, 1> tailResultsB = {stateEventB};
+        const std::array<VariableId, 2> tailOperandsB = {stateB, stateOldB};
+        const InstructionId tailB =
+            linear.addInstruction(Opcode::ChangedAny, tailResultsB, tailOperandsB);
+        const std::array<VariableId, 1> readerResults = {reader};
+        const std::array<VariableId, 1> readerOperands = {stateA};
+        const InstructionId read =
+            linear.addInstruction(Opcode::Assign, readerResults, readerOperands);
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        const std::array<VariableId, 1> forwardOperands = {stateEventA};
+        const InstructionId forward =
+            scheduled.addInstruction(Opcode::ActForward, {}, forwardOperands);
+        const std::array<BlockId, 1> forwardTargets = {BlockId{3}};
+        scheduled.setActivationTargets(forward, forwardTargets);
+        const std::array<VariableId, 1> backwardOperands = {stateEventB};
+        const InstructionId backward =
+            scheduled.addInstruction(Opcode::ActBackward, {}, backwardOperands);
+        const std::array<BlockId, 1> backwardTargets = {BlockId{2}};
+        scheduled.setActivationTargets(backward, backwardTargets);
+
+        const std::array<InstructionId, 1> entry = {inputChanged};
+        scheduled.addBlock(entry);
+        const std::array<InstructionId, 1> compute = {read};
+        scheduled.addBlock(compute);
+        const std::array<InstructionId, 4> commitA = {gateA, writeA, tailA, forward};
+        scheduled.addBlock(commitA);
+        const std::array<InstructionId, 4> commitB = {gateB, writeB, tailB, backward};
+        scheduled.addBlock(commitB);
+        return ExecutableModel{
+            .program = scheduled.finish(),
+            .interface = {},
+            .commitBlockBegin = 2,
+            .commitBlockEnd = 4,
+        };
+    }
+
     int testExecutableCommitStructureValidation()
     {
         if (!validate(makeCommitStructureModel(CommitStructureViolation::None),
@@ -1250,6 +1352,12 @@ namespace
                  .success())
         {
             return fail("well-formed commit Block structure was rejected");
+        }
+        if (!validate(makeCommitChainModel(),
+                      ValidationOptions{.level = ValidationLevel::Semantic})
+                 .success())
+        {
+            return fail("commit-to-commit act.f/act.b chains must be accepted");
         }
         {
             const ValidationResult validation = validate(
@@ -1275,46 +1383,35 @@ namespace
         }
         {
             const ValidationResult validation = validate(
-                makeCommitStructureModel(CommitStructureViolation::ActForwardInsideCommit),
+                makeCommitStructureModel(CommitStructureViolation::MissingGateDetector),
                 ValidationOptions{.level = ValidationLevel::Semantic});
             if (validation.success() ||
                 !containsError(validation,
-                               "ActForward instruction inside a commit Block"))
+                               "commit Block state write is not preceded by a gate detector"))
             {
-                return fail("act.f inside commit Blocks must be rejected");
+                return fail("commit state writes without a head gate detector must be rejected");
             }
         }
         {
             const ValidationResult validation = validate(
-                makeCommitStructureModel(CommitStructureViolation::ActForwardTargetsCommit),
+                makeCommitStructureModel(CommitStructureViolation::ActForwardTargetsEarlierBlock),
                 ValidationOptions{.level = ValidationLevel::Semantic});
             if (validation.success() ||
                 !containsError(validation,
-                               "ActForward target is not a later compute Block"))
+                               "ActForward target is not a later Block"))
             {
-                return fail("act.f targeting a commit Block must be rejected");
+                return fail("act.f that does not target a later Block must be rejected");
             }
         }
         {
             const ValidationResult validation = validate(
-                makeCommitStructureModel(CommitStructureViolation::ActBackwardOutsideCommit),
+                makeCommitStructureModel(CommitStructureViolation::ActBackwardTargetsEntry),
                 ValidationOptions{.level = ValidationLevel::Semantic});
             if (validation.success() ||
                 !containsError(validation,
-                               "ActBackward instruction outside a commit Block"))
+                               "ActBackward target is not a non-entry Block"))
             {
-                return fail("act.b outside commit Blocks must be rejected");
-            }
-        }
-        {
-            const ValidationResult validation = validate(
-                makeCommitStructureModel(CommitStructureViolation::ActBackwardTargetsCommit),
-                ValidationOptions{.level = ValidationLevel::Semantic});
-            if (validation.success() ||
-                !containsError(validation,
-                               "ActBackward target is not a compute Block"))
-            {
-                return fail("act.b targeting a commit Block must be rejected");
+                return fail("act.b targeting the entry Block must be rejected");
             }
         }
         {

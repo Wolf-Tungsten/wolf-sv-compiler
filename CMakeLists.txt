@@ -112,6 +112,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/core/toposort.cpp
     lib/grhsim/am/program.cpp
     lib/grhsim/am/builder.cpp
+    lib/grhsim/am/graph.cpp
     lib/grhsim/am/validate.cpp
     lib/grhsim/am/pipeline.cpp
     lib/grhsim/am/lowering.cpp
@@ -560,6 +561,17 @@ target_compile_definitions(grhsim-am-end-to-end
 )
 
 register_test_exe(grhsim-am-end-to-end)
+
+add_executable(grhsim-am-graph
+    tests/grhsim/am/test_graph.cpp
+)
+
+target_link_libraries(grhsim-am-graph
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(grhsim-am-graph)
 
 add_executable(grhsim-am-lower-json
     tests/grhsim/am/lower_json_smoke.cpp

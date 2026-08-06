@@ -11,11 +11,14 @@ namespace wolvrix::lib::grhsim::am
     // so that GrhSimAmPipeline can hold it by value without a circular include.
 
     // Runs the AM instruction-stream optimizations (dead-code elimination,
-    // constant folding, and pure-op common subexpression elimination) on a
-    // lowered LinearProgramArtifact, then compacts the program so the dense
-    // SchedulingFacts indices stay aligned. On success the artifact is
-    // replaced in place and passes validate(); on failure the artifact is
-    // left unmodified, an error diagnostic is emitted, and false is returned.
+    // constant folding, pure-op common subexpression elimination, assign
+    // alias bypassing, and constant-address never-written memory-read
+    // folding) on a lowered LinearProgramArtifact, then compacts the program
+    // so the dense SchedulingFacts indices stay aligned. Interface entries
+    // that referenced eliminated variables are re-pointed to their alias
+    // representatives. On success the artifact is replaced in place and
+    // passes validate(); on failure the artifact is left unmodified, an
+    // error diagnostic is emitted, and false is returned.
     bool optimizeLinearProgram(LinearProgramArtifact &artifact,
                                const AmOptimizeOptions &options,
                                wolvrix::lib::diag::Diagnostics &diagnostics);

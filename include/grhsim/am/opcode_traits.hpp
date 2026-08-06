@@ -47,7 +47,7 @@ namespace wolvrix::lib::grhsim::am
         case Opcode::RegisterWrite:
             return OpcodeTraits{
                 .effect = OpcodeEffect::StateReadWrite,
-                .stateTargetOperand = 3,
+                .stateTargetOperand = 1,
                 .hasOrderedEffect = true,
                 .variadicOperands = true,
             };
@@ -68,7 +68,7 @@ namespace wolvrix::lib::grhsim::am
         case Opcode::MemoryFill:
             return OpcodeTraits{
                 .effect = OpcodeEffect::StateReadWrite,
-                .stateTargetOperand = 2,
+                .stateTargetOperand = 1,
                 .memoryAccess = true,
                 .hasOrderedEffect = true,
                 .variadicOperands = true,
@@ -76,7 +76,7 @@ namespace wolvrix::lib::grhsim::am
         case Opcode::LatchWrite:
             return OpcodeTraits{
                 .effect = OpcodeEffect::StateReadWrite,
-                .stateTargetOperand = 3,
+                .stateTargetOperand = 1,
                 .hasOrderedEffect = true,
             };
         case Opcode::SystemFunction:

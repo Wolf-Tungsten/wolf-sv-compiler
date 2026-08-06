@@ -178,12 +178,13 @@ normalize、emit、model build 和运行日志名称；difftest 侧继续复用�
 规范中的 `Program` 不是“若干 AM 指令的容器”。它至少已经满足以下可执行契约：
 
 - `B0` 是每次 `eval()` 无条件执行的 EntryBlock；
-- 普通 Block 分为 compute 段和构成连续后缀的 commit 段：compute Block 只在 active
-  时执行，首次求值额外激活全部 compute Block，commit Block 每轮（round）总是扫描；
+- 普通 Block 分为 compute 段和构成连续后缀的 commit 段：两类 Block 都只在 active
+  时执行（首次求值激活全部 Block），commit Block 的激活只来自其首部 gate detector
+  watch 的变量；
 - `changed` 有独占的 `old` Variable，并在比较后更新基线；
-- `act.f` 只出现在 B0 和 compute Block，只指向更大的 compute BlockId，并在同一趟
-  compute 扫描内被消费；`act.b` 只出现在 commit Block，target 为 compute Block，
-  其激发是要求下一 round 的唯一信号；
+- `act.f` 严格前向（目标 BlockId 更大，compute 或 commit Block 皆可），并在同一趟
+  升序扫描内被消费；`act.b` 指向非 EntryBlock 的任意 Block（scheduler 只在 commit
+  Block 尾部产生，目标不大于源块），其激发是要求下一 round 的唯一信号；
 - Block 顺序、event 清零点和 state write 的可见时点共同决定 `eval()` 行为。
 
 GRH 刚完成 opcode lowering 时还没有这些信息。把所有指令临时塞进一个“B0”或“B1”
@@ -316,8 +317,9 @@ ExecutableModel       = (ScheduledProgram, ProgramInterface, commitBlockBegin, c
 
 `commitBlockBegin`/`commitBlockEnd` 是一个半开 Block 区间：commit Block 构成 Block
 空间的连续后缀，区间终点恒为 Program 的 Block 总数；两者均为 0 表示没有 commit
-Block。state write 只允许位于 commit Block；commit Block 每轮总是被扫描，不占用
-激活状态。
+Block。state write 只允许位于 commit Block；commit Block 与 compute Block 一样按
+激活位过滤执行（首次 `eval()` 激活全部 Block），其激活只来自首部 gate detector
+watch 的变量。
 
 两种 artifact 都要校验 port name 唯一、方向对应的 VarId 有效、input/output 逻辑 Type
 兼容、input/inout 的可写性和 input 写隔离。`LinearProgramArtifact` 还要求
@@ -359,7 +361,8 @@ Scheduler 可以选择不同的 Block 粒度或合法拓扑序。只要 `changed
 
 - 一个 Array Variable 表示 memory storage，元素 Type 和固定 depth 已知；
 - `mem.read` 显式给出 memory 与 address；
-- `mem.write`/`mem.fill` 显式给出 address、data、mask/range、condition 和 event；
+- `mem.write` 显式给出 cond、address、mask、data 和 event；`mem.fill` 显式给出已合并
+  写入条件的整片 data 和 event；
 - address/data/mask producer 都是普通 VarId def-use；
 - register、latch、DPI 和 system effect 使用不同 opcode，不再依赖 GRH op class 猜测。
 
@@ -386,21 +389,30 @@ Scheduler 按以下阶段工作，每一阶段只保留下一阶段需要的事�
    编号，commit Block 在 Block 空间中构成连续后缀。
 5. 对跨 block 的可观察 value 变化创建或复用 watch。同一 (Block, VarId, change kind)
    的 activation edge 组共用一个 detector。每个 materialized `changed` 创建独占、
-   `Init = undef` 的 old Variable 和一个 event Variable，并放在所在 Block 尾部、act 之前。
-6. state write 只进入 commit Block。同一 register/memory/latch target 存在多个候选
-   write 时，由块内文本顺序和 commit 段静态 BlockId 顺序兑现 priority/effect order；
-   每个 commit Block 对自身写入的每个 state target 在块尾物化一个共享
-   `changed.any target,targetOld`，实际变化经 `act.b` 激活 reader compute Block。
-   reader 一律在下一 round 才执行、只看到本轮最终值，因此不存在轮内瞬态暴露。
+   `Init = undef` 的 old Variable 和一个 event Variable，并放在所在 Block 的 act
+   之前；commit Block 的 gate detector 放在块首部、全部状态写之前。
+6. state write 只进入 commit Block。commit Block 的结构固定为 [首部 gate detector] +
+   [状态写] + [尾部 watch + act]：首部为块内每个事件签名元素 (kind, raw) 一条克隆
+   `changed.*`（写指令的 event operand 重指向这些块内 detector 的结果；纯 latch 块
+   每条 latch 写一条 `ChangedAny(nextValue)`），门控为全部首部 detector 结果的 OR，
+   整块只判一次，状态写与尾部 watch/act 都在门内。同一 register/memory/latch target
+   存在多个候选 write 时，由块内文本顺序和 commit 段静态 BlockId 顺序兑现
+   priority/effect order；每个 commit Block 对自身写入的每个 state target 在块尾物化
+   一个共享 `changed.any target,targetOld`，实际变化经 `act.b` 激活 reader compute
+   Block。reader 一律在下一 round 才执行、只看到本轮最终值，因此不存在轮内瞬态暴露。
 7. 对外部可写 port 的 watch 在 `B0` 物化；B0 只含 `changed`、派生 event 所需的组合指令
    和 `act.f`。内部 watch 放在其 producer 所在 compute Block 或 writer 所在 commit
-   Block。
-8. B0/compute Block 内指向更大 compute BlockId 的依赖生成 `act.f`；commit Block 的判变
-   event 指向 reader compute Block 生成 `act.b`。commit Block 每轮常扫描，不接收任何
-   激活边。同一 event/target 去重，但不合并语义不同的 old 基线。
+   Block。外部输入同时是 commit Block 的激活来源之一：commit gate detector watch 的
+   输入变量（无定义指令）经 B0 的 `ChangedAny` watch 前向激活对应 commit Block。
+8. 指向更大 BlockId 的激活依赖生成 `act.f`，指向不大于源块的依赖生成 `act.b`：B0 与
+   compute 段内的 watch/def-use 依赖生成 `act.f`；commit Block 的尾部判变 watch 指向
+   reader compute Block 生成 `act.b`。commit Block 不按 def-use 数据边激活：compute→
+   commit 的 `act.f` 只携带被目标块首部 gate detector watch 的变量；commit→commit
+   经 writer 块的共享尾部 watch，按块序前向（同轮）或后向（下轮）。同一 event/target
+   去重，但不合并语义不同的 old 基线。
 9. 按 BlockId 顺序写出 ScheduledProgram，丢弃 derived facts，运行最终 validator。
 
-第一次 `eval()` 激活所有 compute Block 是 Machine 语义，不需要额外伪指令。Scheduler
+第一次 `eval()` 激活所有 Block（compute 与 commit）是 Machine 语义，不需要额外伪指令。Scheduler
 也不能把 `changed.old = current` 的初始化偷偷加入 Program；规范要求 old 使用
 `undef`，首次 event 及其影响可能是 AM 层未定义行为。
 
@@ -412,18 +424,24 @@ reg/latch/memory write 属于 commit。DPI/system/effect 顺序和同 target 多
 
 分块实现全仓唯一（`lib/grhsim/am/activity_schedule.cpp`，从 legacy 逐行移植）：先对
 atom DAG 做 out1/in1/sibling 三路迭代 coarsen（`enableCoarsening` 控制，cluster 指令上限
-为 `dpCoarsenBudget`，0 表示自动取 32 × `maxInstructionsPerBlock`），再在确定性拓扑
+为 `dpCoarsenBudget`，0 表示自动取 1.5 × `maxInstructionsPerBlock`），再在确定性拓扑
 序列上做 segment DP，以“跨段 incoming 激活 value 数加每段 `dpSegmentPenalty`（默认
 1.0）”为代价切成 compute Block。compute Block 受 `maxInstructionsPerBlock`（默认 128）
-限制；commit 侧按 normalized event + update guard 聚合分块（对齐 legacy
-`commitGuardEventBuckets` 的默认行为），受 `maxCommitInstructionsPerBlock`（默认 4096）
-限制；真正的 SCC atom 超限时保留为一个 oversized Block 并报告诊断。commit 跨 target
-合并只改变活动粒度，不改变 Block 内拓扑/effect 次序。
+限制；commit 侧只按事件签名聚合分块——每个 event 经其定义 `changed` 规范化为
+（边沿种类, 被观测 Variable），排序去重后作为分块键；update guard 已删除，不再是
+分块分量（`reg.write/latch.write` 的 cond/mask 折叠进 nextValue，`mem.write` 自带的
+cond/mask 由指令自身判定，均不参与分块）——受 `maxCommitInstructionsPerBlock`
+（默认 4096）限制；真正的 SCC atom 超限时保留为一个 oversized Block 并报告诊断。
+commit 跨 target 合并只改变活动粒度，不改变 Block 内拓扑/effect 次序。
 
-commit Block 没有独立的运行时激活通道：每轮 compute 阶段结束后，全部 commit Block 按
-BlockId 升序执行一次。写指令按文本顺序读取执行点可见的 operand 和 event，由块内
-guard/event 决定是否真正写入；使 visible state 实际变化且存在 reader 时，同块判变 event
-激发 `act.b`，激活该 state 的 reader compute Block 进入下一 round。没有 operand 快照、
+commit Block 不再常扫描：每轮 compute 阶段结束后，commit 阶段按 BlockId 升序、以与
+compute 相同的激活位图过滤执行 commit Block（首次 `eval()` 激活全部 Block）。块首部
+gate detector 先执行并更新基线；门控（全部首部 detector 结果的 OR）为假时整块跳过，
+为真时写指令按文本顺序执行——写自身不再判定 event；`reg.write/latch.write` 的
+cond/mask 已在 lowering 合并进 nextValue，`mem.write` 保留 cond 门控、逐 bit mask 与
+地址越界抑制，`mem.write_lanes` 保留
+`any(laneMask)` 早退。使 visible state 实际变化且存在 reader 时，尾部判变 event 激发
+`act.b`，激活该 state 的 reader compute Block 进入下一 round。没有 operand 快照、
 没有 pending event、没有跨轮保留。
 
 > 历史记录（旧模型，机制已删除）：旧模型曾对 XiangShan commit 路径定位确认，block
@@ -634,24 +652,38 @@ header 中的三个对账指标在生产内部按如下口径计算（harness  s
 - `incoming_copy_cost`：上述每个对按 `max(1, ceil(width/64))` 折算的拷贝总数，
   即 topo-partition-proj 04 文档第一阶段优化目标。
 
-### 3.2.5 AM 指令流优化（DCE / const-fold / CSE，2026-07-31）
+### 3.2.5 AM 指令流优化（DCE / const-fold / CSE / assign 别名 / ROM 折叠，2026-07-31 初版，2026-08-04 扩展）
 
 `grhsim/am/optimize.{hpp,cpp}` 在 lowering 与 schedule 之间提供可选的指令流优化：
-`optimizeLinearProgram(LinearProgramArtifact&, AmOptimizeOptions{dce, constFold, cse},
-Diagnostics&)`。`grhsim-am-lower-json` 经 `--am-optimize=dce,fold,cse`（默认全开）/
+`optimizeLinearProgram(LinearProgramArtifact&, AmOptimizeOptions{dce, constFold, cse, assignAlias, constMemFold, interfaceAlias},
+Diagnostics&)`。`grhsim-am-lower-json` 经 `--am-optimize=dce,fold,cse,alias,memfold,ifacealias`（默认全开）/
 `--no-am-optimize` 控制；实验路径与生产路径均默认开启——生产路径由
 `GrhSimAmPipeline::run` 在 lower 校验后、schedule 前调用，可用
 `setAmOptimizeOptions` 改配或全关。
-动机与两级（GRH 层 + AM 层）实验设计见 topo-partition-proj `docs/20`。
+动机与两级（GRH 层 + AM 层）实验设计见 topo-partition-proj `docs/20`；2026-08-04
+扩展的动机与实测见 pdocs/grh-notepad/supernode-align NO0011。
 
 - **DCE**：根集合 = effect ∈ {StateWrite, StateReadWrite, HostRead, HostEffect} 的指令
-  ∪ `orderedEffects` 涉及指令 ∪ 产出 ExternalOutput/Observable 角色的指令，沿 def-use
-  反图标记活指令。StateRead（MemoryRead）结果无引用且不在 `orderedEffects` 中时可删。
+  ∪ `orderedEffects` 涉及指令 ∪ 产出 ExternalOutput/Observable 角色的指令（跟随别名
+  解析到代表变量），沿 def-use 反图标记活指令。StateRead（MemoryRead）结果无引用且
+  不在 `orderedEffects` 中时可删。
 - **const-fold**：操作数全为常量的纯 op 求值进 literal 池（逐位镜像 interpreter
-  语义），与 CSE 迭代至不动点。
+  语义），与 CSE、assign 别名迭代至不动点。
 - **CSE**：纯 op hash-cons，key = (opcode, result type, 规范化操作数[可交换 op
   排序], slice/system 属性)；Memory/DPI/System/Changed 一律不参与。重复指令的结果
   变量别名为首次出现的变量。
+- **assign 别名**（assignAlias）：单操作数且结果/操作数类型完全一致的 Assign 直接
+  别名其操作数；操作数为 State 角色的 Assign 是 commit read-old 快照
+  （lowering preCommitValue），永不别名。
+- **ROM 折叠**（constMemFold）：目标 memory 无任何写/填充且地址为编译期常量的
+  MemoryRead 折叠为常量——存储零初始化语义下 Undef/Zero init 读出恒 0（与
+  interpreter/emitter 逐位一致），越界地址按 interpreter 语义折 0；Actions init
+  （$readmemh）不参与。香山设计上无从未写入的 memory，该 pass 实测折叠 0 条。
+- **接口重指向**（interfaceAlias）：被消除变量若被 ProgramInterface 引用（输出
+  端口、declaredVariables 可观测变量），compact 时把接口项重指向别名代表，并把
+  ExternalOutput/Observable 角色位转移给代表（角色-接口一致性校验要求集合精确
+  匹配）；State/ExternalInput 角色变量永不别名。关闭则恢复旧策略（带角色变量
+  一律不可别名，香山 84.4 万 declared 变量会使 CSE 几乎失效）。
 - **compaction**：删除采用稠密 id 重写（不用 NOP 标记，避免死指令占用分块容量
   预算）；`instructionEffects` 由 `opcodeTraits(opcode).effect` 机械重算，
   `variableRoles`、`orderedEffects`、`interface.ports/declaredVariables` 与
@@ -660,9 +692,11 @@ Diagnostics&)`。`grhsim-am-lower-json` 经 `--am-optimize=dce,fold,cse`（默�
 
 全香山实测（L1 清理后的 3,946,245 指令输入）：CSE 净删 16,359 条重复纯 op、
 fold 2 条、DCE 0 条（死锥已被 GRH 层收编），耗时 ~6 s；E2（L2-only，未过 L1 的
-脏图）结果见 topo-partition-proj `docs/20` 的实验矩阵。单测
-`tests/grhsim/am/test_optimize.cpp` 覆盖死锥删除、可交换 CSE、fold 级联、
-facts/interface 重映射与根集合安全性。
+脏图）结果见 topo-partition-proj `docs/20` 的实验矩阵。2026-08-04 扩展后实测
+（3,387,378 指令输入）：CSE 162,488 + assign 别名 185,426，指令 -9.9%，香山
+CoreMark 50k difftest 通过且仿真 host time -15.5%（supernode-align NO0011 §6）。
+单测 `tests/grhsim/am/test_optimize.cpp` 覆盖死锥删除、可交换 CSE、fold 级联、
+接口重指向与角色转移、状态快照保留、ROM 折叠与根集合安全性。
 
 ### 3.3 临时 scheduling facts
 
@@ -808,20 +842,23 @@ GRH 风格 def-use 图。跨 shard 需要的静态信息应来自一次紧凑索
 只在当前 shard 写入，生成在 staging directory 完成后才发布，因此 rejected emit 不会留下
 半套 artifact。
 
-生成 runtime 把 compute Block 的激活状态表示为每 64 个 Block 一个 word 的单一
-active 位图（不分 current/next，没有 summary 层；commit Block 每轮总是执行，不占用
-激活状态）。`eval()` 主循环是两阶段 round（2026-07-29 起为静态 dispatch 形态）：
+生成 runtime 把全部 Block 的激活状态表示为每 64 个 Block 一个 word 的单一
+active 位图（不分 current/next，没有 summary 层；compute 与 commit Block 共用）。
+`eval()` 主循环是两阶段 round（2026-07-29 起为静态 dispatch 形态）：
 compute 阶段按 (source, part) 升序直接调用每个覆盖 compute 段的 `eval_scan_*()` 成员
 函数，函数内按 8 个 Block 一个 byte chunk 消费位图——把活动字节快照进局部
 `byteFlags`、清掉全局字节中本 chunk 拥有的位，然后对拥有的位做升序直线
 `if ((byteFlags & bit) != 0) { ... }` 测试并内联执行 Block 体（legacy/GSIM 的 batch
-形态）；`act.f` 的目标恒为更大的 compute Block，同 byte 且属本 chunk 的目标改写
+形态）；`act.f` 的目标恒为更大的 Block，同 byte 且属本 chunk 的目标改写
 在位 `byteFlags`（局部接力），其余经编译期常量掩码写全局位图，两者都因严格前向而
 在同一趟升序遍历内被消费。commit 阶段按 (source, part) 升序直接调用
-`eval_commit_*()`，无条件内联执行全部 commit Block，`act.b` 置位
-reader compute Block 并置 `backwardFired_`，作为“需要下一轮”的唯一信号。一轮完整
-遍历没有任何 `act.b` 激发即收敛；round 计数超过上限（1,000,000）报 did not converge。
-首次 `eval()` 仍激活所有 compute Block。跨块消费的 `changed` 结果使用
+`eval_commit_*()`，以与 compute 阶段相同的 byte-chunk 激活扫描执行被激活的 commit
+Block（同 byte 前向 act 局部接力同样成立）；每个 commit Block 的首部
+`changed.*` gate detector 结果 OR 成单一门控表达式，状态写与尾部 watch/act 都在
+门内，整块只判一次。`act.b` 置位 reader compute Block 并置 `backwardFired_`，作为
+“需要下一轮”的唯一信号。一轮完整遍历没有任何 `act.b` 激发即收敛；round 计数超过
+上限（1,000,000）报 did not converge。首次 `eval()` 激活所有 Block（commit Block
+借此同步 gate detector 基线并评估每个状态写一次）。跨块消费的 `changed` 结果使用
 `set_changed_result` 将实际为真的结果加入 dirty list，每轮结束只清理这些结果，而不是
 生成每个 detector 的静态 clear store；同块消费的 result 每次执行都被重写，不进
 dirty list。
@@ -979,11 +1016,11 @@ Gate：仓库没有第二套 runtime schedule 真相；所有生产入口都经�
 
 | 风险 | 当前旧路径与 AM 契约的差异点 | 必须验证的结果 |
 | --- | --- | --- |
-| 首次求值 | 旧路径 seed compute/activity；AM 先执行 B0，首次求值额外激活全部 compute Block（commit Block 每轮常扫），old 为 `undef` | 不把旧 baseline 强加给 AM；reset 后行为与首次未定义边界分开测 |
-| round 结构 | 旧路径按 batch 调 compute、每 round 扫 commit；AM 对齐同一两阶段 round：compute 按 active 过滤升序执行，commit 常扫描，任一 `act.b` 激发即要求下一轮 | feedback 收敛、写回可见时点和执行次数符合 AM |
-| 激活边 | 旧代码依赖 topo active id 和 batch 内局部传播；AM `act.f` 只指向更大的 compute BlockId 且不出现在 commit Block，`act.b` 只在 commit Block、target 为 compute Block | 每条激活边的放置与 target 范围经 validator 证明 |
+| 首次求值 | 旧路径 seed compute/activity；AM 先执行 B0，首次求值激活全部 Block（compute 与 commit），old 为 `undef` | 不把旧 baseline 强加给 AM；reset 后行为与首次未定义边界分开测 |
+| round 结构 | 旧路径按 batch 调 compute、每 round 扫 commit；AM 对齐同一两阶段 round：compute 与 commit 都按 active 过滤升序执行（commit 相位在后），任一 `act.b` 激发即要求下一轮 | feedback 收敛、写回可见时点和执行次数符合 AM |
+| 激活边 | 旧代码依赖 topo active id 和 batch 内局部传播；AM `act.f` 指向严格更大的 BlockId（compute 或 commit），`act.b` 指向非 EntryBlock 的任意 Block（scheduler 只在 commit Block 尾部产生）；指向 commit Block 的激活边只携带其 gate detector watch 的变量 | 每条激活边的放置与 target 范围经 validator 证明 |
 | event 生命周期 | 旧 event edge slot 通常按 fixed-point round 清零；AM 跨块消费的 changed result 在 round 末清零（同块消费不清），B0 每次 eval 执行 | pos/neg、同轮多消费者和跨轮 event 不丢失或重复 |
-| state write | 旧 commit supernode 每 round 扫描；AM reg/latch/mem write 同样位于每轮常扫的 commit Block，读取执行点 operand，由块内 guard/event 决定写入 | 多写 priority、mask/fill、read-during-write 和 reader reactivation 一致 |
+| state write | 旧 commit supernode 每 round 扫描；AM reg/latch/mem write 位于按激活位执行的 commit Block，reg/latch 写的 cond/mask 已折叠进 nextValue，`mem.write` 保留 cond/mask 操作数与地址越界抑制；写自身无 event 判定，由块首部 gate detector 的 OR 门控整块写入 | 多写 priority、mask/fill、read-during-write 和 reader reactivation 一致 |
 | memory 划分 | 旧 `kMemoryReadPort` 是 source-class 且可能 clone；新层看到显式 `mem.read` 和 Array | address 依赖保留；有副作用/可能 alias 的访问不被非法复制或重排 |
 | 外部输入 | 两条路径都应只观察两次 eval 间的最终值，但 seed 机制不同 | 0->1->0 后再 eval 不产生虚假变化 |
 | DPI/system | 旧 supernode/batch 和 full-pass fast path 可能改变调用次数；AM 要保持 Block、schedule、once/final 顺序 | 逐次调用 trace、参数/返回 ABI 和 finalize 顺序一致 |

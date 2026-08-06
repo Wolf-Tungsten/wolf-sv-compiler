@@ -114,7 +114,7 @@ int main(int argc, char **argv)
                      "[--dp-segment-penalty <value>] "
                      "[--dp-coarsen-budget <count>] [--disable-coarsening] "
                      "[--dp-width-weighted-cost] [--runtime-profile] "
-                     "[--am-optimize=<dce,fold,cse>] [--no-am-optimize]\n";
+                     "[--am-optimize=<dce,fold,cse,alias,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
     const std::string path = argv[1];
@@ -239,6 +239,9 @@ int main(int argc, char **argv)
                 .dce = false,
                 .constFold = false,
                 .cse = false,
+                .assignAlias = false,
+                .constMemFold = false,
+                .interfaceAlias = false,
             };
         }
         else if (argument.starts_with("--am-optimize="))
@@ -249,6 +252,9 @@ int main(int argc, char **argv)
                 .dce = false,
                 .constFold = false,
                 .cse = false,
+                .assignAlias = false,
+                .constMemFold = false,
+                .interfaceAlias = false,
             };
             bool valid = true;
             std::size_t begin = 0;
@@ -270,6 +276,18 @@ int main(int argc, char **argv)
                 else if (token == "cse")
                 {
                     parsed.cse = true;
+                }
+                else if (token == "alias")
+                {
+                    parsed.assignAlias = true;
+                }
+                else if (token == "memfold")
+                {
+                    parsed.constMemFold = true;
+                }
+                else if (token == "ifacealias")
+                {
+                    parsed.interfaceAlias = true;
                 }
                 else if (!token.empty())
                 {

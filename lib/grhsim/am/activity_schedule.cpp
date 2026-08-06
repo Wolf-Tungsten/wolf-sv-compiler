@@ -23,7 +23,7 @@ namespace wolvrix::lib::grhsim::am
         constexpr std::size_t kCoarsenTailLargeClusterThreshold = 100000;
         constexpr std::size_t kCoarsenTailMaxClusterDeltaExclusive = 1024;
         constexpr std::size_t kCoarsenTailMaxConsecutiveIters = 3;
-        constexpr std::size_t kMaxCoarsenIterations = 256;
+        constexpr std::size_t kMaxCoarsenIterations = 1024;
 
         uint64_t elapsedMs(std::chrono::steady_clock::time_point start)
         {
@@ -102,7 +102,6 @@ namespace wolvrix::lib::grhsim::am
             input.atomIsCommit.size() != atomCount ||
             input.atomMinInstruction.size() != atomCount ||
             input.commitEventRank.size() != atomCount ||
-            input.commitGuardRank.size() != atomCount ||
             input.definitions.size() != input.variableCount ||
             input.useOffsets.size() != static_cast<std::size_t>(input.variableCount) + 1 ||
             (!input.variableCopyWeights.empty() &&
@@ -358,67 +357,78 @@ namespace wolvrix::lib::grhsim::am
         };
 
         std::size_t tailIterations = 0;
-        uint32_t idlePassMask = 0;
         std::size_t mergeCounts[3] = {0, 0, 0};
         std::size_t roundsUsed = 0;
         std::string degreeHistogram;
-        CoarsenPass pass = CoarsenPass::Out1;
-        for (std::size_t iteration = 0;
-             input.enableCoarsening && iteration < kMaxCoarsenIterations && idlePassMask != 0x7;
-             ++iteration) {
-            rebuildClusterGraph();
-            if (iteration == 0) {
-                const auto bucketize = [&](bool outgoing) {
-                    std::array<std::size_t, 8> buckets{};
-                    std::size_t total = 0;
-                    for (uint32_t cluster = 0; cluster < graph.count; ++cluster) {
-                        const std::size_t degree =
-                            outgoing ? graph.outOffsets[cluster + 1] - graph.outOffsets[cluster]
-                                     : graph.inOffsets[cluster + 1] - graph.inOffsets[cluster];
-                        total += degree;
-                        const std::size_t bucket =
-                            degree == 0 ? 0
-                            : degree == 1 ? 1
-                            : degree == 2 ? 2
-                            : degree == 3 ? 3
-                            : degree <= 7 ? 4
-                            : degree <= 15 ? 5
-                            : degree <= 63 ? 6
-                                          : 7;
-                        ++buckets[bucket];
-                    }
-                    std::string text = " total=" + std::to_string(total);
-                    const char *labels[8] = {"0", "1", "2", "3", "4-7", "8-15", "16-63", ">=64"};
-                    for (std::size_t index = 0; index < buckets.size(); ++index) {
-                        text += " ";
-                        text += labels[index];
-                        text += "=";
-                        text += std::to_string(buckets[index]);
-                    }
-                    return text;
-                };
-                degreeHistogram = "clusters=" + std::to_string(graph.count) +
-                                  " outdeg{" + bucketize(true) + " } indeg{" + bucketize(false) +
-                                  " }";
+        // Sequential phases in gsim graphCoarsen order: each merge rule runs to
+        // its fixpoint before the next rule starts. The previous round-robin
+        // scheduler let In1/Sibling merges inflate cluster out-degrees and
+        // permanently break out-degree-1 chains before Out1 could collapse
+        // them; on XiangShan this roughly halved the cross-block values.
+        constexpr std::array<CoarsenPass, 3> kPhaseOrder = {
+            CoarsenPass::Out1,
+            CoarsenPass::In1,
+            CoarsenPass::Sibling,
+        };
+        std::size_t iteration = 0;
+        bool stopCoarsening = false;
+        for (const CoarsenPass phasePass : kPhaseOrder) {
+            while (input.enableCoarsening && iteration < kMaxCoarsenIterations &&
+                   !stopCoarsening) {
+                rebuildClusterGraph();
+                if (iteration == 0) {
+                    const auto bucketize = [&](bool outgoing) {
+                        std::array<std::size_t, 8> buckets{};
+                        std::size_t total = 0;
+                        for (uint32_t cluster = 0; cluster < graph.count; ++cluster) {
+                            const std::size_t degree =
+                                outgoing ? graph.outOffsets[cluster + 1] - graph.outOffsets[cluster]
+                                         : graph.inOffsets[cluster + 1] - graph.inOffsets[cluster];
+                            total += degree;
+                            const std::size_t bucket =
+                                degree == 0 ? 0
+                                : degree == 1 ? 1
+                                : degree == 2 ? 2
+                                : degree == 3 ? 3
+                                : degree <= 7 ? 4
+                                : degree <= 15 ? 5
+                                : degree <= 63 ? 6
+                                              : 7;
+                            ++buckets[bucket];
+                        }
+                        std::string text = " total=" + std::to_string(total);
+                        const char *labels[8] = {"0", "1", "2", "3", "4-7", "8-15", "16-63", ">=64"};
+                        for (std::size_t index = 0; index < buckets.size(); ++index) {
+                            text += " ";
+                            text += labels[index];
+                            text += "=";
+                            text += std::to_string(buckets[index]);
+                        }
+                        return text;
+                    };
+                    degreeHistogram = "clusters=" + std::to_string(graph.count) +
+                                      " outdeg{" + bucketize(true) + " } indeg{" + bucketize(false) +
+                                      " }";
+                }
+                const std::size_t clustersBefore = graph.count;
+                lastRoundMerges = 0;
+                const bool changed = coarsenRound(phasePass);
+                mergeCounts[static_cast<uint8_t>(phasePass)] += lastRoundMerges;
+                ++roundsUsed;
+                ++iteration;
+                const std::size_t clusterDelta = lastRoundMerges;
+                const bool smallDeltaTail =
+                    clustersBefore >= kCoarsenTailLargeClusterThreshold &&
+                    clusterDelta < kCoarsenTailMaxClusterDeltaExclusive;
+                tailIterations = smallDeltaTail ? tailIterations + 1 : 0;
+                if (tailIterations >= kCoarsenTailMaxConsecutiveIters) {
+                    stopCoarsening = true;
+                    break;
+                }
+                if (!changed) {
+                    break;
+                }
             }
-            const std::size_t clustersBefore = graph.count;
-            lastRoundMerges = 0;
-            const bool changed = coarsenRound(pass);
-            mergeCounts[static_cast<uint8_t>(pass)] += lastRoundMerges;
-            ++roundsUsed;
-            const uint32_t passBit = 1U << static_cast<uint8_t>(pass);
-            idlePassMask = changed ? (idlePassMask & ~passBit) : (idlePassMask | passBit);
-            const std::size_t clusterDelta = lastRoundMerges;
-            const bool smallDeltaTail =
-                clustersBefore >= kCoarsenTailLargeClusterThreshold &&
-                clusterDelta < kCoarsenTailMaxClusterDeltaExclusive;
-            tailIterations = smallDeltaTail ? tailIterations + 1 : 0;
-            if (tailIterations >= kCoarsenTailMaxConsecutiveIters) {
-                break;
-            }
-            pass = pass == CoarsenPass::Out1
-                       ? CoarsenPass::In1
-                       : (pass == CoarsenPass::In1 ? CoarsenPass::Sibling : CoarsenPass::Out1);
         }
         rebuildClusterGraph();
         const uint64_t coarsenMs = elapsedMs(coarsenStart);
@@ -675,11 +685,11 @@ namespace wolvrix::lib::grhsim::am
         }
 
         // Commit atoms form blocks after all compute blocks: Kahn on the commit
-        // subgraph prioritized by (event rank, guard rank, min instruction), with
-        // bounded merging inside one commit-events bucket under the block limit.
+        // subgraph prioritized by (event rank, min instruction), with bounded
+        // merging inside one commit-events bucket under the block limit.
         uint32_t normalBlockCount = computeBlockCount;
         {
-            using Candidate = std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>;
+            using Candidate = std::tuple<uint32_t, uint32_t, uint32_t>;
             std::priority_queue<Candidate, std::vector<Candidate>, std::greater<>> ready;
             std::vector<uint32_t> indegree(atomCount, 0);
             for (uint32_t atom = 0; atom < atomCount; ++atom) {
@@ -693,7 +703,7 @@ namespace wolvrix::lib::grhsim::am
             }
             for (uint32_t atom = 0; atom < atomCount; ++atom) {
                 if (input.atomIsCommit[atom] != 0 && indegree[atom] == 0) {
-                    ready.emplace(input.commitEventRank[atom], input.commitGuardRank[atom],
+                    ready.emplace(input.commitEventRank[atom],
                                   input.atomMinInstruction[atom], atom);
                 }
             }
@@ -704,7 +714,7 @@ namespace wolvrix::lib::grhsim::am
             uint32_t currentBucketAtom = kInvalidIndex;
             while (!ready.empty()) {
                 const Candidate top = ready.top();
-                const uint32_t atom = std::get<3>(top);
+                const uint32_t atom = std::get<2>(top);
                 if (haveCurrent &&
                     (input.commitEventRank[atom] != input.commitEventRank[currentBucketAtom] ||
                      currentInstructions + input.atomInstructions[atom] > commitMergeLimit)) {
@@ -725,7 +735,6 @@ namespace wolvrix::lib::grhsim::am
                     const uint32_t target = input.atomTargets[offset];
                     if (--indegree[target] == 0) {
                         ready.emplace(input.commitEventRank[target],
-                                      input.commitGuardRank[target],
                                       input.atomMinInstruction[target], target);
                     }
                 }

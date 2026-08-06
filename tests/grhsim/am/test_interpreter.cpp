@@ -81,8 +81,10 @@ namespace {
     };
 
     // input -> (B1) middle -> commit write -> state -> (B2) output.  The
-    // commit Block's change detector fires act.b to re-activate the reader
-    // compute Block on the next round.
+    // entry Block's input watch activates both the compute chain and the
+    // commit Block; inside the commit Block a head changed.any detector on
+    // the input gates the write, and the tail detector on the written state
+    // fires act.b to re-activate the reader compute Block on the next round.
     FeedbackFixture makeFeedbackModel() {
         LinearProgramBuilder linear;
         const TypeId u1Type = linear.addType(Type::bitVector(1));
@@ -99,8 +101,10 @@ namespace {
         const VariableId stateEvent =
             linear.addVariable(u1Type, linear.zeroInit());
         const VariableId output = linear.addVariable(u8Type, linear.zeroInit());
-        const VariableId one = addConstant(linear, u1Type, 1);
-        const VariableId mask = addConstant(linear, u8Type, 0xff);
+        const VariableId commitInputOld =
+            linear.addVariable(u8Type, linear.undefInit());
+        const VariableId commitEvent =
+            linear.addVariable(u1Type, linear.zeroInit());
 
         const InstructionId inputChanged = addInstruction(
             linear, Opcode::ChangedAny, {entryEvent}, {input, inputOld});
@@ -108,9 +112,12 @@ namespace {
             addInstruction(linear, Opcode::Assign, {middle}, {input});
         const InstructionId assignOutput =
             addInstruction(linear, Opcode::Assign, {output}, {state});
+        const InstructionId gateDetect =
+            addInstruction(linear, Opcode::ChangedAny, {commitEvent},
+                           {input, commitInputOld});
         const InstructionId writeState =
             addInstruction(linear, Opcode::RegisterWrite, {},
-                           {one, mask, middle, state, one});
+                           {middle, state, commitEvent});
         const InstructionId detectState = addInstruction(
             linear, Opcode::ChangedAny, {stateEvent}, {state, stateOld});
 
@@ -119,12 +126,13 @@ namespace {
             addInstruction(scheduled, Opcode::ActForward, {}, {entryEvent});
         const InstructionId activateOutput =
             addInstruction(scheduled, Opcode::ActBackward, {}, {stateEvent});
-        setTargets(scheduled, activateMiddle, {BlockId{1}});
+        setTargets(scheduled, activateMiddle, {BlockId{1}, BlockId{3}});
         setTargets(scheduled, activateOutput, {BlockId{2}});
         addBlock(scheduled, {inputChanged, activateMiddle});
         addBlock(scheduled, {assignMiddle});
         addBlock(scheduled, {assignOutput});
-        addBlock(scheduled, {writeState, detectState, activateOutput});
+        addBlock(scheduled,
+                 {gateDetect, writeState, detectState, activateOutput});
 
         return FeedbackFixture{
             .model =
@@ -162,11 +170,12 @@ namespace {
             interpreter.value(fixture.output).lowWord() != 0x35) {
             return fail("act.b feedback did not execute in the next round");
         }
-        // The commit detector rewrites its event on every round; the B0 event
-        // is only consumed inside B0, so it persists until the next eval
-        // re-runs B0.
+        // Commit Blocks only run while activated, so the trailing quiet
+        // round does not re-run the commit tail detector and its event keeps
+        // the fired value; the B0 event is only consumed inside B0, so it
+        // persists until the next eval re-runs B0.
         if (interpreter.value(fixture.entryEvent).lowWord() != 1 ||
-            interpreter.value(fixture.stateEvent).lowWord() != 0) {
+            interpreter.value(fixture.stateEvent).lowWord() != 1) {
             return fail("round-local changed results have the wrong lifetime");
         }
 
@@ -189,6 +198,10 @@ namespace {
         VariableId state;
     };
 
+    // The entry Block watches the clock with changed.any and forwards the
+    // activation to the commit Block, whose head changed.pos detector forms
+    // the write gate.  Activating on every clock edge (not just posedges)
+    // keeps the commit-side old baseline exact.
     RegisterFixture makeRegisterModel() {
         LinearProgramBuilder linear;
         const TypeId u1Type = linear.addType(Type::bitVector(1));
@@ -196,22 +209,28 @@ namespace {
         const VariableId clock = linear.addVariable(u1Type, linear.zeroInit());
         const VariableId clockOld =
             linear.addVariable(u1Type, linear.undefInit());
+        const VariableId clockEvent =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId clockOldCommit =
+            linear.addVariable(u1Type, linear.undefInit());
         const VariableId posedge =
             linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId enabled = addConstant(linear, u1Type, 1);
-        const VariableId mask = addConstant(linear, u8Type, 0xff);
         const VariableId data = linear.addVariable(u8Type, linear.zeroInit());
         const VariableId state = linear.addVariable(u8Type, linear.zeroInit());
 
+        const InstructionId watch = addInstruction(
+            linear, Opcode::ChangedAny, {clockEvent}, {clock, clockOld});
         const InstructionId detect = addInstruction(
-            linear, Opcode::ChangedPos, {posedge}, {clock, clockOld});
-        const InstructionId write =
-            addInstruction(linear, Opcode::RegisterWrite, {},
-                           {enabled, mask, data, state, posedge});
+            linear, Opcode::ChangedPos, {posedge}, {clock, clockOldCommit});
+        const InstructionId write = addInstruction(
+            linear, Opcode::RegisterWrite, {}, {data, state, posedge});
 
         ScheduledProgramBuilder scheduled(linear.finish());
-        addBlock(scheduled, {detect});
-        addBlock(scheduled, {write});
+        const InstructionId activate =
+            addInstruction(scheduled, Opcode::ActForward, {}, {clockEvent});
+        setTargets(scheduled, activate, {BlockId{1}});
+        addBlock(scheduled, {watch, activate});
+        addBlock(scheduled, {detect, write});
         return RegisterFixture{
             .model =
                 ExecutableModel{
@@ -257,11 +276,17 @@ namespace {
         ExecutableModel model;
         VariableId clock;
         VariableId address;
+        VariableId enable;
+        VariableId mask;
         VariableId data;
         VariableId memory;
         VariableId readData;
     };
 
+    // Same clocking scheme as the register model: the entry Block's
+    // changed.any watch activates the commit Block on every clock edge and
+    // the head changed.pos detector gates the write; the read trails the
+    // write inside the gate so it observes the committed row.
     MemoryFixture makeMemoryModel() {
         LinearProgramBuilder linear;
         const TypeId u1Type = linear.addType(Type::bitVector(1));
@@ -271,29 +296,38 @@ namespace {
         const VariableId clock = linear.addVariable(u1Type, linear.zeroInit());
         const VariableId clockOld =
             linear.addVariable(u1Type, linear.undefInit());
+        const VariableId clockEvent =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId clockOldCommit =
+            linear.addVariable(u1Type, linear.undefInit());
         const VariableId posedge =
             linear.addVariable(u1Type, linear.zeroInit());
-        const VariableId enabled = addConstant(linear, u1Type, 1);
         const VariableId address =
             linear.addVariable(u2Type, linear.zeroInit());
-        const VariableId mask = addConstant(linear, u8Type, 0xff);
+        const VariableId enable = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId mask = linear.addVariable(u8Type, linear.zeroInit());
         const VariableId data = linear.addVariable(u8Type, linear.zeroInit());
         const VariableId memory =
             linear.addVariable(memoryType, linear.zeroInit());
         const VariableId readData =
             linear.addVariable(u8Type, linear.zeroInit());
 
+        const InstructionId watch = addInstruction(
+            linear, Opcode::ChangedAny, {clockEvent}, {clock, clockOld});
         const InstructionId detect = addInstruction(
-            linear, Opcode::ChangedPos, {posedge}, {clock, clockOld});
+            linear, Opcode::ChangedPos, {posedge}, {clock, clockOldCommit});
         const InstructionId write =
             addInstruction(linear, Opcode::MemoryWrite, {},
-                           {enabled, address, mask, data, memory, posedge});
+                           {enable, address, mask, data, memory, posedge});
         const InstructionId read = addInstruction(
             linear, Opcode::MemoryRead, {readData}, {memory, address});
 
         ScheduledProgramBuilder scheduled(linear.finish());
-        addBlock(scheduled, {detect});
-        addBlock(scheduled, {write, read});
+        const InstructionId activate =
+            addInstruction(scheduled, Opcode::ActForward, {}, {clockEvent});
+        setTargets(scheduled, activate, {BlockId{1}});
+        addBlock(scheduled, {watch, activate});
+        addBlock(scheduled, {detect, write, read});
         return MemoryFixture{
             .model =
                 ExecutableModel{
@@ -304,6 +338,8 @@ namespace {
                 },
             .clock = clock,
             .address = address,
+            .enable = enable,
+            .mask = mask,
             .data = data,
             .memory = memory,
             .readData = readData,
@@ -320,6 +356,8 @@ namespace {
         const InterpreterValue address =
             InterpreterValue::bitVector(2, Signedness::Unsigned, addressWords);
         if (!interpreter.write(fixture.address, address).success() ||
+            !interpreter.write(fixture.enable, u1(1)).success() ||
+            !interpreter.write(fixture.mask, u8(0xff)).success() ||
             !interpreter.write(fixture.data, u8(0xc3)).success() ||
             !interpreter.write(fixture.clock, u1(1)).success() ||
             !interpreter.eval().success()) {
@@ -350,10 +388,11 @@ namespace {
         VariableId redXor;
     };
 
-    // 8-lane x 8-bit array: a clocked mem.write_lanes scatters packed lanes into
-    // the memory, its tail changed.any reactivates the reader Block, which
-    // packs the whole array back with mem.read_all and applies the pure
-    // array ops.
+    // 8-lane x 8-bit array: the entry Block's changed.any clock watch
+    // activates the commit Block, whose head changed.pos gate drives a
+    // clocked mem.write_lanes that scatters packed lanes into the memory; the
+    // tail changed.any reactivates the reader Block, which packs the whole
+    // array back with mem.read_all and applies the pure array ops.
     ArrayLoopbackFixture makeArrayLoopbackModel() {
         LinearProgramBuilder linear;
         const TypeId u1Type = linear.addType(Type::bitVector(1));
@@ -363,6 +402,10 @@ namespace {
         const TypeId arrayType = linear.addType(Type::array(8, 8));
         const VariableId clock = linear.addVariable(u1Type, linear.zeroInit());
         const VariableId clockOld =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId clockEvent =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId clockOldCommit =
             linear.addVariable(u1Type, linear.undefInit());
         const VariableId posedge =
             linear.addVariable(u1Type, linear.zeroInit());
@@ -385,8 +428,10 @@ namespace {
         const VariableId redAnd = linear.addVariable(u1Type, linear.zeroInit());
         const VariableId redXor = linear.addVariable(u1Type, linear.zeroInit());
 
+        const InstructionId watch = addInstruction(
+            linear, Opcode::ChangedAny, {clockEvent}, {clock, clockOld});
         const InstructionId detect = addInstruction(
-            linear, Opcode::ChangedPos, {posedge}, {clock, clockOld});
+            linear, Opcode::ChangedPos, {posedge}, {clock, clockOldCommit});
         const InstructionId write = addInstruction(
             linear, Opcode::MemoryWriteLanes, {}, {laneMask, data, memory, posedge});
         const InstructionId changed = addInstruction(
@@ -407,13 +452,16 @@ namespace {
             linear, Opcode::ArrayReduceXor, {redXor}, {all});
 
         ScheduledProgramBuilder scheduled(linear.finish());
+        const InstructionId activateCommit =
+            addInstruction(scheduled, Opcode::ActForward, {}, {clockEvent});
+        setTargets(scheduled, activateCommit, {BlockId{2}});
         const InstructionId activate =
             addInstruction(scheduled, Opcode::ActBackward, {}, {memoryEvent});
         setTargets(scheduled, activate, {BlockId{1}});
-        addBlock(scheduled, {detect});
+        addBlock(scheduled, {watch, activateCommit});
         addBlock(scheduled,
                  {readAll, bcast, one, mux, orReduce, andReduce, xorReduce});
-        addBlock(scheduled, {write, changed, activate});
+        addBlock(scheduled, {detect, write, changed, activate});
         return ArrayLoopbackFixture{
             .model =
                 ExecutableModel{
@@ -806,8 +854,10 @@ namespace {
         VariableId guard;
     };
 
-    // The commit Block raises the guard state one round after the edge and
-    // its change detector re-activates the compute Block carrying the task.
+    // The entry Block's changed.any clock watch activates the commit Block,
+    // whose head changed.pos gate raises the guard state on the edge; the
+    // tail change detector then re-activates the compute Block carrying the
+    // task for the next round.
     EventfulTaskFixture makeEventfulTaskModel(bool guardStartsLow,
                                               HostEventMode eventMode) {
         LinearProgramBuilder linear;
@@ -816,6 +866,14 @@ namespace {
         const VariableId clock = linear.addVariable(u1Type, linear.zeroInit());
         const VariableId clockOld =
             linear.addVariable(u1Type, linear.undefInit());
+        const VariableId clockOldWatch =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId clockEvent =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId clockOldCommit =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId posedge =
+            linear.addVariable(u1Type, linear.zeroInit());
         const VariableId event = linear.addVariable(u1Type, linear.zeroInit());
         const VariableId one = addConstant(linear, u1Type, 1);
         const VariableId guardState =
@@ -826,6 +884,8 @@ namespace {
             linear.addVariable(u1Type, linear.zeroInit());
         const VariableId guard = guardStartsLow ? guardState : one;
 
+        const InstructionId watch = addInstruction(
+            linear, Opcode::ChangedAny, {clockEvent}, {clock, clockOldWatch});
         const InstructionId changed = addInstruction(
             linear, Opcode::ChangedPos, {event}, {clock, clockOld});
         const InstructionId task =
@@ -837,20 +897,25 @@ namespace {
                      .schedule = CallSchedule::Normal,
                      .eventMode = eventMode,
                  });
+        const InstructionId gateDetect = addInstruction(
+            linear, Opcode::ChangedPos, {posedge}, {clock, clockOldCommit});
         const InstructionId writeGuard =
             addInstruction(linear, Opcode::RegisterWrite, {},
-                           {one, one, one, guardState, one});
+                           {one, guardState, posedge});
         const InstructionId detectGuard =
             addInstruction(linear, Opcode::ChangedAny, {guardEvent},
                            {guardState, guardStateOld});
 
         ScheduledProgramBuilder scheduled(linear.finish());
+        const InstructionId activateCommit =
+            addInstruction(scheduled, Opcode::ActForward, {}, {clockEvent});
+        setTargets(scheduled, activateCommit, {BlockId{2}});
         const InstructionId reactivate =
             addInstruction(scheduled, Opcode::ActBackward, {}, {guardEvent});
         setTargets(scheduled, reactivate, {BlockId{1}});
-        addBlock(scheduled, {});
+        addBlock(scheduled, {watch, activateCommit});
         addBlock(scheduled, {changed, task});
-        addBlock(scheduled, {writeGuard, detectGuard, reactivate});
+        addBlock(scheduled, {gateDetect, writeGuard, detectGuard, reactivate});
 
         return EventfulTaskFixture{
             .model = ExecutableModel{
@@ -1054,8 +1119,9 @@ namespace {
         VariableId result;
     };
 
-    // The commit Block publishes the argument and raises the guard one round
-    // after the edge; its change detector re-activates the compute Block.
+    // The entry Block's changed.any clock watch activates the commit Block,
+    // whose head changed.pos gate publishes the argument and raises the guard
+    // on the edge; the tail change detector re-activates the compute Block.
     EventfulDpiFixture makeEventfulDpiModel() {
         LinearProgramBuilder linear;
         const TypeId u1Type = linear.addType(Type::bitVector(1));
@@ -1080,6 +1146,14 @@ namespace {
         const VariableId clock = linear.addVariable(u1Type, linear.zeroInit());
         const VariableId clockOld =
             linear.addVariable(u1Type, linear.undefInit());
+        const VariableId clockOldWatch =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId clockEvent =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId clockOldCommit =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId posedge =
+            linear.addVariable(u1Type, linear.zeroInit());
         const VariableId event = linear.addVariable(u1Type, linear.zeroInit());
         const VariableId guard = linear.addVariable(u1Type, linear.zeroInit());
         const VariableId guardOld =
@@ -1090,9 +1164,10 @@ namespace {
             linear.addVariable(u8Type, linear.zeroInit());
         const VariableId result = linear.addVariable(u8Type, linear.zeroInit());
         const VariableId one = addConstant(linear, u1Type, 1);
-        const VariableId mask = addConstant(linear, u8Type, 0xff);
         const VariableId nextArgument = addConstant(linear, u8Type, 0x2a);
 
+        const InstructionId watch = addInstruction(
+            linear, Opcode::ChangedAny, {clockEvent}, {clock, clockOldWatch});
         const InstructionId changed = addInstruction(
             linear, Opcode::ChangedPos, {event}, {clock, clockOld});
         const InstructionId call = addInstruction(
@@ -1103,22 +1178,28 @@ namespace {
                       .eventCount = 1,
                       .eventMode = HostEventMode::Pending,
                   });
+        const InstructionId gateDetect = addInstruction(
+            linear, Opcode::ChangedPos, {posedge}, {clock, clockOldCommit});
         const InstructionId setArgument =
             addInstruction(linear, Opcode::RegisterWrite, {},
-                           {one, mask, nextArgument, argument, one});
+                           {nextArgument, argument, posedge});
         const InstructionId setGuard =
             addInstruction(linear, Opcode::RegisterWrite, {},
-                           {one, one, one, guard, one});
+                           {one, guard, posedge});
         const InstructionId detectGuard = addInstruction(
             linear, Opcode::ChangedAny, {guardEvent}, {guard, guardOld});
 
         ScheduledProgramBuilder scheduled(linear.finish());
+        const InstructionId activateCommit =
+            addInstruction(scheduled, Opcode::ActForward, {}, {clockEvent});
+        setTargets(scheduled, activateCommit, {BlockId{2}});
         const InstructionId reactivate =
             addInstruction(scheduled, Opcode::ActBackward, {}, {guardEvent});
         setTargets(scheduled, reactivate, {BlockId{1}});
-        addBlock(scheduled, {});
+        addBlock(scheduled, {watch, activateCommit});
         addBlock(scheduled, {changed, call});
-        addBlock(scheduled, {setArgument, setGuard, detectGuard, reactivate});
+        addBlock(scheduled,
+                 {gateDetect, setArgument, setGuard, detectGuard, reactivate});
         return EventfulDpiFixture{
             .model = ExecutableModel{
                 .program = scheduled.finish(),

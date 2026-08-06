@@ -300,25 +300,32 @@ namespace {
 
         diag::Diagnostics diagnostics;
         if (!optimizeLinearProgram(artifact, AmOptimizeOptions{}, diagnostics)) {
+            for (const auto &message : diagnostics.messages()) {
+                std::cerr << "  diag: " << message.message << '\n';
+            }
             return fail("fold optimize reported failure");
         }
         const ProgramView program = artifact.program.view();
-        if (program.instructionCount() != 1 ||
-            program.opcode(InstructionId{0}) != Opcode::Assign) {
+        if (program.instructionCount() != 0) {
             return fail("fold cascade did not collapse the constant chain");
         }
-        const auto operands = program.operands(InstructionId{0});
-        if (operands.size() != 1) {
-            return fail("folded assign lost its operand");
+        if (artifact.interface.ports.size() != 1 ||
+            artifact.interface.ports[0].direction != PortDirection::Output) {
+            return fail("fold cascade lost the output port");
         }
-        const std::optional<uint64_t> folded = constantValue(program, operands[0]);
+        const VariableId portOutput = artifact.interface.ports[0].output;
+        const std::optional<uint64_t> folded = constantValue(program, portOutput);
         if (!folded || *folded != 10) {
             return fail("fold cascade produced the wrong constant value");
         }
         const Type &constantType =
-            program.type(program.variable(operands[0]).type);
+            program.type(program.variable(portOutput).type);
         if (constantType.kind != TypeKind::BitVector || constantType.bitWidth != 64) {
             return fail("folded multiply did not keep the widened result type");
+        }
+        if (!hasRole(artifact.schedulingFacts.variableRoles[portOutput.value],
+                     VariableRole::ExternalOutput)) {
+            return fail("fold cascade did not transfer the external-output role");
         }
         if (program.variableCount() != 7) {
             return fail("fold did not intern exactly the two new constants");
@@ -335,8 +342,6 @@ namespace {
         const TypeId bv32 = fixture.builder.addType(Type::bitVector(32));
         const TypeId memoryType = fixture.builder.addType(Type::array(4, 32));
         const VariableId one = fixture.constant(bv32, 1);
-        const VariableId enable = fixture.constant(bv1, 1);
-        const VariableId mask = fixture.constant(bv32, UINT64_C(0xFFFFFFFF));
         const VariableId dataIn = fixture.variable(bv32, VariableRole::ExternalInput);
         const VariableId event = fixture.variable(bv1, VariableRole::ExternalInput);
         const StringId memoryLabel = fixture.builder.addString("mem");
@@ -353,8 +358,12 @@ namespace {
         fixture.emit(Opcode::MemoryRead, {deadRead}, {memory, address});
         const InstructionId orderedRead =
             fixture.emit(Opcode::MemoryRead, {keptRead}, {memory, address});
+        // Reverted mem.write layout [cond, addr, mask, data, target,
+        // events...]: cond=true with a full mask writes dataIn directly.
+        const VariableId oneBit = fixture.constant(bv1, 1);
+        const VariableId fullMask = fixture.constant(bv32, 0xffffffff);
         const InstructionId write = fixture.emit(
-            Opcode::MemoryWrite, {}, {enable, address, mask, dataIn, memory, event});
+            Opcode::MemoryWrite, {}, {oneBit, address, fullMask, dataIn, memory, event});
         fixture.addOrderedEffect(orderedRead, 0, 0);
         fixture.addOrderedEffect(write, 0, 1);
         LinearProgramArtifact artifact = fixture.finish();
@@ -396,8 +405,7 @@ namespace {
         if (writeOperands.size() != 6 ||
             constantValue(program, writeOperands[0]) != std::optional<uint64_t>(1) ||
             constantValue(program, writeOperands[1]) != std::optional<uint64_t>(2) ||
-            constantValue(program, writeOperands[2]) !=
-                std::optional<uint64_t>(UINT64_C(0xFFFFFFFF)) ||
+            constantValue(program, writeOperands[2]) != std::optional<uint64_t>(0xffffffff) ||
             writeOperands[3] != dataIn || writeOperands[4] != memory ||
             writeOperands[5] != event) {
             return fail("MemoryWrite operands were not remapped");
@@ -452,7 +460,7 @@ namespace {
         return 0;
     }
 
-    int testObservableProducerPreserved() {
+    int testObservableAliasRepointsInterface() {
         Fixture fixture;
         const TypeId bv32 = fixture.builder.addType(Type::bitVector(32));
         const VariableId one = fixture.constant(bv32, 1);
@@ -472,24 +480,158 @@ namespace {
         if (!optimizeLinearProgram(artifact, AmOptimizeOptions{}, diagnostics)) {
             return fail("observable optimize reported failure");
         }
+        // The observable producer may be folded/aliased away as long as the
+        // interface is re-pointed to a variable carrying the same value and
+        // the visibility roles move with it.
         const ProgramView program = artifact.program.view();
-        if (program.instructionCount() != 2 || countOpcode(program, Opcode::Add) != 1) {
-            return fail("observable producer must not be folded away");
-        }
-        const std::optional<uint32_t> addIndex = findOpcode(program, Opcode::Add);
-        if (!addIndex) {
-            return fail("observable producer is missing");
-        }
-        const auto results = program.results(InstructionId{*addIndex});
-        if (results.size() != 1 || results[0] != observed) {
-            return fail("observable variable lost its producing instruction");
-        }
-        if (artifact.interface.declaredVariables.size() != 1 ||
-            artifact.interface.declaredVariables[0].variable != observed) {
+        if (artifact.interface.declaredVariables.size() != 1) {
             return fail("declared variable binding was not preserved");
+        }
+        const VariableId declared = artifact.interface.declaredVariables[0].variable;
+        const std::optional<uint64_t> declaredValue = constantValue(program, declared);
+        if (!declaredValue || *declaredValue != 3) {
+            return fail("declared variable does not observe the folded value");
+        }
+        if (!hasRole(artifact.schedulingFacts.variableRoles[declared.value],
+                     VariableRole::Observable)) {
+            return fail("observable role was not transferred to the representative");
+        }
+        if (artifact.interface.ports.size() != 1 ||
+            constantValue(program, artifact.interface.ports[0].output) !=
+                std::optional<uint64_t>(3)) {
+            return fail("output port does not observe the folded value");
         }
         if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
             return failValidation("observable optimized artifact is invalid", result);
+        }
+        return 0;
+    }
+
+    int testAssignAliasKeepsStateSnapshot() {
+        Fixture fixture;
+        const TypeId bv32 = fixture.builder.addType(Type::bitVector(32));
+        const VariableId state = fixture.variable(bv32, VariableRole::State);
+        const VariableId input = fixture.variable(bv32, VariableRole::ExternalInput);
+        const VariableId snapshot = fixture.variable(bv32);
+        const VariableId plain = fixture.variable(bv32);
+        const VariableId computed = fixture.variable(bv32);
+        const VariableId out0 = fixture.variable(bv32, VariableRole::ExternalOutput);
+        const VariableId out1 = fixture.variable(bv32, VariableRole::ExternalOutput);
+        fixture.addInputPort("in", input);
+        fixture.addOutputPort("out0", out0);
+        fixture.addOutputPort("out1", out1);
+        fixture.emit(Opcode::Assign, {snapshot}, {state});
+        fixture.emit(Opcode::Assign, {plain}, {input});
+        fixture.emit(Opcode::Or, {computed}, {plain, plain});
+        fixture.emit(Opcode::Assign, {out0}, {snapshot});
+        fixture.emit(Opcode::Assign, {out1}, {computed});
+        LinearProgramArtifact artifact = fixture.finish();
+        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+            return failValidation("assign-alias fixture is invalid", result);
+        }
+
+        diag::Diagnostics diagnostics;
+        if (!optimizeLinearProgram(artifact, AmOptimizeOptions{}, diagnostics)) {
+            return fail("assign-alias optimize reported failure");
+        }
+        const ProgramView program = artifact.program.view();
+        // The state snapshot Assign must survive; the plain value assigns are
+        // bypassed, so only the snapshot Assign and the Or remain.
+        if (program.instructionCount() != 2 ||
+            countOpcode(program, Opcode::Assign) != 1 ||
+            countOpcode(program, Opcode::Or) != 1) {
+            return fail("assign-alias bypassed the wrong instructions");
+        }
+        const std::optional<uint32_t> assignIndex = findOpcode(program, Opcode::Assign);
+        const auto operands = program.operands(InstructionId{*assignIndex});
+        if (operands.size() != 1 || operands[0] != state) {
+            return fail("state snapshot assign did not keep its state operand");
+        }
+        if (artifact.interface.ports[2].output != snapshot &&
+            artifact.interface.ports[1].output != snapshot) {
+            return fail("snapshot consumer was not preserved");
+        }
+        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+            return failValidation("assign-alias optimized artifact is invalid", result);
+        }
+        return 0;
+    }
+
+    int testConstMemFold() {
+        Fixture fixture;
+        const TypeId bv32 = fixture.builder.addType(Type::bitVector(32));
+        const TypeId memoryType = fixture.builder.addType(Type::array(4, 32));
+        // Memory variables may not carry a Constant init (validation), so the
+        // foldable cases are Zero and Undef init on never-written memories.
+        const VariableId zeroMem = fixture.variable(memoryType, VariableRole::State);
+        const VariableId undefMem = fixture.builder.addVariable(
+            memoryType, fixture.builder.undefInit());
+        fixture.roles.push_back(VariableRole::State);
+        const VariableId ram = fixture.variable(memoryType, VariableRole::State);
+        const TypeId bv1 = fixture.builder.addType(Type::bitVector(1));
+        const VariableId one1 = fixture.constant(bv1, 1);
+        const VariableId dataIn = fixture.variable(bv32, VariableRole::ExternalInput);
+        const VariableId addr1 = fixture.constant(bv32, 1);
+        const VariableId addr9 = fixture.constant(bv32, 9);
+        const VariableId readZero = fixture.variable(bv32);
+        const VariableId readUndef = fixture.variable(bv32);
+        const VariableId readRange = fixture.variable(bv32);
+        const VariableId readRam = fixture.variable(bv32);
+        const VariableId out0 = fixture.variable(bv32, VariableRole::ExternalOutput);
+        const VariableId out1 = fixture.variable(bv32, VariableRole::ExternalOutput);
+        const VariableId out2 = fixture.variable(bv32, VariableRole::ExternalOutput);
+        const VariableId out3 = fixture.variable(bv32, VariableRole::ExternalOutput);
+        fixture.addInputPort("din", dataIn);
+        fixture.addOutputPort("o0", out0);
+        fixture.addOutputPort("o1", out1);
+        fixture.addOutputPort("o2", out2);
+        fixture.addOutputPort("o3", out3);
+        fixture.emit(Opcode::MemoryRead, {readZero}, {zeroMem, addr1});
+        fixture.emit(Opcode::MemoryRead, {readUndef}, {undefMem, addr1});
+        fixture.emit(Opcode::MemoryRead, {readRange}, {zeroMem, addr9});
+        fixture.emit(Opcode::MemoryRead, {readRam}, {ram, addr1});
+        // Reverted mem.write layout [cond, addr, mask, data, target,
+        // events...]: cond=true with a full mask writes dataIn directly.
+        const VariableId fullMask = fixture.constant(bv32, 0xffffffff);
+        fixture.emit(Opcode::MemoryWrite, {}, {one1, addr1, fullMask, dataIn, ram, one1});
+        fixture.emit(Opcode::Assign, {out0}, {readZero});
+        fixture.emit(Opcode::Assign, {out1}, {readUndef});
+        fixture.emit(Opcode::Assign, {out2}, {readRange});
+        fixture.emit(Opcode::Assign, {out3}, {readRam});
+        LinearProgramArtifact artifact = fixture.finish();
+        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+            return failValidation("const-mem-fold fixture is invalid", result);
+        }
+
+        diag::Diagnostics diagnostics;
+        if (!optimizeLinearProgram(artifact, AmOptimizeOptions{}, diagnostics)) {
+            return fail("const-mem-fold optimize reported failure");
+        }
+        const ProgramView program = artifact.program.view();
+        // Zero/Undef-init never-written reads fold to zero (storage is
+        // zero-initialized); out-of-range reads fold to zero. Only the read
+        // of the written memory and the write itself survive.
+        if (countOpcode(program, Opcode::MemoryRead) != 1 ||
+            countOpcode(program, Opcode::MemoryWrite) != 1) {
+            return fail("const-mem-fold eliminated the wrong instructions");
+        }
+        const std::optional<uint64_t> foldedZero =
+            constantValue(program, artifact.interface.ports[1].output);
+        const std::optional<uint64_t> foldedUndef =
+            constantValue(program, artifact.interface.ports[2].output);
+        const std::optional<uint64_t> foldedRange =
+            constantValue(program, artifact.interface.ports[3].output);
+        if (!foldedZero || *foldedZero != 0) {
+            return fail("const-mem-fold did not zero never-written reads");
+        }
+        if (!foldedUndef || *foldedUndef != 0) {
+            return fail("const-mem-fold did not zero undef-init reads");
+        }
+        if (!foldedRange || *foldedRange != 0) {
+            return fail("const-mem-fold did not zero out-of-range reads");
+        }
+        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+            return failValidation("const-mem-fold optimized artifact is invalid", result);
         }
         return 0;
     }
@@ -511,5 +653,11 @@ int main() {
     if (const int result = testMemoryReadNeverCse(); result != 0) {
         return result;
     }
-    return testObservableProducerPreserved();
+    if (const int result = testObservableAliasRepointsInterface(); result != 0) {
+        return result;
+    }
+    if (const int result = testAssignAliasKeepsStateSnapshot(); result != 0) {
+        return result;
+    }
+    return testConstMemFold();
 }

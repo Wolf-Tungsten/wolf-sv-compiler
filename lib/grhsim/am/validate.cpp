@@ -499,7 +499,7 @@ namespace wolvrix::lib::grhsim::am
                     shapeValid = resultCount == 1 && operandCount == 1;
                     break;
                 case Opcode::MemoryWriteLanes:
-                    shapeValid = resultCount == 0 && operandCount >= 4;
+                    shapeValid = resultCount == 0 && operandCount >= 3;
                     break;
                 case Opcode::Concat:
                     shapeValid = resultCount == 1 && operandCount >= 1;
@@ -510,7 +510,7 @@ namespace wolvrix::lib::grhsim::am
                     shapeValid = resultCount == 1 && operandCount == 2;
                     break;
                 case Opcode::RegisterWrite:
-                    shapeValid = resultCount == 0 && operandCount >= 5;
+                    shapeValid = resultCount == 0 && operandCount >= 2;
                     break;
                 case Opcode::MemoryRead:
                     shapeValid = resultCount == 1 && operandCount == 2;
@@ -519,10 +519,10 @@ namespace wolvrix::lib::grhsim::am
                     shapeValid = resultCount == 0 && operandCount >= 6;
                     break;
                 case Opcode::MemoryFill:
-                    shapeValid = resultCount == 0 && operandCount >= 4;
+                    shapeValid = resultCount == 0 && operandCount >= 2;
                     break;
                 case Opcode::LatchWrite:
-                    shapeValid = resultCount == 0 && operandCount == 4;
+                    shapeValid = resultCount == 0 && operandCount == 2;
                     break;
                 case Opcode::SystemFunction:
                     shapeValid = resultCount == 1;
@@ -956,20 +956,17 @@ namespace wolvrix::lib::grhsim::am
             switch (opcode)
             {
             case Opcode::RegisterWrite:
-                if (!results.empty() || operands.size() < 5)
+                if (!results.empty() || operands.size() < 2)
                 {
                     return;
                 }
                 {
-                    const VariableId target = operands[3];
+                    const VariableId target = operands[1];
                     const Type *targetType = variableType(view, target);
-                    const Type *maskType = variableType(view, operands[1]);
-                    valid = isBitVector1(variableType(view, operands[0])) &&
-                            isBitVector(targetType) && isBitVector(maskType) &&
-                            maskType->bitWidth == targetType->bitWidth &&
-                            sameType(variableType(view, operands[2]), targetType) &&
+                    valid = isBitVector(targetType) &&
+                            sameType(variableType(view, operands[0]), targetType) &&
                             isMutable(view, target) &&
-                            validateEventRange(view, operands, 4, target);
+                            validateEventRange(view, operands, 2, target);
                 }
                 break;
             case Opcode::MemoryRead:
@@ -1006,41 +1003,37 @@ namespace wolvrix::lib::grhsim::am
                 }
                 break;
             case Opcode::MemoryFill:
-                if (!results.empty() || operands.size() < 4)
+                if (!results.empty() || operands.size() < 2)
                 {
                     return;
                 }
                 {
-                    const VariableId target = operands[2];
+                    const VariableId target = operands[1];
                     const Type *targetType = variableType(view, target);
-                    const Type *dataType = variableType(view, operands[1]);
+                    const Type *dataType = variableType(view, operands[0]);
                     uint64_t packedWidth = 0;
                     if (targetType)
                     {
                         packedWidth = static_cast<uint64_t>(targetType->elementCount) *
                                       targetType->bitWidth;
                     }
-                    valid = isBitVector1(variableType(view, operands[0])) && targetType &&
-                            targetType->kind == TypeKind::Array && isBitVector(dataType) &&
-                            (dataType->bitWidth == targetType->bitWidth ||
-                             dataType->bitWidth == packedWidth) &&
+                    valid = targetType && targetType->kind == TypeKind::Array &&
+                            isBitVector(dataType) &&
+                            dataType->bitWidth == packedWidth &&
                             isMutable(view, target) &&
-                            validateEventRange(view, operands, 3, target);
+                            validateEventRange(view, operands, 2, target);
                 }
                 break;
             case Opcode::LatchWrite:
-                if (!results.empty() || operands.size() != 4)
+                if (!results.empty() || operands.size() != 2)
                 {
                     return;
                 }
                 {
-                    const VariableId target = operands[3];
+                    const VariableId target = operands[1];
                     const Type *targetType = variableType(view, target);
-                    const Type *maskType = variableType(view, operands[1]);
-                    valid = isBitVector1(variableType(view, operands[0])) &&
-                            isBitVector(targetType) && isBitVector(maskType) &&
-                            maskType->bitWidth == targetType->bitWidth &&
-                            sameType(variableType(view, operands[2]), targetType) &&
+                    valid = isBitVector(targetType) &&
+                            sameType(variableType(view, operands[0]), targetType) &&
                             isMutable(view, target);
                 }
                 break;
@@ -1059,7 +1052,7 @@ namespace wolvrix::lib::grhsim::am
                 }
                 break;
             case Opcode::MemoryWriteLanes:
-                if (!results.empty() || operands.size() < 4)
+                if (!results.empty() || operands.size() < 3)
                 {
                     return;
                 }

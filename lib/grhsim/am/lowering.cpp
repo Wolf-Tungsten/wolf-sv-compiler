@@ -119,11 +119,22 @@ namespace wolvrix::lib::grhsim::am
             uint32_t ordinal = 0;
         };
 
-        struct PendingStateOrderedEffect
+        // One collected state write operation before nextValue merging. The
+        // update condition and write mask are kept as expression operands and
+        // folded into the final nextValue when the writes of one (target,
+        // event signature) chain are materialized; the emitted state write
+        // instruction then carries no cond/mask operands.
+        struct PendingStateWrite
         {
-            InstructionId instruction;
+            Opcode opcode = Opcode::RegisterWrite;
             VariableId target;
+            VariableId cond;     // invalid for mem.write_lanes
+            VariableId mask;     // invalid for mem.write_lanes / mem.fill
+            VariableId data;     // nextValue / element data / fill data / packed lanes
+            VariableId addr;     // mem.write only
+            std::vector<VariableId> events; // empty for latch.write
             std::optional<ExplicitOrder> explicitOrder;
+            std::string context;
         };
 
         struct PendingOrderedGroup
@@ -166,7 +177,7 @@ namespace wolvrix::lib::grhsim::am
                     {
                         return std::nullopt;
                     }
-                    materializeStateOrderedEffects();
+                    materializeStateWrites();
 
                     std::sort(orderedEffects_.begin(), orderedEffects_.end(),
                               [](const OrderedEffect &lhs, const OrderedEffect &rhs) {
@@ -505,6 +516,9 @@ namespace wolvrix::lib::grhsim::am
                 std::size_t instructionCount = 0;
                 std::size_t operandCount = 0;
                 std::size_t resultCount = 0;
+                // Slack for the nextValue merge logic (mux/blend/read-old)
+                // materialized per collected state write.
+                std::size_t mergeSlack = 0;
                 std::size_t stringCount = graph_.inputPorts().size() +
                                           graph_.outputPorts().size() +
                                           graph_.inoutPorts().size() +
@@ -540,10 +554,25 @@ namespace wolvrix::lib::grhsim::am
                             eventCount += typed->size();
                         }
                     }
+                    switch (op.kind())
+                    {
+                    case OperationKind::kRegisterWritePort:
+                    case OperationKind::kLatchWritePort:
+                        mergeSlack += 6;
+                        break;
+                    case OperationKind::kMemoryWritePort:
+                        mergeSlack += 9;
+                        break;
+                    case OperationKind::kMemoryFillPort:
+                        mergeSlack += 3;
+                        break;
+                    default:
+                        break;
+                    }
                 }
-                instructionCount += eventCount;
-                operandCount += 2 * eventCount;
-                resultCount += eventCount;
+                instructionCount += eventCount + mergeSlack;
+                operandCount += 2 * eventCount + 3 * mergeSlack;
+                resultCount += eventCount + mergeSlack;
 
                 ProgramReserve reserve;
                 reserve.types = 64;
@@ -553,7 +582,8 @@ namespace wolvrix::lib::grhsim::am
                 reserve.initActions = graph_.operations().size() / 16;
                 reserve.literals = graph_.operations().size() / 16;
                 reserve.literalWords = graph_.operations().size() / 8;
-                reserve.variables = graph_.values().size() + stateCount + 2 * eventCount;
+                reserve.variables =
+                    graph_.values().size() + stateCount + 2 * eventCount + mergeSlack;
                 reserve.variableLabels = exposedValues_.size() + stateCount;
                 reserve.instructions = instructionCount;
                 reserve.operands = operandCount;
@@ -2110,86 +2140,403 @@ namespace wolvrix::lib::grhsim::am
                 return group;
             }
 
-            void materializeStateOrderedEffects()
+            // Materialize the collected state writes: writes to one target are
+            // ordered exactly like the legacy per-target effect order, then
+            // partitioned by event signature. Register/latch writes inside one
+            // signature fold cond and mask into a single nextValue expression
+            // and collapse to one write per signature; memory element writes
+            // keep their cond/mask operands and stay one instruction per write
+            // (a disabled write is suppressed outright, so no read-old value
+            // is ever needed).
+            void materializeStateWrites()
             {
-                std::map<uint32_t, std::vector<PendingStateOrderedEffect>> effectsByTarget;
-                for (const PendingStateOrderedEffect &effect : pendingStateOrderedEffects_)
+                std::map<uint32_t, std::vector<PendingStateWrite>> writesByTarget;
+                for (PendingStateWrite &write : pendingStateWrites_)
                 {
-                    effectsByTarget[effect.target.value].push_back(effect);
+                    writesByTarget[write.target.value].push_back(std::move(write));
                 }
 
-                for (auto &[targetValue, effects] : effectsByTarget)
+                for (auto &[targetValue, writes] : writesByTarget)
                 {
-                    std::map<uint32_t, std::vector<PendingStateOrderedEffect>>
-                        explicitGroups;
-                    for (const PendingStateOrderedEffect &effect : effects)
+                    std::map<uint32_t, std::vector<PendingStateWrite>> explicitGroups;
+                    for (const PendingStateWrite &write : writes)
                     {
-                        if (effect.explicitOrder)
+                        if (write.explicitOrder)
                         {
-                            explicitGroups[effect.explicitOrder->group].push_back(effect);
+                            explicitGroups[write.explicitOrder->group].push_back(write);
                         }
                     }
-
                     for (auto &[explicitGroup, members] : explicitGroups)
                     {
                         (void)explicitGroup;
                         std::sort(members.begin(), members.end(),
-                                  [](const PendingStateOrderedEffect &lhs,
-                                     const PendingStateOrderedEffect &rhs) {
+                                  [](const PendingStateWrite &lhs,
+                                     const PendingStateWrite &rhs) {
                                       return lhs.explicitOrder->ordinal <
                                              rhs.explicitOrder->ordinal;
                                   });
                     }
 
-                    std::vector<PendingStateOrderedEffect> ordered;
-                    ordered.reserve(effects.size());
+                    std::vector<PendingStateWrite> ordered;
+                    ordered.reserve(writes.size());
                     std::unordered_set<uint32_t> emittedExplicitGroups;
-                    for (const PendingStateOrderedEffect &effect : effects)
+                    for (const PendingStateWrite &write : writes)
                     {
-                        if (!effect.explicitOrder)
+                        if (!write.explicitOrder)
                         {
-                            ordered.push_back(effect);
+                            ordered.push_back(write);
                             continue;
                         }
-                        const uint32_t explicitGroup = effect.explicitOrder->group;
+                        const uint32_t explicitGroup = write.explicitOrder->group;
                         if (!emittedExplicitGroups.insert(explicitGroup).second)
                         {
                             continue;
                         }
-                        const std::vector<PendingStateOrderedEffect> &members =
+                        const std::vector<PendingStateWrite> &members =
                             explicitGroups.at(explicitGroup);
                         ordered.insert(ordered.end(), members.begin(), members.end());
                     }
 
-                    const uint32_t group = stateOrderGroup(VariableId{targetValue});
-                    for (std::size_t ordinal = 0; ordinal < ordered.size(); ++ordinal)
+                    // Partition by event signature, keeping first-appearance
+                    // order of the signatures and in-signature write order.
+                    std::vector<std::vector<PendingStateWrite>> signatureGroups;
+                    std::map<std::vector<uint32_t>, std::size_t> signatureIndex;
+                    for (PendingStateWrite &write : ordered)
                     {
-                        orderedEffects_.push_back(OrderedEffect{
-                            .instruction = ordered[ordinal].instruction,
-                            .group = group,
-                            .ordinal = static_cast<uint32_t>(ordinal),
-                        });
+                        std::vector<uint32_t> key;
+                        key.reserve(write.events.size());
+                        for (const VariableId event : write.events)
+                        {
+                            key.push_back(event.value);
+                        }
+                        std::sort(key.begin(), key.end());
+                        key.erase(std::unique(key.begin(), key.end()), key.end());
+                        const auto [it, inserted] =
+                            signatureIndex.try_emplace(std::move(key),
+                                                       signatureGroups.size());
+                        if (inserted)
+                        {
+                            signatureGroups.emplace_back();
+                        }
+                        signatureGroups[it->second].push_back(std::move(write));
+                    }
+
+                    const uint32_t group = stateOrderGroup(VariableId{targetValue});
+                    uint32_t ordinal = 0;
+                    for (const std::vector<PendingStateWrite> &signatureGroup :
+                         signatureGroups)
+                    {
+                        emitSignatureWrites(signatureGroup, group, ordinal);
                     }
                 }
-                pendingStateOrderedEffects_.clear();
+                pendingStateWrites_.clear();
             }
 
-            void addOrderedEffect(const Operation &op, InstructionId instruction,
-                                  VariableId stateTarget = VariableId::invalid())
+            // Constant classification of a lowering-time variable: only
+            // Constant-initialised bit-vector literals qualify (coerced or
+            // computed values stay Dynamic). Used to fold the merged
+            // nextValue logic at construction time.
+            enum class ConstClass : uint8_t
+            {
+                Dynamic,
+                Zero,
+                AllOnes,
+            };
+
+            ConstClass classifyConstant(VariableId variable, uint32_t width) const
+            {
+                if (!variable.valid() || width == 0)
+                {
+                    return ConstClass::Dynamic;
+                }
+                const VariableRecord &record = builder_.view().variable(variable);
+                const InitDescriptor &init = builder_.view().init(record.init);
+                if (init.kind != InitKind::Constant)
+                {
+                    return ConstClass::Dynamic;
+                }
+                const LiteralView literal = builder_.view().literal(LiteralId{init.payload});
+                const Type &literalType = builder_.view().type(literal.type);
+                if (literalType.kind != TypeKind::BitVector)
+                {
+                    return ConstClass::Dynamic;
+                }
+                bool anyOne = false;
+                bool anyZero = false;
+                for (uint32_t bit = 0; bit < width; ++bit)
+                {
+                    const bool set = bit < literalType.bitWidth &&
+                                     ((literal.words[bit / 64U] >> (bit % 64U)) & 1U) != 0;
+                    anyOne = anyOne || set;
+                    anyZero = anyZero || !set;
+                    if (anyOne && anyZero)
+                    {
+                        return ConstClass::Dynamic;
+                    }
+                }
+                return anyOne ? ConstClass::AllOnes : ConstClass::Zero;
+            }
+
+            bool isConstantOne(VariableId variable) const
+            {
+                return classifyConstant(variable, 1) == ConstClass::AllOnes;
+            }
+
+            bool isConstantZero(VariableId variable) const
+            {
+                return classifyConstant(variable, 1) == ConstClass::Zero;
+            }
+
+            VariableId addPureTyped(Opcode opcode, const Type &type,
+                                    std::span<const VariableId> operands)
+            {
+                const VariableId result = addVariable(type, builder_.undefInit());
+                const std::array<VariableId, 1> results{result};
+                addInstruction(opcode, results, operands);
+                return result;
+            }
+
+            VariableId pureBinary(Opcode opcode, VariableId lhs, VariableId rhs,
+                                  const Type &type)
+            {
+                const std::array<VariableId, 2> operands{lhs, rhs};
+                return addPureTyped(opcode, type, operands);
+            }
+
+            VariableId pureMux(VariableId cond, VariableId whenTrue,
+                               VariableId whenFalse, const Type &type)
+            {
+                const std::array<VariableId, 3> operands{cond, whenTrue, whenFalse};
+                return addPureTyped(Opcode::Mux, type, operands);
+            }
+
+            // (base & ~mask) | (data & mask), folded at construction:
+            // constant masks collapse outright; dynamic masks use the
+            // three-op form base ^ ((base ^ data) & mask).
+            VariableId blendValue(VariableId base, VariableId data, VariableId mask,
+                                  const Type &type)
+            {
+                if (!mask.valid())
+                {
+                    return data;
+                }
+                switch (classifyConstant(mask, type.bitWidth))
+                {
+                case ConstClass::AllOnes:
+                    return data;
+                case ConstClass::Zero:
+                    return base;
+                default:
+                    break;
+                }
+                const VariableId delta = pureBinary(Opcode::Xor, base, data, type);
+                const VariableId gated = pureBinary(Opcode::And, delta, mask, type);
+                return pureBinary(Opcode::Xor, base, gated, type);
+            }
+
+            void recordWriteEffect(InstructionId instruction, uint32_t group,
+                                   uint32_t &ordinal)
+            {
+                orderedEffects_.push_back(OrderedEffect{
+                    .instruction = instruction,
+                    .group = group,
+                    .ordinal = ordinal++,
+                });
+            }
+
+            // Registers/latches: fold the whole chain into a single write
+            // whose nextValue nests cond/mask over the read-old state value.
+            // The chain starts from a pre-commit snapshot of the target
+            // (settled in the compute phase), so the cone is free of direct
+            // state operands and packing can never turn a non-blocking read
+            // into a blocking one; a chain that degenerates to the identity
+            // emits no write at all.
+            VariableId targetSnapshot(VariableId target)
+            {
+                if (const auto found = targetSnapshots_.find(target.value);
+                    found != targetSnapshots_.end())
+                {
+                    return found->second;
+                }
+                const TypeId type = builder_.view().variable(target).type;
+                const VariableId snapshot = addVariable(type, builder_.undefInit());
+                targetSnapshots_.emplace(target.value, snapshot);
+                const std::array<VariableId, 1> results{snapshot};
+                const std::array<VariableId, 1> operands{target};
+                addInstruction(Opcode::Assign, results, operands);
+                return snapshot;
+            }
+
+            void emitMergedScalarWrites(
+                const std::vector<PendingStateWrite> &signatureGroup, uint32_t group,
+                uint32_t &ordinal)
+            {
+                const PendingStateWrite &head = signatureGroup.front();
+                const Type targetType =
+                    builder_.view().type(builder_.view().variable(head.target).type);
+                VariableId acc = targetSnapshot(head.target);
+                const VariableId accStart = acc;
+                for (const PendingStateWrite &write : signatureGroup)
+                {
+                    if (isConstantZero(write.cond))
+                    {
+                        // A write that never fires has no effect, ever.
+                        continue;
+                    }
+                    const VariableId blended =
+                        blendValue(acc, write.data, write.mask, targetType);
+                    if (blended == acc)
+                    {
+                        continue;
+                    }
+                    if (isConstantOne(write.cond))
+                    {
+                        acc = blended;
+                        continue;
+                    }
+                    acc = pureMux(write.cond, blended, acc, targetType);
+                }
+                if (acc == accStart)
+                {
+                    return;
+                }
+                std::vector<VariableId> operands{acc, head.target};
+                operands.insert(operands.end(), head.events.begin(),
+                                head.events.end());
+                const InstructionId instruction =
+                    addInstruction(head.opcode, {}, operands);
+                recordWriteEffect(instruction, group, ordinal);
+            }
+
+            // mem.write chains: one instruction per write, cond/mask kept as
+            // operands. A disabled write is suppressed entirely, so ordered
+            // writes in the same sweep never need to read the old element
+            // value -- there is no read-old threading at all.
+            InstructionId emitMemoryElementWrite(
+                VariableId target, const PendingStateWrite &write,
+                const Type &elementType)
+            {
+                // mem.write keeps cond/mask as operands (reverted from the
+                // merged self-mux form): a disabled write simply never
+                // happens, so no read-old element evaluation is needed at
+                // all. Register chains can start from a scalar pre-commit
+                // snapshot, but a memory cannot be snapshotted wholesale --
+                // its merged form had to read oldValue live at commit time
+                // (the read-old mandatory pull), which is exactly the cost
+                // and the stale-hold hazard this revert removes.
+                // Layout: [cond, addr, mask, data, target, events...].
+                std::vector<VariableId> operands{write.cond, write.addr, write.mask,
+                                                 write.data, target};
+                operands.insert(operands.end(), write.events.begin(),
+                                write.events.end());
+                return addInstruction(Opcode::MemoryWrite, {}, operands);
+            }
+
+            const Type *variableTypeOf(VariableId variable) const
+            {
+                if (!variable.valid() || variable.value >= builder_.view().variableCount())
+                {
+                    return nullptr;
+                }
+                return &builder_.view().type(builder_.view().variable(variable).type);
+            }
+
+            void emitSignatureWrites(
+                const std::vector<PendingStateWrite> &signatureGroup, uint32_t group,
+                uint32_t &ordinal)
+            {
+                const PendingStateWrite &head = signatureGroup.front();
+                if (head.opcode == Opcode::RegisterWrite ||
+                    head.opcode == Opcode::LatchWrite)
+                {
+                    emitMergedScalarWrites(signatureGroup, group, ordinal);
+                    return;
+                }
+                if (head.opcode == Opcode::MemoryWriteLanes)
+                {
+                    for (const PendingStateWrite &write : signatureGroup)
+                    {
+                        std::vector<VariableId> operands{write.cond, write.data,
+                                                         write.target};
+                        operands.insert(operands.end(), write.events.begin(),
+                                        write.events.end());
+                        const InstructionId instruction =
+                            addInstruction(Opcode::MemoryWriteLanes, {}, operands);
+                        recordWriteEffect(instruction, group, ordinal);
+                    }
+                    return;
+                }
+
+                const Type targetType =
+                    builder_.view().type(builder_.view().variable(head.target).type);
+                const Type elementType =
+                    Type::bitVector(targetType.bitWidth, targetType.signedness);
+                for (const PendingStateWrite &write : signatureGroup)
+                {
+                    if (write.opcode == Opcode::MemoryWrite)
+                    {
+                        if (isConstantZero(write.cond) ||
+                            classifyConstant(write.mask, elementType.bitWidth) ==
+                                ConstClass::Zero)
+                        {
+                            // Never fires / never changes a bit: no effect.
+                            continue;
+                        }
+                        const InstructionId instruction =
+                            emitMemoryElementWrite(head.target, write, elementType);
+                        recordWriteEffect(instruction, group, ordinal);
+                        continue;
+                    }
+                    // mem.fill: fold cond into the packed fill image.
+                    if (isConstantZero(write.cond))
+                    {
+                        continue;
+                    }
+                    const uint64_t packedWidth =
+                        static_cast<uint64_t>(targetType.bitWidth) *
+                        targetType.elementCount;
+                    const Type packedType = Type::bitVector(
+                        static_cast<uint32_t>(packedWidth), Signedness::Unsigned);
+                    VariableId packed = write.data;
+                    if (variableTypeOf(write.data) &&
+                        variableTypeOf(write.data)->bitWidth != packedWidth)
+                    {
+                        const std::array<VariableId, 1> broadcastOperands{write.data};
+                        packed = addPureTyped(Opcode::ArrayBroadcast, packedType,
+                                              broadcastOperands);
+                    }
+                    else if (variableTypeOf(write.data) &&
+                             *variableTypeOf(write.data) != packedType)
+                    {
+                        packed = coerceToType(write.data, *variableTypeOf(write.data),
+                                              packedType);
+                    }
+                    VariableId merged = packed;
+                    if (!isConstantOne(write.cond))
+                    {
+                        const std::array<VariableId, 1> readAllResults{
+                            addVariable(packedType, builder_.undefInit())};
+                        const std::array<VariableId, 1> readAllOperands{head.target};
+                        addInstruction(Opcode::MemoryReadAll, readAllResults,
+                                       readAllOperands);
+                        merged = pureMux(write.cond, packed, readAllResults.front(),
+                                         packedType);
+                    }
+                    std::vector<VariableId> operands{merged, head.target};
+                    operands.insert(operands.end(), write.events.begin(),
+                                    write.events.end());
+                    const InstructionId instruction =
+                        addInstruction(Opcode::MemoryFill, {}, operands);
+                    recordWriteEffect(instruction, group, ordinal);
+                }
+            }
+
+            void addOrderedEffect(const Operation &op, InstructionId instruction)
             {
                 const std::optional<ExplicitOrder> explicitOrder =
                     op.id().index < explicitOrderByOperation_.size()
                         ? explicitOrderByOperation_[op.id().index]
                         : std::nullopt;
-                if (stateTarget.valid())
-                {
-                    pendingStateOrderedEffects_.push_back(PendingStateOrderedEffect{
-                        .instruction = instruction,
-                        .target = stateTarget,
-                        .explicitOrder = explicitOrder,
-                    });
-                    return;
-                }
                 if (explicitOrder)
                 {
                     orderedEffects_.push_back(OrderedEffect{
@@ -2237,21 +2584,34 @@ namespace wolvrix::lib::grhsim::am
                     return;
                 }
                 next = preCommitValue(op.operands()[1], next, op);
-                std::vector<VariableId> operands{
-                    preCommitValue(op.operands()[0], mappedValue(op.operands()[0], op), op),
-                    preCommitValue(op.operands()[2], mappedValue(op.operands()[2], op), op),
-                    next,
-                    *target,
+                VariableId mask = coerceToType(mappedValue(op.operands()[2], op),
+                                               typeForValue(op.operands()[2]), targetType);
+                if (!mask.valid())
+                {
+                    error("register write mask cannot be converted to target Type",
+                          opContext(op));
+                    return;
+                }
+                mask = preCommitValue(op.operands()[2], mask, op);
+                PendingStateWrite write{
+                    .opcode = Opcode::RegisterWrite,
+                    .target = *target,
+                    .cond = preCommitValue(op.operands()[0],
+                                           mappedValue(op.operands()[0], op), op),
+                    .mask = mask,
+                    .data = next,
+                    .addr = VariableId::invalid(),
+                    .events = *events,
+                    .explicitOrder = op.id().index < explicitOrderByOperation_.size()
+                                         ? explicitOrderByOperation_[op.id().index]
+                                         : std::nullopt,
+                    .context = opContext(op),
                 };
-                operands.insert(operands.end(), events->begin(), events->end());
-                if (std::any_of(operands.begin(), operands.end(),
-                                [](VariableId value) { return !value.valid(); }))
+                if (!write.cond.valid() || !write.mask.valid() || !write.data.valid())
                 {
                     return;
                 }
-                const InstructionId instruction =
-                    addInstruction(Opcode::RegisterWrite, {}, operands);
-                addOrderedEffect(op, instruction, *target);
+                pendingStateWrites_.push_back(std::move(write));
             }
 
             void lowerLatchWrite(const Operation &op)
@@ -2280,20 +2640,33 @@ namespace wolvrix::lib::grhsim::am
                     error("latch nextValue cannot be converted to target Type", opContext(op));
                     return;
                 }
-                const std::array<VariableId, 4> operands{
-                    mappedValue(op.operands()[0], op),
-                    mappedValue(op.operands()[2], op),
-                    next,
-                    *target,
+                const VariableId mask = coerceToType(
+                    mappedValue(op.operands()[2], op), typeForValue(op.operands()[2]),
+                    targetType);
+                if (!mask.valid())
+                {
+                    error("latch write mask cannot be converted to target Type",
+                          opContext(op));
+                    return;
+                }
+                PendingStateWrite write{
+                    .opcode = Opcode::LatchWrite,
+                    .target = *target,
+                    .cond = mappedValue(op.operands()[0], op),
+                    .mask = mask,
+                    .data = next,
+                    .addr = VariableId::invalid(),
+                    .events = {},
+                    .explicitOrder = op.id().index < explicitOrderByOperation_.size()
+                                         ? explicitOrderByOperation_[op.id().index]
+                                         : std::nullopt,
+                    .context = opContext(op),
                 };
-                if (std::any_of(operands.begin(), operands.end(),
-                                [](VariableId value) { return !value.valid(); }))
+                if (!write.cond.valid() || !write.mask.valid() || !write.data.valid())
                 {
                     return;
                 }
-                const InstructionId instruction =
-                    addInstruction(Opcode::LatchWrite, {}, operands);
-                addOrderedEffect(op, instruction, *target);
+                pendingStateWrites_.push_back(std::move(write));
             }
 
             void lowerMemoryRead(const Operation &op)
@@ -2369,22 +2742,36 @@ namespace wolvrix::lib::grhsim::am
                     return;
                 }
                 data = preCommitValue(op.operands()[2], data, op);
-                std::vector<VariableId> operands{
-                    preCommitValue(op.operands()[0], mappedValue(op.operands()[0], op), op),
-                    preCommitValue(op.operands()[1], mappedValue(op.operands()[1], op), op),
-                    preCommitValue(op.operands()[3], mappedValue(op.operands()[3], op), op),
-                    data,
-                    *target,
+                VariableId mask = coerceToType(mappedValue(op.operands()[3], op),
+                                               typeForValue(op.operands()[3]), elementType);
+                if (!mask.valid())
+                {
+                    error("memory write mask cannot be converted to element Type",
+                          opContext(op));
+                    return;
+                }
+                mask = preCommitValue(op.operands()[3], mask, op);
+                PendingStateWrite write{
+                    .opcode = Opcode::MemoryWrite,
+                    .target = *target,
+                    .cond = preCommitValue(op.operands()[0],
+                                           mappedValue(op.operands()[0], op), op),
+                    .mask = mask,
+                    .data = data,
+                    .addr = preCommitValue(op.operands()[1],
+                                           mappedValue(op.operands()[1], op), op),
+                    .events = *events,
+                    .explicitOrder = op.id().index < explicitOrderByOperation_.size()
+                                         ? explicitOrderByOperation_[op.id().index]
+                                         : std::nullopt,
+                    .context = opContext(op),
                 };
-                operands.insert(operands.end(), events->begin(), events->end());
-                if (std::any_of(operands.begin(), operands.end(),
-                                [](VariableId value) { return !value.valid(); }))
+                if (!write.cond.valid() || !write.mask.valid() || !write.data.valid() ||
+                    !write.addr.valid())
                 {
                     return;
                 }
-                const InstructionId instruction =
-                    addInstruction(Opcode::MemoryWrite, {}, operands);
-                addOrderedEffect(op, instruction, *target);
+                pendingStateWrites_.push_back(std::move(write));
             }
 
             void lowerMemoryReadAll(const Operation &op)
@@ -2454,20 +2841,29 @@ namespace wolvrix::lib::grhsim::am
                     }
                     return;
                 }
-                std::vector<VariableId> operands{
-                    preCommitValue(op.operands()[0], mappedValue(op.operands()[0], op), op),
-                    preCommitValue(op.operands()[1], mappedValue(op.operands()[1], op), op),
-                    *target,
+                // The lane mask already merges the write enable and the lane
+                // granularity, so it stays on the instruction as the
+                // address-like operand.
+                PendingStateWrite write{
+                    .opcode = Opcode::MemoryWriteLanes,
+                    .target = *target,
+                    .cond = preCommitValue(op.operands()[0],
+                                           mappedValue(op.operands()[0], op), op),
+                    .mask = VariableId::invalid(),
+                    .data = preCommitValue(op.operands()[1],
+                                           mappedValue(op.operands()[1], op), op),
+                    .addr = VariableId::invalid(),
+                    .events = *events,
+                    .explicitOrder = op.id().index < explicitOrderByOperation_.size()
+                                         ? explicitOrderByOperation_[op.id().index]
+                                         : std::nullopt,
+                    .context = opContext(op),
                 };
-                operands.insert(operands.end(), events->begin(), events->end());
-                if (std::any_of(operands.begin(), operands.end(),
-                                [](VariableId value) { return !value.valid(); }))
+                if (!write.cond.valid() || !write.data.valid())
                 {
                     return;
                 }
-                const InstructionId instruction =
-                    addInstruction(Opcode::MemoryWriteLanes, {}, operands);
-                addOrderedEffect(op, instruction, *target);
+                pendingStateWrites_.push_back(std::move(write));
             }
 
             void lowerMemoryFill(const Operation &op)
@@ -2505,20 +2901,26 @@ namespace wolvrix::lib::grhsim::am
                     }
                     return;
                 }
-                std::vector<VariableId> operands{
-                    preCommitValue(op.operands()[0], mappedValue(op.operands()[0], op), op),
-                    preCommitValue(op.operands()[1], mappedValue(op.operands()[1], op), op),
-                    *target,
+                PendingStateWrite write{
+                    .opcode = Opcode::MemoryFill,
+                    .target = *target,
+                    .cond = preCommitValue(op.operands()[0],
+                                           mappedValue(op.operands()[0], op), op),
+                    .mask = VariableId::invalid(),
+                    .data = preCommitValue(op.operands()[1],
+                                           mappedValue(op.operands()[1], op), op),
+                    .addr = VariableId::invalid(),
+                    .events = *events,
+                    .explicitOrder = op.id().index < explicitOrderByOperation_.size()
+                                         ? explicitOrderByOperation_[op.id().index]
+                                         : std::nullopt,
+                    .context = opContext(op),
                 };
-                operands.insert(operands.end(), events->begin(), events->end());
-                if (std::any_of(operands.begin(), operands.end(),
-                                [](VariableId value) { return !value.valid(); }))
+                if (!write.cond.valid() || !write.data.valid())
                 {
                     return;
                 }
-                const InstructionId instruction =
-                    addInstruction(Opcode::MemoryFill, {}, operands);
-                addOrderedEffect(op, instruction, *target);
+                pendingStateWrites_.push_back(std::move(write));
             }
 
             CallSchedule callSchedule(const Operation &op)
@@ -2990,11 +3392,12 @@ namespace wolvrix::lib::grhsim::am
             std::vector<VariableRole> variableRoles_;
             std::vector<InstructionEffect> instructionEffects_;
             std::vector<OrderedEffect> orderedEffects_;
-            std::vector<PendingStateOrderedEffect> pendingStateOrderedEffects_;
+            std::vector<PendingStateWrite> pendingStateWrites_;
             uint32_t nextOrderedGroup_ = 0;
             std::unordered_map<uint32_t, uint32_t> stateOrderGroups_;
             std::map<std::pair<Opcode, uint32_t>, VariableId> eventDetectorMemo_;
             std::unordered_map<uint32_t, VariableId> preCommitSnapshots_;
+            std::unordered_map<uint32_t, VariableId> targetSnapshots_;
             uint64_t freshTemporaryCount_ = 0;
             std::size_t flattenedUnknownLiterals_ = 0;
         };

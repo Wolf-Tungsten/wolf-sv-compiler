@@ -450,6 +450,7 @@ namespace wolvrix::lib::grhsim::am
         friend class ScheduledProgram;
         friend class LinearProgramBuilder;
         friend class ScheduledProgramBuilder;
+        friend class AmGraph;
     };
 
     class LinearProgram
@@ -472,6 +473,7 @@ namespace wolvrix::lib::grhsim::am
 
         friend class LinearProgramBuilder;
         friend class ScheduledProgramBuilder;
+        friend class AmGraph;
     };
 
     class ScheduledProgram

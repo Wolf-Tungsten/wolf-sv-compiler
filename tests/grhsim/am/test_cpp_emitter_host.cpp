@@ -149,6 +149,14 @@ ExecutableModel makeHostModel() {
       linear.addVariable(u1Type, linear.undefInit());
   const VariableId pendingStateEvent =
       linear.addVariable(u1Type, linear.zeroInit());
+  const VariableId pendingStateNextWatchOld =
+      linear.addVariable(u1Type, linear.undefInit());
+  const VariableId pendingStateNextWatchEvent =
+      linear.addVariable(u1Type, linear.zeroInit());
+  const VariableId pendingStateGateOld =
+      linear.addVariable(u1Type, linear.undefInit());
+  const VariableId pendingStateGateEvent =
+      linear.addVariable(u1Type, linear.zeroInit());
 
   const auto addInputWatch = [&](VariableId input) {
     const TypeId type = linear.view().variable(input).type;
@@ -424,9 +432,19 @@ ExecutableModel makeHostModel() {
       linear, Opcode::Assign, {pendingEventVisible}, {pendingEvent});
   const InstructionId assignPendingStateNext = addInstruction(
       linear, Opcode::Assign, {pendingStateNext}, {pendingEvent});
-  const InstructionId pendingStateWrite =
-      addInstruction(linear, Opcode::LatchWrite, {},
-                     {pendingStateNext, trueValue, trueValue, pendingState});
+  // Watch group on the latch nextValue: the commit Block's head gate
+  // detector watches pendingStateNext, so the compute Block that defines it
+  // forward-activates the commit Block through a ChangedAny event on it.
+  const InstructionId pendingStateNextWatch =
+      addInstruction(linear, Opcode::ChangedAny, {pendingStateNextWatchEvent},
+                     {pendingStateNext, pendingStateNextWatchOld});
+  // Head gate detector of the commit Block: one ChangedAny per latch write
+  // nextValue; its result forms the Block-level event gate.
+  const InstructionId pendingStateGate =
+      addInstruction(linear, Opcode::ChangedAny, {pendingStateGateEvent},
+                     {pendingStateNext, pendingStateGateOld});
+  const InstructionId pendingStateWrite = addInstruction(
+      linear, Opcode::LatchWrite, {}, {pendingStateNext, pendingState});
   const InstructionId pendingStateChanged =
       addInstruction(linear, Opcode::ChangedAny, {pendingStateEvent},
                      {pendingState, pendingStateOld});
@@ -473,6 +491,10 @@ ExecutableModel makeHostModel() {
   const InstructionId reactivatePending =
       addInstruction(scheduled, Opcode::ActBackward, {}, {pendingStateEvent});
   setTargets(scheduled, reactivatePending, {BlockId{2}});
+  const InstructionId activatePendingCommit =
+      addInstruction(scheduled, Opcode::ActForward, {},
+                     {pendingStateNextWatchEvent});
+  setTargets(scheduled, activatePendingCommit, {BlockId{3}});
   addBlock(scheduled,
            {taskConditionChanged, activateTaskCondition, taskEventChanged,
             activateTaskEvent, dpiConditionChanged, activateDpiCondition,
@@ -482,13 +504,16 @@ ExecutableModel makeHostModel() {
             activatePending});
   addBlock(scheduled, {fwriteCall, wideFwriteCall, stressFwriteCall, dpiCall,
                        jtagCall, signedCall, finishCall, finalWrite});
-  // Round 1 captures the edge and raises the guard; the commit Block's
-  // tracked state write re-fires the pending Block so that round 2 consumes
-  // the call after ChangedPos has recomputed the raw event to zero.
+  // Round 1 captures the edge and raises the guard; the watch on the latch
+  // nextValue forward-activates the commit Block, whose head gate detector
+  // opens the Block so the state write and tail watch run; the tail change
+  // re-fires the pending Block so that round 2 consumes the call after
+  // ChangedPos has recomputed the raw event to zero.
   addBlock(scheduled, {pendingClockChanged, pendingCall, setPendingGuard,
-                       copyPendingEvent, assignPendingStateNext});
-  addBlock(scheduled,
-           {pendingStateWrite, pendingStateChanged, reactivatePending});
+                       copyPendingEvent, assignPendingStateNext,
+                       pendingStateNextWatch, activatePendingCommit});
+  addBlock(scheduled, {pendingStateGate, pendingStateWrite,
+                       pendingStateChanged, reactivatePending});
 
   ProgramInterface interface;
   interface.ports = {

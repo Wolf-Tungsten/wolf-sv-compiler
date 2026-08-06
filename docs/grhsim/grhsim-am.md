@@ -121,8 +121,8 @@ operand 排布、Attribute schema、类型和边界规则见
 
 - `B0` 是 EntryBlock，每次 `eval()` 开始时执行一次；
 - `B1` 及之后依次是 compute Block 连续区间和 commit Block 连续后缀（允许为空）：
-  compute Block 只在被激活时执行，commit Block 每个 round 总是执行。布局与指令
-  放置约束见第 4.1 节。
+  两类 Block 都只在被激活时执行（首次 `eval()` 激活全部 Block）；commit Block 的
+  激活只能来自其首部 gate detector watch 的变量。布局与指令放置约束见第 4.1 节。
 
 ### 2.3 DpiImports
 
@@ -226,7 +226,7 @@ State S
 | `CallCompleted[c]` | `Bool` | `schedule = once` 的 system function/task 是否已经调用 |
 | `PendingHostEvent[c]` | `Bool` | `event_mode = pending` 的 host 指令是否持有已命中、尚未消费的 event |
 | `Finalized` | `Bool` | Machine 是否已执行 finalize |
-| `Active[b]` | `Bool` | compute Block `b` 是否被激活、等待执行 |
+| `Active[b]` | `Bool` | Block `b` 是否被激活、等待执行 |
 
 其中每个 `schedule = once` 的 system function/task 都有一个独占的 `CallCompleted`
 槽，每个携带 pending event 的 host 指令（`system.function/system.task/dpi.call`）
@@ -234,8 +234,8 @@ State S
 两者是 Machine 内部类型，不是 Program 可以声明的 Variable Type；`Nat` 使用数学
 自然数语义，不发生固定位宽回绕。
 
-`Active` 是单一集合，不分当前/下一 round，也没有分层 summary；commit Block 不占用
-激活状态，因为它每个 round 总是执行（见第 4 节）。`changed` 的 `old` 基线和结果
+`Active` 是单一集合，不分当前/下一 round，也没有分层 summary；compute 与 commit
+Block 共用这份激活位图（见第 4 节）。`changed` 的 `old` 基线和结果
 event 都是 VariableArea 中的普通 Variable，其调度生命周期见第 4.3 节。
 
 规范给出了一种连续的逻辑布局，便于统一寻址：
@@ -247,7 +247,7 @@ RoundCounter          VariableCount + 1
 CallCompleted         接下来的 OnceCallCount 个槽
 PendingHostEvent      接下来的 PendingEventCallCount 个槽
 Finalized             再下一个槽
-Active                接下来的 BlockCount 个槽（commit Block 的槽恒为 false）
+Active                接下来的 BlockCount 个槽
 ```
 
 这是语义布局，不是物理实现要求。后端可以内联常量、压缩激活位或消除不需要物化的槽，
@@ -256,8 +256,8 @@ Active                接下来的 BlockCount 个槽（commit Block 的槽恒为
 ## 4. 变化驱动调度
 
 GRHSIM-AM 不在每次求值时无条件运行所有 Block。它以 round 为迭代单位推进：compute
-Block 按激活位过滤执行，commit Block 每个 round 总是执行；变化检测只激活受影响的
-compute Block，直到一次完整遍历不再产生新的激活为止。
+与 commit Block 都按激活位过滤执行（首次 `eval()` 激活全部 Block）；变化检测只激活
+受影响的 Block，直到一次完整遍历不再产生新的激活为止。
 
 ### 4.1 Block 布局与指令放置
 
@@ -266,25 +266,31 @@ BlockId 从 0 开始连续编号，并按类别划分为三个区间：
 ```text
 B0            EntryBlock
 B1 .. Bc      compute Block（组合计算、state read、changed、host 指令）
-Bc+1 .. Bn    commit Block（state write + 判变 + act.b；允许为空）
+Bc+1 .. Bn    commit Block（首部 gate detector + state write + 尾部判变 watch + act；允许为空）
 ```
 
-commit Block 占据连续后缀区间，这是 validator 强制的结构不变量。commit Block 按
-normalized event + update guard 聚合分块；同一 event/guard 桶内的写保持静态
-priority/effect order。
+commit Block 占据连续后缀区间，这是 validator 强制的结构不变量。commit Block 只按
+事件签名（normalized event 集合）聚合分块；update guard 概念已删除，不再是分块分量——
+`reg.write/latch.write` 的写入条件与掩码在 lowering 时合并进 nextValue，`mem.write`
+自带的 cond/mask 由指令自身判定，同样不参与分块。同一事件签名桶内同一 target 的
+register/latch 写链已折叠为单条写，memory 元素写每条保留为一条 `mem.write`；块内与
+commit 段静态顺序保持 priority/effect order。
 
 指令放置约束（validator 强制）：
 
 | 指令 | 允许所在 Block | target 约束 |
 | --- | --- | --- |
-| `act.f` | 仅 EntryBlock 和 compute Block | 严格更大的 compute BlockId |
-| `act.b` | 仅 commit Block | 任意 compute Block |
+| `act.f` | 任意 Block | 严格更大的 BlockId（compute 或 commit Block） |
+| `act.b` | 任意非 EntryBlock | 非 EntryBlock 的任意 BlockId |
 | state write（`reg.write/latch.write/mem.write/mem.fill`） | 仅 commit Block | — |
 | `changed` | 任意 Block | 每条 `changed` 独占 `old`，语义见第 4.2 节 |
 
-`act.f` 不指向 commit Block：commit Block 每个 round 总是执行，不需要激活边。
-compute 段内 `act.f` 严格前向，因此单趟升序扫描就能排空当轮全部 compute 活动——
-这由 Block 编号规则结构性保证，不需要单独的校验 pass。
+`act.f` 严格前向：目标 BlockId 必须大于所在 Block，因此单趟升序扫描就能排空当轮
+全部 compute 与 commit 活动——这由 Block 编号规则结构性保证，不需要单独的校验
+pass。指向 commit Block 的 `act.f` 只允许携带被目标块首部 gate detector watch 的
+变量（时钟源/派生时钟/latch nextValue）；def-use 数据边不激活 commit Block（见
+第 4.4 节）。当前 scheduler 只在 commit Block 尾部物化 `act.b`，且目标不大于源块
+（已扫过的 compute reader 或更早的 commit Block）。
 
 ### 4.2 `changed` 与 `act`
 
@@ -309,16 +315,16 @@ act.b %event {targets = [TargetBlockId...]}
 
 `targets` Attribute 表示静态 BlockId 集合，以下记作 Targets。
 
-- event 为 1 时，`act.f` 将 Targets 置位 `Active`；目标严格前向，在同一趟 compute
-  扫描内被消费；
-- event 为 1 时，`act.b` 将 Targets 置位 `Active`；目标留给下一 round 执行，并标记
-  本轮存在 backward 激活；
+- event 为 1 时，`act.f` 将 Targets 置位 `Active`；目标严格前向，在同一趟升序扫描
+  （compute 或 commit 阶段）内被消费；
+- event 为 1 时，`act.b` 将 Targets 置位 `Active`；目标按约定不大于源块、本轮已被
+  扫过，置位留给下一 round 执行，并标记本轮存在 backward 激活；
 - event 为 0 时不产生激活，act 不修改任何 Variable。
 
 act 的 event 必须在同一 Block 中由更早的指令写入，确保 act 每次执行时消费的是本次
 Block 执行产生的事件，而不是 VariableArea 中残留的旧值。一个 event 可以供同一 Block
-中的多条 act 使用。多个来源重复激活同一 compute Block 仍只记录一个布尔值；结合
-`act.f` 的前向约束，每个 compute Block 在一个 round 内最多执行一次。
+中的多条 act 使用。多个来源重复激活同一 Block 仍只记录一个布尔值；结合
+`act.f` 的前向约束，每个 Block 在一个 round 内最多执行一次。
 
 `act.b` 是唯一的“需要下一 round”信号：一次完整 round 遍历中没有任何 `act.b`
 激发（event == 1）即视为收敛。
@@ -342,14 +348,15 @@ Block 执行产生的事件，而不是 VariableArea 中残留的旧值。一个
 | result 的消费者 | round 末清理 | 理由 |
 | --- | --- | --- |
 | 全部在同一块内（典型：同块 `act.f`/`act.b`） | 不需要 | 块每次执行时 `changed` 必定先于消费者重写 result；块不执行时消费者也不执行，旧值没有读者 |
-| 存在跨块消费者（其他 Block 的 state write event/guard operand、host 指令或组合指令 operand） | 必须清零 | 生产块下一 round 若未被激活就不重新执行，而消费块（尤其常扫描的 commit Block）仍会读；残留的 event=1 会让写每轮重复发生、`act.b` 每轮激发，不动点判断直接失效 |
+| 存在跨块消费者（其他 Block 的 state write event operand、host 指令或组合指令 operand） | 必须清零 | 生产块下一 round 若未被激活就不重新执行，而消费块仍会读；残留的 event=1 会让写每轮重复发生、`act.b` 每轮激发，不动点判断直接失效 |
 
 由此得到规则：
 
 - round 末的清空集合是跨块消费的 `changed` 结果子集：结果为真才进入 dirty-list，
   round 末只清这些；
-- commit Block 内的判变 `changed`（喂同块 `act.b`）属于同块消费，且 commit Block
-  每个 round 必执行、result 每轮重写，不进入 dirty-list；
+- commit Block 内的判变 `changed`（首部 gate detector 喂同块写指令 event operand 与
+  块级门控、尾部 watch 喂同块 `act.b`）属于同块消费：块被激活执行时 detector 必定
+  先于消费者重写 result，不进入 dirty-list；
 - compute 阶段产生的跨块 event 在同一 round 的 commit 阶段可读；下一 round 若未重新
   产生则为 0。每轮末都清理使跨 eval 衔接自然成立：最后一次循环结束时跨块 event 已
   归 0，下次 `eval()` 首轮天然干净；同块消费的 result 是普通 Variable 值，随状态
@@ -363,8 +370,40 @@ Block 执行产生的事件，而不是 VariableArea 中残留的旧值。一个
 
 ### 4.4 state write 与 reader 重激活
 
-commit Block 每个 round 总是执行：写指令按文本顺序执行，由块内 guard/event 决定是否
-真正写入。操作数的读取分两类：
+commit Block 不再每轮常扫：它与 compute Block 一样按激活位执行，首次 `eval()` 激活
+全部 Block。commit Block 的内部结构固定为三段：
+
+```text
+[首部 gate detector] + [状态写] + [尾部 watch changed + act]
+```
+
+- 首部 gate detector：块内每个事件签名元素 `(kind, raw)` 一条克隆 `changed.*`
+  （raw 为被观测的时钟源/派生时钟 Variable；纯 latch 块每条 latch 写一条
+  `ChangedAny(nextValue)`）。写指令的 event operand 已被 scheduler 重指向这些块内
+  detector 的结果。detector 在块每次被激活时先执行并更新 `old` 基线。
+- 门控（gate）= 全部首部 detector 结果的 OR，整块只判一次；状态写与尾部 watch/act
+  都在门内，gate 为假时整块跳过。
+- 状态写自身不做 event 判定：`reg.write/latch.write` 直接
+  `target = nextValue`（写入条件与掩码已在 lowering 折叠进 nextValue，read-old 链式
+  规则见指令集第 12 节）；`mem.write` 保留 cond/mask 操作数，仅当 cond 为真且地址在
+  界内时按 mask 写入选中 row，否则整写抑制；`mem.write_lanes` 只保留
+  `any(laneMask)` 早退；`mem.fill` 恒写整片 packed。
+- 尾部 watch：块对自身写入的每个 state target 物化一条共享
+  `changed.any target, targetOld`，实际变化经 `act.b` 激活 reader compute Block
+  （下一 round 执行，只看到本轮最终值）。
+
+commit Block 的激活来源（调度不变量）：
+
+- compute→commit：`act.f` 只允许携带被目标 commit Block 首部 gate detector watch
+  的变量；def-use 数据边不激活 commit Block（写指令的 addr/data 等 operand 在块被
+  激活执行时按执行点读取，不需要激活）；
+- 外部输入：经 EntryBlock（B0）的 `ChangedAny` watch 前向激活 watch 该输入的
+  commit Block；
+- commit→commit：watch 派生时钟（另一 commit Block 写入的 state）时，经 writer 块的
+  共享尾部 watch 激活——目标块号更大时同轮前向（`act.f`，commit 相位按块号升序，
+  同轮生效），更小时后向（`act.b`，下一轮生效）。
+
+写指令操作数的读取分两类：
 
 - **pre-commit（read-old）**：写指令的非 target、非 event 操作数若**直接引用寄存器
   state**（register read port 直通），lowering 会把它替换为一个快照变量，由一条普通
@@ -373,10 +412,11 @@ commit Block 每个 round 总是执行：写指令按文本顺序执行，由块
   commit 读到的恒为本轮 commit 前的值——同轮 commit 段内先写后读不会读到新值。
   这是对 legacy"sink 数据来自 compute 已收敛值"语义的精确对齐（2026-07-28 XS
   difftest 裁决：就地 read-new 会破坏启动路径上的先写后读链）。
-- **就地读取**：compute 产生的值、RMW 写的 target 旧值（多写 priority 语义要求）
-  和 event 操作数按执行点读取，不做任何跨轮保留。
+- **就地读取**：compute 产生的值、lowering 折叠 nextValue 时对 target 的 read-old
+  引用（reg/latch 折叠链的 acc 初值、`mem.fill` 的 `mem.read_all`）和 event 操作数
+  按执行点读取，不做任何跨轮保留。
 
-实际变化检测与写路径融合：写使 visible state 实际变化且存在 reader 时，由同块
+实际变化检测与写路径融合：写使 visible state 实际变化且存在 reader 时，由同块尾部
 `changed` 探测器产生 event，供同块 `act.b` 消费，激活该 state 的 reader compute
 Block。
 
@@ -389,19 +429,24 @@ priority/effect order；reader 一律在下一 round 才执行，只看到本轮
 EntryBlock 是 `B0`，由 `changed`、用于派生 event 的组合指令和 `act.f` 构成。它在
 每次 `eval()` 开始时无条件执行一次，将两次调用之间的外部净变化转成首个 round 的
 初始 compute 激活。EntryBlock 不包含 `act.b`、state write 或其他有状态指令。
+EntryBlock 的 `ChangedAny` watch 同时是外部输入激活 commit Block 的通道：commit
+Block gate detector watch 的变量若是接口输入（无定义指令），由 B0 watch 并经
+`act.f` 前向激活该 commit Block。
 
 外部写入本身不会直接激活 Block。例如输入从 0 改成 1、又在调用 `eval()` 前改回 0，
 EntryBlock 只看到最终值 0，因此不会观察到中间变化。
 
 ### 4.6 首次求值
 
-第一次 `eval()` 会额外激活所有 compute Block（commit Block 本就每轮执行）。这保证
-即使初始值没有触发 EntryBlock，整个 Program 仍会完成一次初始求值。`changed` 在首次
-求值中正常产生 event，使 backward 依赖可以跨 round 收敛；
-`reg.write/mem.write/mem.fill/latch.write` 也只按其显式 cond 和 event 判断是否写入。
-由于无显式初值的状态和每条 `changed.old` 使用 `undef`，首次 event、状态写和输出
-可能属于 AM 层未定义行为；调用方负责通过 reset/clock 协议建立其需要的有效状态。
-首次求值正常返回时才清除 `FirstEval`；此后只执行由变化传播激活的 compute Block。
+第一次 `eval()` 会激活所有 Block（compute 与 commit；commit Block 借此同步首部
+gate detector 的基线，并在 gate 下评估每个状态写一次）。这保证即使初始值没有触发
+EntryBlock，整个 Program 仍会完成一次初始求值。`changed` 在首次求值中正常产生
+event，使 backward 依赖可以跨 round 收敛；状态写不再有显式 event 判定，是否写入由块
+gate 决定——`reg.write/latch.write/mem.fill` 的写条件已折叠进 payload，`mem.write`
+保留自身 cond 与地址越界判定。由于无显式初值的状态和每条
+`changed.old` 使用 `undef`，首次 event、gate 判定、状态写和输出可能属于 AM 层未
+定义行为；调用方负责通过 reset/clock 协议建立其需要的有效状态。首次求值正常返回时
+才清除 `FirstEval`；此后只执行由变化传播激活的 Block。
 
 ## 5. `eval()` 流程
 
@@ -410,9 +455,10 @@ EntryBlock 只看到最终值 0，因此不会观察到中间变化。
 ```text
 1. 拷贝输入端口，清空激活位和跨块 changed 结果，RoundCounter = 0
 2. 执行 EntryBlock，检测调用间的外部变化
-3. 若 FirstEval = true，激活全部 compute Block，并在本次求值正常返回时清除 FirstEval
-4. round 循环：compute 阶段按激活位升序执行 compute Block，
-   commit 阶段升序执行全部 commit Block；轮末清跨块 changed 结果
+3. 若 FirstEval = true，激活全部 Block（compute 与 commit），并在本次求值正常返回时
+   清除 FirstEval
+4. round 循环：compute 阶段按激活位升序执行 compute Block，commit 阶段随后按激活位
+   升序执行 commit Block；轮末清跨块 changed 结果
 5. 本轮没有任何 act.b 激发则收敛返回
 ```
 
@@ -429,7 +475,7 @@ eval(S):
     execute B0
 
     if initial:
-        activate 全部 compute Block
+        activate 全部 Block（compute 与 commit）
 
     loop:
         backwardFired = false
@@ -437,12 +483,15 @@ eval(S):
         for b = 1 ... c:
             if Active[b]:
                 Active[b] = false
-                execute Bb          // act.f 置位更大的 compute bit，本趟内被消费
-        // commit 阶段：按 BlockId 升序，总是执行
+                execute Bb          // act.f 置位更大的 Block bit，本趟内被消费
+        // commit 阶段：按 BlockId 升序，同样 active 过滤
         for b = c + 1 ... n:
-            execute Bb              // 块内 guard/event 决定写是否发生；
-                                    // 实际写变 -> 同块 changed + act.b 置位 reader bit
-                                    // 并置 backwardFired
+            if Active[b]:
+                Active[b] = false
+                execute Bb          // 首部 gate detector 先执行并更新基线；
+                                    // gate = OR(detector 结果)，为假则跳过状态写与
+                                    // 尾部 watch；实际写变 -> 尾部 changed + act.b
+                                    // 置位 reader bit 并置 backwardFired
         clear 跨块 changed 结果      // round 末，见第 4.3 节
         RoundCounter += 1；超过上限则报告不收敛错误
         if not backwardFired: break
@@ -458,12 +507,13 @@ eval(S):
 - 拷贝输入、写回输出是集成层契约：C++ emitter 在生成的 `eval()` 入口把
   ProgramInterface 输入端口拷入 VariableArea，返回前写回输出端口；解释器后端由
   调用方在 `eval()` 前直接写入输入状态（见第 1 节），可观察效果相同。
-- `act.f` 只允许指向更大的 compute BlockId，在同一趟 compute 扫描内被消费；每个
-  compute Block 每轮最多执行一次（bit 幂等，前向约束保证被消费的 bit 本趟不会被
-  重新置位）。
-- `act.b` 只指向已经扫过的 compute 段，置位的 bit 留给下一 round；它是唯一的“需要
-  下一 round”信号。不动点判断就是循环条件：一趟完整遍历下来没有任何 `act.b` 激发
-  （event == 1）即收敛，逐项对应 legacy 的
+- `act.f` 只允许指向更大的 BlockId（compute 或 commit Block），在同一趟升序扫描内
+  被消费；每个 Block 每轮最多执行一次（bit 幂等，前向约束保证被消费的 bit 本趟
+  不会被重新置位）。
+- `act.b` 指向非 EntryBlock 的任意 Block；scheduler 只在 commit Block 尾部产生它且
+  目标不大于源块，置位的 bit 留给下一 round；它是唯一的“需要下一 round”信号。
+  不动点判断就是循环条件：一趟完整遍历下来没有任何 `act.b` 激发（event == 1）即
+  收敛，逐项对应 legacy 的
   `pending_eval_round = commit_activated_readers_`。
 - 正常返回时 `Active` 全空，跨块 `changed` 结果已在最后一个 round 末清零；Variable
   的值和 `changed` 的 `old` 基线保留到下一次调用。
@@ -548,17 +598,21 @@ temporary；端口到 VarId 的映射属于集成层契约，不能依赖不唯�
   [`latch-transparent-read`](../transform/latch-transparent-read.md)，将透明读旁路显式
   改写为组合逻辑；
 - EntryBlock 只包含 `changed`、event 派生所需的组合指令和 `act.f`，且目标都是
-  compute Block；
-- `act.f/act.b` 消费同一 Block 中先行计算的 `BV<1, unsigned>` event；`act.f` 只能
-  出现在 EntryBlock 和 compute Block，且目标必须是更大的 compute BlockId；`act.b`
-  只能出现在 commit Block，目标是 compute Block（BlockId 任意）；
+  严格更大的 BlockId；
+- `act.f/act.b` 消费同一 Block 中先行计算的 `BV<1, unsigned>` event；`act.f` 目标
+  必须是严格更大的 BlockId（compute 或 commit Block），指向 commit Block 时只能
+  携带其首部 gate detector watch 的变量；`act.b` 只能出现在非 EntryBlock，目标是非
+  EntryBlock 的任意 Block（scheduler 只在 commit Block 尾部产生）；
 - 每条 `changed` 的 `old` 独占且使用空初始化；`changed.any` 的 `new/old` 类型相同，
   `changed.pos/changed.neg` 的 `new/old` 是类型相同的单 bit BV；跨块消费的
   `changed` 结果只允许前向流，生产块 BlockId 必须小于消费块；
 - commit Block 占据 BlockId 连续后缀；`reg.write/mem.write/mem.fill/latch.write`
-  只能出现在 commit Block，读取执行点可见的显式 operand；状态写回后以同块
-  `changed.any` 检测 target 的实际变化，经同块 `act.b` 激活读取者 compute Block；
-  同一 target 的多写由 commit 段静态 BlockId 顺序保证 priority/effect order；
+  只能出现在 commit Block，读取执行点可见的显式 operand；commit Block 以首部 gate
+  detector 开头（`reg.write/latch.write` 的写条件/掩码已在 lowering 合并进
+  nextValue，同一 target 同一事件签名的写链折叠为单条写；`mem.write` 保留 cond/mask
+  操作数，每条元素写一条指令），状态写回后以同块尾部 `changed.any` 检测 target 的实际
+  变化，经同块 `act.b` 激活读取者 compute Block；同一 target 的多写由 commit 段
+  静态 BlockId 顺序保证 priority/effect order；
 - `kSystemFunction/kSystemTask` 分别映射为 `system.function/system.task`；
   `hasSideEffects` 规范化为 `system.function.has_side_effects`，raw event 先变成
   `changed` event，`procKind/hasTiming` 规范化为显式 schedule 和 Block 激活；

@@ -23,7 +23,6 @@ namespace wolvrix::lib::grhsim::am
         std::span<const uint8_t> atomIsCommit;
         std::span<const uint32_t> atomMinInstruction;
         std::span<const uint32_t> commitEventRank;
-        std::span<const uint32_t> commitGuardRank;
         uint32_t variableCount = 0;
         std::span<const uint32_t> definitions; // variable -> defining instruction (kInvalid if none)
         std::span<const uint32_t> useOffsets;  // variable -> using instructions CSR

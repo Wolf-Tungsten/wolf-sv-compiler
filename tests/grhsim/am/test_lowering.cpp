@@ -247,12 +247,21 @@ namespace
         }
 
         const ProgramView program = artifact->program.view();
+        // cond/mask folds into a merged nextValue expression for register,
+        // latch and fill writes (one Mux per folded write), but NOT for
+        // memory element writes: those keep [cond, addr, mask, data, target,
+        // events...] operands, so a disabled write simply never happens and
+        // no read-old element probe is needed. The fill still inserts one
+        // mem.read_all probe for its folded hold path, on top of the
+        // explicit memory read port.
         if (program.dpiImportCount() != 1 ||
             countOpcode(program, Opcode::RegisterWrite) != 1 ||
             countOpcode(program, Opcode::MemoryRead) != 1 ||
+            countOpcode(program, Opcode::MemoryReadAll) != 1 ||
             countOpcode(program, Opcode::MemoryWrite) != 1 ||
             countOpcode(program, Opcode::MemoryFill) != 1 ||
             countOpcode(program, Opcode::LatchWrite) != 1 ||
+            countOpcode(program, Opcode::Mux) != 3 ||
             countOpcode(program, Opcode::SystemFunction) != 2 ||
             countOpcode(program, Opcode::SystemTask) != 1 ||
             countOpcode(program, Opcode::DpiCall) != 1 ||
@@ -262,9 +271,18 @@ namespace
             return fail("lowered opcode inventory is incomplete");
         }
 
-        // All posedge(clk) consumers share one lowered detector instance.
+        // All posedge(clk) consumers share one lowered detector instance, the
+        // negedge(clk) fill shares the single ChangedNeg detector, and the
+        // latch write carries no event operands at all. Event operand
+        // positions follow the new layouts: reg.write [nextValue, target,
+        // events...], mem.write [addr, nextValue, target, events...],
+        // mem.fill [packedData, target, events...], latch.write [nextValue,
+        // target].
         VariableId sharedPosedge;
+        VariableId sharedNegedge;
         bool checkedSharedPosedge = false;
+        bool checkedSharedNegedge = false;
+        bool checkedLatchShape = false;
         for (uint32_t index = 0; index < program.instructionCount(); ++index)
         {
             const InstructionId instruction{index};
@@ -274,28 +292,53 @@ namespace
                 sharedPosedge = program.results(instruction).front();
                 continue;
             }
-            std::size_t eventIndex = 0;
-            if (opcode == Opcode::RegisterWrite)
+            if (opcode == Opcode::ChangedNeg)
             {
-                eventIndex = 4;
-            }
-            else if (opcode == Opcode::MemoryWrite)
-            {
-                eventIndex = 5;
-            }
-            else
-            {
+                sharedNegedge = program.results(instruction).front();
                 continue;
             }
-            if (program.operands(instruction)[eventIndex] != sharedPosedge)
+            const auto operands = program.operands(instruction);
+            if (opcode == Opcode::RegisterWrite)
             {
-                return fail("posedge(clk) writes did not share one lowered detector");
+                if (operands.size() != 3 || operands[2] != sharedPosedge)
+                {
+                    return fail("posedge(clk) writes did not share one lowered detector");
+                }
+                checkedSharedPosedge = true;
+                continue;
             }
-            checkedSharedPosedge = true;
+            if (opcode == Opcode::MemoryWrite)
+            {
+                if (operands.size() != 6 || operands[5] != sharedPosedge)
+                {
+                    return fail("posedge(clk) writes did not share one lowered detector");
+                }
+                checkedSharedPosedge = true;
+                continue;
+            }
+            if (opcode == Opcode::MemoryFill)
+            {
+                if (operands.size() != 3 || operands[2] != sharedNegedge)
+                {
+                    return fail("negedge(clk) fill did not share the lowered detector");
+                }
+                checkedSharedNegedge = true;
+                continue;
+            }
+            if (opcode == Opcode::LatchWrite)
+            {
+                if (operands.size() != 2)
+                {
+                    return fail("latch write must not carry event operands");
+                }
+                checkedLatchShape = true;
+                continue;
+            }
         }
-        if (!checkedSharedPosedge || !sharedPosedge.valid())
+        if (!checkedSharedPosedge || !sharedPosedge.valid() ||
+            !checkedSharedNegedge || !sharedNegedge.valid() || !checkedLatchShape)
         {
-            return fail("missing shared posedge detector");
+            return fail("missing shared edge detector or latch write");
         }
         if (artifact->interface.ports.size() != 8 ||
             artifact->schedulingFacts.orderedEffects.size() != 4)
@@ -355,16 +398,34 @@ namespace
                 continue;
             }
             const auto operands = program.operands(instruction);
-            if (operands.size() != 5)
+            if (operands.size() != 3)
             {
                 return fail("register write did not get canonical AM operands");
             }
-            const Type &maskType = program.type(program.variable(operands[1]).type);
-            const Type &nextType = program.type(program.variable(operands[2]).type);
-            const Type &targetType = program.type(program.variable(operands[3]).type);
-            if (maskType.bitWidth != 8 || nextType != targetType)
+            const Type &nextType = program.type(program.variable(operands[0]).type);
+            const Type &targetType = program.type(program.variable(operands[1]).type);
+            if (nextType != targetType || targetType.bitWidth != 8)
             {
-                return fail("register mask/next/target order or coercion is wrong");
+                return fail("register nextValue/target order or coercion is wrong");
+            }
+            // The lowering does no constant folding, so the conditional write
+            // must keep its merged nextValue as an explicit mux over the
+            // read-old target value.
+            bool nextIsMux = false;
+            for (uint32_t probe = 0; probe < program.instructionCount(); ++probe)
+            {
+                const InstructionId producer{probe};
+                const auto results = program.results(producer);
+                if (!results.empty() && results.front() == operands[0] &&
+                    program.opcode(producer) == Opcode::Mux)
+                {
+                    nextIsMux = true;
+                    break;
+                }
+            }
+            if (!nextIsMux)
+            {
+                return fail("register write nextValue is not the folded cond/mask mux");
             }
             checkedRegisterOrder = true;
         }
@@ -463,7 +524,8 @@ namespace
         const auto mask = constant(graph, "mask_op", "mask", 8, "8'hff");
         const auto fillData =
             constant(graph, "fill_data_op", "fill_data", 32, "32'h44332211");
-        const auto disabled = constant(graph, "disabled_op", "disabled", 1, "1'h0");
+        const auto fillEnable = logic(graph, "fill_enable", 1);
+        graph.bindInputPort("fill_enable", fillEnable);
 
         const auto memory = graph.createOperation(grh::OperationKind::kMemory,
                                                   graph.internSymbol("mem"));
@@ -496,15 +558,26 @@ namespace
         };
         addWrite("high_write", highData, 0);
 
+        // The interleaved fill uses the opposite edge on purpose: under the
+        // new write model a mem.fill always commits its full packed image
+        // when its event fires (the cond only selects between the new image
+        // and the pre-commit read-old image), so a fired same-edge fill
+        // would restore the pre-round image and clobber the priority writes
+        // it interleaves -- the lowering explicitly warns that mixing element
+        // writes with fills in one event domain folds read-old per kind
+        // only. The cond is a live input (a constant-false cond would make
+        // the lowering drop the no-op fill entirely) and the runtime drives
+        // it 0, so the fill stays in the shared ordered state group without
+        // disturbing the priority observation.
         const auto interleavedFill =
             graph.createOperation(grh::OperationKind::kMemoryFillPort,
                                   graph.internSymbol("interleaved_fill"));
-        graph.addOperand(interleavedFill, disabled);
+        graph.addOperand(interleavedFill, fillEnable);
         graph.addOperand(interleavedFill, fillData);
         graph.addOperand(interleavedFill, clock);
         graph.setAttr(interleavedFill, "memSymbol", std::string("mem"));
         graph.setAttr(interleavedFill, "eventEdge",
-                      std::vector<std::string>{"posedge"});
+                      std::vector<std::string>{"negedge"});
 
         addWrite("low_write", lowData, 1);
         graph.freeze();
@@ -545,6 +618,10 @@ namespace
         }
         const std::vector<OrderedEffect> &ordered =
             artifact->schedulingFacts.orderedEffects;
+        // The lowering emits the writes in execution order: priority 1
+        // (low_write) first, priority 0 (high_write) last, so writes[0] is
+        // low_write and writes[1] is high_write, and the read-old threading
+        // lets the later priority-0 write win same-address collisions.
         if (!memoryVariable.valid() || fills.size() != 2 || writes.size() != 2 ||
             ordered.size() != 4 ||
             ordered[0].group != ordered[1].group ||
@@ -552,8 +629,8 @@ namespace
             ordered[2].group != ordered[3].group || ordered[0].ordinal != 0 ||
             ordered[1].ordinal != 1 || ordered[2].ordinal != 2 ||
             ordered[3].ordinal != 3 || ordered[0].instruction != fills[0] ||
-            ordered[1].instruction != writes[1] ||
-            ordered[2].instruction != writes[0] || ordered[3].instruction != fills[1])
+            ordered[1].instruction != writes[0] ||
+            ordered[2].instruction != writes[1] || ordered[3].instruction != fills[1])
         {
             return fail("memory fill and atomic priority writes did not form one state group");
         }
@@ -574,9 +651,10 @@ namespace
         const VariableId addressVariable = findPort("address");
         const VariableId highDataVariable = findPort("high_data");
         const VariableId lowDataVariable = findPort("low_data");
+        const VariableId fillEnableVariable = findPort("fill_enable");
         if (!clockVariable.valid() || !enableVariable.valid() ||
             !addressVariable.valid() || !highDataVariable.valid() ||
-            !lowDataVariable.valid())
+            !lowDataVariable.valid() || !fillEnableVariable.valid())
         {
             return fail("memory priority runtime fixture has an invalid interface");
         }
@@ -601,6 +679,7 @@ namespace
         };
         Interpreter interpreter(*model);
         if (!interpreter.ready() || !interpreter.eval().success() ||
+            !interpreter.write(fillEnableVariable, bitVector(1, 0)).success() ||
             !interpreter.write(enableVariable, bitVector(1, 1)).success() ||
             !interpreter.write(addressVariable, bitVector(2, 2)).success() ||
             !interpreter.write(lowDataVariable, bitVector(8, 0x5a)).success() ||
@@ -629,6 +708,11 @@ namespace
         graph.bindInputPort("next_value", nextValue);
         const auto enabled = constant(graph, "enabled_op", "enabled", 1, "1'h1");
         const auto mask = constant(graph, "mask_op", "mask", 8, "8'hff");
+        // The folded blend logic types its Not/And/Or with the target type,
+        // so each write's mask must carry the target's signedness: "first" is
+        // signed and needs a signed mask, "second" stays unsigned.
+        const auto maskSigned =
+            constant(graph, "mask_signed_op", "mask_signed", 8, "8'hff", true);
 
         const auto addRegister = [&](std::string_view name, std::string init,
                                      bool isSigned) {
@@ -664,19 +748,19 @@ namespace
         graph.addResult(passthrough, firstPassthrough);
 
         const auto addWrite = [&](grh::OperationId reg, grh::ValueId next,
-                                  std::string_view name) {
+                                  grh::ValueId writeMask, std::string_view name) {
             const auto write = graph.createOperation(grh::OperationKind::kRegisterWritePort,
                                                      graph.internSymbol(name));
             graph.addOperand(write, enabled);
             graph.addOperand(write, next);
-            graph.addOperand(write, mask);
+            graph.addOperand(write, writeMask);
             graph.addOperand(write, clock);
             graph.setAttr(write, "regSymbol",
                           std::string(graph.symbolText(graph.operationSymbol(reg))));
             graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
         };
-        addWrite(firstReg, nextValue, "first_write");
-        addWrite(secondReg, firstPassthrough, "second_write");
+        addWrite(firstReg, nextValue, maskSigned, "first_write");
+        addWrite(secondReg, firstPassthrough, mask, "second_write");
         graph.bindOutputPort("first", first);
         graph.bindOutputPort("second", second);
         graph.freeze();
@@ -686,6 +770,10 @@ namespace
         std::optional<LinearProgramArtifact> artifact = lowering.lower(graph, diagnostics);
         if (!artifact || diagnostics.hasError())
         {
+            for (const auto &message : diagnostics.messages())
+            {
+                std::cerr << message.message << " [" << message.context << "]\n";
+            }
             return fail("register-chain graph did not lower");
         }
         const auto findPort = [&](std::string_view name, PortDirection direction) {
@@ -1331,6 +1419,148 @@ namespace
         }
         return 0;
     }
+    // Commit cone packing must not turn non-blocking swaps into blocking
+    // ones: a write's pre-commit data snapshots read another register (not
+    // its own target), so they stay in the compute phase while the merged
+    // RMW logic for the write's own target moves into the commit Block.
+    int testRegisterSwapStaysNonBlocking()
+    {
+        grh::Design design;
+        grh::Graph &graph = design.createGraph("register_swap_nonblocking");
+        design.markAsTop(graph.symbol());
+
+        const auto clock = logic(graph, "clock", 1);
+        graph.bindInputPort("clock", clock);
+        const auto enabled = constant(graph, "enabled_op", "enabled", 1, "1'h1");
+        const auto mask = constant(graph, "mask_op", "mask", 8, "8'hff");
+
+        const auto addRegister = [&](std::string_view name, std::string init) {
+            const auto reg = graph.createOperation(grh::OperationKind::kRegister,
+                                                   graph.internSymbol(name));
+            graph.setAttr(reg, "width", int64_t{8});
+            graph.setAttr(reg, "isSigned", false);
+            graph.setAttr(reg, "initValue", std::move(init));
+            graph.addDeclaredSymbol(graph.operationSymbol(reg));
+            return reg;
+        };
+        const auto regA = addRegister("reg_a", "8'h11");
+        const auto regB = addRegister("reg_b", "8'h22");
+
+        const auto addRead = [&](grh::OperationId reg, std::string_view valueName,
+                                 std::string_view operationName) {
+            const auto value = logic(graph, valueName, 8, false);
+            const auto read = graph.createOperation(grh::OperationKind::kRegisterReadPort,
+                                                    graph.internSymbol(operationName));
+            graph.addResult(read, value);
+            graph.setAttr(read, "regSymbol",
+                          std::string(graph.symbolText(graph.operationSymbol(reg))));
+            return value;
+        };
+        const auto readA = addRead(regA, "read_a", "read_a_op");
+        const auto readB = addRead(regB, "read_b", "read_b_op");
+
+        const auto addWrite = [&](grh::OperationId reg, grh::ValueId next,
+                                  std::string_view name) {
+            const auto write = graph.createOperation(grh::OperationKind::kRegisterWritePort,
+                                                     graph.internSymbol(name));
+            graph.addOperand(write, enabled);
+            graph.addOperand(write, next);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clock);
+            graph.setAttr(write, "regSymbol",
+                          std::string(graph.symbolText(graph.operationSymbol(reg))));
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        };
+        addWrite(regA, readB, "write_a");
+        addWrite(regB, readA, "write_b");
+        graph.bindOutputPort("reg_a", readA);
+        graph.bindOutputPort("reg_b", readB);
+        graph.freeze();
+
+        diag::Diagnostics diagnostics;
+        GrhToAmLowering lowering;
+        std::optional<LinearProgramArtifact> artifact = lowering.lower(graph, diagnostics);
+        if (!artifact || diagnostics.hasError())
+        {
+            return fail("register-swap graph did not lower");
+        }
+        ProductionActivityScheduleStage scheduler;
+        std::optional<ExecutableModel> model = scheduler.schedule(
+            std::move(*artifact),
+            ActivityScheduleOptions{
+                .maxInstructionsPerBlock = 8,
+                .enableCoarsening = true,
+            },
+            diagnostics);
+        if (!model || diagnostics.hasError())
+        {
+            return fail("register-swap AM program did not schedule");
+        }
+
+        const auto findInput = [&](std::string_view name) {
+            const ProgramView program = model->program.view();
+            for (const PortBinding &port : model->interface.ports)
+            {
+                if (port.direction == PortDirection::Input &&
+                    program.string(port.name) == name)
+                {
+                    return port.input;
+                }
+            }
+            return VariableId::invalid();
+        };
+        const auto findDeclared = [&](std::string_view name) {
+            const ProgramView program = model->program.view();
+            for (const VariableLabel &label : program.variableLabels())
+            {
+                if (program.string(label.label) == name)
+                {
+                    return label.variable;
+                }
+            }
+            return VariableId::invalid();
+        };
+        const VariableId clockVariable = findInput("clock");
+        const VariableId variableA = findDeclared("reg_a");
+        const VariableId variableB = findDeclared("reg_b");
+        if (!clockVariable.valid() || !variableA.valid() || !variableB.valid())
+        {
+            return fail("register-swap model has an invalid interface");
+        }
+
+        Interpreter interpreter(*model);
+        const auto pulse = [&](uint64_t level) {
+            const std::array<uint64_t, 1> words = {level};
+            return interpreter
+                .write(clockVariable,
+                       InterpreterValue::bitVector(1, Signedness::Unsigned, words))
+                .success() &&
+                interpreter.eval().success();
+        };
+        if (!interpreter.ready() || !interpreter.eval().success())
+        {
+            return fail("register-swap model did not initialise");
+        }
+        if (interpreter.value(variableA).lowWord() != 0x11 ||
+            interpreter.value(variableB).lowWord() != 0x22)
+        {
+            return fail("register-swap initial values are wrong");
+        }
+        // First posedge: a <= b (0x22), b <= a (0x11); blocking semantics
+        // would give b 0x22 as well.
+        if (!pulse(1) || interpreter.value(variableA).lowWord() != 0x22 ||
+            interpreter.value(variableB).lowWord() != 0x11)
+        {
+            return fail("register swap became blocking after one posedge");
+        }
+        // Second posedge swaps them back.
+        if (!pulse(0) || !pulse(1) || interpreter.value(variableA).lowWord() != 0x11 ||
+            interpreter.value(variableB).lowWord() != 0x22)
+        {
+            return fail("register swap did not toggle back after two posedges");
+        }
+        return 0;
+    }
 } // namespace
 
 int main()
@@ -1348,6 +1578,10 @@ int main()
         return result;
     }
     if (const int result = testRegisterChainSamplesPreCommitState(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testRegisterSwapStaysNonBlocking(); result != 0)
     {
         return result;
     }

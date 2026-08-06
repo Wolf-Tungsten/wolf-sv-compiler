@@ -97,9 +97,11 @@ namespace wolvrix::lib::grhsim::am
         ScheduledProgram program;
         ProgramInterface interface;
         // Commit Blocks form one contiguous suffix of the Block space and are
-        // scanned unconditionally on every round. Zero denotes a schedule
-        // without commit Blocks; otherwise this is a half-open Block range
-        // that ends at the Program's Block count.
+        // activation-filtered like compute Blocks: each runs only when one of
+        // its gate-detector variables activated it (the initial eval activates
+        // every Block). Zero denotes a schedule without commit Blocks;
+        // otherwise this is a half-open Block range that ends at the
+        // Program's Block count.
         uint32_t commitBlockBegin = 0;
         uint32_t commitBlockEnd = 0;
     };
@@ -146,6 +148,21 @@ namespace wolvrix::lib::grhsim::am
         bool dce = true;
         bool constFold = true;
         bool cse = true;
+        // Bypass single-operand Assign instructions (alias the result to the
+        // operand). Assigns reading a state variable are commit read-old
+        // snapshots (lowering preCommitValue) and are never bypassed.
+        bool assignAlias = true;
+        // Fold MemoryRead instructions with a constant address on memories
+        // that are never written. Emitted/interpreted storage is
+        // zero-initialized, so Undef/Zero init reads as zero and Constant
+        // init carries the packed lane literal; both are compile-time known.
+        bool constMemFold = true;
+        // Allow fold/CSE/alias to eliminate results that are referenced by
+        // the ProgramInterface (output ports, declared observables): the
+        // interface entries are re-pointed to the alias representative and
+        // the visibility roles move with them. false restores the legacy
+        // policy (any roled variable is untouchable).
+        bool interfaceAlias = true;
     };
 
     struct GrhSimAmCppOptions

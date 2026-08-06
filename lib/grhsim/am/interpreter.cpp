@@ -1257,26 +1257,10 @@ namespace wolvrix::lib::grhsim::am {
             }
             if (opcode == Opcode::RegisterWrite ||
                 opcode == Opcode::LatchWrite) {
-                const std::size_t targetIndex = 3;
-                bool fire = truth(operands[0]);
-                if (opcode == Opcode::RegisterWrite) {
-                    bool eventHit = false;
-                    for (std::size_t index = 4; index < operands.size();
-                         ++index) {
-                        eventHit = eventHit || truth(operands[index]);
-                    }
-                    fire = fire && eventHit;
-                }
-                if (fire) {
-                    InterpreterValue next = operands[targetIndex];
-                    for (uint64_t bit = 0; bit < next.type().bitWidth; ++bit) {
-                        if (getBit(operands[1].words(), bit)) {
-                            setBit(next.words_, bit,
-                                   getBit(operands[2].words(), bit));
-                        }
-                    }
-                    values[operandIds[targetIndex].value] = std::move(next);
-                }
+                // Merged nextValue form: the update condition and write mask
+                // are already folded into operands[0]; the commit Block's
+                // event gate decides whether this instruction runs at all.
+                values[operandIds[1].value] = operands[0];
                 return {};
             }
             if (opcode == Opcode::MemoryRead) {
@@ -1315,42 +1299,34 @@ namespace wolvrix::lib::grhsim::am {
             if (opcode == Opcode::MemoryWriteLanes) {
                 const std::size_t targetIndex = 2;
                 const Type &memoryType = operands[targetIndex].type();
-                bool eventHit = false;
-                for (std::size_t index = 3; index < operands.size(); ++index) {
-                    eventHit = eventHit || truth(operands[index]);
-                }
-                if (eventHit) {
-                    InterpreterValue next = operands[targetIndex];
-                    const std::size_t stride = wordCount(memoryType.bitWidth);
-                    for (uint64_t row = 0; row < memoryType.elementCount; ++row) {
-                        if (!getBit(operands[0].words(), row)) {
-                            continue;
-                        }
-                        for (uint64_t bit = 0; bit < memoryType.bitWidth;
-                             ++bit) {
-                            setBit(next.words_,
-                                   row * static_cast<uint64_t>(stride) * 64U +
-                                       bit,
-                                   getBit(operands[1].words(),
-                                          row * memoryType.bitWidth + bit));
-                        }
+                InterpreterValue next = operands[targetIndex];
+                const std::size_t stride = wordCount(memoryType.bitWidth);
+                for (uint64_t row = 0; row < memoryType.elementCount; ++row) {
+                    if (!getBit(operands[0].words(), row)) {
+                        continue;
                     }
-                    values[operandIds[targetIndex].value] = std::move(next);
+                    for (uint64_t bit = 0; bit < memoryType.bitWidth;
+                         ++bit) {
+                        setBit(next.words_,
+                               row * static_cast<uint64_t>(stride) * 64U +
+                                   bit,
+                               getBit(operands[1].words(),
+                                      row * memoryType.bitWidth + bit));
+                    }
                 }
+                values[operandIds[targetIndex].value] = std::move(next);
                 return {};
             }
             if (opcode == Opcode::MemoryWrite) {
+                // Reverted cond/mask form: operands = [cond, addr, mask, data,
+                // target, events...]. A disabled write never happens (no
+                // read-old needed); the commit Block's event gate decides
+                // whether this instruction runs at all.
                 const std::size_t targetIndex = 4;
                 const Type &memoryType = operands[targetIndex].type();
                 const uint64_t address =
                     shiftAmount(operands[1], memoryType.elementCount);
-                bool eventHit = false;
-                for (std::size_t index = 5; index < operands.size(); ++index) {
-                    eventHit = eventHit || truth(operands[index]);
-                }
-                const bool fire = truth(operands[0]) && eventHit &&
-                                  address < memoryType.elementCount;
-                if (fire) {
+                if (truth(operands[0]) && address < memoryType.elementCount) {
                     InterpreterValue next = operands[targetIndex];
                     const std::size_t stride = wordCount(memoryType.bitWidth);
                     const std::size_t offset =
@@ -1367,34 +1343,25 @@ namespace wolvrix::lib::grhsim::am {
                 return {};
             }
             if (opcode == Opcode::MemoryFill) {
-                const std::size_t targetIndex = 2;
+                const std::size_t targetIndex = 1;
                 const Type &memoryType = operands[targetIndex].type();
-                bool eventHit = false;
-                for (std::size_t index = 3; index < operands.size(); ++index) {
-                    eventHit = eventHit || truth(operands[index]);
-                }
-                const bool fire = truth(operands[0]) && eventHit;
-                if (fire) {
-                    InterpreterValue next = operands[targetIndex];
-                    const std::size_t stride = wordCount(memoryType.bitWidth);
-                    for (uint64_t element = 0;
-                         element < memoryType.elementCount; ++element) {
-                        for (uint64_t bit = 0; bit < memoryType.bitWidth;
-                             ++bit) {
-                            const uint64_t sourceBit =
-                                operands[1].type().bitWidth ==
-                                        memoryType.bitWidth
-                                    ? bit
-                                    : element * memoryType.bitWidth + bit;
-                            setBit(next.words_,
-                                   element * static_cast<uint64_t>(stride) *
-                                           64U +
-                                       bit,
-                                   getBit(operands[1].words(), sourceBit));
-                        }
+                // The data operand always carries the full packed image; the
+                // fill condition is folded into it by the lowering.
+                InterpreterValue next = operands[targetIndex];
+                const std::size_t stride = wordCount(memoryType.bitWidth);
+                for (uint64_t element = 0;
+                     element < memoryType.elementCount; ++element) {
+                    for (uint64_t bit = 0; bit < memoryType.bitWidth;
+                         ++bit) {
+                        setBit(next.words_,
+                               element * static_cast<uint64_t>(stride) *
+                                       64U +
+                                   bit,
+                               getBit(operands[0].words(),
+                                      element * memoryType.bitWidth + bit));
                     }
-                    values[operandIds[targetIndex].value] = std::move(next);
                 }
+                values[operandIds[targetIndex].value] = std::move(next);
                 return {};
             }
             if (opcode == Opcode::SystemFunction ||
@@ -1435,6 +1402,45 @@ namespace wolvrix::lib::grhsim::am {
             return {};
         }
 
+        // Commit Blocks open with the Block's aggregated changed.* event
+        // detectors. Their results form the single event gate: every state
+        // write (and the tail watch/activation traffic behind it) runs only
+        // when at least one detector fired. Detectors still update their old
+        // baselines on every activation so edge detection stays exact.
+        InterpreterResult executeCommitBlock(BlockId block) {
+            bool gateOpen = true;
+            bool gate = false;
+            for (std::size_t position = 0;
+                 position < model.program.blockSize(block); ++position) {
+                const InstructionId instruction =
+                    model.program.blockInstruction(block, position);
+                const Opcode opcode = program.opcode(instruction);
+                if (gateOpen &&
+                    (opcode == Opcode::ChangedAny || opcode == Opcode::ChangedPos ||
+                     opcode == Opcode::ChangedNeg)) {
+                    InterpreterResult result =
+                        executeInstruction(block, instruction);
+                    if (!result.success()) {
+                        return result;
+                    }
+                    const auto results = program.results(instruction);
+                    gate = gate || truth(values[results.front().value]);
+                    continue;
+                }
+                if (gateOpen) {
+                    gateOpen = false;
+                    if (!gate) {
+                        return {};
+                    }
+                }
+                InterpreterResult result = executeInstruction(block, instruction);
+                if (!result.success()) {
+                    return result;
+                }
+            }
+            return {};
+        }
+
         InterpreterResult eval() {
             if (initializationDiagnostic) {
                 return InterpreterResult{.diagnostic =
@@ -1467,7 +1473,7 @@ namespace wolvrix::lib::grhsim::am {
                                             ? model.commitBlockBegin
                                             : blockCount;
             if (initial) {
-                for (uint32_t block = 1; block < computeEnd; ++block) {
+                for (uint32_t block = 1; block < blockCount; ++block) {
                     active[block] = true;
                 }
             }
@@ -1486,10 +1492,16 @@ namespace wolvrix::lib::grhsim::am {
                         return result;
                     }
                 }
-                // Commit phase: ascending, always executed.
+                // Commit phase: ascending, active-filtered like the compute
+                // phase; a commit Block runs only when one of its watched
+                // event sources activated it.
                 for (uint32_t block = model.commitBlockBegin;
                      block < model.commitBlockEnd; ++block) {
-                    result = executeBlock(BlockId{block});
+                    if (!active[block]) {
+                        continue;
+                    }
+                    active[block] = false;
+                    result = executeCommitBlock(BlockId{block});
                     if (!result.success()) {
                         result.roundsExecuted = roundCounter + 1U;
                         return result;

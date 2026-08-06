@@ -659,12 +659,19 @@ namespace wolvrix::lib::grhsim::am {
                     return false;
                 }
                 analyze();
-                if (options_.constFold || options_.cse) {
+                if (options_.constFold || options_.cse || options_.assignAlias ||
+                    options_.constMemFold) {
                     bool changed = true;
                     while (changed) {
                         changed = false;
                         if (options_.constFold) {
                             changed |= foldPass();
+                        }
+                        if (options_.assignAlias) {
+                            changed |= assignAliasPass();
+                        }
+                        if (options_.constMemFold) {
+                            changed |= constMemFoldPass();
                         }
                         if (options_.cse) {
                             changed |= csePass();
@@ -736,21 +743,6 @@ namespace wolvrix::lib::grhsim::am {
                 alias_.assign(variableCount, VariableId::invalid());
                 transformDead_.assign(instructionCount, 0);
 
-                interfaceReferenced_.assign(variableCount, 0);
-                const auto watch = [&](VariableId variable) {
-                    if (variable.valid() && variable.value < variableCount) {
-                        interfaceReferenced_[variable.value] = 1;
-                    }
-                };
-                for (const PortBinding &port : artifact_.interface.ports) {
-                    watch(port.input);
-                    watch(port.output);
-                    watch(port.outputEnable);
-                }
-                for (const VariableLabel &declared : artifact_.interface.declaredVariables) {
-                    watch(declared.variable);
-                }
-
                 // Canonicalize duplicate constant variables so CSE keys and
                 // folded operands share one representative per (type, value).
                 for (uint32_t index = 0; index < variableCount; ++index) {
@@ -777,10 +769,22 @@ namespace wolvrix::lib::grhsim::am {
                 }
             }
 
+            // A variable may be aliased to a variable with an identical value
+            // when it is neither externally driven nor a state target.
+            // Interface-referenced variables (output ports, declared
+            // observables) may be aliased: compact() re-points the interface
+            // entries to the alias representative.
             bool aliasable(VariableId variable) const {
-                if (!variable.valid() || variable.value >= oldVariableCount_ ||
-                    interfaceReferenced_[variable.value] != 0 ||
-                    roleOf(variable) != VariableRole::None) {
+                if (!variable.valid() || variable.value >= oldVariableCount_) {
+                    return false;
+                }
+                const VariableRole role = roleOf(variable);
+                if (options_.interfaceAlias) {
+                    if (hasRole(role, VariableRole::State) ||
+                        hasRole(role, VariableRole::ExternalInput)) {
+                        return false;
+                    }
+                } else if (role != VariableRole::None) {
                     return false;
                 }
                 const VariableRecord &record = view_.variable(variable);
@@ -980,6 +984,175 @@ namespace wolvrix::lib::grhsim::am {
                 return changed;
             }
 
+            // Bypass single-operand Assign instructions: the result aliases
+            // the (resolved) operand directly. Assigns reading a state
+            // variable are commit read-old snapshots (see lowering
+            // preCommitValue) and must stay, or commit blocks would observe
+            // this round's committed value instead of the pre-commit value.
+            bool assignAliasPass() {
+                bool changed = false;
+                for (uint32_t index = 0; index < oldInstructionCount_; ++index) {
+                    if (transformDead_[index] != 0) {
+                        continue;
+                    }
+                    const InstructionId instruction{index};
+                    if (view_.opcode(instruction) != Opcode::Assign) {
+                        continue;
+                    }
+                    const auto results = view_.results(instruction);
+                    const auto operands = view_.operands(instruction);
+                    if (results.size() != 1 || operands.size() != 1) {
+                        continue;
+                    }
+                    const VariableId result = results.front();
+                    const VariableId operand = operands.front();
+                    if (!operand.valid() || !aliasable(result)) {
+                        continue;
+                    }
+                    if (hasRole(roleOf(operand), VariableRole::State)) {
+                        continue;
+                    }
+                    const VariableRecord &resultRecord = view_.variable(result);
+                    const VariableRecord &operandRecord = view_.variable(operand);
+                    if (!resultRecord.type.valid() || !operandRecord.type.valid() ||
+                        resultRecord.type.value >= view_.typeCount() ||
+                        operandRecord.type.value >= view_.typeCount()) {
+                        continue;
+                    }
+                    if (view_.type(resultRecord.type) != view_.type(operandRecord.type)) {
+                        continue;
+                    }
+                    const uint32_t resolved = resolveVariable(operand.value);
+                    if (resolved == result.value) {
+                        continue;
+                    }
+                    alias_[result.value] = VariableId{resolved};
+                    transformDead_[index] = 1;
+                    ++aliasCount_;
+                    changed = true;
+                }
+                return changed;
+            }
+
+            // Fold MemoryRead instructions with a constant address on memories
+            // that are never written. Storage is zero-initialized (emitted
+            // init() memsets the member region; the interpreter zero-fills),
+            // so Undef/Zero init reads as zero, and Constant init carries the
+            // packed lane literal (lowering arrayLaneConstInit layout: lane k
+            // occupies bits [k*elemWidth, (k+1)*elemWidth)). Out-of-range
+            // addresses read as zero (interpreter MemoryRead semantics).
+            bool constMemFoldPass() {
+                if (!writtenMemories_) {
+                    std::vector<uint8_t> written(oldVariableCount_, 0);
+                    for (uint32_t index = 0; index < oldInstructionCount_; ++index) {
+                        const InstructionId instruction{index};
+                        const OpcodeTraits traits = opcodeTraits(view_.opcode(instruction));
+                        if (!traits.memoryAccess || !traits.hasOrderedEffect ||
+                            traits.stateTargetOperand == OpcodeTraits::kNoTargetOperand) {
+                            continue;
+                        }
+                        const auto operands = view_.operands(instruction);
+                        if (traits.stateTargetOperand >= operands.size()) {
+                            continue;
+                        }
+                        const VariableId target = operands[traits.stateTargetOperand];
+                        if (target.valid() && target.value < oldVariableCount_) {
+                            written[target.value] = 1;
+                        }
+                    }
+                    writtenMemories_ = std::move(written);
+                }
+                const std::vector<uint8_t> &written = *writtenMemories_;
+                bool changed = false;
+                for (uint32_t index = 0; index < oldInstructionCount_; ++index) {
+                    if (transformDead_[index] != 0) {
+                        continue;
+                    }
+                    const InstructionId instruction{index};
+                    if (view_.opcode(instruction) != Opcode::MemoryRead) {
+                        continue;
+                    }
+                    const auto results = view_.results(instruction);
+                    const auto operands = view_.operands(instruction);
+                    if (results.size() != 1 || operands.size() != 2) {
+                        continue;
+                    }
+                    const VariableId result = results.front();
+                    const VariableId memory = operands[0];
+                    const VariableId address = operands[1];
+                    if (!memory.valid() || !address.valid() || !aliasable(result) ||
+                        memory.value >= oldVariableCount_) {
+                        continue;
+                    }
+                    if (written[memory.value] != 0) {
+                        continue;
+                    }
+                    const VariableRecord &memoryRecord = view_.variable(memory);
+                    if (!memoryRecord.type.valid() ||
+                        memoryRecord.type.value >= view_.typeCount()) {
+                        continue;
+                    }
+                    const Type &memoryType = view_.type(memoryRecord.type);
+                    if (memoryType.elementCount == 0 || memoryType.bitWidth == 0) {
+                        continue;
+                    }
+                    const std::optional<ConstOperand> addressValue =
+                        constantWordsOf(resolveVariable(address.value));
+                    if (!addressValue || addressValue->words.empty()) {
+                        continue;
+                    }
+                    const VariableRecord &resultRecord = view_.variable(result);
+                    if (!resultRecord.type.valid() ||
+                        resultRecord.type.value >= view_.typeCount()) {
+                        continue;
+                    }
+                    const Type &resultType = view_.type(resultRecord.type);
+                    if (resultType.kind != TypeKind::BitVector ||
+                        resultType.bitWidth != memoryType.bitWidth) {
+                        continue;
+                    }
+                    uint64_t addressIndex = addressValue->words[0];
+                    for (std::size_t word = 1; word < addressValue->words.size(); ++word) {
+                        if (addressValue->words[word] != 0) {
+                            addressIndex = std::numeric_limits<uint64_t>::max();
+                            break;
+                        }
+                    }
+                    std::vector<uint64_t> folded(wordCount(resultType.bitWidth), 0);
+                    if (addressIndex < memoryType.elementCount) {
+                        if (!memoryRecord.init.valid() ||
+                            memoryRecord.init.value >= view_.initCount()) {
+                            continue;
+                        }
+                        const InitDescriptor &init = view_.init(memoryRecord.init);
+                        if (init.kind == InitKind::Constant) {
+                            const LiteralId literalId{init.payload};
+                            if (!literalId.valid() ||
+                                literalId.value >= view_.literalCount()) {
+                                continue;
+                            }
+                            const LiteralView literal = view_.literal(literalId);
+                            const uint64_t base =
+                                addressIndex * static_cast<uint64_t>(memoryType.bitWidth);
+                            for (uint32_t bit = 0; bit < resultType.bitWidth; ++bit) {
+                                if (getBit(literal.words, base + bit)) {
+                                    setBit(folded, bit);
+                                }
+                            }
+                        } else if (init.kind != InitKind::Zero &&
+                                   init.kind != InitKind::Undef) {
+                            continue;  // Actions init loads contents at runtime
+                        }
+                    }
+                    alias_[result.value] = VariableId{internConstant(
+                        resultRecord.type, resultType, std::move(folded))};
+                    transformDead_[index] = 1;
+                    ++memFoldCount_;
+                    changed = true;
+                }
+                return changed;
+            }
+
             void markLiveInstructions() {
                 live_.assign(oldInstructionCount_, 0);
                 if (!options_.dce) {
@@ -1026,15 +1199,17 @@ namespace wolvrix::lib::grhsim::am {
                         mark(index);
                     }
                 }
-                // Roots: producers of externally visible variables.
+                // Roots: producers of externally visible variables. Aliased
+                // variables root their alias representative instead.
                 for (uint32_t variable = 0; variable < oldVariableCount_; ++variable) {
                     const VariableRole role = roleOf(VariableId{variable});
                     if (!hasRole(role, VariableRole::ExternalOutput) &&
                         !hasRole(role, VariableRole::Observable)) {
                         continue;
                     }
-                    if (producer[variable] != kInvalidIndex) {
-                        mark(producer[variable]);
+                    const uint32_t resolved = resolveVariable(variable);
+                    if (resolved < producer.size() && producer[resolved] != kInvalidIndex) {
+                        mark(producer[resolved]);
                     }
                 }
 
@@ -1196,9 +1371,32 @@ namespace wolvrix::lib::grhsim::am {
                     }
                 }
 
+                // Interface entries keep referring to the eliminated
+                // duplicates unless re-pointed to their alias representatives
+                // (values are identical by construction).
+                ProgramInterface rebuiltInterface = artifact_.interface;
+                for (PortBinding &port : rebuiltInterface.ports) {
+                    if (port.input.valid()) {
+                        port.input = VariableId{resolveVariable(port.input.value)};
+                    }
+                    if (port.output.valid()) {
+                        port.output = VariableId{resolveVariable(port.output.value)};
+                    }
+                    if (port.outputEnable.valid()) {
+                        port.outputEnable =
+                            VariableId{resolveVariable(port.outputEnable.value)};
+                    }
+                }
+                for (VariableLabel &declared : rebuiltInterface.declaredVariables) {
+                    if (declared.variable.valid()) {
+                        declared.variable =
+                            VariableId{resolveVariable(declared.variable.value)};
+                    }
+                }
+
                 LinearProgramArtifact optimized{
                     .program = builder.finish(),
-                    .interface = artifact_.interface,
+                    .interface = std::move(rebuiltInterface),
                     .schedulingFacts = {},
                 };
                 optimized.schedulingFacts.variableRoles.reserve(oldVariableCount_ +
@@ -1209,6 +1407,33 @@ namespace wolvrix::lib::grhsim::am {
                 }
                 optimized.schedulingFacts.variableRoles.resize(
                     oldVariableCount_ + newConstants_.size(), VariableRole::None);
+                // Transfer interface visibility roles from aliased variables
+                // to their alias representatives so the roles stay consistent
+                // with the re-pointed ProgramInterface.
+                constexpr uint8_t kInterfaceRoleBits =
+                    static_cast<uint8_t>(VariableRole::ExternalOutput) |
+                    static_cast<uint8_t>(VariableRole::Observable);
+                for (uint32_t index = 0; index < oldVariableCount_; ++index) {
+                    if (!alias_[index].valid()) {
+                        continue;
+                    }
+                    const uint8_t role =
+                        static_cast<uint8_t>(optimized.schedulingFacts.variableRoles[index]);
+                    const uint8_t carried = role & kInterfaceRoleBits;
+                    if (carried == 0) {
+                        continue;
+                    }
+                    optimized.schedulingFacts.variableRoles[index] =
+                        static_cast<VariableRole>(role & ~kInterfaceRoleBits);
+                    const uint32_t resolved = resolveVariable(index);
+                    if (resolved < optimized.schedulingFacts.variableRoles.size()) {
+                        optimized.schedulingFacts.variableRoles[resolved] =
+                            static_cast<VariableRole>(
+                                static_cast<uint8_t>(
+                                    optimized.schedulingFacts.variableRoles[resolved]) |
+                                carried);
+                    }
+                }
                 optimized.schedulingFacts.instructionEffects.reserve(keptInstructions);
                 for (uint32_t index = 0; index < oldInstructionCount_; ++index) {
                     if (live_[index] != 0) {
@@ -1239,7 +1464,10 @@ namespace wolvrix::lib::grhsim::am {
                         " -> " + std::to_string(keptInstructions) +
                         " (fold=" + std::to_string(foldedCount_) +
                         " cse=" + std::to_string(cseCount_) +
-                        " dce=" + std::to_string(removed - foldedCount_ - cseCount_) +
+                        " alias=" + std::to_string(aliasCount_) +
+                        " memfold=" + std::to_string(memFoldCount_) +
+                        " dce=" + std::to_string(removed - foldedCount_ - cseCount_ -
+                                                aliasCount_ - memFoldCount_) +
                         ") constants_added=" + std::to_string(newConstants_.size()),
                     std::string(kDiagnosticContext));
                 artifact_ = std::move(optimized);
@@ -1256,13 +1484,15 @@ namespace wolvrix::lib::grhsim::am {
             std::vector<VariableId> alias_;
             std::vector<uint8_t> transformDead_;
             std::vector<uint8_t> live_;
-            std::vector<uint8_t> interfaceReferenced_;
             std::vector<uint8_t> inOrderedEffect_;
+            std::optional<std::vector<uint8_t>> writtenMemories_;
             std::vector<ConstantSlot> newConstants_;
             std::unordered_map<ConstantKey, uint32_t, ConstantKeyHash> constantVars_;
             std::unordered_map<uint32_t, uint32_t> canonicalConst_;
             std::size_t foldedCount_ = 0;
             std::size_t cseCount_ = 0;
+            std::size_t aliasCount_ = 0;
+            std::size_t memFoldCount_ = 0;
         };
 
     } // namespace
@@ -1270,7 +1500,8 @@ namespace wolvrix::lib::grhsim::am {
     bool optimizeLinearProgram(LinearProgramArtifact &artifact,
                                const AmOptimizeOptions &options,
                                wolvrix::lib::diag::Diagnostics &diagnostics) {
-        if (!options.dce && !options.constFold && !options.cse) {
+        if (!options.dce && !options.constFold && !options.cse && !options.assignAlias &&
+            !options.constMemFold) {
             return true;
         }
         try {

@@ -1,5 +1,6 @@
 #include "grhsim/am/pipeline.hpp"
 
+#include "grhsim/am/graph.hpp"
 #include "grhsim/am/opcode_traits.hpp"
 #include "grhsim/am/optimize.hpp"
 
@@ -148,7 +149,7 @@ namespace wolvrix::lib::grhsim::am
             {
             case Opcode::RegisterWrite:
             case Opcode::LatchWrite:
-                target = 3;
+                target = 1;
                 break;
             case Opcode::MemoryRead:
                 target = 0;
@@ -163,7 +164,7 @@ namespace wolvrix::lib::grhsim::am
                 target = 4;
                 break;
             case Opcode::MemoryFill:
-                target = 2;
+                target = 1;
                 break;
             default:
                 return std::nullopt;
@@ -709,6 +710,8 @@ namespace wolvrix::lib::grhsim::am
             {
                 const BlockId blockId{block};
                 const bool isCommitBlock = block >= commitBegin;
+                bool seenGateDetector = false;
+                bool seenStateWrite = false;
                 for (std::size_t position = 0;
                      position < model.program.blockSize(blockId); ++position)
                 {
@@ -719,31 +722,39 @@ namespace wolvrix::lib::grhsim::am
                         continue;
                     }
                     const Opcode opcode = program.opcode(instruction);
-                    if (isStateWrite(opcode) && !isCommitBlock)
+                    if (isStateWrite(opcode))
                     {
-                        addError(result, options,
-                                 "AM state write instruction outside a commit Block: instruction=" +
-                                     std::to_string(instruction.value) +
-                                     " block=" + std::to_string(block));
-                    }
-                    if (opcode == Opcode::ActForward)
-                    {
-                        if (isCommitBlock)
+                        if (!isCommitBlock)
                         {
                             addError(result, options,
-                                     "AM ActForward instruction inside a commit Block: instruction=" +
+                                     "AM state write instruction outside a commit Block: instruction=" +
                                          std::to_string(instruction.value) +
                                          " block=" + std::to_string(block));
                         }
+                        seenStateWrite = true;
+                        if (isCommitBlock && !seenGateDetector)
+                        {
+                            addError(result, options,
+                                     "AM commit Block state write is not preceded by a gate detector: instruction=" +
+                                         std::to_string(instruction.value) +
+                                         " block=" + std::to_string(block));
+                        }
+                    }
+                    if (isCommitBlock && isChangedOpcode(opcode) && !seenStateWrite)
+                    {
+                        seenGateDetector = true;
+                    }
+                    if (opcode == Opcode::ActForward)
+                    {
                         if (const auto attributes = program.activationAttributes(instruction))
                         {
                             for (const BlockId target : attributes->targets)
                             {
                                 if (!target.valid() || target.value <= block ||
-                                    target.value >= commitBegin)
+                                    target.value >= blockCount)
                                 {
                                     addError(result, options,
-                                             "AM ActForward target is not a later compute Block: instruction=" +
+                                             "AM ActForward target is not a later Block: instruction=" +
                                                  std::to_string(instruction.value) +
                                                  " target=" + std::to_string(target.value));
                                 }
@@ -752,22 +763,15 @@ namespace wolvrix::lib::grhsim::am
                     }
                     if (opcode == Opcode::ActBackward)
                     {
-                        if (!isCommitBlock)
-                        {
-                            addError(result, options,
-                                     "AM ActBackward instruction outside a commit Block: instruction=" +
-                                         std::to_string(instruction.value) +
-                                         " block=" + std::to_string(block));
-                        }
                         if (const auto attributes = program.activationAttributes(instruction))
                         {
                             for (const BlockId target : attributes->targets)
                             {
                                 if (!target.valid() || target.value < 1 ||
-                                    target.value >= commitBegin)
+                                    target.value >= blockCount)
                                 {
                                     addError(result, options,
-                                             "AM ActBackward target is not a compute Block: instruction=" +
+                                             "AM ActBackward target is not a non-entry Block: instruction=" +
                                                  std::to_string(instruction.value) +
                                                  " target=" + std::to_string(target.value));
                                 }
@@ -837,12 +841,17 @@ namespace wolvrix::lib::grhsim::am
         }
         const std::vector<uint32_t> watchedInputs =
             entryWatchedInputs(model.program, interfaceInputs);
-        // Commit Blocks scan every round, so an input only needs EntryBlock
-        // activation when some Block outside the commit range reads it.
+        // Commit Blocks are activation-driven, but only some input reads need
+        // an EntryBlock watch: reads inside compute Blocks (they recompute)
+        // and the watched operand of commit-Block changed.* gate detectors
+        // (that is exactly the activation path, e.g. the clock). Write value
+        // operands in commit Blocks (addr/data/laneMask/...) are read live
+        // when the Block's own event fires and need no activation.
         std::vector<uint32_t> activationInputs;
-        for (uint32_t block = 0; block < commitBegin; ++block)
+        for (uint32_t block = 0; block < blockCount; ++block)
         {
             const BlockId blockId{block};
+            const bool isCommitBlock = block >= commitBegin;
             for (std::size_t position = 0;
                  position < model.program.blockSize(blockId); ++position)
             {
@@ -852,9 +861,16 @@ namespace wolvrix::lib::grhsim::am
                 {
                     continue;
                 }
-                for (const VariableId operand : program.operands(instruction))
+                const Opcode opcode = program.opcode(instruction);
+                const auto operands = program.operands(instruction);
+                for (std::size_t operandPosition = 0;
+                     operandPosition < operands.size(); ++operandPosition)
                 {
-                    if (operand.valid() &&
+                    const VariableId operand = operands[operandPosition];
+                    const bool needsWatch =
+                        !isCommitBlock ||
+                        (isChangedOpcode(opcode) && operandPosition == 0);
+                    if (needsWatch && operand.valid() &&
                         std::binary_search(interfaceInputs.begin(), interfaceInputs.end(),
                                            operand.value))
                     {
@@ -922,6 +938,21 @@ namespace wolvrix::lib::grhsim::am
                               diagnostics))
         {
             return result;
+        }
+
+        // The graph form is the working IR: everything between lowering and
+        // emission runs on the AmGraph. For now this is a lossless
+        // round-trip; graph passes land here one by one.
+        {
+            AmGraph graph = AmGraph::fromLinearProgram(linear);
+            linear = graph.toLinearProgram();
+            if (!reportValidation(validate(linear,
+                                           ValidationOptions{.level = ValidationLevel::Semantic}),
+                                  "grhsim-am-graph",
+                                  diagnostics))
+            {
+                return result;
+            }
         }
 
         if (!optimizeLinearProgram(linear, optimizeOptions_, diagnostics) ||

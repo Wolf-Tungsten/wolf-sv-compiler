@@ -594,8 +594,6 @@ namespace
         const VariableId readData = addOutput(u8Type, "read_data");
         const VariableId memoryChanged = addOutput(u1Type, "memory_changed");
 
-        const std::array<uint64_t, 1> oneWords = {1};
-        const VariableId event = addBitConstant(linear, u1Type, oneWords);
         const VariableId memory = linear.addVariable(memoryType, linear.zeroInit());
         const VariableId memoryOld = linear.addVariable(memoryType, linear.undefInit());
         const VariableId changedEvent = linear.addVariable(u1Type, linear.zeroInit());
@@ -604,12 +602,48 @@ namespace
         const VariableId commitChangedEvent =
             linear.addVariable(u1Type, linear.zeroInit());
 
+        // Commit gate detectors: one head changed.any per input the commit
+        // Block reads, each with a private old baseline. Their results form
+        // the Block's single event gate and serve as the writes' event
+        // operands (the scheduler's re-pointed clones in hand-built form).
+        const std::array<VariableId, 6> gateWatched = {
+            fillEnable, writeEnable, address, writeMask, writeData, fillData,
+        };
+        const std::array<TypeId, 6> gateTypes = {
+            u1Type, u1Type, u8Type, u8Type, u8Type, u32Type,
+        };
+        std::array<VariableId, 6> gateEvents{};
+        std::array<InstructionId, 6> gateDetectors{};
+        for (std::size_t index = 0; index < gateWatched.size(); ++index)
+        {
+            const VariableId gateOld =
+                linear.addVariable(gateTypes[index], linear.undefInit());
+            gateEvents[index] = linear.addVariable(u1Type, linear.zeroInit());
+            gateDetectors[index] = addInstruction(
+                Opcode::ChangedAny, {gateEvents[index]},
+                {gateWatched[index], gateOld});
+        }
+
+        // The update conditions: the fill keeps the current packed image
+        // unless fill_enable; the element write keeps cond/mask as operands
+        // (reverted from the merged self-mux form), so the masked write is
+        // gated on write_enable directly and no read-old helper chain is
+        // needed.
+        const VariableId memoryPacked = linear.addVariable(u32Type, linear.zeroInit());
+        const VariableId fillNext = linear.addVariable(u32Type, linear.zeroInit());
+
+        const InstructionId readPacked = addInstruction(
+            Opcode::MemoryReadAll, {memoryPacked}, {memory});
+        const InstructionId selectFill = addInstruction(
+            Opcode::Mux, {fillNext}, {fillEnable, fillData, memoryPacked});
         const InstructionId fill = addInstruction(
-            Opcode::MemoryFill, {}, {fillEnable, fillData, memory, event});
+            Opcode::MemoryFill, {},
+            {fillNext, memory, gateEvents[0], gateEvents[5]});
         const InstructionId write = addInstruction(
             Opcode::MemoryWrite,
             {},
-            {writeEnable, address, writeMask, writeData, memory, event});
+            {writeEnable, address, writeMask, writeData, memory, gateEvents[1],
+             gateEvents[2], gateEvents[3], gateEvents[4]});
         const InstructionId read = addInstruction(
             Opcode::MemoryRead, {readData}, {memory, address});
         const InstructionId changed = addInstruction(
@@ -637,7 +671,9 @@ namespace
             const std::array<VariableId, 1> activateOperands = {inputChanged};
             const InstructionId activate = scheduled.addInstruction(
                 Opcode::ActForward, {}, activateOperands);
-            const std::array<BlockId, 1> targets = {BlockId{1}};
+            // Every watched input activates the compute readers and, through
+            // the commit Block's gate-detector watch, the commit Block too.
+            const std::array<BlockId, 2> targets = {BlockId{1}, BlockId{2}};
             scheduled.setActivationTargets(activate, targets);
             entry.push_back(detect);
             entry.push_back(activate);
@@ -649,14 +685,16 @@ namespace
             read, changed, exposeChanged,
         };
         scheduled.addBlock(readers);
-        // Commit Block: the state writes plus the same-Block change detector
-        // feeding act.b; it executes unconditionally every round.
+        // Commit Block: the head gate detectors run on every activation and
+        // their OR gates everything else — the nextValue computation, the
+        // state writes, and the tail watch detector feeding act.b.
         const InstructionId activateReaders = scheduled.addInstruction(
             Opcode::ActBackward, {}, std::array{commitChangedEvent});
         scheduled.setActivationTargets(activateReaders, std::array{BlockId{1}});
-        const std::array<InstructionId, 4> commit = {
-            fill, write, detectCommitChanged, activateReaders,
-        };
+        std::vector<InstructionId> commit(gateDetectors.begin(), gateDetectors.end());
+        commit.insert(commit.end(),
+                      {readPacked, selectFill, fill, write, detectCommitChanged,
+                       activateReaders});
         scheduled.addBlock(commit);
 
         return MemoryEmitterFixture{
@@ -755,13 +793,15 @@ namespace
 
         // ST00011 array write-point activation: the commit Block's tail
         // changed.any on the memory is replaced by change flags accumulated at
-        // the Block's own write sites (mem.write element compare, mem.fill
-        // per-element detect in the fill loop); the whole-array compare and
-        // baseline copy survive only for the compute-Block detector, which has
-        // no same-Block write site.
+        // the Block's own write sites (mem.write element masked-write-detect —
+        // cond/mask are operands again, so the write site emits
+        // masked_write_words_detect — and mem.fill per-element detect in the
+        // fill loop); the whole-array compare and baseline copy survive only
+        // for the compute-Block detector, which has no same-Block write site.
         const std::optional<std::string> memoryBlocksText =
             readTextFile(outputDirectory / "grhsim_MemoryTop_blocks_0.cpp");
         if (!memoryBlocksText ||
+            countOccurrences(*memoryBlocksText, "assign_words_detect(") != 0 ||
             countOccurrences(*memoryBlocksText, "masked_write_words_detect(") != 1 ||
             countOccurrences(*memoryBlocksText, "slice_words_detect(") != 1 ||
             countOccurrences(*memoryBlocksText, "bool arrChg_0 = false;") != 1 ||
@@ -861,10 +901,11 @@ namespace
         VariableId bcast1;
     };
 
-    // 8-lane x 8-bit array loopback: a clocked mem.write_lanes scatters packed
-    // lanes into the memory, the commit Block's tail changed.any reactivates
-    // the reader Block, which packs the array with mem.read_all and applies
-    // the pure array ops.
+    // 8-lane x 8-bit array loopback: the entry Block's clock watch activates
+    // the commit Block, whose head changed.pos gate drives a clocked
+    // mem.write_lanes that scatters packed lanes into the memory; the commit
+    // Block's tail changed.any reactivates the reader Block, which packs the
+    // array with mem.read_all and applies the pure array ops.
     ArrayEmitterFixture makeArrayEmitterFixture()
     {
         LinearProgramBuilder linear;
@@ -937,6 +978,9 @@ namespace
         const VariableId bcast1 = addOutput(u64Type, "bcast1");
 
         const VariableId clockOld = linear.addVariable(u1Type, linear.undefInit());
+        const VariableId clockEvent = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId commitClockOld =
+            linear.addVariable(u1Type, linear.undefInit());
         const VariableId clockPos = linear.addVariable(u1Type, linear.zeroInit());
         const VariableId memory = linear.addVariable(arrayType, linear.zeroInit());
         const VariableId memoryOld =
@@ -944,8 +988,13 @@ namespace
         const VariableId memoryEvent =
             linear.addVariable(u1Type, linear.zeroInit());
 
+        // The entry Block's changed.any clock watch activates the commit
+        // Block on every edge; the head changed.pos clone inside the commit
+        // Block forms the write gate.
+        const InstructionId watchClock = addInstruction(
+            Opcode::ChangedAny, {clockEvent}, {clock, clockOld});
         const InstructionId detectClock = addInstruction(
-            Opcode::ChangedPos, {clockPos}, {clock, clockOld});
+            Opcode::ChangedPos, {clockPos}, {clock, commitClockOld});
         const InstructionId write = addInstruction(
             Opcode::MemoryWriteLanes, {}, {laneMask, data, memory, clockPos});
         const InstructionId readAll = addInstruction(
@@ -980,9 +1029,12 @@ namespace
             Opcode::ChangedAny, {memoryEvent}, {memory, memoryOld});
 
         ScheduledProgramBuilder scheduled(linear.finish());
-        std::vector<InstructionId> entry{detectClock};
-        const std::array<VariableId, 13> computeInputs = {
-            laneMask, data, scalar, index, clock, sel1, t1,
+        const InstructionId activateCommit = scheduled.addInstruction(
+            Opcode::ActForward, {}, std::array{clockEvent});
+        scheduled.setActivationTargets(activateCommit, std::array{BlockId{2}});
+        std::vector<InstructionId> entry{watchClock, activateCommit};
+        const std::array<VariableId, 12> computeInputs = {
+            laneMask, data, scalar, index, sel1, t1,
             f1, sel5, t13, f13, scalar13, bit1,
         };
         for (VariableId input : computeInputs)
@@ -1013,8 +1065,8 @@ namespace
         const InstructionId activateReaders = scheduled.addInstruction(
             Opcode::ActBackward, {}, std::array{memoryEvent});
         scheduled.setActivationTargets(activateReaders, std::array{BlockId{1}});
-        const std::array<InstructionId, 3> commit = {
-            write, changed, activateReaders,
+        const std::array<InstructionId, 4> commit = {
+            detectClock, write, changed, activateReaders,
         };
         scheduled.addBlock(commit);
 
@@ -1566,6 +1618,7 @@ namespace
         VariableId inputChanged;
         VariableId forwardChanged;
         VariableId backwardChanged;
+        VariableId commitForwardEvent;
     };
 
     PackedActivityFixture makePackedActivityFixture()
@@ -1598,6 +1651,11 @@ namespace
             linear.addVariable(u1Type, linear.zeroInit());
         const std::array<uint64_t, 1> oneWords = {1};
         const VariableId one = addBitConstant(linear, u1Type, oneWords);
+        const VariableId commitForwardOld =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId commitForwardEvent =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId writeNext = linear.addVariable(u1Type, linear.zeroInit());
 
         const auto addInstruction = [&](Opcode opcode,
                                         std::initializer_list<VariableId> results,
@@ -1617,10 +1675,18 @@ namespace
             addInstruction(Opcode::Assign, {forwardOutput}, {forwardStage});
         const InstructionId assignBackwardOutput =
             addInstruction(Opcode::Assign, {backwardOutput}, {backwardState});
+        // Commit head gate detector: a changed.any clone on the write's raw
+        // event source (forwardStage). The write's update condition folds
+        // into nextValue: mux(forwardChanged, 1, backwardState).
+        const InstructionId detectCommitForward =
+            addInstruction(Opcode::ChangedAny, {commitForwardEvent},
+                           {forwardStage, commitForwardOld});
+        const InstructionId blendWriteNext = addInstruction(
+            Opcode::Mux, {writeNext}, {forwardChanged, one, backwardState});
         const InstructionId writeBackward =
             addInstruction(Opcode::RegisterWrite,
                            {},
-                           {forwardChanged, one, one, backwardState, one});
+                           {writeNext, backwardState, commitForwardEvent});
         const InstructionId detectBackward = addInstruction(
             Opcode::ChangedAny, {backwardChanged}, {backwardState, backwardStateOld});
 
@@ -1639,6 +1705,8 @@ namespace
             addScheduledInstruction(Opcode::ActForward, {}, {forwardStage});
         const InstructionId activateMany =
             addScheduledInstruction(Opcode::ActForward, {}, {forwardStage});
+        const InstructionId activateCommit =
+            addScheduledInstruction(Opcode::ActForward, {}, {forwardChanged});
         const InstructionId activateBackward =
             addScheduledInstruction(Opcode::ActBackward, {}, {backwardChanged});
         const std::array<BlockId, 2> entryTargets = {
@@ -1646,6 +1714,7 @@ namespace
             BlockId{kForwardBlock},
         };
         const std::array<BlockId, 1> finalTargets = {BlockId{kFinalBlock}};
+        const std::array<BlockId, 1> commitTargets = {BlockId{kCommitBlock}};
         const std::array<BlockId, 1> backwardTargets = {BlockId{kBackwardBlock}};
         // Eight empty Blocks in one activity word: high enough fanout to select
         // the constant-mask emission form, and executing them is a no-op.
@@ -1656,6 +1725,7 @@ namespace
         scheduled.setActivationTargets(activateForward, entryTargets);
         scheduled.setActivationTargets(activateFinal, finalTargets);
         scheduled.setActivationTargets(activateMany, manyTargets);
+        scheduled.setActivationTargets(activateCommit, commitTargets);
         scheduled.setActivationTargets(activateBackward, backwardTargets);
 
         for (uint32_t block = 0; block <= kCommitBlock; ++block)
@@ -1670,11 +1740,12 @@ namespace
             }
             else if (block == kForwardBlock)
             {
-                const std::array<InstructionId, 4> forward = {
+                const std::array<InstructionId, 5> forward = {
                     assignForwardStage,
                     detectForward,
                     activateFinal,
                     activateMany,
+                    activateCommit,
                 };
                 scheduled.addBlock(forward);
             }
@@ -1694,10 +1765,15 @@ namespace
             }
             else if (block == kCommitBlock)
             {
-                // The commit Block always executes; the forwardChanged event
-                // (round-local, cross-Block) gates the write, and the same-Block
-                // detector drives act.b back to the reader compute Block.
-                const std::array<InstructionId, 3> commit = {
+                // The commit Block is activation-driven: the forward Block
+                // act.f's it through forwardChanged (the gate detector's
+                // watched event), and inside the Block the head changed.any
+                // clone on forwardStage gates the write plus the tail
+                // detector that drives act.b back to the reader compute
+                // Block.
+                const std::array<InstructionId, 5> commit = {
+                    detectCommitForward,
+                    blendWriteNext,
                     writeBackward,
                     detectBackward,
                     activateBackward,
@@ -1744,6 +1820,7 @@ namespace
             .inputChanged = inputChanged,
             .forwardChanged = forwardChanged,
             .backwardChanged = backwardChanged,
+            .commitForwardEvent = commitForwardEvent,
         };
     }
 
@@ -1855,6 +1932,13 @@ namespace
             lastShardText->find("active_byte_ref(14) & UINT8_C(0x80)") ==
                 std::string::npos ||
             lastShardText->find("active_byte_ref(16) & UINT8_C(0x3)") ==
+                std::string::npos ||
+            // The commit phase scans the same way: byte 16's commit-owned
+            // bit (Block 130) snapshots, clears, and bit-tests like any
+            // compute chunk.
+            lastShardText->find("active_byte_ref(16) & UINT8_C(0x4);") ==
+                std::string::npos ||
+            lastShardText->find("active_byte_ref(16) &= UINT8_C(0xfb);") ==
                 std::string::npos ||
             lastShardText->find("active_byte_ref(17") != std::string::npos)
         {
@@ -2015,9 +2099,12 @@ namespace
         // bitmap, except forward targets in the same activity byte owned by
         // the emitting chunk, which relay into the scan-local byteFlags (see
         // the fixture's manyTargets: 66 and 67 relay, 68..73 stay global); an
-        // act.b also raises backwardFired_. This fixture opts into the
-        // compile-time runtime profile, so the mask path also carries its
-        // counted profile statement (6 masked + 2 relayed = 8).
+        // act.b also raises backwardFired_. The forward Block activates the
+        // commit Block through the gate detector's watched event
+        // (forwardChanged, dense changed result 0 -> Block 130's mask 0x4).
+        // This fixture opts into the compile-time runtime profile, so the
+        // mask path also carries its counted profile statement (6 masked + 2
+        // relayed = 8).
         if (headerText->find("static constexpr bool kRuntimeProfileCompiled = true;") ==
                 std::string::npos ||
             headerText->find("profilePerBlockExecs_") == std::string::npos ||
@@ -2035,6 +2122,10 @@ namespace
                 std::string::npos ||
             generatedSourceText.find("activeWords_[1] |= UINT64_C(0x2);") ==
                 std::string::npos ||
+            generatedSourceText.find("if ((changedResults_[0] != 0)) {\n"
+                                     "                if (runtimeProfileEnabled_) profileActivateForward_ += 1;\n"
+                                     "                activeWords_[2] |= UINT64_C(0x4);") ==
+                std::string::npos ||
             generatedSourceText.find("backwardFired_ = true;") == std::string::npos ||
             generatedSourceText.find("profileActivateForward_ += 8;") ==
                 std::string::npos ||
@@ -2051,12 +2142,19 @@ namespace
         const std::string entryAccumulate =
             "bool detGrp_0 = (v" + std::to_string(fixture.input.value) + " != v" +
             std::to_string(fixture.inputOld.value) + ");";
+        // Commit Block event gating: the head changed.any clone on the raw
+        // event source runs on every activation and refreshes its baseline;
+        // its result forms the single gate wrapping the write and the tail
+        // watch traffic.
+        const std::string commitGate =
+            "if ((v" + std::to_string(fixture.commitForwardEvent.value) + " != 0)) {";
         // ST00013: the commit Block's state detector is fused into the
         // RegisterWrite site (write-point compare, store and raise only on a
         // real change); its group accumulator reads the write-point flag
         // instead of a tail compare, and the old baseline is gone.
         const std::string commitAccumulate = "bool detGrp_0 = wrChg_0;";
         if (generatedSourceText.find(entryAccumulate) == std::string::npos ||
+            generatedSourceText.find(commitGate) == std::string::npos ||
             generatedSourceText.find(commitAccumulate) == std::string::npos ||
             generatedSourceText.find("bool wrChg_0 = false;") == std::string::npos ||
             generatedSourceText.find("wrChg_0 = true;") == std::string::npos ||
@@ -2071,14 +2169,17 @@ namespace
         }
         // Per-Block profile counters move into the dispatch form: scan Blocks
         // count at the top of their bit-test branch, the commit Block counts
-        // unconditionally, and B0 counts only its per-Block entry. The scan
-        // itself is straight-line: no switch, countr_zero, or do-while.
+        // inside its own activity bit test (commit Blocks are
+        // activation-filtered like every other Block), and B0 counts only its
+        // per-Block entry. The scan itself is straight-line: no switch,
+        // countr_zero, or do-while.
         if (generatedSourceText.find(
                 "if ((byteFlags & UINT8_C(0x1)) != 0) {\n"
                 "                if (runtimeProfileEnabled_) { profilePerBlockExecs_[64] += 1; ++profileBlockExecs_; }") ==
                 std::string::npos ||
             generatedSourceText.find(
-                "        if (runtimeProfileEnabled_) { profilePerBlockExecs_[130] += 1; ++profileCommitBlockExecs_; }") ==
+                "if ((byteFlags & UINT8_C(0x4)) != 0) {\n"
+                "                if (runtimeProfileEnabled_) { profilePerBlockExecs_[130] += 1; ++profileCommitBlockExecs_; }") ==
                 std::string::npos ||
             generatedSourceText.find(
                 "::execute_block_0() {\n"
@@ -2226,10 +2327,11 @@ int main()
         const VariableId stateChanged = linear.addVariable(u1Type, linear.zeroInit());
 
         const std::array<uint64_t, 1> oneWords = {1};
-        const std::array<uint64_t, 1> maskWords = {0xff};
-        const VariableId one = addBitConstant(linear, u1Type, oneWords);
         const VariableId oneValue = addBitConstant(linear, u8Type, oneWords);
-        const VariableId mask = addBitConstant(linear, u8Type, maskWords);
+        const VariableId commitClockOld =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId commitPosedge =
+            linear.addVariable(u1Type, linear.zeroInit());
 
         const InstructionId watchClock =
             addInstruction(Opcode::ChangedAny, {entryEvent}, {clock, clockOld});
@@ -2241,12 +2343,15 @@ int main()
             addInstruction(Opcode::Assign, {sampledState}, {state});
         const InstructionId sampleCommitEvent =
             addInstruction(Opcode::Assign, {commitEvent}, {posedge});
+        // Commit head gate detector: the changed.pos clone on the clock. Both
+        // writes are unconditional in their nextValue (constant cond, full
+        // mask), so nextValue is the data operand directly.
+        const InstructionId gateDetect = addInstruction(
+            Opcode::ChangedPos, {commitPosedge}, {clock, commitClockOld});
         const InstructionId writeState = addInstruction(
-            Opcode::RegisterWrite, {}, {one, mask, payload, state, posedge});
+            Opcode::RegisterWrite, {}, {payload, state, commitPosedge});
         const InstructionId writeCount = addInstruction(
-            Opcode::RegisterWrite,
-            {},
-            {one, mask, nextCommitCount, commitCount, posedge});
+            Opcode::RegisterWrite, {}, {nextCommitCount, commitCount, commitPosedge});
         const InstructionId detectState =
             addInstruction(Opcode::ChangedAny, {stateChanged}, {state, stateOld});
 
@@ -2267,15 +2372,17 @@ int main()
             addScheduledInstruction(Opcode::ActForward, {entryEvent});
         const InstructionId activateReaders =
             addScheduledInstruction(Opcode::ActBackward, {stateChanged});
-        scheduled.setActivationTargets(enterClock, std::array{BlockId{1}});
+        // The entry clock watch activates both the compute chain and the
+        // commit Block (through its gate detector's watched clock source).
+        scheduled.setActivationTargets(enterClock, std::array{BlockId{1}, BlockId{3}});
         scheduled.setActivationTargets(activateReaders, std::array{BlockId{2}});
         addBlock({watchClock, enterClock});
         addBlock({detectPosedge, addCommitCount});
         addBlock({sampleState, sampleCommitEvent});
-        // Commit Block: scanned unconditionally every round; the round-local
-        // posedge event gates the writes, and the same-Block detector
-        // reactivates the reader compute Block through act.b.
-        addBlock({writeState, writeCount, detectState, activateReaders});
+        // Commit Block: activation-driven like every Block; the head
+        // changed.pos clone gates the writes, and the tail same-Block
+        // detector reactivates the reader compute Block through act.b.
+        addBlock({gateDetect, writeState, writeCount, detectState, activateReaders});
 
         return ExecutableModel{
             .program = scheduled.finish(),
@@ -2441,7 +2548,9 @@ int main()
 
         // The static straight-line dispatch carries the compute Blocks in
         // eval_scan_0 (one byte chunk owning Blocks 1 and 2), the entry Block
-        // in execute_block_0, and the commit Block in eval_commit_0.
+        // in execute_block_0, and the commit Block in eval_commit_0, which is
+        // activation-scanned over byte 0's commit-owned bit (Block 3, 0x8)
+        // exactly like a compute chunk.
         if (blockText->find("void GrhSIM_PhasedCommitTop::execute_block_0() {") ==
                 std::string::npos ||
             blockText->find("void GrhSIM_PhasedCommitTop::eval_scan_0() {") ==
@@ -2458,10 +2567,33 @@ int main()
                 std::string::npos ||
             blockText->find("void GrhSIM_PhasedCommitTop::eval_commit_0() {") ==
                 std::string::npos ||
+            blockText->find("active_byte_ref(0) & UINT8_C(0x8);") ==
+                std::string::npos ||
+            blockText->find("active_byte_ref(0) &= UINT8_C(0xf7);") ==
+                std::string::npos ||
+            blockText->find(
+                "            if ((byteFlags & UINT8_C(0x8)) != 0) {") ==
+                std::string::npos ||
             blockText->find("switch") != std::string::npos ||
             blockText->find("    case ") != std::string::npos)
         {
             return fail("AM C++ emitter did not split the static scan and commit dispatch");
+        }
+
+        // Commit event gating: the head changed.pos clone on the clock runs
+        // on every activation (refreshing its baseline), and its result is
+        // the single gate wrapping both state writes and the tail watch; the
+        // entry clock watch activates the commit Block (mask 0xa = Blocks 1
+        // and 3) because the gate detector watches its clock source. ST00013
+        // still fuses the tail state detector into the RegisterWrite site.
+        if (blockText->find("bool detGrp_0 = (v0 != v6);") == std::string::npos ||
+            blockText->find("activeWords_[0] |= UINT64_C(0xa);") ==
+                std::string::npos ||
+            blockText->find("if ((v15 != 0)) {") == std::string::npos ||
+            blockText->find("bool wrChg_0 = false;") == std::string::npos ||
+            blockText->find("bool detGrp_0 = wrChg_0;") == std::string::npos)
+        {
+            return fail("AM C++ emitter did not gate the commit Block on its head detector");
         }
 
         const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
@@ -2555,23 +2687,39 @@ int main()
         const VariableId guardB = builder.addVariable(type, builder.undefInit());
         const VariableId guardC = builder.addVariable(type, builder.undefInit());
         const VariableId dataA = builder.addVariable(type, builder.undefInit());
+        const VariableId nextA = builder.addVariable(type, builder.undefInit());
+        const VariableId nextB = builder.addVariable(type, builder.undefInit());
+        const VariableId nextC = builder.addVariable(type, builder.undefInit());
+        const VariableId nextD = builder.addVariable(type, builder.undefInit());
         const VariableId outputA = builder.addVariable(type, builder.undefInit());
         const VariableId outputB = builder.addVariable(type, builder.undefInit());
         const VariableId outputC = builder.addVariable(type, builder.undefInit());
         const VariableId outputD = builder.addVariable(type, builder.undefInit());
 
+        // Merged nextValue form: each write's update condition is folded into
+        // a mux against the current state, and the write's event operands
+        // list exactly the sources whose change can require a re-evaluation
+        // (they become the commit Block's gate detectors).
         builder.addInstruction(Opcode::Assign, std::array{guardB}, std::array{stateA});
+        builder.addInstruction(Opcode::Mux, std::array{nextB},
+                               std::array{guardB, one, stateB});
         builder.addInstruction(Opcode::RegisterWrite, {},
-                               std::array{guardB, one, one, stateB, one});
+                               std::array{nextB, stateB, guardB});
         builder.addInstruction(Opcode::Assign, std::array{guardC}, std::array{stateB});
+        builder.addInstruction(Opcode::Mux, std::array{nextC},
+                               std::array{guardC, one, stateC});
         builder.addInstruction(Opcode::RegisterWrite, {},
-                               std::array{guardC, one, one, stateC, one});
+                               std::array{nextC, stateC, guardC});
         builder.addInstruction(Opcode::LogicOr, std::array{dataA},
                                std::array{stateC, one});
+        builder.addInstruction(Opcode::Mux, std::array{nextA},
+                               std::array{start, dataA, stateA});
         builder.addInstruction(Opcode::RegisterWrite, {},
-                               std::array{start, one, dataA, stateA, one});
+                               std::array{nextA, stateA, start, dataA});
+        builder.addInstruction(Opcode::Mux, std::array{nextD},
+                               std::array{start, guardB, stateD});
         builder.addInstruction(Opcode::RegisterWrite, {},
-                               std::array{start, one, guardB, stateD, one});
+                               std::array{nextD, stateD, start, guardB});
         builder.addInstruction(Opcode::Assign, std::array{outputA}, std::array{stateA});
         builder.addInstruction(Opcode::Assign, std::array{outputB}, std::array{stateB});
         builder.addInstruction(Opcode::Assign, std::array{outputC}, std::array{stateC});
@@ -2616,6 +2764,10 @@ int main()
             VariableRole::None,
             VariableRole::None,
             VariableRole::None,
+            VariableRole::None,
+            VariableRole::None,
+            VariableRole::None,
+            VariableRole::None,
             VariableRole::ExternalOutput,
             VariableRole::ExternalOutput,
             VariableRole::ExternalOutput,
@@ -2623,11 +2775,15 @@ int main()
         };
         facts.instructionEffects = {
             InstructionEffect::Pure,
-            InstructionEffect::StateReadWrite,
             InstructionEffect::Pure,
             InstructionEffect::StateReadWrite,
             InstructionEffect::Pure,
+            InstructionEffect::Pure,
             InstructionEffect::StateReadWrite,
+            InstructionEffect::Pure,
+            InstructionEffect::Pure,
+            InstructionEffect::StateReadWrite,
+            InstructionEffect::Pure,
             InstructionEffect::StateReadWrite,
             InstructionEffect::Pure,
             InstructionEffect::Pure,

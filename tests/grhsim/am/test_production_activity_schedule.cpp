@@ -103,6 +103,22 @@ namespace
         return count;
     }
 
+    std::size_t countHeadGateDetectors(const ExecutableModel &model, BlockId block)
+    {
+        const ProgramView view = model.program.view();
+        std::size_t count = 0;
+        for (std::size_t position = 0; position < model.program.blockSize(block); ++position) {
+            const InstructionId instruction = model.program.blockInstruction(block, position);
+            const Opcode opcode = view.opcode(instruction);
+            if (opcode != Opcode::ChangedAny && opcode != Opcode::ChangedPos &&
+                opcode != Opcode::ChangedNeg) {
+                break;
+            }
+            ++count;
+        }
+        return count;
+    }
+
     bool watchActivatesTarget(const ExecutableModel &model, BlockId source, VariableId watched,
                               Opcode activationOpcode, BlockId expectedTarget)
     {
@@ -713,8 +729,6 @@ namespace
         const LiteralId oneLiteral = builder.addBitLiteral(eventType, oneWords);
         const VariableId enabled =
             builder.addVariable(eventType, builder.addConstantInit(oneLiteral));
-        const VariableId mask =
-            builder.addVariable(eventType, builder.addConstantInit(oneLiteral));
         const VariableId data = builder.addVariable(eventType, builder.zeroInit());
         const InitAction stateInitAction{
             .kind = InitActionKind::Set,
@@ -734,9 +748,10 @@ namespace
         const std::array<VariableId, 2> edgeOperands = {clock, clockOld};
         const InstructionId detector =
             builder.addInstruction(Opcode::ChangedPos, edgeResults, edgeOperands);
-        const std::array<VariableId, 5> writeOperands = {
-            enabled, mask, data, state, posedge,
-        };
+        // Merged nextValue form: the write itself is unconditional; the commit
+        // Block's head gate (a ChangedPos clone watching the clock) decides
+        // whether it runs.
+        const std::array<VariableId, 3> writeOperands = {data, state, posedge};
         const InstructionId writer =
             builder.addInstruction(Opcode::RegisterWrite, {}, writeOperands);
         const std::array<VariableId, 3> taskOperands = {enabled, state, posedge};
@@ -758,9 +773,8 @@ namespace
         };
         SchedulingFacts facts;
         facts.variableRoles = {
-            VariableRole::None, VariableRole::None,          VariableRole::None,
-            VariableRole::State, VariableRole::ExternalInput, VariableRole::None,
-            VariableRole::None,
+            VariableRole::None, VariableRole::None, VariableRole::State,
+            VariableRole::ExternalInput, VariableRole::None, VariableRole::None,
         };
         facts.instructionEffects = {
             InstructionEffect::StateReadWrite,
@@ -828,14 +842,14 @@ namespace
         const TypeId valueType = builder.addType(Type::bitVector(8));
         const StringId taskName = builder.addString("host_effect");
         const VariableId enabled = builder.addVariable(eventType, builder.zeroInit());
-        const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
         const VariableId data = builder.addVariable(valueType, builder.zeroInit());
         const VariableId state = builder.addVariable(valueType, builder.zeroInit());
         const VariableId event = builder.addVariable(eventType, builder.zeroInit());
 
-        const std::array<VariableId, 5> writeOperands = {
-            enabled, mask, data, state, event,
-        };
+        // Neither effectful instruction carries an explicit ordered-effect
+        // group, so the implicit ordered-effect chain forces the commit ahead
+        // of the pre-commit host task.
+        const std::array<VariableId, 3> writeOperands = {data, state, event};
         builder.addInstruction(Opcode::RegisterWrite, {}, writeOperands);
         const std::array<VariableId, 1> taskOperands = {enabled};
         const InstructionId task =
@@ -848,7 +862,6 @@ namespace
 
         SchedulingFacts facts;
         facts.variableRoles = {
-            VariableRole::None,
             VariableRole::None,
             VariableRole::None,
             VariableRole::State,
@@ -893,22 +906,20 @@ namespace
         const TypeId addressType = builder.addType(Type::bitVector(2));
         const TypeId valueType = builder.addType(Type::bitVector(8));
         const TypeId memoryType = builder.addType(Type::array(4, 8));
-        const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
         const VariableId address = builder.addVariable(addressType, builder.zeroInit());
+        const VariableId enable = builder.addVariable(eventType, builder.zeroInit());
         const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
         const VariableId data = builder.addVariable(valueType, builder.zeroInit());
         const VariableId memory = builder.addVariable(memoryType, builder.zeroInit());
         const VariableId event = builder.addVariable(eventType, builder.zeroInit());
-        const std::array<VariableId, 6> operands = {
-            condition, address, mask, data, memory, event,
-        };
+        const std::array<VariableId, 6> operands = {enable, address, mask, data, memory, event};
         const InstructionId first = builder.addInstruction(Opcode::MemoryWrite, {}, operands);
         const InstructionId second = builder.addInstruction(Opcode::MemoryWrite, {}, operands);
 
         SchedulingFacts facts;
         facts.variableRoles = {
-            VariableRole::None, VariableRole::None,  VariableRole::None,
-            VariableRole::None, VariableRole::State, VariableRole::None,
+            VariableRole::None, VariableRole::None, VariableRole::None, VariableRole::None,
+            VariableRole::State, VariableRole::None,
         };
         facts.instructionEffects = {
             InstructionEffect::StateReadWrite,
@@ -934,15 +945,21 @@ namespace
             model ? findInstructionBlock(*model, second) : std::nullopt;
         const std::optional<BlockId> firstBlock =
             model ? findInstructionBlock(*model, first) : std::nullopt;
-        // Same event/guard bucket: the ordered writers share one commit Block
-        // and keep their explicit ordinal order inside it.
+        // Same event bucket: the ordered writers share one commit Block and
+        // keep their explicit ordinal order behind the Block's head gate
+        // detector.
         if (!model || diagnostics.hasError() || model->program.blockCount() != 2 ||
             !secondBlock || !firstBlock || *secondBlock != BlockId{1} ||
-            *firstBlock != BlockId{1} ||
-            model->program.blockInstruction(BlockId{1}, 0) != second ||
-            model->program.blockInstruction(BlockId{1}, 1) != first ||
+            *firstBlock != BlockId{1}) {
+            return fail("same-memory ordered writers did not share one commit Block");
+        }
+        const std::optional<std::size_t> secondPosition =
+            blockInstructionPosition(*model, BlockId{1}, second);
+        const std::optional<std::size_t> firstPosition =
+            blockInstructionPosition(*model, BlockId{1}, first);
+        if (!secondPosition || !firstPosition || *secondPosition >= *firstPosition ||
             !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
-            return fail("same-memory ordered writers did not stay ordered inside one commit Block");
+            return fail("same-memory ordered writers did not stay ordered inside the commit Block");
         }
         return 0;
     }
@@ -961,30 +978,25 @@ namespace
         const TypeId addressType = builder.addType(Type::bitVector(2));
         const TypeId valueType = builder.addType(Type::bitVector(8));
         const TypeId memoryType = builder.addType(Type::array(4, 8));
-        const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
         const VariableId address = builder.addVariable(addressType, builder.zeroInit());
+        const VariableId enable = builder.addVariable(eventType, builder.zeroInit());
         const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
         const VariableId data = builder.addVariable(valueType, builder.zeroInit());
         const VariableId memory = builder.addVariable(memoryType, builder.zeroInit());
         const VariableId event = builder.addVariable(eventType, builder.zeroInit());
         const VariableId registerTarget = builder.addVariable(valueType, builder.zeroInit());
 
-        const std::array<VariableId, 6> memoryOperands = {
-            condition, address, mask, data, memory, event,
-        };
+        const std::array<VariableId, 6> memoryOperands = {enable, address, mask, data, memory, event};
         const InstructionId memoryWrite =
             builder.addInstruction(Opcode::MemoryWrite, {}, memoryOperands);
-        const std::array<VariableId, 5> registerOperands = {
-            condition, mask, data, registerTarget, event,
-        };
+        const std::array<VariableId, 3> registerOperands = {data, registerTarget, event};
         const InstructionId registerWrite =
             builder.addInstruction(Opcode::RegisterWrite, {}, registerOperands);
 
         SchedulingFacts facts;
         facts.variableRoles = {
-            VariableRole::None, VariableRole::None,  VariableRole::None,
-            VariableRole::None, VariableRole::State, VariableRole::None,
-            VariableRole::State,
+            VariableRole::None, VariableRole::None, VariableRole::None, VariableRole::None,
+            VariableRole::State, VariableRole::None, VariableRole::State,
         };
         facts.instructionEffects = {
             InstructionEffect::StateReadWrite,
@@ -1018,13 +1030,18 @@ namespace
                 .enableCoarsening = false,
             },
             diagnostics);
-        // Same event/guard bucket: the ordered writes share one commit Block
-        // and keep their explicit ordinal order inside it.
-        if (!model || diagnostics.hasError() || model->program.blockCount() != 2 ||
-            model->program.blockInstruction(BlockId{1}, 0) != fixture.registerWrite ||
-            model->program.blockInstruction(BlockId{1}, 1) != fixture.memoryWrite ||
+        // Same event bucket: the ordered writes share one commit Block and
+        // keep their explicit ordinal order behind the head gate detector.
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 2) {
+            return fail("ordered state and memory writes did not share one commit Block");
+        }
+        const std::optional<std::size_t> registerPosition =
+            blockInstructionPosition(*model, BlockId{1}, fixture.registerWrite);
+        const std::optional<std::size_t> memoryPosition =
+            blockInstructionPosition(*model, BlockId{1}, fixture.memoryWrite);
+        if (!registerPosition || !memoryPosition || *registerPosition >= *memoryPosition ||
             !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
-            return fail("ordered state and memory writes did not share one ordered commit Block");
+            return fail("ordered state and memory writes lost their order inside the commit Block");
         }
         return 0;
     }
@@ -1051,15 +1068,25 @@ namespace
                 .enableCoarsening = true,
             },
             splitDiagnostics);
+        // The cap-2 run packs both same-bucket writes into one commit Block
+        // (in implicit program order, behind the head gate detector); the
+        // cap-1 run splits the bucket into two commit Blocks in the same
+        // order.
+        const std::optional<std::size_t> coarsenedMemoryPosition =
+            coarsened ? blockInstructionPosition(*coarsened, BlockId{1},
+                                                 coarsenedFixture.memoryWrite)
+                      : std::nullopt;
+        const std::optional<std::size_t> coarsenedRegisterPosition =
+            coarsened ? blockInstructionPosition(*coarsened, BlockId{1},
+                                                 coarsenedFixture.registerWrite)
+                      : std::nullopt;
         if (!coarsened || !split || coarsenedDiagnostics.hasError() ||
             splitDiagnostics.hasError() || coarsened->program.blockCount() != 2 ||
-            coarsened->program.blockSize(BlockId{1}) != 2 ||
-            coarsened->program.blockInstruction(BlockId{1}, 0) != coarsenedFixture.memoryWrite ||
-            coarsened->program.blockInstruction(BlockId{1}, 1) != coarsenedFixture.registerWrite ||
-            split->program.blockCount() != 3 || split->program.blockSize(BlockId{1}) != 1 ||
-            split->program.blockSize(BlockId{2}) != 1 ||
-            split->program.blockInstruction(BlockId{1}, 0) != splitFixture.memoryWrite ||
-            split->program.blockInstruction(BlockId{2}, 0) != splitFixture.registerWrite ||
+            !coarsenedMemoryPosition || !coarsenedRegisterPosition ||
+            *coarsenedMemoryPosition >= *coarsenedRegisterPosition ||
+            split->program.blockCount() != 3 ||
+            findInstructionBlock(*split, splitFixture.memoryWrite) != BlockId{1} ||
+            findInstructionBlock(*split, splitFixture.registerWrite) != BlockId{2} ||
             !validate(*coarsened, ValidationOptions{.level = ValidationLevel::Semantic}).success() ||
             !validate(*split, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
             return fail("independent commit atoms did not obey the commit instruction cap");
@@ -1073,34 +1100,28 @@ namespace
         DifferentMiddle,
     };
 
-    enum class CommitFixtureGuardPattern
-    {
-        Same,
-        DifferentMiddle,
-    };
-
-    struct CommitEventGuardFixture
+    struct CommitEventFixture
     {
         LinearProgramArtifact linear;
         std::array<InstructionId, 3> writes;
     };
 
-    CommitEventGuardFixture makeCommitEventGuardFixture(
-        CommitFixtureEventPattern eventPattern, CommitFixtureGuardPattern guardPattern)
+    CommitEventFixture makeCommitEventFixture(CommitFixtureEventPattern eventPattern)
     {
         LinearProgramBuilder builder;
         const TypeId eventType = builder.addType(Type::bitVector(1));
         const TypeId addressType = builder.addType(Type::bitVector(2));
         const TypeId valueType = builder.addType(Type::bitVector(8));
+        const TypeId packedType = builder.addType(Type::bitVector(32));
         const TypeId memoryType = builder.addType(Type::array(4, 8));
 
         const VariableId rawEvent = builder.addVariable(eventType, builder.zeroInit());
         const VariableId otherRawEvent = builder.addVariable(eventType, builder.zeroInit());
-        const VariableId guard = builder.addVariable(eventType, builder.zeroInit());
-        const VariableId otherGuard = builder.addVariable(eventType, builder.zeroInit());
         const VariableId address = builder.addVariable(addressType, builder.zeroInit());
+        const VariableId enable = builder.addVariable(eventType, builder.zeroInit());
         const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
         const VariableId data = builder.addVariable(valueType, builder.zeroInit());
+        const VariableId packedData = builder.addVariable(packedType, builder.zeroInit());
         const VariableId registerTarget = builder.addVariable(valueType, builder.zeroInit());
         const VariableId writeMemory = builder.addVariable(memoryType, builder.zeroInit());
         const VariableId fillMemory = builder.addVariable(memoryType, builder.zeroInit());
@@ -1120,20 +1141,16 @@ namespace
                 builder.addInstruction(Opcode::ChangedPos, results, operands);
         }
 
-        const VariableId middleGuard =
-            guardPattern == CommitFixtureGuardPattern::DifferentMiddle ? otherGuard : guard;
-        const std::array<VariableId, 5> registerOperands = {
-            guard, mask, data, registerTarget, events[0],
-        };
+        const std::array<VariableId, 3> registerOperands = {data, registerTarget, events[0]};
         const InstructionId registerWrite =
             builder.addInstruction(Opcode::RegisterWrite, {}, registerOperands);
         const std::array<VariableId, 6> memoryWriteOperands = {
-            middleGuard, address, mask, data, writeMemory, events[1],
+            enable, address, mask, data, writeMemory, events[1],
         };
         const InstructionId memoryWrite =
             builder.addInstruction(Opcode::MemoryWrite, {}, memoryWriteOperands);
-        const std::array<VariableId, 4> memoryFillOperands = {
-            guard, data, fillMemory, events[2],
+        const std::array<VariableId, 3> memoryFillOperands = {
+            packedData, fillMemory, events[2],
         };
         const InstructionId memoryFill =
             builder.addInstruction(Opcode::MemoryFill, {}, memoryFillOperands);
@@ -1151,7 +1168,7 @@ namespace
             OrderedEffect{.instruction = memoryWrite, .group = 41, .ordinal = 0},
             OrderedEffect{.instruction = memoryFill, .group = 42, .ordinal = 0},
         };
-        return CommitEventGuardFixture{
+        return CommitEventFixture{
             .linear = LinearProgramArtifact{
                 .program = builder.finish(),
                 .schedulingFacts = std::move(facts),
@@ -1160,8 +1177,8 @@ namespace
         };
     }
 
-    std::optional<ExecutableModel> scheduleCommitEventGuardFixture(
-        CommitEventGuardFixture &&fixture, wolvrix::lib::diag::Diagnostics &diagnostics)
+    std::optional<ExecutableModel> scheduleCommitEventFixture(
+        CommitEventFixture &&fixture, wolvrix::lib::diag::Diagnostics &diagnostics)
     {
         return schedule(
             std::move(fixture.linear),
@@ -1175,34 +1192,38 @@ namespace
 
     int testCommitEventsCanonicalizeChangedDetectors()
     {
-        CommitEventGuardFixture fixture = makeCommitEventGuardFixture(
-            CommitFixtureEventPattern::Same, CommitFixtureGuardPattern::Same);
+        CommitEventFixture fixture =
+            makeCommitEventFixture(CommitFixtureEventPattern::Same);
         const std::array<InstructionId, 3> writes = fixture.writes;
         wolvrix::lib::diag::Diagnostics diagnostics;
         std::optional<ExecutableModel> model =
-            scheduleCommitEventGuardFixture(std::move(fixture), diagnostics);
+            scheduleCommitEventFixture(std::move(fixture), diagnostics);
         const std::optional<BlockId> first = model ? findInstructionBlock(*model, writes[0])
                                                     : std::nullopt;
         const std::optional<BlockId> second = model ? findInstructionBlock(*model, writes[1])
                                                      : std::nullopt;
         const std::optional<BlockId> third = model ? findInstructionBlock(*model, writes[2])
                                                     : std::nullopt;
+        // Three distinct changed-event variables over one raw source
+        // canonicalize to one event signature: a single commit Block gated by
+        // a single head detector.
         if (!model || diagnostics.hasError() || model->program.blockCount() != 3 || !first ||
             !second || !third || *first != *second || *first != *third ||
+            countHeadGateDetectors(*model, *first) != 1 ||
             !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
-            return fail("equivalent changed-event detectors did not share one commit Block");
+            return fail("equivalent changed-event detectors did not share one gated commit Block");
         }
         return 0;
     }
 
     int testDifferentCommitEventsStartNewBlocks()
     {
-        CommitEventGuardFixture fixture = makeCommitEventGuardFixture(
-            CommitFixtureEventPattern::DifferentMiddle, CommitFixtureGuardPattern::Same);
+        CommitEventFixture fixture =
+            makeCommitEventFixture(CommitFixtureEventPattern::DifferentMiddle);
         const std::array<InstructionId, 3> writes = fixture.writes;
         wolvrix::lib::diag::Diagnostics diagnostics;
         std::optional<ExecutableModel> model =
-            scheduleCommitEventGuardFixture(std::move(fixture), diagnostics);
+            scheduleCommitEventFixture(std::move(fixture), diagnostics);
         const std::optional<BlockId> first = model ? findInstructionBlock(*model, writes[0])
                                                     : std::nullopt;
         const std::optional<BlockId> second = model ? findInstructionBlock(*model, writes[1])
@@ -1211,30 +1232,44 @@ namespace
                                                     : std::nullopt;
         if (!model || diagnostics.hasError() || model->program.blockCount() != 4 || !first ||
             !second || !third || *first != *third || *first == *second ||
+            countHeadGateDetectors(*model, *first) != 1 ||
+            countHeadGateDetectors(*model, *second) != 1 ||
             !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
             return fail("different commit events were packed into the same Block");
         }
         return 0;
     }
 
-    int testCommitGuardsGroupWithoutForcingBlockBoundary()
+    int testCommitNextValuesDoNotSplitEventBuckets()
     {
-        CommitEventGuardFixture fixture = makeCommitEventGuardFixture(
-            CommitFixtureEventPattern::Same, CommitFixtureGuardPattern::DifferentMiddle);
+        CommitEventFixture fixture =
+            makeCommitEventFixture(CommitFixtureEventPattern::Same);
         const std::array<InstructionId, 3> writes = fixture.writes;
         wolvrix::lib::diag::Diagnostics diagnostics;
         std::optional<ExecutableModel> model =
-            scheduleCommitEventGuardFixture(std::move(fixture), diagnostics);
+            scheduleCommitEventFixture(std::move(fixture), diagnostics);
         const std::optional<BlockId> block = model ? findInstructionBlock(*model, writes[0])
                                                    : std::nullopt;
+        // The commit bucket key is the event signature alone: distinct
+        // nextValue expressions (scalar write data vs packed fill data) still
+        // share one commit Block, packed in deterministic instruction order
+        // behind the single head gate detector.
         if (!model || diagnostics.hasError() || model->program.blockCount() != 3 || !block ||
             findInstructionBlock(*model, writes[1]) != block ||
             findInstructionBlock(*model, writes[2]) != block ||
-            model->program.blockInstruction(*block, 0) != writes[0] ||
-            model->program.blockInstruction(*block, 1) != writes[2] ||
-            model->program.blockInstruction(*block, 2) != writes[1] ||
+            countHeadGateDetectors(*model, *block) != 1) {
+            return fail("same-event writes with different nextValues did not share one Block");
+        }
+        const std::optional<std::size_t> registerPosition =
+            blockInstructionPosition(*model, *block, writes[0]);
+        const std::optional<std::size_t> memoryPosition =
+            blockInstructionPosition(*model, *block, writes[1]);
+        const std::optional<std::size_t> fillPosition =
+            blockInstructionPosition(*model, *block, writes[2]);
+        if (!registerPosition || !memoryPosition || !fillPosition ||
+            *registerPosition >= *memoryPosition || *memoryPosition >= *fillPosition ||
             !validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
-            return fail("same-event commit guards were not grouped and packed deterministically");
+            return fail("same-event commit writes were not packed deterministically");
         }
         return 0;
     }
@@ -1252,11 +1287,12 @@ namespace
                 .collectStats = true,
             },
             diagnostics);
+        // The explicit commit chain splits at the commit cap: one write per
+        // commit Block (each behind its own head gate detector), ordered by
+        // the ordinal edge.
         if (!model || diagnostics.hasError() || model->program.blockCount() != 3 ||
-            model->program.blockSize(BlockId{1}) != 1 ||
-            model->program.blockSize(BlockId{2}) != 1 ||
-            model->program.blockInstruction(BlockId{1}, 0) != fixture.registerWrite ||
-            model->program.blockInstruction(BlockId{2}, 0) != fixture.memoryWrite) {
+            findInstructionBlock(*model, fixture.registerWrite) != BlockId{1} ||
+            findInstructionBlock(*model, fixture.memoryWrite) != BlockId{2}) {
             return fail("ordered commit edges did not split cleanly at the commit cap");
         }
 
@@ -1295,8 +1331,8 @@ namespace
         const TypeId addressType = builder.addType(Type::bitVector(2));
         const TypeId valueType = builder.addType(Type::bitVector(8));
         const TypeId memoryType = builder.addType(Type::array(4, 8));
-        const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
         const VariableId address = builder.addVariable(addressType, builder.zeroInit());
+        const VariableId enable = builder.addVariable(eventType, builder.zeroInit());
         const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
         const VariableId data = builder.addVariable(valueType, builder.zeroInit());
         const VariableId memory = builder.addVariable(memoryType, builder.zeroInit());
@@ -1307,9 +1343,7 @@ namespace
         const std::array<VariableId, 1> readResults = {readData};
         const InstructionId reader =
             builder.addInstruction(Opcode::MemoryRead, readResults, readOperands);
-        const std::array<VariableId, 6> writeOperands = {
-            condition, address, mask, data, memory, event,
-        };
+        const std::array<VariableId, 6> writeOperands = {enable, address, mask, data, memory, event};
         const InstructionId firstWrite =
             builder.addInstruction(Opcode::MemoryWrite, {}, writeOperands);
         const InstructionId finalWrite =
@@ -1317,9 +1351,8 @@ namespace
 
         SchedulingFacts facts;
         facts.variableRoles = {
-            VariableRole::None, VariableRole::None,  VariableRole::None,
-            VariableRole::None, VariableRole::State, VariableRole::None,
-            VariableRole::None,
+            VariableRole::None, VariableRole::None, VariableRole::None, VariableRole::None,
+            VariableRole::State, VariableRole::None, VariableRole::None,
         };
         facts.instructionEffects = {
             InstructionEffect::StateRead,
@@ -1361,13 +1394,19 @@ namespace
             findInstructionBlock(*model, fixture.firstWrite);
         const std::optional<BlockId> finalWriterBlock =
             findInstructionBlock(*model, fixture.finalWrite);
-        // The ordered writers share one commit Block, so one ChangedAny watch
-        // reactivates the reader through ActBackward.
+        // The ordered writers share one commit Block, so one tail ChangedAny
+        // watch reactivates the reader through ActBackward; the writers keep
+        // their ordinal order behind the Block's head gate detector.
+        const std::optional<std::size_t> finalPosition =
+            model ? blockInstructionPosition(*model, BlockId{2}, fixture.finalWrite)
+                  : std::nullopt;
+        const std::optional<std::size_t> firstPosition =
+            model ? blockInstructionPosition(*model, BlockId{2}, fixture.firstWrite)
+                  : std::nullopt;
         if (!readerBlock || !firstWriterBlock || !finalWriterBlock ||
             *readerBlock != BlockId{1} || *finalWriterBlock != BlockId{2} ||
-            *firstWriterBlock != BlockId{2} ||
-            model->program.blockInstruction(BlockId{2}, 0) != fixture.finalWrite ||
-            model->program.blockInstruction(BlockId{2}, 1) != fixture.firstWrite ||
+            *firstWriterBlock != BlockId{2} || !finalPosition || !firstPosition ||
+            *finalPosition >= *firstPosition ||
             countChangedWatches(*model, fixture.memory) != 1 ||
             !watchActivatesTarget(*model, *finalWriterBlock, fixture.memory, Opcode::ActBackward,
                                   *readerBlock) ||
@@ -1441,11 +1480,14 @@ namespace
             findInstructionBlock(*model, firstWrite);
         const std::optional<BlockId> finalWriterBlock =
             findInstructionBlock(*model, finalWrite);
+        const std::optional<std::size_t> finalPosition =
+            model ? blockInstructionPosition(*model, BlockId{2}, finalWrite) : std::nullopt;
+        const std::optional<std::size_t> firstPosition =
+            model ? blockInstructionPosition(*model, BlockId{2}, firstWrite) : std::nullopt;
         if (!readerBlock || !firstWriterBlock || !finalWriterBlock ||
             *readerBlock != BlockId{1} || *finalWriterBlock != BlockId{2} ||
-            *firstWriterBlock != BlockId{2} ||
-            model->program.blockInstruction(BlockId{2}, 0) != finalWrite ||
-            model->program.blockInstruction(BlockId{2}, 1) != firstWrite ||
+            *firstWriterBlock != BlockId{2} || !finalPosition || !firstPosition ||
+            *finalPosition >= *firstPosition ||
             countChangedWatches(*model, memory) != 1 ||
             !watchActivatesTarget(*model, *finalWriterBlock, memory, Opcode::ActBackward,
                                   *readerBlock) ||
@@ -1459,8 +1501,6 @@ namespace
     {
         LinearProgramBuilder builder;
         const TypeId eventType = builder.addType(Type::bitVector(1));
-        const TypeId signedConditionType =
-            builder.addType(Type::bitVector(1, Signedness::Signed));
         const TypeId addressType = builder.addType(Type::bitVector(2));
         const TypeId valueType = builder.addType(Type::bitVector(8));
         const TypeId memoryType = builder.addType(Type::array(4, 8));
@@ -1470,15 +1510,13 @@ namespace
                 type, builder.addConstantInit(builder.addBitLiteral(type, words)));
         };
 
-        const VariableId earlierEnabled =
-            builder.addVariable(signedConditionType, builder.zeroInit());
-        const VariableId disabled = addConstant(eventType, 0);
-        const VariableId companionTrigger =
-            builder.addVariable(eventType, builder.zeroInit());
+        // One mutable event variable gates every writer: the commit Blocks'
+        // head detectors fire when the tick changes.
+        const VariableId tick = builder.addVariable(eventType, builder.zeroInit());
         const VariableId address = addConstant(addressType, 2);
-        const VariableId mask = addConstant(valueType, 0xff);
         const VariableId data = addConstant(valueType, 0x5a);
-        const VariableId event = addConstant(eventType, 1);
+        const VariableId enable = addConstant(eventType, 1);
+        const VariableId mask = addConstant(valueType, 0xff);
         const VariableId memory = builder.addVariable(memoryType, builder.zeroInit());
         const VariableId companionMemory =
             builder.addVariable(memoryType, builder.zeroInit());
@@ -1489,20 +1527,15 @@ namespace
         const InstructionId reader =
             builder.addInstruction(Opcode::MemoryRead, readerResults, readerOperands);
         const std::array<VariableId, 6> companionOperands = {
-            companionTrigger, address, mask, data, companionMemory, event,
+            enable, address, mask, data, companionMemory, tick,
         };
         const InstructionId companionWrite =
             builder.addInstruction(Opcode::MemoryWrite, {}, companionOperands);
-        const std::array<VariableId, 6> earlierOperands = {
-            earlierEnabled, address, mask, data, memory, event,
-        };
+        const std::array<VariableId, 6> earlierOperands = {enable, address, mask, data, memory, tick};
         const InstructionId earlierWrite =
             builder.addInstruction(Opcode::MemoryWrite, {}, earlierOperands);
-        const std::array<VariableId, 6> finalOperands = {
-            disabled, address, mask, data, memory, event,
-        };
         const InstructionId finalWrite =
-            builder.addInstruction(Opcode::MemoryWrite, {}, finalOperands);
+            builder.addInstruction(Opcode::MemoryWrite, {}, earlierOperands);
 
         const StringId outputName = builder.addString("read_data");
         ProgramInterface interface;
@@ -1515,9 +1548,8 @@ namespace
         };
         SchedulingFacts facts;
         facts.variableRoles = {
-            VariableRole::None, VariableRole::None,          VariableRole::None,
-            VariableRole::None, VariableRole::None,          VariableRole::None,
-            VariableRole::None, VariableRole::State,         VariableRole::State,
+            VariableRole::None, VariableRole::None, VariableRole::None, VariableRole::None,
+            VariableRole::None, VariableRole::State, VariableRole::State,
             VariableRole::ExternalOutput,
         };
         facts.instructionEffects = {
@@ -1571,12 +1603,7 @@ namespace
         const std::array<uint64_t, 1> highWords = {1};
         if (!interpreter.ready() || !interpreter.eval().success() ||
             !interpreter
-                 .write(earlierEnabled,
-                        InterpreterValue::bitVector(1, Signedness::Signed, highWords))
-                 .success() ||
-            !interpreter
-                 .write(companionTrigger,
-                        InterpreterValue::bitVector(1, Signedness::Unsigned, highWords))
+                 .write(tick, InterpreterValue::bitVector(1, Signedness::Unsigned, highWords))
                  .success()) {
             return fail("split-commit fixture could not enter its write eval");
         }
@@ -1589,51 +1616,41 @@ namespace
         return 0;
     }
 
-    int testCommitGuardReadsLiveStateFromEarlierCommitBlock()
+    int testCommitWriteReadsLiveStateFromEarlierCommitBlock()
     {
         LinearProgramBuilder builder;
         const TypeId eventType = builder.addType(Type::bitVector(1));
-        const TypeId valueType = builder.addType(Type::bitVector(8));
-        const auto addConstant = [&builder](TypeId type, uint64_t value) {
+        const auto addConstant = [&builder, &eventType](uint64_t value) {
             const std::array<uint64_t, 1> words = {value};
             return builder.addVariable(
-                type, builder.addConstantInit(builder.addBitLiteral(type, words)));
+                eventType, builder.addConstantInit(builder.addBitLiteral(eventType, words)));
         };
 
-        const VariableId start = builder.addVariable(eventType, builder.zeroInit());
-        const VariableId disabled = addConstant(eventType, 0);
-        const VariableId one = addConstant(eventType, 1);
-        const VariableId eventA = addConstant(eventType, 1);
-        const VariableId eventB = addConstant(eventType, 1);
-        const VariableId eventC = addConstant(eventType, 1);
-        const VariableId mask = addConstant(valueType, 0xff);
-        const VariableId data = addConstant(valueType, 0x5a);
+        const VariableId tick = builder.addVariable(eventType, builder.zeroInit());
+        const VariableId tick2 = builder.addVariable(eventType, builder.zeroInit());
+        const VariableId dormant = builder.addVariable(eventType, builder.zeroInit());
+        const VariableId one = addConstant(1);
+        const VariableId zero = addConstant(0);
         const VariableId stateX = builder.addVariable(eventType, builder.zeroInit());
-        const VariableId stateY = builder.addVariable(valueType, builder.zeroInit());
-        const VariableId output = builder.addVariable(valueType, builder.undefInit());
+        const VariableId stateY = builder.addVariable(eventType, builder.zeroInit());
+        const VariableId output = builder.addVariable(eventType, builder.undefInit());
 
         const std::array<VariableId, 1> readerResults = {output};
         const std::array<VariableId, 1> readerOperands = {stateY};
         const InstructionId reader =
             builder.addInstruction(Opcode::Assign, readerResults, readerOperands);
-        const std::array<VariableId, 5> earlierXOperands = {
-            start, one, one, stateX, eventA,
-        };
+        // earlierY's nextValue reads stateX directly, so it observes the live
+        // value committed by the earlier commit Block in the same round.
+        const std::array<VariableId, 3> earlierXOperands = {one, stateX, tick};
         const InstructionId earlierX =
             builder.addInstruction(Opcode::RegisterWrite, {}, earlierXOperands);
-        const std::array<VariableId, 5> finalXOperands = {
-            disabled, one, one, stateX, eventB,
-        };
+        const std::array<VariableId, 3> finalXOperands = {zero, stateX, dormant};
         const InstructionId finalX =
             builder.addInstruction(Opcode::RegisterWrite, {}, finalXOperands);
-        const std::array<VariableId, 5> earlierYOperands = {
-            stateX, mask, data, stateY, eventB,
-        };
+        const std::array<VariableId, 3> earlierYOperands = {stateX, stateY, tick2};
         const InstructionId earlierY =
             builder.addInstruction(Opcode::RegisterWrite, {}, earlierYOperands);
-        const std::array<VariableId, 5> finalYOperands = {
-            disabled, mask, data, stateY, eventC,
-        };
+        const std::array<VariableId, 3> finalYOperands = {zero, stateY, dormant};
         const InstructionId finalY =
             builder.addInstruction(Opcode::RegisterWrite, {}, finalYOperands);
 
@@ -1649,7 +1666,6 @@ namespace
         SchedulingFacts facts;
         facts.variableRoles = {
             VariableRole::None, VariableRole::None, VariableRole::None,
-            VariableRole::None, VariableRole::None, VariableRole::None,
             VariableRole::None, VariableRole::None, VariableRole::State,
             VariableRole::State, VariableRole::ExternalOutput,
         };
@@ -1659,12 +1675,6 @@ namespace
             InstructionEffect::StateReadWrite,
             InstructionEffect::StateReadWrite,
             InstructionEffect::StateReadWrite,
-        };
-        facts.orderedEffects = {
-            OrderedEffect{.instruction = earlierX, .group = 91, .ordinal = 0},
-            OrderedEffect{.instruction = finalX, .group = 91, .ordinal = 1},
-            OrderedEffect{.instruction = earlierY, .group = 91, .ordinal = 2},
-            OrderedEffect{.instruction = finalY, .group = 91, .ordinal = 3},
         };
         LinearProgramArtifact linear{
             .program = builder.finish(),
@@ -1691,13 +1701,13 @@ namespace
             model ? findInstructionBlock(*model, earlierY) : std::nullopt;
         const std::optional<BlockId> blockC =
             model ? findInstructionBlock(*model, finalY) : std::nullopt;
-        // stateX has only a commit-Block reader (the earlierY guard), so it
-        // gets no watch; stateY has a compute reader, so both of its writer
-        // Blocks watch it and reactivate the reader.
-        if (!model || diagnostics.hasError() || model->program.blockCount() != 5 ||
+        // stateX has only commit-Block readers (the earlierY nextValue), so it
+        // gets no tail watch; stateY has a compute reader, so both of its
+        // writer Blocks watch it and reactivate the reader.
+        if (!model || diagnostics.hasError() || model->program.blockCount() != 6 ||
             !readerBlock || !blockA || !finalXBlock || !blockB || !blockC ||
-            *finalXBlock != *blockB ||
-            !(*readerBlock < *blockA && *blockA < *blockB && *blockB < *blockC) ||
+            !(*readerBlock < *blockA && *blockA < *finalXBlock && *finalXBlock < *blockB &&
+              *blockB < *blockC) ||
             countChangedWatches(*model, stateX) != 0 ||
             countChangedWatches(*model, stateY) != 2 ||
             !watchActivatesTarget(*model, *blockB, stateY, Opcode::ActBackward,
@@ -1712,19 +1722,23 @@ namespace
         const std::array<uint64_t, 1> highWords = {1};
         if (!interpreter.ready() || !interpreter.eval().success() ||
             !interpreter
-                 .write(start, InterpreterValue::bitVector(
+                 .write(tick, InterpreterValue::bitVector(
+                                   1, Signedness::Unsigned, highWords))
+                 .success() ||
+            !interpreter
+                 .write(tick2, InterpreterValue::bitVector(
                                    1, Signedness::Unsigned, highWords))
                  .success()) {
-            return fail("commit-guard fixture could not enter its start eval");
+            return fail("live-state commit fixture could not enter its start eval");
         }
         // earlierY reads the live stateX written by the earlier commit Block in
         // the same round; the reader reruns one round later through act.b.
         const InterpreterResult result = interpreter.eval();
         if (!result.success() || result.roundsExecuted != 2 ||
             interpreter.value(stateX).lowWord() != 1 ||
-            interpreter.value(stateY).lowWord() != 0x5a ||
-            interpreter.value(output).lowWord() != 0x5a) {
-            return fail("commit guard did not observe the live earlier-commit state");
+            interpreter.value(stateY).lowWord() != 1 ||
+            interpreter.value(output).lowWord() != 1) {
+            return fail("commit write did not observe the live earlier-commit state");
         }
         return 0;
     }
@@ -1735,19 +1749,15 @@ namespace
         const TypeId eventType = builder.addType(Type::bitVector(1));
         const TypeId valueType = builder.addType(Type::bitVector(8));
         const StringId outputName = builder.addString("output");
-        const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
         const VariableId event = builder.addVariable(eventType, builder.zeroInit());
         const VariableId data = builder.addVariable(valueType, builder.zeroInit());
-        const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
         const VariableId state = builder.addVariable(valueType, builder.zeroInit());
         const VariableId output = builder.addVariable(valueType, builder.undefInit());
         const std::array<VariableId, 1> readResults = {output};
         const std::array<VariableId, 1> readOperands = {state};
         const InstructionId reader =
             builder.addInstruction(Opcode::Assign, readResults, readOperands);
-        const std::array<VariableId, 5> writeOperands = {
-            condition, mask, data, state, event,
-        };
+        const std::array<VariableId, 3> writeOperands = {data, state, event};
         const InstructionId writer =
             builder.addInstruction(Opcode::RegisterWrite, {}, writeOperands);
 
@@ -1761,8 +1771,8 @@ namespace
         };
         SchedulingFacts facts;
         facts.variableRoles = {
-            VariableRole::None, VariableRole::None,  VariableRole::None,
-            VariableRole::None, VariableRole::State, VariableRole::ExternalOutput,
+            VariableRole::None, VariableRole::None, VariableRole::State,
+            VariableRole::ExternalOutput,
         };
         facts.instructionEffects = {
             InstructionEffect::Pure,
@@ -1786,7 +1796,7 @@ namespace
                                                         diagnostics);
         if (!model || diagnostics.hasError() || model->program.blockCount() != 3 ||
             model->program.blockInstruction(BlockId{1}, 0) != reader ||
-            model->program.blockInstruction(BlockId{2}, 0) != writer) {
+            findInstructionBlock(*model, writer) != BlockId{2}) {
             return fail("state reader/writer blocks were not built deterministically");
         }
         const ProgramView view = model->program.view();
@@ -1820,10 +1830,10 @@ namespace
             return builder.addVariable(
                 type, builder.addConstantInit(builder.addBitLiteral(type, words)));
         };
-        const VariableId enabled = addConstant(eventType, 1);
         const VariableId address = addConstant(addressType, 2);
-        const VariableId mask = addConstant(valueType, 0xff);
         const VariableId writeEvent = builder.addVariable(eventType, builder.zeroInit());
+        const VariableId enable = addConstant(eventType, 1);
+        const VariableId mask = addConstant(valueType, 0xff);
         const VariableId data = builder.addVariable(valueType, builder.zeroInit());
         const VariableId memory = builder.addVariable(memoryType, builder.zeroInit());
         const VariableId registerState = builder.addVariable(valueType, builder.zeroInit());
@@ -1833,14 +1843,12 @@ namespace
         const std::array<VariableId, 2> readerOperands = {memory, address};
         const InstructionId reader =
             builder.addInstruction(Opcode::MemoryRead, readerResults, readerOperands);
-        const std::array<VariableId, 4> registerOperands = {
-            enabled, mask, data, registerState,
-        };
+        // The latch write is eventless: its commit Block gates on a
+        // ChangedAny watch over the merged nextValue.
+        const std::array<VariableId, 2> registerOperands = {data, registerState};
         const InstructionId registerWrite =
             builder.addInstruction(Opcode::LatchWrite, {}, registerOperands);
-        const std::array<VariableId, 6> memoryOperands = {
-            enabled, address, mask, data, memory, writeEvent,
-        };
+        const std::array<VariableId, 6> memoryOperands = {enable, address, mask, data, memory, writeEvent};
         const InstructionId memoryWrite =
             builder.addInstruction(Opcode::MemoryWrite, {}, memoryOperands);
 
@@ -1855,9 +1863,9 @@ namespace
         };
         SchedulingFacts facts;
         facts.variableRoles = {
-            VariableRole::None,  VariableRole::None, VariableRole::None,
-            VariableRole::None,  VariableRole::None, VariableRole::State,
-            VariableRole::State, VariableRole::ExternalOutput,
+            VariableRole::None, VariableRole::None, VariableRole::None, VariableRole::None,
+            VariableRole::None, VariableRole::State, VariableRole::State,
+            VariableRole::ExternalOutput,
         };
         facts.instructionEffects = {
             InstructionEffect::StateRead,
@@ -1921,6 +1929,7 @@ namespace
     {
         LinearProgramArtifact linear;
         VariableId start;
+        VariableId tick;
         VariableId stateA;
         VariableId stateB;
         VariableId stateC;
@@ -1933,27 +1942,29 @@ namespace
     {
         LinearProgramBuilder builder;
         const TypeId type = builder.addType(Type::bitVector(1));
-        const std::array<uint64_t, 1> oneWords = {1};
-        const auto oneInit =
-            builder.addConstantInit(builder.addBitLiteral(type, oneWords));
         const VariableId start = builder.addVariable(type, builder.zeroInit());
-        const VariableId one = builder.addVariable(type, oneInit);
+        const VariableId tick = builder.addVariable(type, builder.zeroInit());
         const VariableId stateA = builder.addVariable(type, builder.zeroInit());
         const VariableId stateB = builder.addVariable(type, builder.zeroInit());
         const VariableId stateC = builder.addVariable(type, builder.zeroInit());
-        const VariableId guardB = builder.addVariable(type, builder.undefInit());
-        const VariableId guardC = builder.addVariable(type, builder.undefInit());
-        const VariableId dataA = builder.addVariable(type, builder.undefInit());
+        const VariableId oldA = builder.addVariable(type, builder.undefInit());
+        const VariableId oldB = builder.addVariable(type, builder.undefInit());
+        const VariableId eventA = builder.addVariable(type, builder.zeroInit());
+        const VariableId eventB = builder.addVariable(type, builder.zeroInit());
 
-        builder.addInstruction(Opcode::Assign, std::array{guardB}, std::array{stateA});
-        const InstructionId writerB = builder.addInstruction(
-            Opcode::RegisterWrite, {}, std::array{guardB, one, one, stateB, one});
-        builder.addInstruction(Opcode::Assign, std::array{guardC}, std::array{stateB});
-        const InstructionId writerC = builder.addInstruction(
-            Opcode::RegisterWrite, {}, std::array{guardC, one, one, stateC, one});
-        builder.addInstruction(Opcode::LogicOr, std::array{dataA}, std::array{stateC, one});
+        // Each writer's gate watches the previous commit's state: writerB
+        // fires on a stateA change, writerC on a stateB change, so the chain
+        // resolves in static Block order once writerA commits.
+        builder.addInstruction(Opcode::ChangedAny, std::array{eventA},
+                               std::array{stateA, oldA});
+        builder.addInstruction(Opcode::ChangedAny, std::array{eventB},
+                               std::array{stateB, oldB});
         const InstructionId writerA = builder.addInstruction(
-            Opcode::RegisterWrite, {}, std::array{start, one, dataA, stateA, one});
+            Opcode::RegisterWrite, {}, std::array{start, stateA, tick});
+        const InstructionId writerB = builder.addInstruction(
+            Opcode::RegisterWrite, {}, std::array{stateA, stateB, eventA});
+        const InstructionId writerC = builder.addInstruction(
+            Opcode::RegisterWrite, {}, std::array{stateB, stateC, eventB});
 
         SchedulingFacts facts;
         facts.variableRoles = {
@@ -1965,13 +1976,13 @@ namespace
             VariableRole::None,
             VariableRole::None,
             VariableRole::None,
+            VariableRole::None,
         };
         facts.instructionEffects = {
-            InstructionEffect::Pure,
             InstructionEffect::StateReadWrite,
-            InstructionEffect::Pure,
             InstructionEffect::StateReadWrite,
-            InstructionEffect::Pure,
+            InstructionEffect::StateReadWrite,
+            InstructionEffect::StateReadWrite,
             InstructionEffect::StateReadWrite,
         };
         return CommitCycleFixture{
@@ -1980,6 +1991,7 @@ namespace
                 .schedulingFacts = std::move(facts),
             },
             .start = start,
+            .tick = tick,
             .stateA = stateA,
             .stateB = stateB,
             .stateC = stateC,
@@ -2011,12 +2023,12 @@ namespace
             first ? findInstructionBlock(*first, firstFixture.writerB) : std::nullopt;
         const std::optional<BlockId> blockC =
             first ? findInstructionBlock(*first, firstFixture.writerC) : std::nullopt;
-        // Same event bucket at the commit cap: one writer per commit Block,
-        // ascending in implicit program order (B before C before A).
+        // One writer per commit Block at the cap, ascending in static order:
+        // A (tick bucket) before B (stateA bucket) before C (stateB bucket).
         if (!first || !second || firstDiagnostics.hasError() || secondDiagnostics.hasError() ||
-            !blockA || !blockB || !blockC || !(*blockB < *blockC && *blockC < *blockA) ||
-            first->program.blockCount() != 7 ||
-            first->commitBlockBegin != blockB->value ||
+            !blockA || !blockB || !blockC || !(*blockA < *blockB && *blockB < *blockC) ||
+            first->program.blockCount() != 6 ||
+            first->commitBlockBegin != blockA->value ||
             first->commitBlockEnd != first->program.blockCount() ||
             programShape(*first) != programShape(*second) ||
             !validate(*first, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
@@ -2028,6 +2040,10 @@ namespace
         if (!interpreter.ready() || !interpreter.eval().success() ||
             !interpreter
                  .write(firstFixture.start,
+                        InterpreterValue::bitVector(1, Signedness::Unsigned, highWords))
+                 .success() ||
+            !interpreter
+                 .write(firstFixture.tick,
                         InterpreterValue::bitVector(1, Signedness::Unsigned, highWords))
                  .success()) {
             return fail("cyclic commit fixture could not enter its source eval");
@@ -2169,8 +2185,6 @@ namespace
         LinearProgramBuilder builder;
         const TypeId eventType = builder.addType(Type::bitVector(1));
         const TypeId valueType = builder.addType(Type::bitVector(8));
-        const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
-        const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
         const VariableId data = builder.addVariable(valueType, builder.zeroInit());
         const VariableId state = builder.addVariable(valueType, builder.zeroInit());
         const VariableId event = builder.addVariable(eventType, builder.zeroInit());
@@ -2182,9 +2196,7 @@ namespace
         const std::array<VariableId, 1> readOperands = {state};
         const InstructionId reader =
             builder.addInstruction(Opcode::Assign, readResults, readOperands);
-        const std::array<VariableId, 5> writeOperands = {
-            condition, mask, data, state, event,
-        };
+        const std::array<VariableId, 3> writeOperands = {data, state, event};
         const InstructionId writer =
             builder.addInstruction(Opcode::RegisterWrite, {}, writeOperands);
         const std::array<VariableId, 1> producerResults = {temporary};
@@ -2198,9 +2210,8 @@ namespace
 
         SchedulingFacts facts;
         facts.variableRoles = {
+            VariableRole::None, VariableRole::State, VariableRole::None,
             VariableRole::None, VariableRole::None, VariableRole::None,
-            VariableRole::State, VariableRole::None, VariableRole::None,
-            VariableRole::None, VariableRole::None,
         };
         facts.instructionEffects = {
             InstructionEffect::Pure,
@@ -2357,8 +2368,6 @@ namespace
         const VariableId loopRhs = builder.addVariable(valueType, builder.zeroInit());
         const VariableId firstResult = builder.addVariable(valueType, builder.undefInit());
         const VariableId secondResult = builder.addVariable(valueType, builder.undefInit());
-        const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
-        const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
         const VariableId data = builder.addVariable(valueType, builder.zeroInit());
         const VariableId state = builder.addVariable(valueType, builder.zeroInit());
         const VariableId event = builder.addVariable(eventType, builder.zeroInit());
@@ -2397,12 +2406,12 @@ namespace
                                                 .schedule = CallSchedule::Normal,
                                                 .hasSideEffects = false,
                                             });
-        const std::array<VariableId, 5> writeOperands = {condition, mask, data, state, event};
+        const std::array<VariableId, 3> writeOperands = {data, state, event};
         const InstructionId writer =
             builder.addInstruction(Opcode::RegisterWrite, {}, writeOperands);
 
         SchedulingFacts facts;
-        facts.variableRoles.assign(12, VariableRole::None);
+        facts.variableRoles.assign(10, VariableRole::None);
         facts.variableRoles[state.value] = VariableRole::State;
         facts.instructionEffects = {
             InstructionEffect::Pure,     InstructionEffect::Pure,
@@ -2441,15 +2450,15 @@ namespace
         for (std::string line; std::getline(in, line);) {
             lines.push_back(line);
         }
-        // 1 header + 7 nodes + 3 def-use edges + 5 external reads + 1 order edge.
-        if (lines.size() != 17) {
+        // 1 header + 7 nodes + 3 def-use edges + 3 external reads + 1 order edge.
+        if (lines.size() != 15) {
             return fail("instruction graph export wrote an unexpected line count: " +
                         std::to_string(lines.size()));
         }
         const std::string expectedHeader =
             "{\"record\":\"header\",\"format\":\"wolvrix.am-instruction-graph.v1\","
-            "\"instructions\":7,\"variables\":12,\"atoms\":6,\"comb_loop_atoms\":1,"
-            "\"def_use_edges\":3,\"external_reads\":5,\"order_edges\":1}";
+            "\"instructions\":7,\"variables\":10,\"atoms\":6,\"comb_loop_atoms\":1,"
+            "\"def_use_edges\":3,\"external_reads\":3,\"order_edges\":1}";
         if (lines.front() != expectedHeader) {
             return fail("instruction graph export header mismatch: " + lines.front());
         }
@@ -2496,8 +2505,6 @@ namespace
             edgeLines.count(defUseEdge(loopLhs, loopForward, loopBackward, 8)) != 1 ||
             edgeLines.count(defUseEdge(loopRhs, loopBackward, loopForward, 8)) != 1 ||
             edgeLines.count(externalRead(input, readInput, 8)) != 1 ||
-            edgeLines.count(externalRead(condition, writer, 1)) != 1 ||
-            edgeLines.count(externalRead(mask, writer, 8)) != 1 ||
             edgeLines.count(externalRead(data, writer, 8)) != 1 ||
             edgeLines.count(externalRead(event, writer, 1)) != 1 ||
             edgeLines.count(orderEdge) != 1) {
@@ -2553,8 +2560,6 @@ namespace
         const VariableId valueB = builder.addVariable(valueType, builder.undefInit());
         const VariableId loopLhs = builder.addVariable(valueType, builder.zeroInit());
         const VariableId loopRhs = builder.addVariable(valueType, builder.zeroInit());
-        const VariableId condition = builder.addVariable(eventType, builder.zeroInit());
-        const VariableId mask = builder.addVariable(valueType, builder.zeroInit());
         const VariableId state = builder.addVariable(valueType, builder.zeroInit());
         const VariableId event = builder.addVariable(eventType, builder.zeroInit());
 
@@ -2570,11 +2575,11 @@ namespace
         const std::array<VariableId, 1> rhsResults = {loopRhs};
         const std::array<VariableId, 1> rhsOperands = {loopLhs};
         builder.addInstruction(Opcode::Assign, rhsResults, rhsOperands);
-        const std::array<VariableId, 5> writeOperands = {condition, mask, valueB, state, event};
+        const std::array<VariableId, 3> writeOperands = {valueB, state, event};
         builder.addInstruction(Opcode::RegisterWrite, {}, writeOperands);
 
         SchedulingFacts facts;
-        facts.variableRoles.assign(9, VariableRole::None);
+        facts.variableRoles.assign(7, VariableRole::None);
         facts.variableRoles[state.value] = VariableRole::State;
         facts.instructionEffects = {
             InstructionEffect::Pure, InstructionEffect::Pure,
@@ -2613,12 +2618,13 @@ namespace
             return fail("block assignment export wrote an unexpected line count: " +
                         std::to_string(lines.size()));
         }
-        // One compute block (instructions 0-3, cap 8) and one commit block
-        // (the register write). The only cross-block value is valueB flowing
-        // compute->commit; the only permanent-boundary compute read is input.
+        // One compute block (the comb-loop assign pair plus the two value
+        // producers) and one commit block. Cone packing is gone: the
+        // register write's fan-in stays in compute, so exactly one value
+        // crosses the compute->commit boundary (dag_edges/pairs/copy = 1).
         const std::string expectedHeader =
             "{\"record\":\"header\",\"format\":\"wolvrix.am-block-assignment.v1\","
-            "\"instructions\":5,\"variables\":9,\"blocks\":2,\"compute_blocks\":1,"
+            "\"instructions\":5,\"variables\":7,\"blocks\":2,\"compute_blocks\":1,"
             "\"commit_blocks\":1,\"input_sink_block\":0,\"dag_edges\":1,"
             "\"compute_compute_value_pairs\":1,\"incoming_copy_cost\":1}";
         if (lines.front() != expectedHeader) {
@@ -2628,11 +2634,12 @@ namespace
             lines[2] != "{\"record\":\"block\",\"id\":2,\"kind\":\"commit\",\"size\":1}") {
             return fail("block assignment export block records mismatch");
         }
+        const std::array<uint32_t, 5> expectedBlocks = {1, 1, 1, 1, 2};
         for (uint32_t instruction = 0; instruction < 5; ++instruction) {
             const std::string expected =
                 std::string("{\"record\":\"assign\",\"instr\":") +
                 std::to_string(instruction) +
-                ",\"block\":" + (instruction < 4 ? "1" : "2") + "}";
+                ",\"block\":" + std::to_string(expectedBlocks[instruction]) + "}";
             if (lines[3 + instruction] != expected) {
                 return fail("block assignment export assign record mismatch: " +
                             lines[3 + instruction]);
@@ -2689,7 +2696,6 @@ namespace
             .atomIsCommit = atomIsCommit,
             .atomMinInstruction = atomMinInstruction,
             .commitEventRank = commitRanks,
-            .commitGuardRank = commitRanks,
             .variableCount = 3,
             .definitions = definitions,
             .useOffsets = useOffsets,
@@ -2773,7 +2779,7 @@ int main()
     if (const int result = testDifferentCommitEventsStartNewBlocks(); result != 0) {
         return result;
     }
-    if (const int result = testCommitGuardsGroupWithoutForcingBlockBoundary(); result != 0) {
+    if (const int result = testCommitNextValuesDoNotSplitEventBuckets(); result != 0) {
         return result;
     }
     if (const int result = testOrderedCommitChainSplitsAtCommitCap(); result != 0) {
@@ -2788,7 +2794,7 @@ int main()
     if (const int result = testSplitCommitBlocksEachWatchAndReactivateReader(); result != 0) {
         return result;
     }
-    if (const int result = testCommitGuardReadsLiveStateFromEarlierCommitBlock(); result != 0) {
+    if (const int result = testCommitWriteReadsLiveStateFromEarlierCommitBlock(); result != 0) {
         return result;
     }
     if (const int result = testStateChangeUsesBackwardReaderActivation(); result != 0) {

@@ -2,6 +2,7 @@
 
 #include "grhsim/am/builder.hpp"
 #include "grhsim/am/activity_schedule.hpp"
+#include "grhsim/am/graph.hpp"
 #include "grhsim/am/opcode_traits.hpp"
 
 #include <algorithm>
@@ -704,7 +705,6 @@ namespace wolvrix::lib::grhsim::am
         using CommitEventPart = std::pair<uint8_t, uint32_t>;
         using CommitInstructionEventKey = std::vector<CommitEventPart>;
         using CommitAtomEventKey = std::vector<CommitInstructionEventKey>;
-        using CommitAtomGuardKey = std::vector<uint32_t>;
 
         uint8_t changedEventKind(Opcode opcode) noexcept
         {
@@ -735,48 +735,47 @@ namespace wolvrix::lib::grhsim::am
             return CommitEventPart{0, event.value};
         }
 
-        struct CommitInstructionBucketKey
+        // Event operands trail the fixed operands of a state write. Returns
+        // the first event-operand position (operandCount when none).
+        std::size_t stateWriteEventBegin(Opcode opcode, std::size_t operandCount) noexcept
         {
-            CommitInstructionEventKey events;
-            uint32_t guard = kInvalidIndex;
-        };
-
-        CommitInstructionBucketKey commitInstructionBucketKey(ProgramView program,
-                                                               const DefUseIndex &defUse,
-                                                               InstructionId instruction)
-        {
-            const auto operands = program.operands(instruction);
-            CommitInstructionBucketKey key;
-            if (!operands.empty()) {
-                key.guard = operands.front().value;
-            }
-
-            std::size_t eventBegin = operands.size();
-            switch (program.opcode(instruction)) {
+            std::size_t eventBegin = operandCount;
+            switch (opcode) {
             case Opcode::RegisterWrite:
-                eventBegin = 4;
+                eventBegin = 2;
                 break;
             case Opcode::MemoryWrite:
                 eventBegin = 5;
                 break;
             case Opcode::MemoryFill:
-                eventBegin = 3;
+                eventBegin = 2;
                 break;
             case Opcode::MemoryWriteLanes:
                 eventBegin = 3;
                 break;
-            case Opcode::LatchWrite:
-                break;
             default:
-                return key;
+                break;
             }
-            eventBegin = std::min(eventBegin, operands.size());
-            key.events.reserve(operands.size() - eventBegin);
+            return std::min(eventBegin, operandCount);
+        }
+
+        // The commit bucket key of a state write is its canonical event
+        // signature; the update condition is folded into nextValue and no
+        // longer exists as an operand, so there is no guard component.
+        CommitInstructionEventKey commitInstructionEventKey(ProgramView program,
+                                                            const DefUseIndex &defUse,
+                                                            InstructionId instruction)
+        {
+            const auto operands = program.operands(instruction);
+            CommitInstructionEventKey key;
+            const std::size_t eventBegin =
+                stateWriteEventBegin(program.opcode(instruction), operands.size());
+            key.reserve(operands.size() - eventBegin);
             for (std::size_t index = eventBegin; index < operands.size(); ++index) {
-                key.events.push_back(canonicalCommitEvent(program, defUse, operands[index]));
+                key.push_back(canonicalCommitEvent(program, defUse, operands[index]));
             }
-            std::sort(key.events.begin(), key.events.end());
-            key.events.erase(std::unique(key.events.begin(), key.events.end()), key.events.end());
+            std::sort(key.begin(), key.end());
+            key.erase(std::unique(key.begin(), key.end()), key.end());
             return key;
         }
 
@@ -1039,6 +1038,125 @@ namespace wolvrix::lib::grhsim::am
                 edgeCursor = end;
             }
         }
+
+        // The finalizer: turns the settled schedule (per-Block node lists,
+        // gate-detector plan, activation edges) into the executable program.
+        // This is the single place that assigns the Block layout, materializes
+        // the changed.* gate detectors and the Act instructions, and fixes the
+        // intra-Block instruction order.
+        std::optional<ExecutableModel> finalizeScheduledModel(
+            AmGraph &graph, ProgramView program, const DefUseIndex &defUse,
+            const std::vector<std::vector<uint32_t>> &blockNodes,
+            const std::vector<std::vector<CommitEventPart>> &commitGateParts,
+            std::vector<ActivationEdge> &activationEdges, uint32_t normalBlockCount,
+            uint32_t commitBlockBegin, uint32_t commitBlockEnd, TypeId eventType,
+            bool needsEventType, const MaterializationCounts &materialization,
+            std::size_t headDetectorCount, uint32_t instructionCount,
+            diag::Diagnostics &diagnostics)
+        {
+            const auto isCommitBlock = [&](uint32_t block) {
+                return commitBlockBegin != 0 && block >= commitBlockBegin;
+            };
+            LinearProgramArtifact scheduledInput = graph.toLinearProgram();
+            ProgramInterface interface = std::move(scheduledInput.interface);
+            try {
+                ScheduledProgramBuilder builder(std::move(scheduledInput.program));
+                builder.reserve(ScheduledProgramReserve{
+                    .additionalTypes = needsEventType && !eventType.valid() ? 1U : 0U,
+                    .additionalVariables = (materialization.detectors + headDetectorCount) * 2,
+                    .additionalInstructions =
+                        materialization.detectors + headDetectorCount + materialization.activations,
+                    .additionalOperands =
+                        (materialization.detectors + headDetectorCount) * 2 +
+                        materialization.activations,
+                    .additionalResults = materialization.detectors + headDetectorCount,
+                    .blocks = static_cast<std::size_t>(normalBlockCount) + 1,
+                    .blockInstructionIds = static_cast<std::size_t>(instructionCount) +
+                                           materialization.detectors + headDetectorCount +
+                                           materialization.activations,
+                    .activationInstructions = materialization.activations,
+                    .activationTargets = materialization.targets,
+                });
+                if (needsEventType && !eventType.valid()) {
+                    eventType = builder.addType(Type::bitVector(1));
+                }
+
+                std::size_t edgeCursor = 0;
+                builder.beginBlock();
+                appendWatchGroups(builder, 0, activationEdges, edgeCursor, eventType);
+                builder.endBlock();
+
+                for (uint32_t block = 1; block <= normalBlockCount; ++block) {
+                    builder.beginBlock();
+                    std::map<CommitEventPart, VariableId> gateEvents;
+                    if (isCommitBlock(block)) {
+                        // The Block's aggregated gate detectors come first: one
+                        // changed.* per watched (kind, variable) part, so the
+                        // whole Block shares a single merged event check.
+                        for (const CommitEventPart &part : commitGateParts[block]) {
+                            const VariableId watched{part.second};
+                            const TypeId watchedType = builder.view().variable(watched).type;
+                            const VariableId oldValue =
+                                builder.addVariable(watchedType, builder.undefInit());
+                            const VariableId event =
+                                builder.addVariable(eventType, builder.zeroInit());
+                            const std::array<VariableId, 1> results = {event};
+                            const std::array<VariableId, 2> operands = {watched, oldValue};
+                            Opcode detectorOpcode = Opcode::ChangedAny;
+                            if (part.first == changedEventKind(Opcode::ChangedPos)) {
+                                detectorOpcode = Opcode::ChangedPos;
+                            } else if (part.first == changedEventKind(Opcode::ChangedNeg)) {
+                                detectorOpcode = Opcode::ChangedNeg;
+                            }
+                            const InstructionId detector =
+                                builder.addInstruction(detectorOpcode, results, operands);
+                            builder.appendBlockInstruction(detector);
+                            gateEvents.emplace(part, event);
+                        }
+                    }
+                    for (const uint32_t instructionValue : blockNodes[block]) {
+                        const InstructionId instruction{instructionValue};
+                        if (isCommitBlock(block) && !gateEvents.empty()) {
+                            // Re-point the write's event operands at the in-Block
+                            // detector results so the Block-level gate and the
+                            // writes observe one shared detector set.
+                            const auto operands = program.operands(instruction);
+                            const std::size_t eventBegin = stateWriteEventBegin(
+                                program.opcode(instruction), operands.size());
+                            for (std::size_t index = eventBegin; index < operands.size();
+                                 ++index) {
+                                const CommitEventPart part =
+                                    canonicalCommitEvent(program, defUse, operands[index]);
+                                const auto found = gateEvents.find(part);
+                                if (found != gateEvents.end()) {
+                                    builder.setInstructionOperand(instruction, index,
+                                                                  found->second);
+                                }
+                            }
+                        }
+                        builder.appendBlockInstruction(instruction);
+                    }
+                    appendWatchGroups(builder, block, activationEdges, edgeCursor, eventType);
+                    builder.endBlock();
+                }
+                if (edgeCursor != activationEdges.size()) {
+                    diagnostics.error("internal error: not all AM activation edges were materialized",
+                                      std::string(kDiagnosticContext));
+                    return std::nullopt;
+                }
+
+                return ExecutableModel{
+                    .program = builder.finish(),
+                    .interface = std::move(interface),
+                    .commitBlockBegin = commitBlockBegin,
+                    .commitBlockEnd = commitBlockEnd,
+                };
+            } catch (const std::exception &error) {
+                diagnostics.error(std::string("AM activity scheduling failed: ") + error.what(),
+                                  std::string(kDiagnosticContext));
+                return std::nullopt;
+            }
+        }
     } // namespace
 
     std::optional<ExecutableModel>
@@ -1060,18 +1178,21 @@ namespace wolvrix::lib::grhsim::am
             return std::nullopt;
         }
 
-        const ProgramView program = linear.program.view();
+        // The scheduler operates on the graph form: the linear artifact is
+        // ingested once and every analysis below reads the graph's storage.
+        AmGraph graph = AmGraph::fromLinearProgram(linear);
+        const ProgramView program = graph.program();
         const uint32_t instructionCount = static_cast<uint32_t>(program.instructionCount());
         const uint32_t variableCount = static_cast<uint32_t>(program.variableCount());
         const DefUseIndex defUse = buildDefUseIndex(program);
         std::vector<OrderEdge> orderedEdges;
-        orderedEdges.reserve(linear.schedulingFacts.orderedEffects.size());
+        orderedEdges.reserve(graph.orderedEffects().size());
         std::vector<uint8_t> hasExplicitOrder(instructionCount, 0);
         std::vector<uint32_t> explicitOrderGroup(instructionCount, kInvalidIndex);
         uint32_t previousGroup = 0;
         uint32_t previousInstruction = kInvalidIndex;
         bool havePrevious = false;
-        for (const OrderedEffect &effect : linear.schedulingFacts.orderedEffects) {
+        for (const OrderedEffect &effect : graph.orderedEffects()) {
             const uint32_t instruction = effect.instruction.value;
             if (hasExplicitOrder[instruction] &&
                 explicitOrderGroup[instruction] != effect.group) {
@@ -1192,7 +1313,7 @@ namespace wolvrix::lib::grhsim::am
             std::span<uint32_t> members(atomMembers.data() + atomMemberOffsets[atom],
                                         atomMemberOffsets[atom + 1] - atomMemberOffsets[atom]);
             if (!orderAtomInstructions(members, program, defUse, orderedEdges,
-                                       linear.schedulingFacts.instructionEffects, localIndex,
+                                       graph.instructionEffects(), localIndex,
                                        diagnostics)) {
                 return std::nullopt;
             }
@@ -1211,7 +1332,6 @@ namespace wolvrix::lib::grhsim::am
             std::size_t stateWrites = 0;
             BlockClass blockClass = BlockClass::Compute;
             CommitAtomEventKey commitEvents;
-            CommitAtomGuardKey commitGuards;
         };
         std::vector<AtomCost> atomCosts(atomCount);
         std::size_t oversizedAtomCount = 0;
@@ -1227,10 +1347,8 @@ namespace wolvrix::lib::grhsim::am
                  ++offset) {
                 const uint32_t instruction = atomMembers[offset];
                 if (stateWriteTarget(program, InstructionId{instruction})) {
-                    CommitInstructionBucketKey bucket = commitInstructionBucketKey(
-                        program, defUse, InstructionId{instruction});
-                    cost.commitEvents.push_back(std::move(bucket.events));
-                    cost.commitGuards.push_back(bucket.guard);
+                    cost.commitEvents.push_back(commitInstructionEventKey(
+                        program, defUse, InstructionId{instruction}));
                     ++cost.stateWrites;
                     hasCommit = true;
                     continue;
@@ -1250,10 +1368,6 @@ namespace wolvrix::lib::grhsim::am
             cost.commitEvents.erase(
                 std::unique(cost.commitEvents.begin(), cost.commitEvents.end()),
                 cost.commitEvents.end());
-            std::sort(cost.commitGuards.begin(), cost.commitGuards.end());
-            cost.commitGuards.erase(
-                std::unique(cost.commitGuards.begin(), cost.commitGuards.end()),
-                cost.commitGuards.end());
             maxAtomInstructions = std::max(maxAtomInstructions, cost.instructions);
             maxAtomStateWrites = std::max(maxAtomStateWrites, cost.stateWrites);
             const std::size_t instructionLimit =
@@ -1285,15 +1399,8 @@ namespace wolvrix::lib::grhsim::am
             atomMinInstruction[atom] = atomMembers[atomMemberOffsets[atom]];
         }
 
-        struct EventBucketRanks
-        {
-            uint32_t event = 0;
-            uint32_t nextGuard = 0;
-            std::map<CommitAtomGuardKey, uint32_t> guards;
-        };
-        std::map<CommitAtomEventKey, EventBucketRanks> bucketRanks;
+        std::map<CommitAtomEventKey, uint32_t> eventRanks;
         std::vector<uint32_t> commitEventRank(atomCount, 0);
-        std::vector<uint32_t> commitGuardRank(atomCount, 0);
         std::vector<uint32_t> atomsByInstruction(atomCount);
         std::iota(atomsByInstruction.begin(), atomsByInstruction.end(), uint32_t{0});
         std::sort(atomsByInstruction.begin(), atomsByInstruction.end(),
@@ -1301,23 +1408,15 @@ namespace wolvrix::lib::grhsim::am
                       return std::tie(atomMinInstruction[lhs], lhs) <
                              std::tie(atomMinInstruction[rhs], rhs);
                   });
-        uint32_t nextEventRank = 0;
         for (uint32_t atom : atomsByInstruction) {
             const AtomCost &cost = atomCosts[atom];
             if (cost.blockClass != BlockClass::Commit) {
                 continue;
             }
-            auto [eventIt, eventInserted] = bucketRanks.try_emplace(cost.commitEvents);
-            if (eventInserted) {
-                eventIt->second.event = nextEventRank++;
-            }
-            auto [guardIt, guardInserted] =
-                eventIt->second.guards.try_emplace(cost.commitGuards);
-            if (guardInserted) {
-                guardIt->second = eventIt->second.nextGuard++;
-            }
-            commitEventRank[atom] = eventIt->second.event;
-            commitGuardRank[atom] = guardIt->second;
+            const auto [eventIt, inserted] = eventRanks.try_emplace(
+                cost.commitEvents, static_cast<uint32_t>(eventRanks.size()));
+            (void)inserted;
+            commitEventRank[atom] = eventIt->second;
         }
 
         const auto readyIndex = [](BlockClass blockClass) {
@@ -1356,7 +1455,6 @@ namespace wolvrix::lib::grhsim::am
             .atomIsCommit = atomIsCommit,
             .atomMinInstruction = atomMinInstruction,
             .commitEventRank = commitEventRank,
-            .commitGuardRank = commitGuardRank,
             .variableCount = variableCount,
             .definitions = defUse.definitions,
             .useOffsets = defUse.useOffsets,
@@ -1411,8 +1509,8 @@ namespace wolvrix::lib::grhsim::am
         }
 
         std::vector<uint32_t> externalInputs;
-        externalInputs.reserve(linear.interface.ports.size());
-        for (const PortBinding &port : linear.interface.ports) {
+        externalInputs.reserve(graph.interface().ports.size());
+        for (const PortBinding &port : graph.interface().ports) {
             if (port.direction == PortDirection::Input || port.direction == PortDirection::Inout) {
                 externalInputs.push_back(port.input.value);
             }
@@ -1450,33 +1548,169 @@ namespace wolvrix::lib::grhsim::am
             commitBlockCount == 0 ? 0U : commitBlockBegin + commitBlockCount;
 
         std::vector<uint32_t> instructionBlock(instructionCount, 0);
-        std::vector<uint32_t> semanticBlockCounts(normalBlockCount + 1, 0);
-        for (uint32_t atom : atomTopo) {
-            semanticBlockCounts[atomBlock[atom]] +=
-                static_cast<uint32_t>(atomCosts[atom].instructions);
-        }
-        std::vector<uint32_t> semanticBlockOffsets(normalBlockCount + 2, 0);
-        for (uint32_t block = 1; block <= normalBlockCount; ++block) {
-            semanticBlockOffsets[block + 1] =
-                semanticBlockOffsets[block] + semanticBlockCounts[block];
-        }
-        std::vector<uint32_t> semanticInstructions(instructionCount, 0);
-        std::vector<uint32_t> semanticCursor(semanticBlockOffsets.begin(),
-                                             semanticBlockOffsets.end() - 1);
+        // Per-Block ordered node lists: the graph-level block assignment.
+        // Block membership and intra-Block order live here (not in a flat
+        // layout array) so passes annotate and the finalizer serializes once.
+        std::vector<std::vector<uint32_t>> blockNodes(normalBlockCount + 1);
         for (uint32_t atom : atomTopo) {
             const uint32_t block = atomBlock[atom];
+            auto &nodes = blockNodes[block];
+            nodes.reserve(nodes.size() + atomCosts[atom].instructions);
             for (uint32_t offset = atomMemberOffsets[atom]; offset < atomMemberOffsets[atom + 1];
                  ++offset) {
                 const uint32_t instruction = atomMembers[offset];
-                const uint32_t position = semanticCursor[block]++;
-                semanticInstructions[position] = instruction;
+                nodes.push_back(instruction);
                 instructionBlock[instruction] = block;
             }
+        }
+        std::vector<uint32_t> semanticBlockCounts(normalBlockCount + 1, 0);
+        for (uint32_t block = 1; block <= normalBlockCount; ++block) {
+            semanticBlockCounts[block] = static_cast<uint32_t>(blockNodes[block].size());
         }
 
         const auto isCommitBlock = [&](uint32_t block) {
             return commitBlockBegin != 0 && block >= commitBlockBegin;
         };
+
+        // Cone packing has been removed: register/latch merged write chains
+        // settle correctly from pre-commit compute snapshots, and memory
+        // writes carry cond/mask at the write site (masked_write_words), so
+        // nothing needs to be pulled into commit Blocks. The full pass was a
+        // measurable net loss on the production design (commit-Block code
+        // ballooned 28x, 533s vs 330s for 50k coremark cycles) and the only
+        // remaining mandatory piece (read-old element evaluation) is gone
+        // with the cond/mask revert of mem.write.
+        for (uint32_t block = 1; block <= normalBlockCount; ++block) {
+            semanticBlockCounts[block] =
+                static_cast<uint32_t>(blockNodes[block].size());
+        }
+
+        // Intra-Block order guard for commit Blocks: a use must not precede
+        // its definition when both live in the same commit Block. Commit
+        // Blocks interleave gate detectors with ordered state writes, and a
+        // stale emission order silently corrupts simulation (a use then
+        // observes the previous round's value), so fail loudly instead.
+        // Compute Blocks are exempt: a def-use SCC atom intentionally
+        // iterates within its Block, so a use may legitimately precede its
+        // definition there.
+        if (commitBlockBegin != 0) {
+            std::vector<uint32_t> positionOf(instructionCount, kInvalidIndex);
+            for (uint32_t block = commitBlockBegin; block < commitBlockEnd; ++block) {
+                const auto &nodes = blockNodes[block];
+                for (std::size_t position = 0; position < nodes.size(); ++position) {
+                    positionOf[nodes[position]] = static_cast<uint32_t>(position);
+                }
+                for (std::size_t position = 0; position < nodes.size(); ++position) {
+                    const auto operands = program.operands(InstructionId{nodes[position]});
+                    for (const VariableId operand : operands) {
+                        if (!operand.valid() || operand.value >= defUse.definitions.size()) {
+                            continue;
+                        }
+                        const uint32_t definition = defUse.definitions[operand.value];
+                        if (definition == kInvalidIndex ||
+                            instructionBlock[definition] != block) {
+                            continue;
+                        }
+                        if (positionOf[definition] >= position) {
+                            diagnostics.error(
+                                "AM intra-Block order violation: instruction=" +
+                                    std::to_string(nodes[position]) + " uses variable=" +
+                                    std::to_string(operand.value) + " defined by instruction=" +
+                                    std::to_string(definition) + " later in block=" +
+                                    std::to_string(block),
+                                std::string(kDiagnosticContext));
+                            return std::nullopt;
+                        }
+                    }
+                }
+                for (const uint32_t instruction : nodes) {
+                    positionOf[instruction] = kInvalidIndex;
+                }
+            }
+        }
+
+        // Clock-domain view of every commit Block: the (kind, variable) parts
+        // its aggregated gate detectors watch. Eventful writes contribute
+        // their canonical raw event sources; latch writes are eventless and
+        // contribute their merged nextValue, so an eventless Block gates on an
+        // actual nextValue change. Every watched part becomes one in-Block
+        // changed.* detector during materialization.
+        std::vector<std::vector<CommitEventPart>> commitGateParts(normalBlockCount + 1);
+        std::unordered_map<uint32_t, std::vector<uint32_t>> commitStateWriters;
+        std::size_t headDetectorCount = 0;
+        for (uint32_t block = commitBlockBegin; block < commitBlockEnd; ++block) {
+            std::vector<CommitEventPart> parts;
+            for (const uint32_t instructionValue : blockNodes[block]) {
+                const InstructionId instruction{instructionValue};
+                const std::optional<VariableId> target =
+                    stateWriteTarget(program, instruction);
+                if (!target) {
+                    continue;
+                }
+                commitStateWriters[target->value].push_back(block);
+                const auto operands = program.operands(instruction);
+                if (program.opcode(instruction) == Opcode::LatchWrite) {
+                    parts.push_back(CommitEventPart{changedEventKind(Opcode::ChangedAny),
+                                                    operands.front().value});
+                    continue;
+                }
+                const std::size_t eventBegin =
+                    stateWriteEventBegin(program.opcode(instruction), operands.size());
+                for (std::size_t index = eventBegin; index < operands.size(); ++index) {
+                    parts.push_back(canonicalCommitEvent(program, defUse, operands[index]));
+                }
+            }
+            std::sort(parts.begin(), parts.end());
+            parts.erase(std::unique(parts.begin(), parts.end()), parts.end());
+            headDetectorCount += parts.size();
+            commitGateParts[block] = std::move(parts);
+        }
+
+        // Phase-discipline audit (debug): a state variable read inside a
+        // commit Block must be a target that Block itself writes (an
+        // intra-Block RMW / ordered-chain live read). Reading a state variable
+        // written only by *other* Blocks observes a live, possibly
+        // just-committed value where a pre-commit snapshot is expected -- the
+        // phase-shear hazard. Report those, they are never legitimate here.
+        if (std::getenv("WOLVRIX_GRHSIM_AM_AUDIT_PHASE") != nullptr) {
+            // writerBlocks[v] = sorted set of commit Blocks writing v.
+            std::unordered_map<uint32_t, std::vector<uint32_t>> writersOf;
+            for (const auto &[target, blocks] : commitStateWriters) {
+                writersOf[target] = blocks;
+            }
+            std::map<std::string, std::size_t> violationsByName;
+            std::size_t violations = 0;
+            for (uint32_t block = commitBlockBegin; block < commitBlockEnd; ++block) {
+                for (const uint32_t instructionValue : blockNodes[block]) {
+                    const InstructionId instruction{instructionValue};
+                    const auto operands = program.operands(instruction);
+                    for (std::size_t position = 0; position < operands.size(); ++position) {
+                        const VariableId operand = operands[position];
+                        if (!operand.valid()) {
+                            continue;
+                        }
+                        const auto found = writersOf.find(operand.value);
+                        if (found == writersOf.end()) {
+                            continue;  // not a state variable
+                        }
+                        const auto &writers = found->second;
+                        if (std::find(writers.begin(), writers.end(), block) !=
+                            writers.end()) {
+                            continue;  // this Block writes it: RMW/chain read
+                        }
+                        const auto label = program.variableLabel(operand);
+                        const std::string name =
+                            label ? std::string(program.string(*label)) : std::string("<anon>");
+                        ++violationsByName[name];
+                        ++violations;
+                    }
+                }
+            }
+            std::fprintf(stderr, "[phase-audit] foreign-state live reads: %zu\n", violations);
+            for (const auto &[name, count] : violationsByName) {
+                std::fprintf(stderr, "[phase-audit]   %6zu  %s\n", count, name.c_str());
+            }
+        }
 
         if (const char *exportPath = std::getenv(kBlockAssignmentExportEnv)) {
             if (exportPath[0] == '\0' ||
@@ -1499,7 +1733,8 @@ namespace wolvrix::lib::grhsim::am
                 used = true;
                 const uint32_t targetBlock = instructionBlock[defUse.uses[offset]];
                 if (isCommitBlock(targetBlock)) {
-                    // Commit Blocks are scanned unconditionally every round.
+                    // Commit Blocks draw their activation exclusively from
+                    // gate-detector variables (explicit pass below).
                     continue;
                 }
                 activationEdges.push_back(ActivationEdge{
@@ -1519,7 +1754,9 @@ namespace wolvrix::lib::grhsim::am
 
         // A def->use edge activates the using Block only when it is a different
         // compute Block; same-Block uses are covered by in-Block instruction
-        // order and uses inside commit Blocks need no activation.
+        // order. Edges into commit Blocks are NOT taken from def-use: a commit
+        // Block may only be activated through one of its gate-detector
+        // variables (see the explicit pass below).
         for (uint32_t variable = 0; variable < variableCount; ++variable) {
             const uint32_t definition = defUse.definitions[variable];
             if (definition == kInvalidIndex) {
@@ -1542,15 +1779,58 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
+        // Commit Block activation (clock-domain rule): a compute or commit
+        // Block may forward activation into a commit Block only through a
+        // variable that at least one of the target Block's gate detectors
+        // watches. Sources: the variable's defining Block, the entry Block
+        // for source-less values (interface inputs), or every commit Block
+        // writing the watched state variable (derived clocks).
+        for (uint32_t block = commitBlockBegin; block < commitBlockEnd; ++block) {
+            for (const CommitEventPart &part : commitGateParts[block]) {
+                const uint32_t watched = part.second;
+                const uint32_t definition = defUse.definitions[watched];
+                if (definition != kInvalidIndex) {
+                    const uint32_t sourceBlock = instructionBlock[definition];
+                    if (sourceBlock != block) {
+                        activationEdges.push_back(ActivationEdge{
+                            .sourceBlock = sourceBlock,
+                            .variable = watched,
+                            .targetBlock = block,
+                            .directEvent =
+                                isChanged(program.opcode(InstructionId{definition})),
+                        });
+                    }
+                    continue;
+                }
+                const auto writers = commitStateWriters.find(watched);
+                if (writers == commitStateWriters.end()) {
+                    // Source-less non-state value (e.g. an interface input):
+                    // the entry Block watches it and forwards the activation.
+                    activationEdges.push_back(ActivationEdge{
+                        .sourceBlock = 0,
+                        .variable = watched,
+                        .targetBlock = block,
+                    });
+                    continue;
+                }
+                for (const uint32_t writerBlock : writers->second) {
+                    activationEdges.push_back(ActivationEdge{
+                        .sourceBlock = writerBlock,
+                        .variable = watched,
+                        .targetBlock = block,
+                    });
+                }
+            }
+        }
+
         // Each commit Block watches the state targets written inside it and
         // reactivates the compute Blocks reading them (ActBackward). Edges
         // sharing one (commit Block, state target) pair collapse into a single
         // detector during materialization.
         for (uint32_t block = commitBlockBegin; block < commitBlockEnd; ++block) {
-            for (uint32_t offset = semanticBlockOffsets[block];
-                 offset < semanticBlockOffsets[block + 1]; ++offset) {
+            for (const uint32_t instruction : blockNodes[block]) {
                 const std::optional<VariableId> target =
-                    stateWriteTarget(program, InstructionId{semanticInstructions[offset]});
+                    stateWriteTarget(program, InstructionId{instruction});
                 if (!target) {
                     continue;
                 }
@@ -1582,7 +1862,7 @@ namespace wolvrix::lib::grhsim::am
         }
 
         const MaterializationCounts materialization = countMaterialization(activationEdges);
-        const bool needsEventType = materialization.detectors != 0;
+        const bool needsEventType = materialization.detectors != 0 || headDetectorCount != 0;
         TypeId eventType;
         if (needsEventType) {
             for (uint32_t type = 0; type < program.typeCount(); ++type) {
@@ -1595,52 +1875,78 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
-        ProgramInterface interface = std::move(linear.interface);
-        linear.schedulingFacts.clearAndRelease();
+        std::optional<ExecutableModel> finalized = finalizeScheduledModel(
+            graph, program, defUse, blockNodes, commitGateParts, activationEdges,
+            normalBlockCount, commitBlockBegin, commitBlockEnd, eventType, needsEventType,
+            materialization, headDetectorCount, instructionCount, diagnostics);
+        if (!finalized) {
+            return std::nullopt;
+        }
+        ExecutableModel model = std::move(*finalized);
         try {
-            ScheduledProgramBuilder builder(std::move(linear.program));
-            builder.reserve(ScheduledProgramReserve{
-                .additionalTypes = needsEventType && !eventType.valid() ? 1U : 0U,
-                .additionalVariables = materialization.detectors * 2,
-                .additionalInstructions = materialization.detectors + materialization.activations,
-                .additionalOperands = materialization.detectors * 2 + materialization.activations,
-                .additionalResults = materialization.detectors,
-                .blocks = static_cast<std::size_t>(normalBlockCount) + 1,
-                .blockInstructionIds = static_cast<std::size_t>(instructionCount) +
-                                       materialization.detectors + materialization.activations,
-                .activationInstructions = materialization.activations,
-                .activationTargets = materialization.targets,
-            });
-            if (needsEventType && !eventType.valid()) {
-                eventType = builder.addType(Type::bitVector(1));
-            }
-
-            std::size_t edgeCursor = 0;
-            builder.beginBlock();
-            appendWatchGroups(builder, 0, activationEdges, edgeCursor, eventType);
-            builder.endBlock();
-
-            for (uint32_t block = 1; block <= normalBlockCount; ++block) {
-                builder.beginBlock();
-                for (uint32_t offset = semanticBlockOffsets[block];
-                     offset < semanticBlockOffsets[block + 1]; ++offset) {
-                    builder.appendBlockInstruction(InstructionId{semanticInstructions[offset]});
+            if (const char *dumpVars = std::getenv("WOLVRIX_GRHSIM_AM_DUMP_VARIABLES")) {
+                if (dumpVars[0] != '\0') {
+                    const ProgramView scheduledView = model.program.view();
+                    for (const VariableLabel &label : scheduledView.variableLabels()) {
+                        const std::string_view name = scheduledView.string(label.label);
+                        if (name.find(dumpVars) != std::string_view::npos) {
+                            std::fprintf(stderr, "[var-dump] v%u %.*s\n", label.variable.value,
+                                         static_cast<int>(name.size()), name.data());
+                        }
+                    }
                 }
-                appendWatchGroups(builder, block, activationEdges, edgeCursor, eventType);
-                builder.endBlock();
             }
-            if (edgeCursor != activationEdges.size()) {
-                diagnostics.error("internal error: not all AM activation edges were materialized",
-                                  std::string(kDiagnosticContext));
-                return std::nullopt;
+            if (const char *dumpFilter = std::getenv("WOLVRIX_GRHSIM_AM_DUMP_COMMIT_BLOCKS")) {
+                if (dumpFilter[0] != '\0') {
+                    // Debug dump: print every commit Block whose writes touch a
+                    // labeled variable containing the filter substring.
+                    const ProgramView scheduledView = model.program.view();
+                    std::unordered_map<uint32_t, std::string> variableNames;
+                    for (const VariableLabel &label : scheduledView.variableLabels()) {
+                        variableNames[label.variable.value] =
+                            std::string(scheduledView.string(label.label));
+                    }
+                    for (uint32_t block = model.commitBlockBegin; block < model.commitBlockEnd;
+                         ++block) {
+                        const BlockId blockId{block};
+                        bool matches = false;
+                        for (std::size_t position = 0; position < model.program.blockSize(blockId);
+                             ++position) {
+                            const InstructionId instruction =
+                                model.program.blockInstruction(blockId, position);
+                            const std::optional<VariableId> target =
+                                stateWriteTarget(scheduledView, instruction);
+                            if (target) {
+                                const auto name = variableNames.find(target->value);
+                                if (name != variableNames.end() &&
+                                    name->second.find(dumpFilter) != std::string::npos) {
+                                    matches = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!matches) {
+                            continue;
+                        }
+                        std::fprintf(stderr, "[commit-dump] block %u size %zu:\n", block,
+                                     model.program.blockSize(blockId));
+                        for (std::size_t position = 0;
+                             position < model.program.blockSize(blockId); ++position) {
+                            const InstructionId instruction =
+                                model.program.blockInstruction(blockId, position);
+                            const auto operands = scheduledView.operands(instruction);
+                            std::fprintf(stderr, "  [%4zu] i%u %-16s", position,
+                                         instruction.value,
+                                         std::string(toString(scheduledView.opcode(instruction)))
+                                             .c_str());
+                            for (const VariableId operand : operands) {
+                                std::fprintf(stderr, " v%u", operand.value);
+                            }
+                            std::fprintf(stderr, "\n");
+                        }
+                    }
+                }
             }
-
-            ExecutableModel model{
-                .program = builder.finish(),
-                .interface = std::move(interface),
-                .commitBlockBegin = commitBlockBegin,
-                .commitBlockEnd = commitBlockEnd,
-            };
             if (!reportValidation(
                     validate(model, ValidationOptions{.level = ValidationLevel::Semantic}),
                     diagnostics)) {

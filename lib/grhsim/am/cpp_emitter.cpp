@@ -289,19 +289,19 @@ namespace wolvrix::lib::grhsim::am
             // planned write site / detector.
             mutable int32_t arrayWriteAccum = -1;
             mutable int32_t arrayDetectorAccum = -1;
-            // ST00012 commit event batch gating: every state write in a commit
-            // Block is already individually guarded by (cond && (e1 || ...)),
-            // so a Block whose watched event set is entirely quiet performs no
-            // write, no write-site flag, and no useful tail-detector work
-            // (baseline-drift firings from other writer Blocks are redundant
-            // duplicates: activation is idempotent and each writer Block covers
-            // all readers). The emitter therefore wraps the whole Block body
-            // in one batch event check (the legacy commit-batch idiom),
-            // replacing per-statement event loads with one branch per Block on
-            // quiet rounds. Eligibility: every state write carries at least
-            // one event operand and no event operand is produced inside the
-            // Block (an in-block producer would be read before assignment).
-            std::vector<std::optional<std::string>> blockCommitGate;
+            // Commit event gating: every commit Block opens with its
+            // aggregated changed.* gate detectors (one per watched clock-domain
+            // source, or one per latch nextValue), so the emitter evaluates the
+            // deduplicated OR of their results once and wraps the rest of the
+            // Block (all writes plus the tail watch/activation traffic) in a
+            // single batch check. The gate replaces the legacy per-statement
+            // event evaluation entirely.
+            struct CommitGate
+            {
+                std::string expression;
+                uint32_t headCount = 0;
+            };
+            std::vector<CommitGate> blockCommitGate;
             uint64_t commitGateBlockCount = 0;
             // ST00013 scalar write-point detection fusion (P5): a commit Block
             // tail changed.any on a BitVector state target costs one compare
@@ -1448,14 +1448,6 @@ namespace wolvrix::lib::grhsim::am
                     state, operands[1], resultType.bitWidth, resultType.signedness);
                 return std::array<std::string, 2>{lhs, rhs};
             };
-            const auto emitEventfulStateWrite =
-                [&](std::size_t eventBegin, std::string condition, std::string body) {
-                    const std::string eventHit = eventHitExpr(
-                        state, operands,
-                        static_cast<uint32_t>(operands.size() - eventBegin));
-                    return "if (" + condition + " && " + eventHit + ") { " + body +
-                           " }\n";
-                };
 
             if (opcode == Opcode::Assign &&
                 (isWideBitVector(state, results.front()) ||
@@ -1578,29 +1570,24 @@ namespace wolvrix::lib::grhsim::am
             }
 
             if ((opcode == Opcode::RegisterWrite || opcode == Opcode::LatchWrite) &&
-                isWideBitVector(state, operands[3]))
+                isWideBitVector(state, operands[1]))
             {
-                const uint32_t width = variableType(state, operands[3]).bitWidth;
-                const std::string writeArgs =
-                    wideDataExpr(state, operands[3]) + ", " + wideDataExpr(state, operands[2]) +
-                    ", " + wideDataExpr(state, operands[1]) + ", " + std::to_string(width) + ")";
-                std::string body;
+                // Merged nextValue form: operands[0] is the fully blended
+                // next value, operands[1] the state target; the Block gate
+                // already decided that this write runs.
+                const uint32_t width = variableType(state, operands[1]).bitWidth;
                 if (opcode == Opcode::RegisterWrite && state.scalarWriteRaise >= 0)
                 {
-                    // ST00013: the detect variant performs the same masked
-                    // write and reports a real change for the raise flag.
-                    body = "wrChg_" + std::to_string(state.scalarWriteRaise) +
-                           " |= masked_write_words_detect(" + writeArgs + ";";
+                    // ST00013: report a real change for the raise flag.
+                    return "wrChg_" + std::to_string(state.scalarWriteRaise) +
+                           " |= assign_words_detect(" + wideDataExpr(state, operands[1]) +
+                           ", " + std::to_string(width) + ", " +
+                           wideDataExpr(state, operands[0]) + ", " +
+                           std::to_string(width) + ", false);\n";
                 }
-                else
-                {
-                    body = "masked_write_words(" + writeArgs + ";";
-                }
-                if (opcode == Opcode::RegisterWrite)
-                {
-                    return emitEventfulStateWrite(4, boolExpr(state, operands[0]), body);
-                }
-                return "if (" + boolExpr(state, operands[0]) + ") { " + body + " }\n";
+                return "assign_words(" + wideDataExpr(state, operands[1]) + ", " +
+                       std::to_string(width) + ", " + wideDataExpr(state, operands[0]) +
+                       ", " + std::to_string(width) + ", false);\n";
             }
 
             if (opcode == Opcode::ArrayMux || opcode == Opcode::ArrayReduceOr ||
@@ -1829,13 +1816,10 @@ namespace wolvrix::lib::grhsim::am
                 }
                 case Opcode::RegisterWrite:
                 {
-                    const VariableId target = operands[3];
+                    const VariableId target = operands[1];
+                    const uint32_t width = variableType(state, target).bitWidth;
                     const std::string nextValue =
-                        "((" + valueExpr(state, target) + " & ~" +
-                        valueExpr(state, operands[1]) + ") | (" +
-                        valueExpr(state, operands[2]) + " & " + valueExpr(state, operands[1]) +
-                        ")) & " + maskExpr(variableType(state, target).bitWidth);
-                    std::string body;
+                        valueExpr(state, operands[0]) + " & " + maskExpr(width);
                     if (state.scalarWriteRaise >= 0)
                     {
                         // ST00013: compare at the write point and store only
@@ -1843,24 +1827,18 @@ namespace wolvrix::lib::grhsim::am
                         // idiom); the tail detector reads the raise flag.
                         const std::string next =
                             "wrNext_" + std::to_string(instruction.value);
-                        body = "{ const auto " + next + " = " + nextValue + ";\nif (" + next +
+                        return "{ const auto " + next + " = " + nextValue + ";\nif (" + next +
                                " != " + valueExpr(state, target) + ") { " +
                                valueExpr(state, target) + " = " + next + "; wrChg_" +
-                               std::to_string(state.scalarWriteRaise) + " = true; } }";
+                               std::to_string(state.scalarWriteRaise) + " = true; } }\n";
                     }
-                    else
-                    {
-                        body = valueExpr(state, target) + " = " + nextValue + ";";
-                    }
-                    return emitEventfulStateWrite(4, boolExpr(state, operands[0]), body);
+                    return valueExpr(state, target) + " = " + nextValue + ";\n";
                 }
                 case Opcode::LatchWrite:
                 {
-                    const VariableId target = operands[3];
-                    return "if (" + boolExpr(state, operands[0]) + ") { " + valueExpr(state, target) + " = ((" +
-                           valueExpr(state, target) + " & ~" + valueExpr(state, operands[1]) + ") | (" +
-                           valueExpr(state, operands[2]) + " & " + valueExpr(state, operands[1]) + ")) & " +
-                           maskExpr(variableType(state, target).bitWidth) + "; }\n";
+                    const VariableId target = operands[1];
+                    return valueExpr(state, target) + " = " + valueExpr(state, operands[0]) +
+                           " & " + maskExpr(variableType(state, target).bitWidth) + ";\n";
                 }
                 case Opcode::MemoryRead:
                 {
@@ -1927,7 +1905,8 @@ namespace wolvrix::lib::grhsim::am
                     {
                         body = "masked_write_words(" + writeArgs + ";";
                     }
-                    code += emitEventfulStateWrite(5, condition, body) + "}\n";
+                    code += "if (" + condition + ") { " + body + " }\n";
+                    code += "}\n";
                     return code;
                 }
                 case Opcode::MemoryReadAll:
@@ -1962,39 +1941,26 @@ namespace wolvrix::lib::grhsim::am
                     {
                         body = "array_write_scatter(" + scatterArgs + ";";
                     }
-                    const std::string condition =
-                        "any_words(" + wordDataExpr(state, operands[0]) + ", " +
-                        std::to_string(laneMaskType.bitWidth) + ")";
-                    return emitEventfulStateWrite(3, condition, body);
+                    // The lane mask already carries the per-lane write
+                    // enable; skip the scatter entirely when it is empty.
+                    return "if (any_words(" + wordDataExpr(state, operands[0]) + ", " +
+                           std::to_string(laneMaskType.bitWidth) + ")) { " + body + " }\n";
                 }
                 case Opcode::MemoryFill:
                 {
-                    const Type &memoryType = variableType(state, operands[2]);
-                    const Type &dataType = variableType(state, operands[1]);
-                    const uint32_t stride = variableStorage(state, operands[2]).wordCount;
+                    // The data operand is the full packed image with the fill
+                    // condition already folded in by the lowering.
+                    const Type &memoryType = variableType(state, operands[1]);
+                    const Type &dataType = variableType(state, operands[0]);
+                    const uint32_t stride = variableStorage(state, operands[1]).wordCount;
                     const std::string suffix = std::to_string(instruction.value);
                     const std::string element = "memory_element_" + suffix;
                     std::string body = "for (std::size_t " + element + " = 0; " + element +
                                        " < " + std::to_string(memoryType.elementCount) + "; ++" +
                                        element + ") { ";
-                    const std::string target = wordDataExpr(state, operands[2]) + " + " + element +
+                    const std::string target = wordDataExpr(state, operands[1]) + " + " + element +
                                                " * " + std::to_string(stride);
                     std::string elementWrite;
-                    if (dataType.bitWidth == memoryType.bitWidth)
-                    {
-                        elementWrite = "assign_words(" + target + ", " +
-                                       std::to_string(memoryType.bitWidth) + ", " +
-                                       wordDataExpr(state, operands[1]) + ", " +
-                                       std::to_string(dataType.bitWidth) + ", false);";
-                    }
-                    else
-                    {
-                        elementWrite = "slice_words(" + target + ", " +
-                                       std::to_string(memoryType.bitWidth) + ", " +
-                                       wordDataExpr(state, operands[1]) + ", " +
-                                       std::to_string(dataType.bitWidth) + ", " + element +
-                                       " * " + std::to_string(memoryType.bitWidth) + ");";
-                    }
                     if (state.arrayWriteAccum >= 0)
                     {
                         // ST00011: a re-fill of identical values must not
@@ -2002,39 +1968,37 @@ namespace wolvrix::lib::grhsim::am
                         // tracks real per-element change inside the loop.
                         const std::string accum =
                             "arrChg_" + std::to_string(state.arrayWriteAccum);
-                        if (dataType.bitWidth == memoryType.bitWidth)
-                        {
-                            elementWrite =
-                                accum + " |= assign_words_detect(" + target + ", " +
-                                std::to_string(memoryType.bitWidth) + ", " +
-                                wordDataExpr(state, operands[1]) + ", " +
-                                std::to_string(dataType.bitWidth) + ", false);";
-                        }
-                        else
-                        {
-                            elementWrite =
-                                accum + " |= slice_words_detect(" + target + ", " +
-                                std::to_string(memoryType.bitWidth) + ", " +
-                                wordDataExpr(state, operands[1]) + ", " +
-                                std::to_string(dataType.bitWidth) + ", " + element +
-                                " * " + std::to_string(memoryType.bitWidth) + ");";
-                        }
+                        elementWrite =
+                            accum + " |= slice_words_detect(" + target + ", " +
+                            std::to_string(memoryType.bitWidth) + ", " +
+                            wordDataExpr(state, operands[0]) + ", " +
+                            std::to_string(dataType.bitWidth) + ", " + element +
+                            " * " + std::to_string(memoryType.bitWidth) + ");";
+                    }
+                    else
+                    {
+                        elementWrite = "slice_words(" + target + ", " +
+                                       std::to_string(memoryType.bitWidth) + ", " +
+                                       wordDataExpr(state, operands[0]) + ", " +
+                                       std::to_string(dataType.bitWidth) + ", " + element +
+                                       " * " + std::to_string(memoryType.bitWidth) + ");";
                     }
                     body += elementWrite + " }";
-                    return emitEventfulStateWrite(3, boolExpr(state, operands[0]), body);
+                    return body + "\n";
                 }
                 case Opcode::ActForward:
                 case Opcode::ActBackward:
                 {
                     const auto attributes = state.program.activationAttributes(instruction);
                     const bool forward = opcode == Opcode::ActForward;
-                    // Act targets are always compute Blocks, so activation is a
-                    // constant-mask OR into the single active bitmap. A fired
-                    // ActBackward also flags that another round is needed.
-                    // While emitting a scan Block, same-byte forward targets
-                    // owned by the current byte chunk relay into the scan-local
-                    // byteFlags instead (strictly forward, so the bit is still
-                    // pending in this chunk's ascending test sequence).
+                    // Act targets span compute and commit Blocks, so activation
+                    // is a constant-mask OR into the single active bitmap. A
+                    // fired ActBackward also flags that another round is
+                    // needed. While emitting inside a byte-chunk scan,
+                    // same-byte forward targets owned by the current chunk
+                    // relay into the scan-local byteFlags instead (strictly
+                    // forward, so the bit is still pending in this chunk's
+                    // ascending test sequence).
                     std::map<uint32_t, uint64_t> masks;
                     uint8_t relayMask = 0;
                     if (!splitActivationTargets(state, forward, attributes->targets,
@@ -2646,20 +2610,23 @@ namespace wolvrix::lib::grhsim::am
 
         constexpr std::string_view kScanBlockTestEpilogue = "            }\n";
 
-        std::string commitBlockPrologue(std::size_t blockIndex,
-                                        bool runtimeProfile)
+        std::string commitBlockTestPrologue(std::size_t blockIndex,
+                                            bool runtimeProfile)
         {
-            std::string text = "    {\n";
+            // Commit Blocks are activation-filtered exactly like compute
+            // Blocks: the byte-chunk scan above owns the bit snapshot/clear.
+            std::string text =
+                "            if ((byteFlags & " +
+                byteMaskLiteral(static_cast<uint8_t>(1U << (blockIndex % 8U))) +
+                ") != 0) {\n";
             if (runtimeProfile)
             {
-                text += "        if (runtimeProfileEnabled_) { profilePerBlockExecs_[" +
+                text += "                if (runtimeProfileEnabled_) { profilePerBlockExecs_[" +
                         std::to_string(blockIndex) +
                         "] += 1; ++profileCommitBlockExecs_; }\n";
             }
             return text;
         }
-
-        constexpr std::string_view kCommitBlockEpilogue = "    }\n";
 
         bool addByteCount(uint64_t &total, uint64_t increment)
         {
@@ -2829,17 +2796,17 @@ namespace wolvrix::lib::grhsim::am
                                wolvrix::lib::diag::Diagnostics &diagnostics)
         {
             const std::optional<uint64_t> bodyBytes =
-                measureBlockBody(model, state, blockIndex, "        ", diagnostics);
+                measureBlockBody(model, state, blockIndex, "                ", diagnostics);
             if (!bodyBytes)
             {
                 return std::nullopt;
             }
             uint64_t byteCount = static_cast<uint64_t>(
-                commitBlockPrologue(blockIndex, state.runtimeProfile).size());
+                commitBlockTestPrologue(blockIndex, state.runtimeProfile).size());
             const auto &commitGate = state.blockCommitGate[blockIndex];
-            if (commitGate &&
+            if (commitGate.headCount != 0 &&
                 (!addByteCount(byteCount,
-                               static_cast<uint64_t>(12 + commitGate->size() + 4)) ||
+                               static_cast<uint64_t>(12 + commitGate.expression.size() + 4)) ||
                  !addByteCount(byteCount, static_cast<uint64_t>(10))))
             {
                 diagnostics.error("AM C++ emitter source size overflow: block=" +
@@ -2848,7 +2815,7 @@ namespace wolvrix::lib::grhsim::am
                 return std::nullopt;
             }
             if (!addByteCount(byteCount, *bodyBytes) ||
-                !addByteCount(byteCount, kCommitBlockEpilogue.size()))
+                !addByteCount(byteCount, kScanBlockTestEpilogue.size()))
             {
                 diagnostics.error("AM C++ emitter source size overflow: block=" +
                                       std::to_string(blockIndex),
@@ -3457,7 +3424,7 @@ namespace wolvrix::lib::grhsim::am
                     }
                     else if (opcode == Opcode::MemoryFill)
                     {
-                        arrayWrites[operands[2].value].push_back(
+                        arrayWrites[operands[1].value].push_back(
                             static_cast<uint32_t>(position));
                     }
                     else if (opcode == Opcode::MemoryWriteLanes)
@@ -3562,10 +3529,12 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
-        // ST00012: computes the per-Block batch event gate expression for
-        // commit Blocks (see EmitState::blockCommitGate). The gate is the
-        // deduplicated OR of every state write's event operands, reused in
-        // the same boolExpr form the individual writes emit.
+        // Computes the per-Block batch event gate for commit Blocks (see
+        // EmitState::blockCommitGate). The gate is the deduplicated OR of the
+        // Block's leading changed.* gate detectors (the instructions before
+        // the first state write); headCount records where the gated region
+        // begins. Every commit Block carries its detectors by construction,
+        // so the gate always exists when the Block has anything to gate.
         void planCommitEventGates(const ExecutableModel &model, EmitState &state)
         {
             state.blockCommitGate.clear();
@@ -3580,79 +3549,34 @@ namespace wolvrix::lib::grhsim::am
             {
                 const BlockId block{blockIndex};
                 const std::size_t blockSize = model.program.blockSize(block);
-                if (blockSize == 0)
-                {
-                    continue;
-                }
-                std::vector<uint32_t> eventVars;
-                bool anyWrite = false;
-                bool eligible = true;
-                for (std::size_t position = 0; position < blockSize && eligible;
-                     ++position)
+                std::string gate;
+                uint32_t headCount = 0;
+                for (std::size_t position = 0; position < blockSize; ++position)
                 {
                     const InstructionId instruction =
                         model.program.blockInstruction(block, position);
-                    const Opcode opcode = state.program.opcode(instruction);
-                    std::size_t eventBegin = 0;
-                    switch (opcode)
+                    if (!isDetectorChangedOpcode(state.program.opcode(instruction)))
                     {
-                    case Opcode::RegisterWrite: eventBegin = 4; break;
-                    case Opcode::MemoryWrite: eventBegin = 5; break;
-                    case Opcode::MemoryFill: eventBegin = 3; break;
-                    case Opcode::MemoryWriteLanes: eventBegin = 3; break;
-                    case Opcode::LatchWrite:
-                        // Latch writes are event-less (guard-only), so the
-                        // Block can never be event-gated as a whole.
-                        eligible = false;
-                        continue;
-                    default: continue;
-                    }
-                    anyWrite = true;
-                    const auto operands = state.program.operands(instruction);
-                    if (operands.size() <= eventBegin)
-                    {
-                        // A state write without any event operand executes on
-                        // its guard alone; the Block cannot be gated.
-                        eligible = false;
                         break;
                     }
-                    for (std::size_t index = eventBegin; index < operands.size();
-                         ++index)
+                    const auto results = state.program.results(instruction);
+                    if (results.size() != 1)
                     {
-                        eventVars.push_back(operands[index].value);
-                    }
-                }
-                if (!eligible || !anyWrite)
-                {
-                    continue;
-                }
-                std::sort(eventVars.begin(), eventVars.end());
-                eventVars.erase(std::unique(eventVars.begin(), eventVars.end()),
-                                eventVars.end());
-                for (const uint32_t variable : eventVars)
-                {
-                    if (state.variableDefBlock[variable] == blockIndex)
-                    {
-                        // An in-block event producer would be read before
-                        // assignment by a Block-level gate.
-                        eligible = false;
                         break;
                     }
-                }
-                if (!eligible)
-                {
-                    continue;
-                }
-                std::string gate;
-                for (const uint32_t variable : eventVars)
-                {
                     if (!gate.empty())
                     {
                         gate += " || ";
                     }
-                    gate += boolExpr(state, VariableId{variable});
+                    gate += boolExpr(state, results.front());
+                    ++headCount;
                 }
-                state.blockCommitGate[blockIndex] = std::move(gate);
+                if (headCount == 0 || headCount >= blockSize)
+                {
+                    continue;
+                }
+                state.blockCommitGate[blockIndex] =
+                    EmitState::CommitGate{std::move(gate), headCount};
                 ++state.commitGateBlockCount;
             }
         }
@@ -3696,12 +3620,12 @@ namespace wolvrix::lib::grhsim::am
                     const auto operands = state.program.operands(instruction);
                     if (opcode == Opcode::RegisterWrite)
                     {
-                        registerWrites[operands[3].value].push_back(
+                        registerWrites[operands[1].value].push_back(
                             static_cast<uint32_t>(position));
                     }
                     else if (opcode == Opcode::LatchWrite)
                     {
-                        latchTargets.insert(operands[3].value);
+                        latchTargets.insert(operands[1].value);
                     }
                     for (const VariableId operand : operands)
                     {
@@ -5853,7 +5777,10 @@ namespace
                 << "    roundCounter_ = 0;\n"
                 << "    execute_block_0();\n"
                 << "    if (initial) {\n"
-                << "        for (std::size_t block = 1; block < kComputeBlockEnd; ++block) {\n"
+                << "        // First eval activates every Block: compute Blocks settle the\n"
+                << "        // comb cloud and commit Blocks sync every gate-detector baseline\n"
+                << "        // and evaluate every state write once.\n"
+                << "        for (std::size_t block = 1; block < kBlockCount; ++block) {\n"
                 << "            activeWords_[block / 64U] |= UINT64_C(1) << (block % 64U);\n"
                 << "        }\n"
                 << "    }\n"
@@ -5890,7 +5817,8 @@ namespace
                         ? "        const auto profileCommitStart = runtimeProfileEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};\n"
                         : "");
         // Commit phase: one static call per source part covering commit
-        // Blocks, in ascending (source, part) order; commit Blocks always run.
+        // Blocks, in ascending (source, part) order; each part scans its
+        // activity byte chunks exactly like the compute phase.
         for (const std::vector<BlockSourcePart> &sourceParts : *blockSourcePlan)
         {
             for (const BlockSourcePart &part : sourceParts)
@@ -5917,8 +5845,54 @@ namespace
                 << "        if (roundCounter_ > UINT64_C(1000000)) throw std::runtime_error(\"AM eval did not converge\");\n"
                 << "        if (!backwardFired_) break;\n"
                 << "    }\n"
-                << "    if (initial) firstEval_ = false;\n"
-                << (state.runtimeProfile
+                << "    if (initial) firstEval_ = false;\n";
+        // Debug change-trace (WOLVRIX_GRHSIM_AM_TRACE selects labeled variables
+        // by substring at emit time; WOLVRIX_GRHSIM_AM_TRACE_RUN gates printing
+        // at runtime). Prints each traced variable's value when it changes.
+        if (const char *traceSpec = std::getenv("WOLVRIX_GRHSIM_AM_TRACE")) {
+            std::vector<std::string> needles;
+            std::string spec(traceSpec);
+            std::size_t begin = 0;
+            while (begin <= spec.size()) {
+                const std::size_t comma = spec.find(',', begin);
+                needles.push_back(comma == std::string::npos
+                                      ? spec.substr(begin)
+                                      : spec.substr(begin, comma - begin));
+                if (comma == std::string::npos) {
+                    break;
+                }
+                begin = comma + 1;
+            }
+            const ProgramView traceView = model.program.view();
+            runtime << "    if (std::getenv(\"WOLVRIX_GRHSIM_AM_TRACE_RUN\") != nullptr) {\n"
+                    << "        static std::uint64_t traceEval = 0; ++traceEval;\n";
+            for (const VariableLabel &label : traceView.variableLabels()) {
+                const std::string_view name = traceView.string(label.label);
+                bool matches = false;
+                for (const std::string &needle : needles) {
+                    if (!needle.empty() && name.find(needle) != std::string_view::npos) {
+                        matches = true;
+                        break;
+                    }
+                }
+                if (!matches) {
+                    continue;
+                }
+                const Type &type = traceView.type(traceView.variable(label.variable).type);
+                if (type.kind != TypeKind::BitVector || type.bitWidth > 64) {
+                    continue;
+                }
+                const std::string field = "v" + std::to_string(label.variable.value);
+                runtime << "        { static std::uint64_t shadow = ~UINT64_C(0);"
+                        << " if (" << field << " != shadow) {"
+                        << " std::fprintf(stderr, \"[tr] ev=%llu " << name << " %llu->%llu\\n\","
+                        << " (unsigned long long)traceEval, (unsigned long long)shadow,"
+                        << " (unsigned long long)" << field << "); shadow = " << field
+                        << "; } }\n";
+            }
+            runtime << "    }\n";
+        }
+        runtime << (state.runtimeProfile
                         ? "    if (runtimeProfileEnabled_) {\n"
                           "        profileRounds_ += roundCounter_;\n"
                           "        profileEvalNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - profileEvalStart).count());\n"
@@ -6132,7 +6106,8 @@ namespace
                 }
 
                 const auto writeBlockBody = [&](std::size_t blockIndex,
-                                                std::string_view indentation) {
+                                                std::string_view indentation,
+                                                const EmitState::CommitGate *gate = nullptr) {
                     beginLocalityBlock(state, static_cast<uint32_t>(blockIndex));
                     writeIndentedLines(blockSource,
                                        localValueDeclarations(state),
@@ -6148,14 +6123,25 @@ namespace
                                        scalarWatchDeclarations(scalarPlan),
                                        indentation);
                     const BlockId block{static_cast<uint32_t>(blockIndex)};
+                    const std::size_t blockSize = model.program.blockSize(block);
+                    const std::string gatedIndentation =
+                        std::string(indentation) + "    ";
                     const EmitState::DetectorGroupPlan *detectorPlan =
                         detectorPlanFor(state, blockIndex);
                     std::vector<uint8_t> detectorGroupDeclared(
                         detectorPlan != nullptr ? detectorPlan->groups.size() : 0, 0);
                     for (std::size_t index = 0;
-                         index < model.program.blockSize(block);
+                         index < blockSize;
                          ++index)
                     {
+                        if (gate != nullptr && index == gate->headCount)
+                        {
+                            // The Block's single merged event gate: everything
+                            // from here on (writes and tail watch traffic)
+                            // runs only when a gate detector fired.
+                            blockSource << indentation << "if (" << gate->expression
+                                        << ") {\n";
+                        }
                         const InstructionId instruction =
                             model.program.blockInstruction(block, index);
                         std::string error;
@@ -6172,7 +6158,14 @@ namespace
                                               std::string(kContext));
                             return false;
                         }
-                        writeIndentedLines(blockSource, *code, indentation);
+                        writeIndentedLines(blockSource, *code,
+                                           gate != nullptr && index >= gate->headCount
+                                               ? gatedIndentation
+                                               : indentation);
+                    }
+                    if (gate != nullptr && gate->headCount < blockSize)
+                    {
+                        blockSource << indentation << "}\n";
                     }
                     endLocalityBlock(state);
                     return true;
@@ -6264,27 +6257,43 @@ namespace
                     blockSource << commitSourcePrologue(className,
                                                         part.sourceIndex,
                                                         part.partIndex);
-                    for (std::size_t blockIndex = commitLo;
-                         blockIndex < commitHi;
-                         ++blockIndex)
+                    // Commit phase: the same byte-chunk activation scan as the
+                    // compute phase, over the commit Block range. A commit
+                    // Block runs only when a watched event source activated
+                    // it; same-byte forward activations relay through
+                    // byteFlags exactly like the compute scan.
+                    for (const ScanByteChunk &chunk :
+                         scanByteChunks(commitLo, commitHi))
                     {
-                        blockSource << commitBlockPrologue(blockIndex,
-                                                           state.runtimeProfile);
-                        const auto &commitGate = state.blockCommitGate[blockIndex];
-                        if (commitGate)
+                        blockSource << scanByteChunkPrologue(chunk.byteIndex,
+                                                             chunk.ownedMask);
+                        state.scanRelayByte =
+                            static_cast<int32_t>(chunk.byteIndex);
+                        state.scanRelayMask = chunk.ownedMask;
+                        for (std::size_t blockIndex = chunk.firstBlock;
+                             blockIndex < chunk.endBlock;
+                             ++blockIndex)
                         {
-                            blockSource << "        if (" << *commitGate << ") {\n";
+                            blockSource << commitBlockTestPrologue(
+                                blockIndex, state.runtimeProfile);
+                            const EmitState::CommitGate &commitGate =
+                                state.blockCommitGate[blockIndex];
+                            const EmitState::CommitGate *gate =
+                                commitGate.headCount != 0 ? &commitGate : nullptr;
+                            if (!writeBlockBody(blockIndex, "                ", gate))
+                            {
+                                blocksGenerated = false;
+                                break;
+                            }
+                            blockSource << kScanBlockTestEpilogue;
                         }
-                        if (!writeBlockBody(blockIndex, "        "))
+                        state.scanRelayByte = -1;
+                        state.scanRelayMask = 0;
+                        if (!blocksGenerated)
                         {
-                            blocksGenerated = false;
                             break;
                         }
-                        if (commitGate)
-                        {
-                            blockSource << "        }\n";
-                        }
-                        blockSource << kCommitBlockEpilogue;
+                        blockSource << kScanByteChunkEpilogue;
                     }
                     if (!blocksGenerated)
                     {
