@@ -1,5 +1,5 @@
-#include "grhsim/am/builder.hpp"
-#include "grhsim/am/interpreter.hpp"
+#include "grhsim/am/grhsim_am_program.hpp"
+#include "grhsim/am/grhsim_am_program_interpreter.hpp"
 
 #include <array>
 #include <cstdint>

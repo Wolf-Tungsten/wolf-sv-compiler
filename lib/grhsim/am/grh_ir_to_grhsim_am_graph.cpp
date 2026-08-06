@@ -1,7 +1,7 @@
-#include "grhsim/am/lowering.hpp"
+#include "grhsim/am/grh_ir_to_grhsim_am_graph.hpp"
 
-#include "grhsim/am/builder.hpp"
-#include "grhsim/am/opcode_traits.hpp"
+#include "grhsim/am/grhsim_am_program.hpp"
+#include "grhsim/am/grhsim_am_opcode_traits.hpp"
 
 #include "slang/numeric/SVInt.h"
 
@@ -150,12 +150,12 @@ namespace wolvrix::lib::grhsim::am
         public:
             LoweringContext(const Graph &graph,
                             diag::Diagnostics &diagnostics,
-                            const GrhToAmLoweringOptions &options)
+                            const GrhIRToGrhSimAMGraphLoweringOptions &options)
                 : graph_(graph), diagnostics_(diagnostics), options_(options)
             {
             }
 
-            std::optional<LinearProgramArtifact> run()
+            std::optional<AmGraph> run()
             {
                 try
                 {
@@ -179,7 +179,7 @@ namespace wolvrix::lib::grhsim::am
                     }
                     materializeStateWrites();
 
-                    std::sort(orderedEffects_.begin(), orderedEffects_.end(),
+                    std::sort(amGraph_.orderedEffects().begin(), amGraph_.orderedEffects().end(),
                               [](const OrderedEffect &lhs, const OrderedEffect &rhs) {
                                   if (lhs.group != rhs.group)
                                   {
@@ -187,18 +187,12 @@ namespace wolvrix::lib::grhsim::am
                                   }
                                   return lhs.ordinal < rhs.ordinal;
                               });
+                    amGraph_.mutableInterface() = std::move(interface_);
 
-                    LinearProgramArtifact artifact{
-                        .program = builder_.finish(),
-                        .interface = std::move(interface_),
-                        .schedulingFacts = SchedulingFacts{
-                            .variableRoles = std::move(variableRoles_),
-                            .instructionEffects = std::move(instructionEffects_),
-                            .orderedEffects = std::move(orderedEffects_),
-                        },
-                    };
+                    // The graph is the lowering product itself: it was built
+                    // natively, no linear intermediate ever existed.
                     const ValidationResult validation =
-                        validate(artifact, ValidationOptions{.level = ValidationLevel::Semantic,
+                        validate(amGraph_, ValidationOptions{.level = ValidationLevel::Semantic,
                                                              .maxErrors = 64});
                     if (!validation.success())
                     {
@@ -215,7 +209,7 @@ namespace wolvrix::lib::grhsim::am
                                 std::to_string(flattenedUnknownLiterals_),
                             "grhsim-am-lowering");
                     }
-                    return artifact;
+                    return std::optional<AmGraph>(std::move(amGraph_));
                 }
                 catch (const std::exception &ex)
                 {
@@ -594,7 +588,7 @@ namespace wolvrix::lib::grhsim::am
                 reserve.dpiCallAttributes = instructionCount / 128;
                 reserve.dpiImports = 64;
                 reserve.dpiParameters = 512;
-                builder_.reserve(reserve);
+                amGraph_.reserve(reserve);
             }
 
             Type typeForValue(ValueId value)
@@ -621,7 +615,7 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return found->second;
                 }
-                const TypeId id = builder_.addType(type);
+                const TypeId id = amGraph_.addType(type);
                 typeIds_.emplace(type, id);
                 return id;
             }
@@ -633,22 +627,41 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return found->second;
                 }
-                const StringId id = builder_.addString(text);
+                const StringId id = amGraph_.addString(text);
                 stringIds_.emplace(std::string(text), id);
                 return id;
+            }
+
+            AmValueFacts valueFactsFor(TypeId type, InitId init, VariableRole role)
+            {
+                AmValueFacts facts;
+                facts.roles = role;
+                if (hasRole(role, VariableRole::State))
+                {
+                    facts.kind = AmValueKind::State;
+                    if (amGraph_.program().type(type).kind == TypeKind::Array)
+                    {
+                        facts.stateKind = AmStateKind::Memory;
+                    }
+                }
+                else if (hasRole(role, VariableRole::ExternalInput))
+                {
+                    facts.kind = AmValueKind::Input;
+                }
+                else if (init.valid() &&
+                         amGraph_.program().init(init).kind == InitKind::Constant)
+                {
+                    facts.kind = AmValueKind::Constant;
+                }
+                return facts;
             }
 
             VariableId addVariable(TypeId type, InitId init,
                                    std::optional<StringId> label = std::nullopt,
                                    VariableRole role = VariableRole::None)
             {
-                const VariableId id = builder_.addVariable(type, init, label);
-                if (id.value != variableRoles_.size())
-                {
-                    throw std::logic_error("AM lowering variable role table lost dense alignment");
-                }
-                variableRoles_.push_back(role);
-                return id;
+                return amGraph_.addVariable(type, init, label,
+                                            valueFactsFor(type, init, role));
             }
 
             VariableId addVariable(const Type &type, InitId init,
@@ -660,11 +673,22 @@ namespace wolvrix::lib::grhsim::am
 
             void addRole(VariableId variable, VariableRole role)
             {
-                if (!variable.valid() || variable.value >= variableRoles_.size())
+                if (!variable.valid() || variable.value >= amGraph_.variableCount())
                 {
                     throw std::logic_error("invalid AM variable role update");
                 }
-                variableRoles_[variable.value] = variableRoles_[variable.value] | role;
+                AmValueFacts facts = amGraph_.valueFacts(variable);
+                facts.roles = facts.roles | role;
+                if (hasRole(facts.roles, VariableRole::State))
+                {
+                    facts.kind = AmValueKind::State;
+                }
+                else if (hasRole(facts.roles, VariableRole::ExternalInput) &&
+                         facts.kind != AmValueKind::State)
+                {
+                    facts.kind = AmValueKind::Input;
+                }
+                amGraph_.setValueFacts(variable, facts);
             }
 
             InstructionId addInstruction(Opcode opcode,
@@ -672,37 +696,10 @@ namespace wolvrix::lib::grhsim::am
                                          std::span<const VariableId> operands,
                                          std::optional<InstructionEffect> effect = std::nullopt)
             {
-                const InstructionId id = builder_.addInstruction(opcode, results, operands);
-                if (id.value != instructionEffects_.size())
-                {
-                    throw std::logic_error("AM lowering effect table lost dense alignment");
-                }
+                const InstructionId id = amGraph_.addInstruction(opcode, results, operands);
                 if (effect)
                 {
-                    instructionEffects_.push_back(*effect);
-                }
-                else
-                {
-                    switch (opcodeTraits(opcode).effect)
-                    {
-                    case OpcodeEffect::Pure:
-                        instructionEffects_.push_back(InstructionEffect::Pure);
-                        break;
-                    case OpcodeEffect::ChangeDetector:
-                    case OpcodeEffect::StateReadWrite:
-                        instructionEffects_.push_back(InstructionEffect::StateReadWrite);
-                        break;
-                    case OpcodeEffect::StateRead:
-                        instructionEffects_.push_back(InstructionEffect::StateRead);
-                        break;
-                    case OpcodeEffect::HostRead:
-                        instructionEffects_.push_back(InstructionEffect::HostRead);
-                        break;
-                    case OpcodeEffect::HostEffect:
-                    case OpcodeEffect::Activation:
-                        instructionEffects_.push_back(InstructionEffect::HostEffect);
-                        break;
-                    }
+                    amGraph_.setInstructionEffect(id, *effect);
                 }
                 return id;
             }
@@ -818,7 +815,7 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return std::nullopt;
                 }
-                const LiteralId literal = builder_.addBitLiteral(scalarType, *words);
+                const LiteralId literal = amGraph_.addBitLiteral(scalarType, *words);
                 return InitExpr{.kind = InitExprKind::Literal, .literal = literal};
             }
 
@@ -841,7 +838,7 @@ namespace wolvrix::lib::grhsim::am
                     {
                         return std::nullopt;
                     }
-                    literalId = builder_.addBitLiteral(typeId, *words);
+                    literalId = amGraph_.addBitLiteral(typeId, *words);
                 }
                 else if (type.kind == TypeKind::Real)
                 {
@@ -855,7 +852,7 @@ namespace wolvrix::lib::grhsim::am
                             throw std::invalid_argument("trailing characters");
                         }
                         const uint64_t bits = std::bit_cast<uint64_t>(value);
-                        literalId = builder_.addBitLiteral(typeId,
+                        literalId = amGraph_.addBitLiteral(typeId,
                                                           std::span<const uint64_t>(&bits, 1));
                     }
                     catch (const std::exception &ex)
@@ -868,14 +865,14 @@ namespace wolvrix::lib::grhsim::am
                 }
                 else if (type.kind == TypeKind::String)
                 {
-                    literalId = builder_.addStringLiteral(typeId, *literal);
+                    literalId = amGraph_.addStringLiteral(typeId, *literal);
                 }
                 else
                 {
                     error("GRH constant cannot have Array type", opContext(op));
                     return std::nullopt;
                 }
-                return builder_.addConstantInit(literalId);
+                return amGraph_.addConstantInit(literalId);
             }
 
             std::optional<InitId> arrayLaneConstInit(const Operation &op, ValueId result,
@@ -933,8 +930,8 @@ namespace wolvrix::lib::grhsim::am
                         }
                     }
                 }
-                const LiteralId literalId = builder_.addBitLiteral(typeId, words);
-                return builder_.addConstantInit(literalId);
+                const LiteralId literalId = amGraph_.addBitLiteral(typeId, words);
+                return amGraph_.addConstantInit(literalId);
             }
 
             std::optional<InitId> registerInit(const Operation &op, TypeId type,
@@ -943,7 +940,7 @@ namespace wolvrix::lib::grhsim::am
                 const auto value = optionalAttr<std::string>(op, "initValue");
                 if (!value)
                 {
-                    return builder_.undefInit();
+                    return amGraph_.undefInit();
                 }
                 const auto expression = makeInitExpr(*value, type, width, isSigned,
                                                      opContext(op));
@@ -955,7 +952,7 @@ namespace wolvrix::lib::grhsim::am
                     .kind = InitActionKind::Set,
                     .expression = *expression,
                 };
-                return builder_.addActionsInit(std::span<const InitAction>(&action, 1));
+                return amGraph_.addActionsInit(std::span<const InitAction>(&action, 1));
             }
 
             std::optional<InitId> memoryInit(const Operation &op, TypeId elementType,
@@ -970,7 +967,7 @@ namespace wolvrix::lib::grhsim::am
                 const bool any = kinds || files || values || starts || lengths;
                 if (!any || (kinds && kinds->empty()))
                 {
-                    return builder_.undefInit();
+                    return amGraph_.undefInit();
                 }
                 if (!kinds || !files || !starts || !lengths ||
                     files->size() != kinds->size() || starts->size() != kinds->size() ||
@@ -1059,7 +1056,7 @@ namespace wolvrix::lib::grhsim::am
                         .count = fillCount,
                     });
                 }
-                return builder_.addActionsInit(actions);
+                return amGraph_.addActionsInit(actions);
             }
 
             void createStateVariables()
@@ -1116,7 +1113,7 @@ namespace wolvrix::lib::grhsim::am
                         const TypeId typeId = internType(type);
                         init = op.kind() == OperationKind::kRegister
                                    ? registerInit(op, typeId, width, *signedAttr)
-                                   : std::optional<InitId>(builder_.undefInit());
+                                   : std::optional<InitId>(amGraph_.undefInit());
                     }
                     if (!init)
                     {
@@ -1321,7 +1318,7 @@ namespace wolvrix::lib::grhsim::am
                     }
                     const StringId symbolId = internString(symbol);
                     const DpiImportId importId =
-                        builder_.addDpiImport(symbolId, parameters, returnValue);
+                        amGraph_.addDpiImport(symbolId, parameters, returnValue);
                     dpiImportByOperation_[operation.index] = DpiImportInfo{
                         .valid = true,
                         .symbol = symbol,
@@ -1376,8 +1373,8 @@ namespace wolvrix::lib::grhsim::am
                             continue;
                         }
                         const Type expected = typeForValue(value);
-                        const Type actual = builder_.view().type(
-                            builder_.view().variable(*target).type);
+                        const Type actual = amGraph_.program().type(
+                            amGraph_.program().variable(*target).type);
                         if (expected != actual)
                         {
                             error("state read result Type does not match its declaration",
@@ -1390,7 +1387,7 @@ namespace wolvrix::lib::grhsim::am
 
                     const Type type = typeForValue(value);
                     const TypeId typeId = internType(type);
-                    InitId init = builder_.zeroInit();
+                    InitId init = amGraph_.zeroInit();
                     if (definition.valid() &&
                         graph_.opKind(definition) == OperationKind::kConstant)
                     {
@@ -1462,8 +1459,8 @@ namespace wolvrix::lib::grhsim::am
                     return found->second;
                 }
 
-                const TypeId type = builder_.view().variable(source).type;
-                const VariableId snapshot = addVariable(type, builder_.undefInit());
+                const TypeId type = amGraph_.program().variable(source).type;
+                const VariableId snapshot = addVariable(type, amGraph_.undefInit());
                 preCommitSnapshots_.emplace(source.value, snapshot);
                 const std::array<VariableId, 1> results{snapshot};
                 const std::array<VariableId, 1> operands{source};
@@ -1598,7 +1595,7 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return VariableId::invalid();
                 }
-                const VariableId converted = addVariable(targetType, builder_.zeroInit());
+                const VariableId converted = addVariable(targetType, amGraph_.zeroInit());
                 const std::array<VariableId, 1> results{converted};
                 const std::array<VariableId, 1> operands{source};
                 addInstruction(Opcode::Assign, results, operands);
@@ -1621,9 +1618,9 @@ namespace wolvrix::lib::grhsim::am
                 const std::size_t wordCount =
                     (static_cast<std::size_t>(type.bitWidth) + 63) / 64;
                 const std::vector<uint64_t> words(wordCount, 0);
-                const LiteralId literal = builder_.addBitLiteral(typeId, words);
+                const LiteralId literal = amGraph_.addBitLiteral(typeId, words);
                 const VariableId variable =
-                    addVariable(typeId, builder_.addConstantInit(literal));
+                    addVariable(typeId, amGraph_.addConstantInit(literal));
                 zeroConstants_.emplace(type, variable);
                 return variable;
             }
@@ -1646,7 +1643,7 @@ namespace wolvrix::lib::grhsim::am
                 }
                 const VariableId zero = zeroConstant(sourceType);
                 const VariableId condition =
-                    addVariable(Type::bitVector(1), builder_.zeroInit());
+                    addVariable(Type::bitVector(1), amGraph_.zeroInit());
                 const std::array<VariableId, 1> results{condition};
                 const std::array<VariableId, 2> operands{source, zero};
                 addInstruction(Opcode::Ne, results, operands);
@@ -2047,7 +2044,7 @@ namespace wolvrix::lib::grhsim::am
                 VariableId nativeDestination = destination;
                 if (*nativeType != resultType)
                 {
-                    nativeDestination = addVariable(*nativeType, builder_.zeroInit());
+                    nativeDestination = addVariable(*nativeType, amGraph_.zeroInit());
                     ++freshTemporaryCount_;
                 }
                 const std::array<VariableId, 1> loweredResults{nativeDestination};
@@ -2055,7 +2052,7 @@ namespace wolvrix::lib::grhsim::am
                     addInstruction(opcode, loweredResults, loweredOperands);
                 if (opcode == Opcode::SliceStatic)
                 {
-                    builder_.setSliceStaticAttributes(instruction, sliceLsb);
+                    amGraph_.setSliceStaticAttributes(instruction, sliceLsb);
                 }
                 if (nativeDestination != destination)
                 {
@@ -2117,8 +2114,8 @@ namespace wolvrix::lib::grhsim::am
                         continue;
                     }
                     const Type rawType = typeForValue(raw);
-                    const VariableId old = addVariable(rawType, builder_.undefInit());
-                    const VariableId event = addVariable(eventType, builder_.zeroInit());
+                    const VariableId old = addVariable(rawType, amGraph_.undefInit());
+                    const VariableId event = addVariable(eventType, amGraph_.zeroInit());
                     const std::array<VariableId, 1> results{event};
                     const std::array<VariableId, 2> eventOperands{rawVariable, old};
                     addInstruction(opcode, results, eventOperands);
@@ -2249,14 +2246,14 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return ConstClass::Dynamic;
                 }
-                const VariableRecord &record = builder_.view().variable(variable);
-                const InitDescriptor &init = builder_.view().init(record.init);
+                const VariableRecord &record = amGraph_.program().variable(variable);
+                const InitDescriptor &init = amGraph_.program().init(record.init);
                 if (init.kind != InitKind::Constant)
                 {
                     return ConstClass::Dynamic;
                 }
-                const LiteralView literal = builder_.view().literal(LiteralId{init.payload});
-                const Type &literalType = builder_.view().type(literal.type);
+                const LiteralView literal = amGraph_.program().literal(LiteralId{init.payload});
+                const Type &literalType = amGraph_.program().type(literal.type);
                 if (literalType.kind != TypeKind::BitVector)
                 {
                     return ConstClass::Dynamic;
@@ -2290,7 +2287,7 @@ namespace wolvrix::lib::grhsim::am
             VariableId addPureTyped(Opcode opcode, const Type &type,
                                     std::span<const VariableId> operands)
             {
-                const VariableId result = addVariable(type, builder_.undefInit());
+                const VariableId result = addVariable(type, amGraph_.undefInit());
                 const std::array<VariableId, 1> results{result};
                 addInstruction(opcode, results, operands);
                 return result;
@@ -2337,11 +2334,47 @@ namespace wolvrix::lib::grhsim::am
             void recordWriteEffect(InstructionId instruction, uint32_t group,
                                    uint32_t &ordinal)
             {
-                orderedEffects_.push_back(OrderedEffect{
+                amGraph_.orderedEffects().push_back(OrderedEffect{
                     .instruction = instruction,
                     .group = group,
                     .ordinal = ordinal++,
                 });
+                // Refine the write target's state kind from the write opcode,
+                // mirroring the AmGraph::fromLinearProgram derivation so
+                // native construction and ingestion agree exactly.
+                const ProgramView program = amGraph_.program();
+                const Opcode opcode = program.opcode(instruction);
+                const OpcodeTraits traits = opcodeTraits(opcode);
+                if (traits.stateTargetOperand == OpcodeTraits::kNoTargetOperand)
+                {
+                    return;
+                }
+                const auto operands = program.operands(instruction);
+                if (traits.stateTargetOperand >= operands.size())
+                {
+                    return;
+                }
+                const VariableId target = operands[traits.stateTargetOperand];
+                if (!target.valid() || target.value >= amGraph_.variableCount())
+                {
+                    return;
+                }
+                AmValueFacts facts = amGraph_.valueFacts(target);
+                switch (opcode)
+                {
+                case Opcode::LatchWrite:
+                    facts.stateKind = AmStateKind::Latch;
+                    break;
+                case Opcode::MemoryWrite:
+                case Opcode::MemoryFill:
+                case Opcode::MemoryWriteLanes:
+                    facts.stateKind = AmStateKind::Memory;
+                    break;
+                default:
+                    facts.stateKind = AmStateKind::Register;
+                    break;
+                }
+                amGraph_.setValueFacts(target, facts);
             }
 
             // Registers/latches: fold the whole chain into a single write
@@ -2358,8 +2391,8 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return found->second;
                 }
-                const TypeId type = builder_.view().variable(target).type;
-                const VariableId snapshot = addVariable(type, builder_.undefInit());
+                const TypeId type = amGraph_.program().variable(target).type;
+                const VariableId snapshot = addVariable(type, amGraph_.undefInit());
                 targetSnapshots_.emplace(target.value, snapshot);
                 const std::array<VariableId, 1> results{snapshot};
                 const std::array<VariableId, 1> operands{target};
@@ -2373,7 +2406,7 @@ namespace wolvrix::lib::grhsim::am
             {
                 const PendingStateWrite &head = signatureGroup.front();
                 const Type targetType =
-                    builder_.view().type(builder_.view().variable(head.target).type);
+                    amGraph_.program().type(amGraph_.program().variable(head.target).type);
                 VariableId acc = targetSnapshot(head.target);
                 const VariableId accStart = acc;
                 for (const PendingStateWrite &write : signatureGroup)
@@ -2434,11 +2467,11 @@ namespace wolvrix::lib::grhsim::am
 
             const Type *variableTypeOf(VariableId variable) const
             {
-                if (!variable.valid() || variable.value >= builder_.view().variableCount())
+                if (!variable.valid() || variable.value >= amGraph_.program().variableCount())
                 {
                     return nullptr;
                 }
-                return &builder_.view().type(builder_.view().variable(variable).type);
+                return &amGraph_.program().type(amGraph_.program().variable(variable).type);
             }
 
             void emitSignatureWrites(
@@ -2468,7 +2501,7 @@ namespace wolvrix::lib::grhsim::am
                 }
 
                 const Type targetType =
-                    builder_.view().type(builder_.view().variable(head.target).type);
+                    amGraph_.program().type(amGraph_.program().variable(head.target).type);
                 const Type elementType =
                     Type::bitVector(targetType.bitWidth, targetType.signedness);
                 for (const PendingStateWrite &write : signatureGroup)
@@ -2515,7 +2548,7 @@ namespace wolvrix::lib::grhsim::am
                     if (!isConstantOne(write.cond))
                     {
                         const std::array<VariableId, 1> readAllResults{
-                            addVariable(packedType, builder_.undefInit())};
+                            addVariable(packedType, amGraph_.undefInit())};
                         const std::array<VariableId, 1> readAllOperands{head.target};
                         addInstruction(Opcode::MemoryReadAll, readAllResults,
                                        readAllOperands);
@@ -2539,7 +2572,7 @@ namespace wolvrix::lib::grhsim::am
                         : std::nullopt;
                 if (explicitOrder)
                 {
-                    orderedEffects_.push_back(OrderedEffect{
+                    amGraph_.orderedEffects().push_back(OrderedEffect{
                         .instruction = instruction,
                         .group = explicitOrder->group,
                         .ordinal = explicitOrder->ordinal,
@@ -2560,8 +2593,8 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return;
                 }
-                const Type targetType = builder_.view().type(
-                    builder_.view().variable(*target).type);
+                const Type targetType = amGraph_.program().type(
+                    amGraph_.program().variable(*target).type);
                 if (!requireLogic(op.operands()[1], op, targetType.bitWidth) ||
                     !requireLogic(op.operands()[2], op, targetType.bitWidth))
                 {
@@ -2625,8 +2658,8 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return;
                 }
-                const Type targetType = builder_.view().type(
-                    builder_.view().variable(*target).type);
+                const Type targetType = amGraph_.program().type(
+                    amGraph_.program().variable(*target).type);
                 if (!requireLogic(op.operands()[1], op, targetType.bitWidth) ||
                     !requireLogic(op.operands()[2], op, targetType.bitWidth))
                 {
@@ -2681,8 +2714,8 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return;
                 }
-                const Type targetType = builder_.view().type(
-                    builder_.view().variable(*target).type);
+                const Type targetType = amGraph_.program().type(
+                    amGraph_.program().variable(*target).type);
                 const Type resultType = typeForValue(op.results()[0]);
                 const Type elementType = Type::bitVector(targetType.bitWidth,
                                                          targetType.signedness);
@@ -2716,8 +2749,8 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return;
                 }
-                const Type targetType = builder_.view().type(
-                    builder_.view().variable(*target).type);
+                const Type targetType = amGraph_.program().type(
+                    amGraph_.program().variable(*target).type);
                 const Type elementType = Type::bitVector(targetType.bitWidth,
                                                          targetType.signedness);
                 if (!requireLogic(op.operands()[2], op, targetType.bitWidth) ||
@@ -2786,8 +2819,8 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return;
                 }
-                const Type targetType = builder_.view().type(
-                    builder_.view().variable(*target).type);
+                const Type targetType = amGraph_.program().type(
+                    amGraph_.program().variable(*target).type);
                 const Type resultType = typeForValue(op.results()[0]);
                 const uint64_t packedWidth =
                     static_cast<uint64_t>(targetType.elementCount) * targetType.bitWidth;
@@ -2821,8 +2854,8 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return;
                 }
-                const Type targetType = builder_.view().type(
-                    builder_.view().variable(*target).type);
+                const Type targetType = amGraph_.program().type(
+                    amGraph_.program().variable(*target).type);
                 const uint64_t packedWidth =
                     static_cast<uint64_t>(targetType.elementCount) * targetType.bitWidth;
                 if (packedWidth > std::numeric_limits<uint32_t>::max() ||
@@ -2880,8 +2913,8 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return;
                 }
-                const Type targetType = builder_.view().type(
-                    builder_.view().variable(*target).type);
+                const Type targetType = amGraph_.program().type(
+                    amGraph_.program().variable(*target).type);
                 const uint64_t packedWidth =
                     static_cast<uint64_t>(targetType.bitWidth) * targetType.elementCount;
                 const uint32_t dataWidth =
@@ -2978,7 +3011,7 @@ namespace wolvrix::lib::grhsim::am
                     Opcode::SystemFunction, results, operands,
                     hasSideEffects ? InstructionEffect::HostEffect
                                    : InstructionEffect::HostRead);
-                builder_.setSystemFunctionAttributes(
+                amGraph_.setSystemFunctionAttributes(
                     instruction,
                     SystemFunctionAttributes{
                         .name = internString(name),
@@ -3046,7 +3079,7 @@ namespace wolvrix::lib::grhsim::am
                 }
                 const InstructionId instruction =
                     addInstruction(Opcode::SystemTask, {}, operands);
-                builder_.setSystemTaskAttributes(
+                amGraph_.setSystemTaskAttributes(
                     instruction,
                     SystemTaskAttributes{
                         .name = internString(name),
@@ -3148,7 +3181,7 @@ namespace wolvrix::lib::grhsim::am
                              import.returnType.kind == TypeKind::BitVector)
                     {
                         const VariableId temporary =
-                            addVariable(import.returnType, builder_.zeroInit());
+                            addVariable(import.returnType, amGraph_.zeroInit());
                         results.push_back(temporary);
                         resultBridges.push_back(ResultBridge{
                             .target = target,
@@ -3237,7 +3270,7 @@ namespace wolvrix::lib::grhsim::am
                                  parameter.type.kind == TypeKind::BitVector)
                         {
                             const VariableId temporary =
-                                addVariable(parameter.type, builder_.zeroInit());
+                                addVariable(parameter.type, amGraph_.zeroInit());
                             results.push_back(temporary);
                             resultBridges.push_back(ResultBridge{
                                 .target = target,
@@ -3275,7 +3308,7 @@ namespace wolvrix::lib::grhsim::am
                 }
                 const InstructionId instruction =
                     addInstruction(Opcode::DpiCall, results, operands);
-                builder_.setDpiCallAttributes(
+                amGraph_.setDpiCallAttributes(
                     instruction,
                     DpiCallAttributes{
                         .importSymbol = import.symbolId,
@@ -3374,8 +3407,8 @@ namespace wolvrix::lib::grhsim::am
 
             const Graph &graph_;
             diag::Diagnostics &diagnostics_;
-            GrhToAmLoweringOptions options_;
-            LinearProgramBuilder builder_;
+            GrhIRToGrhSimAMGraphLoweringOptions options_;
+            AmGraph amGraph_;
             ProgramInterface interface_;
             bool failed_ = false;
             std::map<Type, TypeId> typeIds_;
@@ -3389,9 +3422,6 @@ namespace wolvrix::lib::grhsim::am
             std::unordered_set<uint32_t> exposedValues_;
             std::unordered_set<uint32_t> declaredValueIndices_;
             std::unordered_set<uint32_t> declaredStateIndices_;
-            std::vector<VariableRole> variableRoles_;
-            std::vector<InstructionEffect> instructionEffects_;
-            std::vector<OrderedEffect> orderedEffects_;
             std::vector<PendingStateWrite> pendingStateWrites_;
             uint32_t nextOrderedGroup_ = 0;
             std::unordered_map<uint32_t, uint32_t> stateOrderGroups_;
@@ -3403,8 +3433,8 @@ namespace wolvrix::lib::grhsim::am
         };
     } // namespace
 
-    std::optional<LinearProgramArtifact>
-    GrhToAmLowering::lower(const grh::Graph &graph,
+    std::optional<AmGraph>
+    GrhIRToGrhSimAMGraphLowering::lower(const grh::Graph &graph,
                            diag::Diagnostics &diagnostics)
     {
         return LoweringContext(graph, diagnostics, options_).run();

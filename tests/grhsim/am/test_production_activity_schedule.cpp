@@ -1,7 +1,7 @@
-#include "grhsim/am/builder.hpp"
-#include "grhsim/am/interpreter.hpp"
-#include "grhsim/am/production_activity_schedule.hpp"
-#include "grhsim/am/activity_schedule.hpp"
+#include "grhsim/am/grhsim_am_program.hpp"
+#include "grhsim/am/grhsim_am_program_interpreter.hpp"
+#include "grhsim/am/grh_ir_to_grhsim_am_program.hpp"
+#include "grhsim/am/grhsim_am_graph_partition.hpp"
 
 #include <array>
 #include <cstdint>
@@ -31,8 +31,7 @@ namespace
                                             const ActivityScheduleOptions &options,
                                             wolvrix::lib::diag::Diagnostics &diagnostics)
     {
-        ProductionActivityScheduleStage scheduler;
-        return scheduler.schedule(std::move(linear), options, diagnostics);
+        return GrhIRToGrhSimAMProgram::graphToProgram(AmGraph::fromLinearProgram(linear), options, diagnostics);
     }
 
     std::optional<BlockId> findInstructionBlock(const ExecutableModel &model,
@@ -2687,7 +2686,7 @@ namespace
         std::iota(instructionAtom.begin(), instructionAtom.end(), uint32_t{0});
         const std::array<uint32_t, 3> copyWeights = {8, 1, 1};
 
-        GrhSimAmActivityScheduleInput input{
+        AmGraphPartitionInput input{
             .atomCount = kAtoms,
             .atomOffsets = atomOffsets,
             .atomTargets = atomTargets,
@@ -2706,7 +2705,14 @@ namespace
             .segmentPenalty = 1.0,
         };
         std::string error;
-        const auto unitResult = scheduleGrhSimAmActivityBlocks(input, error);
+        auto split = splitAmGraph(input, error);
+        if (!split) {
+            return fail("graph split failed: " + error);
+        }
+        optAmComputeGraph(split->computeGraph, input);
+        // Every atom is compute, so compute-local ids coincide with the
+        // global atom ids used by the assertions below.
+        const auto unitResult = partitionAmComputeGraph(input, *split, error);
         if (!unitResult) {
             return fail("unit-cost block formation failed: " + error);
         }
@@ -2721,7 +2727,7 @@ namespace
         }
 
         input.variableCopyWeights = copyWeights;
-        const auto weightedResult = scheduleGrhSimAmActivityBlocks(input, error);
+        const auto weightedResult = partitionAmComputeGraph(input, *split, error);
         if (!weightedResult) {
             return fail("width-weighted block formation failed: " + error);
         }
@@ -2733,6 +2739,104 @@ namespace
         }
         if (weightedResult->atomBlock[54] != weightedResult->atomBlock[55]) {
             return fail("width-weighted DP should not cut between atoms 54 and 55");
+        }
+        return 0;
+    }
+
+    // split-am-graph must isolate the two induced subgraphs (no cross-class
+    // edges inside either subgraph), and the two partition passes bucket the
+    // atoms as expected: direct assertions on the split and on both
+    // partition results.
+    int testComputeCommitGraphSplitAndPartitions()
+    {
+        constexpr uint32_t kAtoms = 9; // 0..5 compute, 6..8 commit
+        // Edges: 0->1, 0->2, 1->3, 2->3, 3->4, 4->5 (compute DAG),
+        //        4->6, 5->7, 5->8 (compute->commit boundary), 6->7 (commit chain).
+        const std::vector<std::pair<uint32_t, uint32_t>> edges = {
+            {0, 1}, {0, 2}, {1, 3}, {2, 3}, {3, 4}, {4, 5}, {4, 6}, {5, 7}, {5, 8}, {6, 7},
+        };
+        std::vector<uint32_t> atomOffsets(kAtoms + 1, 0);
+        for (const auto &[source, target] : edges) {
+            ++atomOffsets[source + 1];
+        }
+        std::partial_sum(atomOffsets.begin(), atomOffsets.end(), atomOffsets.begin());
+        std::vector<uint32_t> atomTargets(atomOffsets.back());
+        {
+            std::vector<uint32_t> cursor(atomOffsets.begin(), atomOffsets.end() - 1);
+            for (const auto &[source, target] : edges) {
+                atomTargets[cursor[source]++] = target;
+            }
+        }
+        const std::vector<uint32_t> atomInstructions(kAtoms, 1);
+        const std::vector<uint32_t> atomStateWrites = {0, 0, 0, 0, 0, 0, 1, 1, 1};
+        const std::vector<uint8_t> atomIsCommit = {0, 0, 0, 0, 0, 0, 1, 1, 1};
+        std::vector<uint32_t> atomMinInstruction(kAtoms);
+        std::iota(atomMinInstruction.begin(), atomMinInstruction.end(), uint32_t{0});
+        const std::vector<uint32_t> commitRanks = {0, 0, 0, 0, 0, 0, 0, 0, 1};
+        const uint32_t none = std::numeric_limits<uint32_t>::max();
+        const std::vector<uint32_t> definitions = {0, none};
+        const std::vector<uint32_t> useOffsets = {0, 4, 5};
+        const std::vector<uint32_t> uses = {1, 2, 3, 6, 7};
+        std::vector<uint32_t> instructionAtom(kAtoms);
+        std::iota(instructionAtom.begin(), instructionAtom.end(), uint32_t{0});
+
+        AmGraphPartitionInput input{
+            .atomCount = kAtoms,
+            .atomOffsets = atomOffsets,
+            .atomTargets = atomTargets,
+            .atomInstructions = atomInstructions,
+            .atomStateWrites = atomStateWrites,
+            .atomIsCommit = atomIsCommit,
+            .atomMinInstruction = atomMinInstruction,
+            .commitEventRank = commitRanks,
+            .variableCount = 2,
+            .definitions = definitions,
+            .useOffsets = useOffsets,
+            .uses = uses,
+            .instructionAtom = instructionAtom,
+            .maxInstructionsPerBlock = 60,
+            .enableCoarsening = false,
+            .segmentPenalty = 1.0,
+        };
+
+        std::string error;
+        auto split = splitAmGraph(input, error);
+        if (!split) {
+            return fail("graph split failed: " + error);
+        }
+        if (split->computeGraph.atomCount != 6 || split->commitGraph.atomCount != 3) {
+            return fail("split atom counts mismatch");
+        }
+        // Compute subgraph keeps only the 6 compute->compute edges; the commit
+        // subgraph keeps only 6->7 (local 0->1). Boundary edges 4->6/5->7/5->8
+        // belong to neither subgraph.
+        if (split->computeGraph.targets.size() != 6 || split->commitGraph.targets.size() != 1) {
+            return fail("split induced edge counts mismatch");
+        }
+        optAmComputeGraph(split->computeGraph, input);
+        const auto compute = partitionAmComputeGraph(input, *split, error);
+        if (!compute) {
+            return fail("compute partition failed: " + error);
+        }
+        const auto commit = partitionAmCommitGraph(input, *split, error);
+        if (!commit) {
+            return fail("commit partition failed: " + error);
+        }
+        // Six single-instruction compute atoms under a capacity-60 segment DP
+        // with unit penalty: one block holds them all.
+        if (compute->blockCount != 1) {
+            return fail("compute partition should form one block");
+        }
+        for (uint32_t local = 0; local < split->computeGraph.atomCount; ++local) {
+            if (compute->atomBlock[local] != 1) {
+                return fail("every compute atom should land in the single compute block");
+            }
+        }
+        // Event clustering: same-rank commit atoms 6/7 (local 0/1) share one
+        // block; rank 1 atom 8 (local 2) forms another.
+        if (commit->blockCount != 2 || commit->atomBlock[0] != commit->atomBlock[1] ||
+            commit->atomBlock[0] == commit->atomBlock[2]) {
+            return fail("commit event clustering mismatch");
         }
         return 0;
     }
@@ -2828,6 +2932,9 @@ int main()
         return result;
     }
     if (const int result = testWidthWeightedCopyCostChangesSegmentation(); result != 0) {
+        return result;
+    }
+    if (const int result = testComputeCommitGraphSplitAndPartitions(); result != 0) {
         return result;
     }
     return 0;

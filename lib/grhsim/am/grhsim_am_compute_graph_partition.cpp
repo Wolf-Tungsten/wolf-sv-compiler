@@ -1,4 +1,6 @@
-#include "grhsim/am/activity_schedule.hpp"
+#include "grhsim/am/grhsim_am_compute_graph_partition.hpp"
+
+#include "grhsim_am_common.hpp"
 
 #include <algorithm>
 #include <array>
@@ -8,6 +10,7 @@
 #include <limits>
 #include <numeric>
 #include <queue>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -15,11 +18,10 @@
 namespace wolvrix::lib::grhsim::am
 {
 
+    using namespace detail;
+
     namespace
     {
-        constexpr uint32_t kInvalidIndex = std::numeric_limits<uint32_t>::max();
-        // Aligns with the legacy guard/event merge op cap for one commit block.
-        constexpr std::size_t kMaxGuardEventMergeOps = 4096;
         constexpr std::size_t kCoarsenTailLargeClusterThreshold = 100000;
         constexpr std::size_t kCoarsenTailMaxClusterDeltaExclusive = 1024;
         constexpr std::size_t kCoarsenTailMaxConsecutiveIters = 3;
@@ -79,8 +81,8 @@ namespace wolvrix::lib::grhsim::am
         struct ClusterGraph
         {
             uint32_t count = 0;
-            std::vector<uint32_t> clusterOfAtom; // atomCount, kInvalidIndex for commit atoms
-            std::vector<uint32_t> rootOf;        // dense cluster -> representative atom
+            std::vector<uint32_t> clusterOfAtom; // computeAtomCount
+            std::vector<uint32_t> rootOf;        // dense cluster -> representative local atom
             std::vector<uint32_t> outOffsets;
             std::vector<uint32_t> outTargets;
             std::vector<uint32_t> inOffsets;
@@ -88,75 +90,51 @@ namespace wolvrix::lib::grhsim::am
         };
     } // namespace
 
-    std::optional<GrhSimAmActivityScheduleResult>
-    scheduleGrhSimAmActivityBlocks(const GrhSimAmActivityScheduleInput &input, std::string &error)
+    std::optional<AmComputeActivityGraph>
+    partitionAmComputeGraph(const AmGraphPartitionInput &input,
+                            const AmGraphSplit &split, std::string &error)
     {
         error.clear();
-        const uint32_t atomCount = input.atomCount;
         const auto fail = [&](std::string message) {
             error = std::move(message);
-            return std::optional<GrhSimAmActivityScheduleResult>();
+            return std::optional<AmComputeActivityGraph>();
         };
-        if (input.atomOffsets.size() != static_cast<std::size_t>(atomCount) + 1 ||
-            input.atomInstructions.size() != atomCount || input.atomStateWrites.size() != atomCount ||
-            input.atomIsCommit.size() != atomCount ||
-            input.atomMinInstruction.size() != atomCount ||
-            input.commitEventRank.size() != atomCount ||
-            input.definitions.size() != input.variableCount ||
-            input.useOffsets.size() != static_cast<std::size_t>(input.variableCount) + 1 ||
-            (!input.variableCopyWeights.empty() &&
-             input.variableCopyWeights.size() != input.variableCount)) {
-            return fail("internal error: malformed coarsen-dp block formation input");
+        if (!validateActivityInputShape(input, error) ||
+            !validateSplitShape(input, split, error)) {
+            return std::nullopt;
         }
-        for (uint32_t atom = 0; atom < atomCount; ++atom) {
-            if (input.atomIsCommit[atom] == 0) {
-                continue;
-            }
-            for (uint32_t offset = input.atomOffsets[atom]; offset < input.atomOffsets[atom + 1];
-                 ++offset) {
-                const uint32_t target = input.atomTargets[offset];
-                if (target >= atomCount) {
-                    return fail("internal error: atom DAG target out of range");
-                }
-                if (input.atomIsCommit[target] == 0) {
-                    return fail("AM dependency requires a state commit before pre-commit work");
-                }
-            }
-        }
+        const AmComputeGraph &computeGraph = split.computeGraph;
+        const uint32_t computeAtomCount = computeGraph.atomCount;
 
         const auto coarsenStart = std::chrono::steady_clock::now();
 
         DisjointSet dsu;
-        dsu.parent.resize(atomCount);
-        dsu.weight.resize(atomCount);
-        dsu.minInstruction.resize(atomCount);
-        dsu.oversized.resize(atomCount);
-        dsu.minLevel.resize(atomCount, 0);
-        dsu.maxLevel.resize(atomCount, 0);
-        uint32_t computeAtomCount = 0;
-        for (uint32_t atom = 0; atom < atomCount; ++atom) {
+        dsu.parent.resize(computeAtomCount);
+        dsu.weight.resize(computeAtomCount);
+        dsu.minInstruction.resize(computeAtomCount);
+        dsu.oversized.resize(computeAtomCount);
+        dsu.minLevel.resize(computeAtomCount, 0);
+        dsu.maxLevel.resize(computeAtomCount, 0);
+        for (uint32_t atom = 0; atom < computeAtomCount; ++atom) {
+            const uint32_t global = computeGraph.globalOfAtom[atom];
             dsu.parent[atom] = atom;
-            dsu.weight[atom] = input.atomInstructions[atom];
-            dsu.minInstruction[atom] = input.atomMinInstruction[atom];
+            dsu.weight[atom] = input.atomInstructions[global];
+            dsu.minInstruction[atom] = input.atomMinInstruction[global];
             dsu.oversized[atom] = static_cast<uint8_t>(
-                input.atomInstructions[atom] > input.maxInstructionsPerBlock ? 1 : 0);
-            computeAtomCount += input.atomIsCommit[atom] == 0 ? 1U : 0U;
+                input.atomInstructions[global] > input.maxInstructionsPerBlock ? 1 : 0);
         }
 
         // Rebuilds the dense cluster DAG from the current union-find state.
         // Cluster ids are assigned in atom order so every round is deterministic.
-        std::vector<uint32_t> denseOfRoot(atomCount, kInvalidIndex);
+        std::vector<uint32_t> denseOfRoot(computeAtomCount, kInvalidIndex);
         std::vector<uint32_t> touchedRoots;
         touchedRoots.reserve(computeAtomCount);
         ClusterGraph graph;
         const auto rebuildClusterGraph = [&]() {
-            graph.clusterOfAtom.assign(atomCount, kInvalidIndex);
+            graph.clusterOfAtom.assign(computeAtomCount, kInvalidIndex);
             graph.rootOf.clear();
             touchedRoots.clear();
-            for (uint32_t atom = 0; atom < atomCount; ++atom) {
-                if (input.atomIsCommit[atom] != 0) {
-                    continue;
-                }
+            for (uint32_t atom = 0; atom < computeAtomCount; ++atom) {
                 const uint32_t root = dsu.find(atom);
                 uint32_t dense = denseOfRoot[root];
                 if (dense == kInvalidIndex) {
@@ -173,16 +151,12 @@ namespace wolvrix::lib::grhsim::am
             graph.count = static_cast<uint32_t>(graph.rootOf.size());
             graph.outOffsets.assign(static_cast<std::size_t>(graph.count) + 1, 0);
             std::vector<uint32_t> targetMark(graph.count, 0);
-            for (uint32_t atom = 0; atom < atomCount; ++atom) {
+            for (uint32_t atom = 0; atom < computeAtomCount; ++atom) {
                 const uint32_t source = graph.clusterOfAtom[atom];
-                if (source == kInvalidIndex) {
-                    continue;
-                }
-                for (uint32_t offset = input.atomOffsets[atom];
-                     offset < input.atomOffsets[atom + 1]; ++offset) {
-                    const uint32_t target = graph.clusterOfAtom[input.atomTargets[offset]];
-                    if (target == kInvalidIndex || target == source ||
-                        targetMark[target] == source + 1) {
+                for (uint32_t offset = computeGraph.offsets[atom];
+                     offset < computeGraph.offsets[atom + 1]; ++offset) {
+                    const uint32_t target = graph.clusterOfAtom[computeGraph.targets[offset]];
+                    if (target == source || targetMark[target] == source + 1) {
                         continue;
                     }
                     targetMark[target] = source + 1;
@@ -194,16 +168,12 @@ namespace wolvrix::lib::grhsim::am
             graph.outTargets.resize(graph.outOffsets.back());
             std::fill(targetMark.begin(), targetMark.end(), 0);
             std::vector<uint32_t> cursor(graph.outOffsets.begin(), graph.outOffsets.end() - 1);
-            for (uint32_t atom = 0; atom < atomCount; ++atom) {
+            for (uint32_t atom = 0; atom < computeAtomCount; ++atom) {
                 const uint32_t source = graph.clusterOfAtom[atom];
-                if (source == kInvalidIndex) {
-                    continue;
-                }
-                for (uint32_t offset = input.atomOffsets[atom];
-                     offset < input.atomOffsets[atom + 1]; ++offset) {
-                    const uint32_t target = graph.clusterOfAtom[input.atomTargets[offset]];
-                    if (target == kInvalidIndex || target == source ||
-                        targetMark[target] == source + 1) {
+                for (uint32_t offset = computeGraph.offsets[atom];
+                     offset < computeGraph.offsets[atom + 1]; ++offset) {
+                    const uint32_t target = graph.clusterOfAtom[computeGraph.targets[offset]];
+                    if (target == source || targetMark[target] == source + 1) {
                         continue;
                     }
                     targetMark[target] = source + 1;
@@ -243,7 +213,7 @@ namespace wolvrix::lib::grhsim::am
             Sibling = 2,
         };
         std::vector<uint32_t> level;
-        std::vector<uint32_t> mergeMark(atomCount, 0);
+        std::vector<uint32_t> mergeMark(computeAtomCount, 0);
         uint32_t passStamp = 0;
         std::vector<std::pair<uint32_t, uint32_t>> siblingBuffer;
         std::size_t lastRoundMerges = 0;
@@ -465,7 +435,7 @@ namespace wolvrix::lib::grhsim::am
             return fail("internal error: AM coarsened cluster graph is cyclic");
         }
         std::vector<uint32_t> topoPos(graph.count, 0);
-        for (uint32_t pos = 0; pos < graph.count; ++pos) {
+        for (std::size_t pos = 0; pos < graph.count; ++pos) {
             topoPos[clusterOrder[pos]] = pos;
         }
 
@@ -479,9 +449,9 @@ namespace wolvrix::lib::grhsim::am
             if (definition == kInvalidIndex || definition >= input.instructionAtom.size()) {
                 continue;
             }
-            const uint32_t cluster = graph.clusterOfAtom[input.instructionAtom[definition]];
-            if (cluster != kInvalidIndex) {
-                sourcePos[variable] = topoPos[cluster];
+            const uint32_t local = computeGraph.localOfAtom[input.instructionAtom[definition]];
+            if (local != kInvalidIndex) {
+                sourcePos[variable] = topoPos[graph.clusterOfAtom[local]];
             }
         }
         std::vector<uint32_t> sourceOffsets(static_cast<std::size_t>(graph.count) + 1, 0);
@@ -509,11 +479,11 @@ namespace wolvrix::lib::grhsim::am
                 if (use >= input.instructionAtom.size()) {
                     return fail("internal error: use instruction out of range");
                 }
-                const uint32_t cluster = graph.clusterOfAtom[input.instructionAtom[use]];
-                if (cluster == kInvalidIndex) {
+                const uint32_t local = computeGraph.localOfAtom[input.instructionAtom[use]];
+                if (local == kInvalidIndex) {
                     continue; // uses inside commit atoms do not participate in this DP
                 }
-                const uint32_t pos = topoPos[cluster];
+                const uint32_t pos = topoPos[graph.clusterOfAtom[local]];
                 if (clusterMark[pos] == variable + 1) {
                     continue;
                 }
@@ -529,12 +499,12 @@ namespace wolvrix::lib::grhsim::am
             for (uint32_t variable = 0; variable < input.variableCount; ++variable) {
                 for (uint32_t offset = input.useOffsets[variable];
                      offset < input.useOffsets[variable + 1]; ++offset) {
-                    const uint32_t cluster =
-                        graph.clusterOfAtom[input.instructionAtom[input.uses[offset]]];
-                    if (cluster == kInvalidIndex) {
+                    const uint32_t local =
+                        computeGraph.localOfAtom[input.instructionAtom[input.uses[offset]]];
+                    if (local == kInvalidIndex) {
                         continue;
                     }
-                    const uint32_t pos = topoPos[cluster];
+                    const uint32_t pos = topoPos[graph.clusterOfAtom[local]];
                     if (clusterMark[pos] == variable + 1) {
                         continue;
                     }
@@ -633,48 +603,42 @@ namespace wolvrix::lib::grhsim::am
         }
         const uint64_t dpMs = elapsedMs(dpStart);
 
-        GrhSimAmActivityScheduleResult result;
-        result.atomBlock.assign(atomCount, kInvalidIndex);
-        for (uint32_t atom = 0; atom < atomCount; ++atom) {
-            const uint32_t cluster = graph.clusterOfAtom[atom];
-            if (cluster != kInvalidIndex) {
-                result.atomBlock[atom] = segmentOfPos[topoPos[cluster]];
-            }
+        AmComputeActivityGraph result;
+        result.blockCount = computeBlockCount;
+        result.atomBlock.assign(computeAtomCount, kInvalidIndex);
+        for (uint32_t atom = 0; atom < computeAtomCount; ++atom) {
+            result.atomBlock[atom] = segmentOfPos[topoPos[graph.clusterOfAtom[atom]]];
         }
 
-        // Compute atoms first: a block-grouped Kahn keeps atomTopo topological
-        // both across and inside blocks.
-        result.atomTopo.reserve(atomCount);
+        // A block-grouped Kahn keeps the compute topo topological both across
+        // and inside blocks.
+        result.atomTopo.reserve(computeAtomCount);
         {
             using Candidate = std::tuple<uint32_t, uint32_t, uint32_t>;
             std::priority_queue<Candidate, std::vector<Candidate>, std::greater<>> ready;
-            std::vector<uint32_t> indegree(atomCount, 0);
-            for (uint32_t atom = 0; atom < atomCount; ++atom) {
-                if (input.atomIsCommit[atom] != 0) {
-                    continue;
-                }
-                for (uint32_t offset = input.atomOffsets[atom];
-                     offset < input.atomOffsets[atom + 1]; ++offset) {
-                    const uint32_t target = input.atomTargets[offset];
-                    if (input.atomIsCommit[target] == 0) {
-                        ++indegree[target];
-                    }
+            std::vector<uint32_t> indegree(computeAtomCount, 0);
+            for (uint32_t atom = 0; atom < computeAtomCount; ++atom) {
+                for (uint32_t offset = computeGraph.offsets[atom];
+                     offset < computeGraph.offsets[atom + 1]; ++offset) {
+                    ++indegree[computeGraph.targets[offset]];
                 }
             }
-            for (uint32_t atom = 0; atom < atomCount; ++atom) {
-                if (input.atomIsCommit[atom] == 0 && indegree[atom] == 0) {
-                    ready.emplace(result.atomBlock[atom], input.atomMinInstruction[atom], atom);
+            for (uint32_t atom = 0; atom < computeAtomCount; ++atom) {
+                if (indegree[atom] == 0) {
+                    ready.emplace(result.atomBlock[atom],
+                                  input.atomMinInstruction[computeGraph.globalOfAtom[atom]], atom);
                 }
             }
             while (!ready.empty()) {
                 const uint32_t atom = std::get<2>(ready.top());
                 ready.pop();
                 result.atomTopo.push_back(atom);
-                for (uint32_t offset = input.atomOffsets[atom];
-                     offset < input.atomOffsets[atom + 1]; ++offset) {
-                    const uint32_t target = input.atomTargets[offset];
-                    if (input.atomIsCommit[target] == 0 && --indegree[target] == 0) {
-                        ready.emplace(result.atomBlock[target], input.atomMinInstruction[target],
+                for (uint32_t offset = computeGraph.offsets[atom];
+                     offset < computeGraph.offsets[atom + 1]; ++offset) {
+                    const uint32_t target = computeGraph.targets[offset];
+                    if (--indegree[target] == 0) {
+                        ready.emplace(result.atomBlock[target],
+                                      input.atomMinInstruction[computeGraph.globalOfAtom[target]],
                                       target);
                     }
                 }
@@ -684,69 +648,6 @@ namespace wolvrix::lib::grhsim::am
             return fail("internal error: AM compute atom graph is cyclic");
         }
 
-        // Commit atoms form blocks after all compute blocks: Kahn on the commit
-        // subgraph prioritized by (event rank, min instruction), with bounded
-        // merging inside one commit-events bucket under the block limit.
-        uint32_t normalBlockCount = computeBlockCount;
-        {
-            using Candidate = std::tuple<uint32_t, uint32_t, uint32_t>;
-            std::priority_queue<Candidate, std::vector<Candidate>, std::greater<>> ready;
-            std::vector<uint32_t> indegree(atomCount, 0);
-            for (uint32_t atom = 0; atom < atomCount; ++atom) {
-                if (input.atomIsCommit[atom] == 0) {
-                    continue;
-                }
-                for (uint32_t offset = input.atomOffsets[atom];
-                     offset < input.atomOffsets[atom + 1]; ++offset) {
-                    ++indegree[input.atomTargets[offset]];
-                }
-            }
-            for (uint32_t atom = 0; atom < atomCount; ++atom) {
-                if (input.atomIsCommit[atom] != 0 && indegree[atom] == 0) {
-                    ready.emplace(input.commitEventRank[atom],
-                                  input.atomMinInstruction[atom], atom);
-                }
-            }
-            const std::size_t commitMergeLimit =
-                std::min(input.maxCommitInstructionsPerBlock, kMaxGuardEventMergeOps);
-            bool haveCurrent = false;
-            std::size_t currentInstructions = 0;
-            uint32_t currentBucketAtom = kInvalidIndex;
-            while (!ready.empty()) {
-                const Candidate top = ready.top();
-                const uint32_t atom = std::get<2>(top);
-                if (haveCurrent &&
-                    (input.commitEventRank[atom] != input.commitEventRank[currentBucketAtom] ||
-                     currentInstructions + input.atomInstructions[atom] > commitMergeLimit)) {
-                    haveCurrent = false;
-                }
-                if (!haveCurrent) {
-                    ++normalBlockCount;
-                    currentInstructions = 0;
-                    currentBucketAtom = atom;
-                    haveCurrent = true;
-                }
-                ready.pop();
-                result.atomBlock[atom] = normalBlockCount;
-                result.atomTopo.push_back(atom);
-                currentInstructions += input.atomInstructions[atom];
-                for (uint32_t offset = input.atomOffsets[atom];
-                     offset < input.atomOffsets[atom + 1]; ++offset) {
-                    const uint32_t target = input.atomTargets[offset];
-                    if (--indegree[target] == 0) {
-                        ready.emplace(input.commitEventRank[target],
-                                      input.atomMinInstruction[target], target);
-                    }
-                }
-            }
-        }
-        if (result.atomTopo.size() != atomCount) {
-            return fail("internal error: AM commit atom graph is cyclic");
-        }
-
-        result.normalBlockCount = normalBlockCount;
-        result.computeBlockCount = computeBlockCount;
-        result.commitBlockCount = normalBlockCount - computeBlockCount;
         result.clustersAfterCoarsen = graph.count;
         result.dpSegments = computeBlockCount;
         result.coarsenMs = coarsenMs;

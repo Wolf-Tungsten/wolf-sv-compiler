@@ -1,7 +1,7 @@
-#ifndef WOLVRIX_GRHSIM_AM_OPCODE_TRAITS_HPP
-#define WOLVRIX_GRHSIM_AM_OPCODE_TRAITS_HPP
+#ifndef WOLVRIX_GRHSIM_AM_GRHSIM_AM_OPCODE_TRAITS_HPP
+#define WOLVRIX_GRHSIM_AM_GRHSIM_AM_OPCODE_TRAITS_HPP
 
-#include "grhsim/am/program.hpp"
+#include "grhsim/am/grhsim_am_program.hpp"
 
 #include <cstdint>
 
@@ -122,4 +122,4 @@ namespace wolvrix::lib::grhsim::am
 
 } // namespace wolvrix::lib::grhsim::am
 
-#endif // WOLVRIX_GRHSIM_AM_OPCODE_TRAITS_HPP
+#endif // WOLVRIX_GRHSIM_AM_GRHSIM_AM_OPCODE_TRAITS_HPP

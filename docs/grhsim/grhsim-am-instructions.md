@@ -18,6 +18,10 @@ Logic 时产生本稿指令；Real/String constant 遵循同一规则。本文�
 不是 GRHSIM-AM 指令，必须在 lower 前消解。Real/String 专用组合指令仍待后续定义；
 constant、`changed.any`、系统调用和 DPI 已按本文定义覆盖 Real/String。
 
+本稿指令同时是 `AmGraph` 工作图形式的 op 载荷：图形式只改变指令的承载与连接
+（Variable 声明语义、状态操作数边的 PreCommit/Live 分类显式化），不改变任何指令
+语义，见[流水线文档](grhsim-am-pipeline.md) 2.4 节。
+
 ## 2. 公共语义
 
 ### 2.1 Instruction schema

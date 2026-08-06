@@ -1,8 +1,8 @@
 #include "core/grh.hpp"
-#include "grhsim/am/cpp_emitter.hpp"
-#include "grhsim/am/interpreter.hpp"
-#include "grhsim/am/lowering.hpp"
-#include "grhsim/am/production_activity_schedule.hpp"
+#include "grhsim/am/grhsim_am_program_cpp_emitter.hpp"
+#include "grhsim/am/grhsim_am_program_interpreter.hpp"
+#include "grhsim/am/grh_ir_to_grhsim_am_graph.hpp"
+#include "grhsim/am/grh_ir_to_grhsim_am_program.hpp"
 
 #include <array>
 #include <cstdlib>
@@ -162,14 +162,13 @@ namespace
         graph.freeze();
 
         diag::Diagnostics diagnostics;
-        GrhToAmLowering lowering;
-        std::optional<LinearProgramArtifact> linear = lowering.lower(graph, diagnostics);
+        GrhIRToGrhSimAMGraphLowering lowering;
+        std::optional<AmGraph> linear = lowering.lower(graph, diagnostics);
         if (!linear || diagnostics.hasError())
         {
             return fail("array GRH-to-AM lowering failed");
         }
-        ProductionActivityScheduleStage scheduler;
-        std::optional<ExecutableModel> model = scheduler.schedule(
+        std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
             std::move(*linear),
             ActivityScheduleOptions{
                 .maxInstructionsPerBlock = 8,
@@ -523,14 +522,13 @@ namespace
         graph.freeze();
 
         diag::Diagnostics diagnostics;
-        GrhToAmLowering lowering;
-        std::optional<LinearProgramArtifact> linear = lowering.lower(graph, diagnostics);
+        GrhIRToGrhSimAMGraphLowering lowering;
+        std::optional<AmGraph> linear = lowering.lower(graph, diagnostics);
         if (!linear || diagnostics.hasError())
         {
             return fail("reset-cone graph did not lower");
         }
-        ProductionActivityScheduleStage scheduler;
-        std::optional<ExecutableModel> model = scheduler.schedule(
+        std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
             std::move(*linear),
             ActivityScheduleOptions{
                 .maxInstructionsPerBlock = 8,
@@ -657,14 +655,13 @@ int main()
     graph.freeze();
 
     diag::Diagnostics diagnostics;
-    GrhToAmLowering lowering;
-    std::optional<LinearProgramArtifact> linear = lowering.lower(graph, diagnostics);
+    GrhIRToGrhSimAMGraphLowering lowering;
+    std::optional<AmGraph> linear = lowering.lower(graph, diagnostics);
     if (!linear || diagnostics.hasError())
     {
         return fail("concrete GRH-to-AM lowering failed");
     }
-    ProductionActivityScheduleStage scheduler;
-    std::optional<ExecutableModel> model = scheduler.schedule(
+    std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
         std::move(*linear),
         ActivityScheduleOptions{
             .maxInstructionsPerBlock = 8,

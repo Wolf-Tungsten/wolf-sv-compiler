@@ -1,8 +1,8 @@
 #include "core/grh.hpp"
-#include "grhsim/am/cpp_emitter.hpp"
-#include "grhsim/am/lowering.hpp"
-#include "grhsim/am/optimize.hpp"
-#include "grhsim/am/production_activity_schedule.hpp"
+#include "grhsim/am/grhsim_am_program_cpp_emitter.hpp"
+#include "grhsim/am/grh_ir_to_grhsim_am_graph.hpp"
+#include "grhsim/am/grhsim_am_graph_optimize.hpp"
+#include "grhsim/am/grh_ir_to_grhsim_am_program.hpp"
 
 #include <charconv>
 #include <chrono>
@@ -366,15 +366,14 @@ int main(int argc, char **argv)
 
         phaseStart = std::chrono::steady_clock::now();
         diag::Diagnostics diagnostics;
-        GrhToAmLowering lowering(GrhToAmLoweringOptions{
+        GrhIRToGrhSimAMGraphLowering lowering(GrhIRToGrhSimAMGraphLoweringOptions{
             .unknownLogic = UnknownLogicPolicy::FlattenToZero,
         });
-        std::optional<LinearProgramArtifact> artifact =
-            lowering.lower(*graph, diagnostics);
+        std::optional<AmGraph> amGraph = lowering.lower(*graph, diagnostics);
         const uint64_t lowerMs = elapsedMilliseconds(phaseStart);
         std::cerr << "[grhsim-am-lower-json] lower complete ms=" << lowerMs
                   << " peak_rss_kib=" << peakRssKiB() << '\n';
-        if (!artifact || diagnostics.hasError())
+        if (!amGraph || diagnostics.hasError())
         {
             printDiagnostics(diagnostics);
             std::cerr << "lowering failed after " << lowerMs << " ms"
@@ -385,7 +384,7 @@ int main(int argc, char **argv)
         {
             phaseStart = std::chrono::steady_clock::now();
             const bool optimized =
-                optimizeLinearProgram(*artifact, amOptimize, diagnostics);
+                optimizeAmGraph(*amGraph, amOptimize, diagnostics);
             const uint64_t optimizeMs = elapsedMilliseconds(phaseStart);
             std::cerr << "[grhsim-am-lower-json] optimize complete ms="
                       << optimizeMs << " peak_rss_kib=" << peakRssKiB() << '\n';
@@ -397,12 +396,11 @@ int main(int argc, char **argv)
                 return 1;
             }
         }
-        const ProgramStorageStats stats = artifact->program.view().storageStats();
-        const std::size_t interfacePorts = artifact->interface.ports.size();
+        const ProgramStorageStats stats = amGraph->program().storageStats();
+        const std::size_t interfacePorts = amGraph->interface().ports.size();
         const std::size_t declaredVariables =
-            artifact->interface.declaredVariables.size();
-        const std::size_t orderedEffects =
-            artifact->schedulingFacts.orderedEffects.size();
+            amGraph->interface().declaredVariables.size();
+        const std::size_t orderedEffects = amGraph->orderedEffects().size();
         design = grh::Design{};
         std::cerr << "[grhsim-am-lower-json] graph released current_rss_kib="
                   << currentRssKiB() << '\n';
@@ -418,9 +416,8 @@ int main(int argc, char **argv)
         if (runSchedule)
         {
             phaseStart = std::chrono::steady_clock::now();
-            ProductionActivityScheduleStage scheduler;
-            model = scheduler.schedule(
-                std::move(*artifact),
+            model = GrhIRToGrhSimAMProgram::graphToProgram(
+                std::move(*amGraph),
                 ActivityScheduleOptions{
                     .maxInstructionsPerBlock = maxInstructionsPerBlock,
                     .enableCoarsening = enableCoarsening,

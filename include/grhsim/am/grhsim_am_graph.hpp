@@ -1,9 +1,9 @@
-#ifndef WOLVRIX_GRHSIM_AM_GRAPH_HPP
-#define WOLVRIX_GRHSIM_AM_GRAPH_HPP
+#ifndef WOLVRIX_GRHSIM_AM_GRHSIM_AM_GRAPH_HPP
+#define WOLVRIX_GRHSIM_AM_GRHSIM_AM_GRAPH_HPP
 
-#include "grhsim/am/pipeline.hpp"
-#include "grhsim/am/program.hpp"
+#include "grhsim/am/grhsim_am_program.hpp"
 
+#include <cstddef>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -113,6 +113,14 @@ namespace wolvrix::lib::grhsim::am
         LiteralId addBitLiteral(TypeId type, std::span<const uint64_t> words);
         InitId addConstantInit(LiteralId literal);
 
+        // Builder parity so lowering can construct the graph natively (the
+        // linear builder is no longer the only construction path).
+        void reserve(const ProgramReserve &reserve);
+        InitId undefInit() const noexcept { return InitId{0}; }
+        InitId zeroInit() const noexcept { return InitId{1}; }
+        LiteralId addStringLiteral(TypeId type, std::string_view bytes);
+        InitId addActionsInit(std::span<const InitAction> actions);
+
         // State-access classification of one operand edge. Anything never
         // marked is PreCommit.
         AmStateAccess stateAccess(InstructionId instruction, std::size_t operandPosition) const;
@@ -139,4 +147,4 @@ namespace wolvrix::lib::grhsim::am
 
 } // namespace wolvrix::lib::grhsim::am
 
-#endif // WOLVRIX_GRHSIM_AM_GRAPH_HPP
+#endif // WOLVRIX_GRHSIM_AM_GRHSIM_AM_GRAPH_HPP

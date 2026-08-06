@@ -1,8 +1,15 @@
-#include "grhsim/am/pipeline.hpp"
+#include "grhsim/am/grh_ir_to_grhsim_am_program.hpp"
 
-#include "grhsim/am/graph.hpp"
-#include "grhsim/am/opcode_traits.hpp"
-#include "grhsim/am/optimize.hpp"
+#include "grhsim/am/grhsim_am_commit_graph_partition.hpp"
+#include "grhsim/am/grhsim_am_compute_graph_optimize.hpp"
+#include "grhsim/am/grhsim_am_compute_graph_partition.hpp"
+#include "grhsim/am/grhsim_am_graph_optimize.hpp"
+#include "grhsim/am/grhsim_am_graph_split.hpp"
+#include "grhsim/am/grhsim_am_graph_to_program.hpp"
+#include "grhsim/am/grhsim_am_graph.hpp"
+#include "grhsim/am/grhsim_am_opcode_traits.hpp"
+
+#include "grhsim_am_common.hpp"
 
 #include <algorithm>
 #include <iterator>
@@ -662,6 +669,82 @@ namespace wolvrix::lib::grhsim::am
         return result;
     }
 
+    ValidationResult validate(const AmGraph &graph,
+                              const ValidationOptions &options)
+    {
+        const ProgramView program = graph.program();
+        SchedulingFacts facts;
+        facts.variableRoles = graph.variableRoles();
+        facts.instructionEffects = graph.instructionEffects();
+        facts.orderedEffects = graph.orderedEffects();
+
+        ValidationResult result = validate(program, options);
+        appendErrors(result, validate(graph.interface(), program, options), options);
+        appendErrors(result, validate(facts, program, options), options);
+        if (program.valid())
+        {
+            const std::vector<uint32_t> interfaceInputs = interfaceInputVariables(graph.interface());
+            if (!interfaceInputs.empty())
+            {
+                for (uint32_t index = 0; index < program.instructionCount(); ++index)
+                {
+                    if (writesInterfaceInput(program, InstructionId{index}, interfaceInputs))
+                    {
+                        addError(result,
+                                 options,
+                                 "AM instruction writes a ProgramInterface input: instruction=" +
+                                     std::to_string(index));
+                    }
+                }
+            }
+            if (facts.variableRoles.size() != program.variableCount())
+            {
+                return result;
+            }
+            const std::vector<uint32_t> interfaceOutputs = interfaceOutputVariables(graph.interface());
+            std::vector<uint32_t> roleInputs;
+            std::vector<uint32_t> roleOutputs;
+            roleInputs.reserve(interfaceInputs.size());
+            roleOutputs.reserve(interfaceOutputs.size());
+            for (uint32_t index = 0; index < facts.variableRoles.size(); ++index)
+            {
+                if (hasRole(facts.variableRoles[index], VariableRole::ExternalInput))
+                {
+                    roleInputs.push_back(index);
+                }
+                if (hasRole(facts.variableRoles[index], VariableRole::ExternalOutput))
+                {
+                    roleOutputs.push_back(index);
+                }
+            }
+            if (roleInputs != interfaceInputs)
+            {
+                addError(result,
+                         options,
+                         "AM SchedulingFacts external-input roles do not match ProgramInterface");
+            }
+            if (roleOutputs != interfaceOutputs)
+            {
+                addError(result,
+                         options,
+                         "AM SchedulingFacts external-output roles do not match ProgramInterface");
+            }
+            for (uint32_t index = 0; index < program.instructionCount(); ++index)
+            {
+                const std::optional<VariableId> target = stateTarget(program, InstructionId{index});
+                if (target && target->valid() && target->value < program.variableCount() &&
+                    !hasRole(facts.variableRoles[target->value], VariableRole::State))
+                {
+                    addError(result,
+                             options,
+                             "AM state/memory target is missing the State variable role: instruction=" +
+                                 std::to_string(index));
+                }
+            }
+        }
+        return result;
+    }
+
     ValidationResult validate(const ExecutableModel &model,
                               const ValidationOptions &options)
     {
@@ -893,46 +976,101 @@ namespace wolvrix::lib::grhsim::am
         return result;
     }
 
-    GrhSimAmPipeline::GrhSimAmPipeline(GrhToAmLoweringStage &lowering,
-                                       AmActivityScheduleStage &scheduler,
+    GrhIRToGrhSimAMProgram::GrhIRToGrhSimAMProgram(GrhIRToGrhSimAMGraphLoweringStage &lowering,
                                        GrhSimAmCppEmitStage &emitter)
-        : lowering_(lowering), scheduler_(scheduler), emitter_(emitter)
+        : lowering_(lowering), emitter_(emitter)
     {
     }
 
-    void GrhSimAmPipeline::setAmOptimizeOptions(AmOptimizeOptions options)
+    void GrhIRToGrhSimAMProgram::setAmOptimizeOptions(AmOptimizeOptions options)
     {
         optimizeOptions_ = options;
     }
 
-    std::optional<LinearProgramArtifact>
-    GrhSimAmPipeline::lower(const wolvrix::lib::grh::Graph &graph,
+    std::optional<AmGraph>
+    GrhIRToGrhSimAMProgram::lower(const wolvrix::lib::grh::Graph &graph,
                             wolvrix::lib::diag::Diagnostics &diagnostics)
     {
         if (diagnostics.hasError())
         {
             return std::nullopt;
         }
-        std::optional<LinearProgramArtifact> linear = lowering_.lower(graph, diagnostics);
-        if (!linear || diagnostics.hasError())
+        std::optional<AmGraph> lowered = lowering_.lower(graph, diagnostics);
+        if (!lowered || diagnostics.hasError())
         {
             return std::nullopt;
         }
-        return linear;
+        return lowered;
     }
 
-    GrhSimAmPipelineResult
-    GrhSimAmPipeline::run(LinearProgramArtifact &&linear,
+    std::optional<ExecutableModel>
+    GrhIRToGrhSimAMProgram::graphToProgram(AmGraph &&graph,
+                                   const ActivityScheduleOptions &options,
+                                   wolvrix::lib::diag::Diagnostics &diagnostics)
+    {
+        if (diagnostics.hasError()) {
+            return std::nullopt;
+        }
+        if (options.maxInstructionsPerBlock == 0 || options.maxCommitInstructionsPerBlock == 0) {
+            diagnostics.error("AM activity scheduling limits must be non-zero",
+                              std::string(detail::kDiagnosticContext));
+            return std::nullopt;
+        }
+        if (!detail::reportValidation(
+                validate(graph, ValidationOptions{.level = ValidationLevel::Semantic}),
+                diagnostics)) {
+            return std::nullopt;
+        }
+
+        // ---- stage: split-am-graph --------------------------------------
+        std::optional<AmGraphSplitContext> context =
+            splitAmGraphStage(graph, options, diagnostics);
+        if (!context) {
+            return std::nullopt;
+        }
+        const AmGraphPartitionInput blockInput = context->partitionInput();
+
+        // ---- stage: opt-am-compute-graph --------------------------------
+        // Reserved compute-graph optimization stage (currently a no-op).
+        optAmComputeGraph(context->split.computeGraph, blockInput);
+
+        // ---- stage: partition-am-compute-graph --------------------------
+        // Activity-driven partitioning of the compute graph, producing the
+        // GRHSIM AM Compute Activity Graph.
+        std::string blockError;
+        const auto computeActivity =
+            partitionAmComputeGraph(blockInput, context->split, blockError);
+        if (!computeActivity) {
+            diagnostics.error(std::move(blockError), std::string(detail::kDiagnosticContext));
+            return std::nullopt;
+        }
+
+        // ---- stage: partition-am-commit-graph ---------------------------
+        // Event-clustering partitioning of the commit graph, producing the
+        // GRHSIM AM Commit Event Graph.
+        const auto commitEvent = partitionAmCommitGraph(blockInput, context->split, blockError);
+        if (!commitEvent) {
+            diagnostics.error(std::move(blockError), std::string(detail::kDiagnosticContext));
+            return std::nullopt;
+        }
+
+        // ---- stage: materialize -----------------------------------------
+        return materializeAmProgram(graph, *context, *computeActivity, *commitEvent, options,
+                                    diagnostics);
+    }
+
+    GrhIRToGrhSimAMProgramResult
+    GrhIRToGrhSimAMProgram::run(AmGraph &&graph,
                           const ActivityScheduleOptions &scheduleOptions,
                           const GrhSimAmCppOptions &emitOptions,
                           wolvrix::lib::diag::Diagnostics &diagnostics)
     {
-        GrhSimAmPipelineResult result;
+        GrhIRToGrhSimAMProgramResult result;
         if (diagnostics.hasError())
         {
             return result;
         }
-        if (!reportValidation(validate(linear,
+        if (!reportValidation(validate(graph,
                                        ValidationOptions{.level = ValidationLevel::Semantic}),
                               "grhsim-am-lower",
                               diagnostics))
@@ -940,29 +1078,14 @@ namespace wolvrix::lib::grhsim::am
             return result;
         }
 
-        // The graph form is the working IR: everything between lowering and
-        // emission runs on the AmGraph. For now this is a lossless
-        // round-trip; graph passes land here one by one.
-        {
-            AmGraph graph = AmGraph::fromLinearProgram(linear);
-            linear = graph.toLinearProgram();
-            if (!reportValidation(validate(linear,
-                                           ValidationOptions{.level = ValidationLevel::Semantic}),
-                                  "grhsim-am-graph",
-                                  diagnostics))
-            {
-                return result;
-            }
-        }
-
-        if (!optimizeLinearProgram(linear, optimizeOptions_, diagnostics) ||
+        if (!optimizeAmGraph(graph, optimizeOptions_, diagnostics) ||
             diagnostics.hasError())
         {
             return result;
         }
 
         std::optional<ExecutableModel> model =
-            scheduler_.schedule(std::move(linear), scheduleOptions, diagnostics);
+            graphToProgram(std::move(graph), scheduleOptions, diagnostics);
         if (!model || diagnostics.hasError())
         {
             return result;
@@ -982,18 +1105,18 @@ namespace wolvrix::lib::grhsim::am
         return result;
     }
 
-    GrhSimAmPipelineResult
-    GrhSimAmPipeline::run(const wolvrix::lib::grh::Graph &graph,
+    GrhIRToGrhSimAMProgramResult
+    GrhIRToGrhSimAMProgram::run(const wolvrix::lib::grh::Graph &graph,
                           const ActivityScheduleOptions &scheduleOptions,
                           const GrhSimAmCppOptions &emitOptions,
                           wolvrix::lib::diag::Diagnostics &diagnostics)
     {
-        std::optional<LinearProgramArtifact> linear = lower(graph, diagnostics);
-        if (!linear)
+        std::optional<AmGraph> lowered = lower(graph, diagnostics);
+        if (!lowered)
         {
             return {};
         }
-        return run(std::move(*linear), scheduleOptions, emitOptions, diagnostics);
+        return run(std::move(*lowered), scheduleOptions, emitOptions, diagnostics);
     }
 
 } // namespace wolvrix::lib::grhsim::am

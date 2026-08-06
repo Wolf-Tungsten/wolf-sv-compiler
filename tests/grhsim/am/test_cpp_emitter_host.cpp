@@ -1,5 +1,5 @@
-#include "grhsim/am/builder.hpp"
-#include "grhsim/am/cpp_emitter.hpp"
+#include "grhsim/am/grhsim_am_program.hpp"
+#include "grhsim/am/grhsim_am_program_cpp_emitter.hpp"
 
 #include <array>
 #include <cstdint>

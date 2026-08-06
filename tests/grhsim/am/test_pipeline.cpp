@@ -1,7 +1,6 @@
-#include "grhsim/am/builder.hpp"
-#include "grhsim/am/opcode_traits.hpp"
-#include "grhsim/am/pipeline.hpp"
-#include "grhsim/am/production_activity_schedule.hpp"
+#include "grhsim/am/grhsim_am_program.hpp"
+#include "grhsim/am/grhsim_am_opcode_traits.hpp"
+#include "grhsim/am/grh_ir_to_grhsim_am_program.hpp"
 
 #include <array>
 #include <cstddef>
@@ -45,13 +44,6 @@ namespace
         InvalidSchedulingFacts,
     };
 
-    enum class ScheduleBehavior
-    {
-        Success,
-        ReturnFailure,
-        InvalidInterface,
-    };
-
     enum class EmitBehavior
     {
         Success,
@@ -62,10 +54,6 @@ namespace
     {
         std::vector<std::string> calls;
         bool lowerSawGraph = false;
-        bool schedulerSawLinearProgram = false;
-        bool schedulerSawInterface = false;
-        bool schedulerSawSchedulingFacts = false;
-        bool schedulerSawOptions = false;
         bool emitterSawScheduledProgram = false;
         bool emitterSawInterface = false;
         bool emitterSawOptions = false;
@@ -102,7 +90,7 @@ namespace
         };
     }
 
-    class MockLowering final : public GrhToAmLoweringStage
+    class MockLowering final : public GrhIRToGrhSimAMGraphLoweringStage
     {
     public:
         MockLowering(MockState &state, LowerBehavior behavior)
@@ -110,7 +98,7 @@ namespace
         {
         }
 
-        std::optional<LinearProgramArtifact>
+        std::optional<AmGraph>
         lower(const wolvrix::lib::grh::Graph &graph,
               wolvrix::lib::diag::Diagnostics &diagnostics) override
         {
@@ -122,93 +110,24 @@ namespace
                 return std::nullopt;
             }
 
-            LinearProgramArtifact artifact = makeLinearArtifact();
+            AmGraph lowered = AmGraph::fromLinearProgram(makeLinearArtifact());
             if (behavior_ == LowerBehavior::InvalidInterface)
             {
-                artifact.interface.ports.front().output =
-                    artifact.interface.ports.front().input;
+                lowered.mutableInterface().ports.front().output =
+                    lowered.mutableInterface().ports.front().input;
             }
             else if (behavior_ == LowerBehavior::InvalidSchedulingFacts)
             {
-                artifact.schedulingFacts.variableRoles.clear();
+                AmValueFacts facts = lowered.valueFacts(VariableId{0});
+                facts.roles = VariableRole::None;
+                lowered.setValueFacts(VariableId{0}, facts);
             }
-            return std::optional<LinearProgramArtifact>(std::move(artifact));
+            return std::optional<AmGraph>(std::move(lowered));
         }
 
     private:
         MockState &state_;
         LowerBehavior behavior_;
-    };
-
-    class MockScheduler final : public AmActivityScheduleStage
-    {
-    public:
-        MockScheduler(MockState &state, ScheduleBehavior behavior)
-            : state_(state), behavior_(behavior)
-        {
-        }
-
-        std::optional<ExecutableModel>
-        schedule(LinearProgramArtifact &&linear,
-                 const ActivityScheduleOptions &options,
-                 wolvrix::lib::diag::Diagnostics &diagnostics) override
-        {
-            state_.calls.emplace_back("schedule");
-            const ProgramView view = linear.program.view();
-            state_.schedulerSawLinearProgram =
-                linear.program.valid() && view.variableCount() == 1 &&
-                view.instructionCount() == 0;
-            state_.schedulerSawInterface =
-                linear.interface.ports.size() == 1 &&
-                linear.interface.ports.front().direction == PortDirection::Input &&
-                linear.interface.ports.front().input == VariableId{0} &&
-                linear.interface.declaredVariables.size() == 1;
-            state_.schedulerSawSchedulingFacts =
-                linear.schedulingFacts.variableRoles.size() == 1 &&
-                linear.schedulingFacts.instructionEffects.empty() &&
-                linear.schedulingFacts.orderedEffects.empty();
-            state_.schedulerSawOptions =
-                options.maxInstructionsPerBlock == 17 &&
-                options.maxCommitInstructionsPerBlock == 23 && !options.enableCoarsening &&
-                options.collectStats;
-
-            if (behavior_ == ScheduleBehavior::ReturnFailure)
-            {
-                diagnostics.error("mock scheduling failed", "mock-schedule");
-                return std::nullopt;
-            }
-
-            ProgramInterface interface = std::move(linear.interface);
-            ScheduledProgramBuilder builder(std::move(linear.program));
-            const TypeId type = builder.view().variable(VariableId{0}).type;
-            const VariableId oldValue = builder.addVariable(type, builder.undefInit());
-            const VariableId event = builder.addVariable(type, builder.zeroInit());
-            const std::array<VariableId, 1> changedResults = {event};
-            const std::array<VariableId, 2> changedOperands = {VariableId{0}, oldValue};
-            const InstructionId changed =
-                builder.addInstruction(Opcode::ChangedAny, changedResults, changedOperands);
-            const std::array<VariableId, 1> actOperands = {event};
-            const InstructionId activate =
-                builder.addInstruction(Opcode::ActForward, {}, actOperands);
-            const std::array<BlockId, 1> targets = {BlockId{1}};
-            builder.setActivationTargets(activate, targets);
-            const std::array<InstructionId, 2> entryInstructions = {changed, activate};
-            builder.addBlock(entryInstructions);
-            builder.addBlock({});
-            ExecutableModel model{
-                .program = builder.finish(),
-                .interface = std::move(interface),
-            };
-            if (behavior_ == ScheduleBehavior::InvalidInterface)
-            {
-                model.interface.ports.front().input = VariableId::invalid();
-            }
-            return std::optional<ExecutableModel>(std::move(model));
-        }
-
-    private:
-        MockState &state_;
-        ScheduleBehavior behavior_;
     };
 
     class MockEmitter final : public GrhSimAmCppEmitStage
@@ -266,14 +185,12 @@ namespace
     };
 
     CaseOutcome runCase(LowerBehavior lowerBehavior,
-                        ScheduleBehavior scheduleBehavior,
                         EmitBehavior emitBehavior)
     {
         MockState state;
         MockLowering lowering(state, lowerBehavior);
-        MockScheduler scheduler(state, scheduleBehavior);
         MockEmitter emitter(state, emitBehavior);
-        GrhSimAmPipeline pipeline(lowering, scheduler, emitter);
+        GrhIRToGrhSimAMProgram pipeline(lowering, emitter);
 
         wolvrix::lib::grh::Design design;
         wolvrix::lib::grh::Graph &graph = design.createGraph("pipeline_top");
@@ -291,7 +208,7 @@ namespace
         };
         emitOptions.attributes.emplace("mode", "test");
 
-        GrhSimAmPipelineResult result = pipeline.run(
+        GrhIRToGrhSimAMProgramResult result = pipeline.run(
             graph,
             scheduleOptions,
             emitOptions,
@@ -312,7 +229,6 @@ namespace
     {
         const CaseOutcome outcome = runCase(
             LowerBehavior::Success,
-            ScheduleBehavior::Success,
             EmitBehavior::Success);
         if (!outcome.success || !outcome.hasModel || outcome.diagnosticsHaveError ||
             outcome.modelBlockCount != 2 ||
@@ -320,14 +236,11 @@ namespace
         {
             return fail("successful pipeline must return its ScheduledProgram and emitted artifacts");
         }
-        if (outcome.state.calls != std::vector<std::string>{"lower", "schedule", "emit"})
+        if (outcome.state.calls != std::vector<std::string>{"lower", "emit"})
         {
             return fail("pipeline stages must run strictly as Linear -> Scheduled -> emit");
         }
-        if (!outcome.state.lowerSawGraph || !outcome.state.schedulerSawLinearProgram ||
-            !outcome.state.schedulerSawInterface ||
-            !outcome.state.schedulerSawSchedulingFacts ||
-            !outcome.state.schedulerSawOptions ||
+        if (!outcome.state.lowerSawGraph ||
             !outcome.state.emitterSawScheduledProgram ||
             !outcome.state.emitterSawInterface || !outcome.state.emitterSawOptions)
         {
@@ -340,11 +253,10 @@ namespace
     {
         MockState state;
         MockLowering lowering(state, LowerBehavior::Success);
-        MockScheduler scheduler(state, ScheduleBehavior::Success);
         MockEmitter emitter(state, EmitBehavior::Success);
-        GrhSimAmPipeline pipeline(lowering, scheduler, emitter);
+        GrhIRToGrhSimAMProgram pipeline(lowering, emitter);
         wolvrix::lib::diag::Diagnostics diagnostics;
-        std::optional<LinearProgramArtifact> linear;
+        std::optional<AmGraph> linear;
         {
             wolvrix::lib::grh::Design design;
             wolvrix::lib::grh::Graph &graph = design.createGraph("pipeline_top");
@@ -368,14 +280,14 @@ namespace
             .attributes = {},
         };
         emitOptions.attributes.emplace("mode", "test");
-        GrhSimAmPipelineResult result = pipeline.run(
+        GrhIRToGrhSimAMProgramResult result = pipeline.run(
             std::move(*linear),
             scheduleOptions,
             emitOptions,
             diagnostics);
         if (!result.success || !result.model || diagnostics.hasError() ||
             result.artifacts != std::vector<std::string>{"model.cpp", "support.cpp"} ||
-            state.calls != std::vector<std::string>{"lower", "schedule", "emit"})
+            state.calls != std::vector<std::string>{"lower", "emit"})
         {
             return fail("staged pipeline must run after its source Graph has been destroyed");
         }
@@ -386,19 +298,18 @@ namespace
     {
         MockState state;
         MockLowering lowering(state, LowerBehavior::Success);
-        MockScheduler scheduler(state, ScheduleBehavior::Success);
         MockEmitter emitter(state, EmitBehavior::Success);
-        GrhSimAmPipeline pipeline(lowering, scheduler, emitter);
-        LinearProgramArtifact linear = makeLinearArtifact();
+        GrhIRToGrhSimAMProgram pipeline(lowering, emitter);
+        AmGraph linear = AmGraph::fromLinearProgram(makeLinearArtifact());
         wolvrix::lib::diag::Diagnostics diagnostics;
         diagnostics.error("existing failure", "test");
-        const GrhSimAmPipelineResult result = pipeline.run(
+        const GrhIRToGrhSimAMProgramResult result = pipeline.run(
             std::move(linear),
             ActivityScheduleOptions{},
             GrhSimAmCppOptions{},
             diagnostics);
         if (result.success || result.model || !result.artifacts.empty() ||
-            !linear.program.valid() || !state.calls.empty())
+            !linear.program().valid() || !state.calls.empty())
         {
             return fail("an existing diagnostic error must not consume the staged artifact");
         }
@@ -409,7 +320,6 @@ namespace
     {
         const CaseOutcome outcome = runCase(
             LowerBehavior::InvalidInterface,
-            ScheduleBehavior::Success,
             EmitBehavior::Success);
         if (outcome.success || outcome.hasModel || !outcome.diagnosticsHaveError ||
             outcome.state.calls != std::vector<std::string>{"lower"})
@@ -423,7 +333,6 @@ namespace
     {
         const CaseOutcome outcome = runCase(
             LowerBehavior::InvalidSchedulingFacts,
-            ScheduleBehavior::Success,
             EmitBehavior::Success);
         if (outcome.success || outcome.hasModel || !outcome.diagnosticsHaveError ||
             outcome.state.calls != std::vector<std::string>{"lower"})
@@ -1017,25 +926,10 @@ namespace
         return 0;
     }
 
-    int testScheduledInterfaceGate()
-    {
-        const CaseOutcome outcome = runCase(
-            LowerBehavior::Success,
-            ScheduleBehavior::InvalidInterface,
-            EmitBehavior::Success);
-        if (outcome.success || outcome.hasModel || !outcome.diagnosticsHaveError ||
-            outcome.state.calls != std::vector<std::string>{"lower", "schedule"})
-        {
-            return fail("invalid scheduled ProgramInterface must gate the emitter");
-        }
-        return 0;
-    }
-
     int testFailureShortCircuiting()
     {
         const CaseOutcome lowerFailure = runCase(
             LowerBehavior::ReturnFailure,
-            ScheduleBehavior::Success,
             EmitBehavior::Success);
         if (lowerFailure.success || lowerFailure.hasModel ||
             !lowerFailure.diagnosticsHaveError ||
@@ -1044,24 +938,38 @@ namespace
             return fail("lowering failure must short-circuit scheduler and emitter");
         }
 
-        const CaseOutcome scheduleFailure = runCase(
-            LowerBehavior::Success,
-            ScheduleBehavior::ReturnFailure,
-            EmitBehavior::Success);
-        if (scheduleFailure.success || scheduleFailure.hasModel ||
-            !scheduleFailure.diagnosticsHaveError ||
-            scheduleFailure.state.calls != std::vector<std::string>{"lower", "schedule"})
+        // The schedule stage is GrhIRToGrhSimAMProgram::graphToProgram itself, so a
+        // schedule-stage failure is injected through invalid scheduling
+        // limits: schedule() rejects them before the emitter can run.
         {
-            return fail("scheduler failure must short-circuit the emitter");
+            MockState state;
+            MockLowering lowering(state, LowerBehavior::Success);
+            MockEmitter emitter(state, EmitBehavior::Success);
+            GrhIRToGrhSimAMProgram pipeline(lowering, emitter);
+            wolvrix::lib::grh::Design design;
+            wolvrix::lib::grh::Graph &graph = design.createGraph("pipeline_top");
+            wolvrix::lib::diag::Diagnostics diagnostics;
+            const ActivityScheduleOptions scheduleOptions{
+                .maxInstructionsPerBlock = 0,
+            };
+            const GrhIRToGrhSimAMProgramResult result = pipeline.run(
+                graph,
+                scheduleOptions,
+                GrhSimAmCppOptions{},
+                diagnostics);
+            if (result.success || result.model || !diagnostics.hasError() ||
+                state.calls != std::vector<std::string>{"lower"})
+            {
+                return fail("scheduler failure must short-circuit the emitter");
+            }
         }
 
         const CaseOutcome emitFailure = runCase(
             LowerBehavior::Success,
-            ScheduleBehavior::Success,
             EmitBehavior::ReturnFailure);
         if (emitFailure.success || !emitFailure.hasModel ||
             !emitFailure.diagnosticsHaveError ||
-            emitFailure.state.calls != std::vector<std::string>{"lower", "schedule", "emit"} ||
+            emitFailure.state.calls != std::vector<std::string>{"lower", "emit"} ||
             emitFailure.artifacts != std::vector<std::string>{"partial.cpp"})
         {
             return fail("emitter failure must preserve the scheduled model and partial artifact list");
@@ -1072,10 +980,11 @@ namespace
     int testProductionWatchesOtherwiseUnusedInputs()
     {
         LinearProgramArtifact linear = makeLinearArtifact();
-        ProductionActivityScheduleStage scheduler;
         wolvrix::lib::diag::Diagnostics diagnostics;
         std::optional<ExecutableModel> model =
-            scheduler.schedule(std::move(linear), ActivityScheduleOptions{}, diagnostics);
+            GrhIRToGrhSimAMProgram::graphToProgram(AmGraph::fromLinearProgram(linear),
+                                           ActivityScheduleOptions{},
+                                           diagnostics);
         if (!model || diagnostics.hasError() || model->program.blockCount() != 2 ||
             model->program.blockSize(BlockId{0}) != 2 ||
             model->program.blockSize(BlockId{1}) != 0)
@@ -1469,10 +1378,6 @@ int main()
         return result;
     }
     if (const int result = testExecutableInputCoverageTracksEntryBlockDataflow(); result != 0)
-    {
-        return result;
-    }
-    if (const int result = testScheduledInterfaceGate(); result != 0)
     {
         return result;
     }

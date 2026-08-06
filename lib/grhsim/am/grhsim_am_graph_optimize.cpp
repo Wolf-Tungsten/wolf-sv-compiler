@@ -1,7 +1,7 @@
-#include "grhsim/am/optimize.hpp"
+#include "grhsim/am/grhsim_am_graph_optimize.hpp"
 
-#include "grhsim/am/builder.hpp"
-#include "grhsim/am/opcode_traits.hpp"
+#include "grhsim/am/grhsim_am_program.hpp"
+#include "grhsim/am/grhsim_am_opcode_traits.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -644,13 +644,13 @@ namespace wolvrix::lib::grhsim::am {
         // Optimizer.
         // ------------------------------------------------------------------
 
-        class LinearProgramOptimizer {
+        class AmGraphOptimizer {
         public:
-            LinearProgramOptimizer(LinearProgramArtifact &artifact,
-                                   const AmOptimizeOptions &options,
-                                   diag::Diagnostics &diagnostics)
-                : artifact_(artifact), options_(options), diagnostics_(diagnostics),
-                  view_(artifact.program.view()) {}
+            AmGraphOptimizer(AmGraph &graph,
+                             const AmOptimizeOptions &options,
+                             diag::Diagnostics &diagnostics)
+                : graph_(graph), options_(options), diagnostics_(diagnostics),
+                  view_(graph.program()) {}
 
             bool run() {
                 if (!view_.valid()) {
@@ -684,8 +684,8 @@ namespace wolvrix::lib::grhsim::am {
                     kept += live != 0;
                 }
                 if (kept == live_.size() && newConstants_.empty()) {
-                    // Nothing was removed or rewritten; the artifact is untouched.
-                    return validateSelf(artifact_);
+                    // Nothing was removed or rewritten; the graph is untouched.
+                    return validateSelf(graph_);
                 }
                 return compact(kept);
             }
@@ -698,12 +698,7 @@ namespace wolvrix::lib::grhsim::am {
             };
 
             VariableRole roleOf(VariableId variable) const {
-                const std::vector<VariableRole> &roles =
-                    artifact_.schedulingFacts.variableRoles;
-                if (!variable.valid() || variable.value >= roles.size()) {
-                    return VariableRole::None;
-                }
-                return roles[variable.value];
+                return graph_.valueFacts(variable).roles;
             }
 
             // Same mechanical mapping as lowering.cpp's effect table fill and
@@ -761,7 +756,7 @@ namespace wolvrix::lib::grhsim::am {
 
                 inOrderedEffect_.assign(instructionCount, 0);
                 for (const OrderedEffect &effect :
-                     artifact_.schedulingFacts.orderedEffects) {
+                     graph_.orderedEffects()) {
                     if (effect.instruction.valid() &&
                         effect.instruction.value < instructionCount) {
                         inOrderedEffect_[effect.instruction.value] = 1;
@@ -1229,7 +1224,7 @@ namespace wolvrix::lib::grhsim::am {
                 }
             }
 
-            bool validateSelf(const LinearProgramArtifact &candidate) {
+            bool validateSelf(const AmGraph &candidate) {
                 const ValidationResult validation =
                     validate(candidate, ValidationOptions{
                                               .level = ValidationLevel::Semantic,
@@ -1241,7 +1236,7 @@ namespace wolvrix::lib::grhsim::am {
                 const std::size_t reported =
                     std::min(validation.errors.size(), kMaxReportedErrors);
                 for (std::size_t index = 0; index < reported; ++index) {
-                    diagnostics_.error("AM optimize produced an invalid artifact: " +
+                    diagnostics_.error("AM optimize produced an invalid graph: " +
                                            validation.errors[index],
                                        std::string(kDiagnosticContext));
                 }
@@ -1257,7 +1252,7 @@ namespace wolvrix::lib::grhsim::am {
                     }
                 }
 
-                LinearProgramBuilder builder;
+                AmGraph next;
                 const ProgramStorageStats stats = view_.storageStats();
                 ProgramReserve reserve{};
                 reserve.types = view_.typeCount();
@@ -1283,23 +1278,54 @@ namespace wolvrix::lib::grhsim::am {
                     stats.arena(ProgramArena::DpiCallAttributes).elements;
                 reserve.dpiImports = view_.dpiImportCount();
                 reserve.dpiParameters = stats.arena(ProgramArena::DpiParameters).elements;
-                builder.reserve(reserve);
+                next.reserve(reserve);
 
                 // Types, strings, and literals are copied in order so their
                 // IDs stay identical; only InstructionIds are compacted.
                 for (uint32_t index = 0; index < view_.typeCount(); ++index) {
-                    builder.addType(view_.type(TypeId{index}));
+                    next.addType(view_.type(TypeId{index}));
                 }
                 for (uint32_t index = 0; index < view_.stringCount(); ++index) {
-                    builder.addString(view_.string(StringId{index}));
+                    next.addString(view_.string(StringId{index}));
                 }
                 for (uint32_t index = 0; index < view_.literalCount(); ++index) {
                     const LiteralView literal = view_.literal(LiteralId{index});
                     const Type &type = view_.type(literal.type);
                     if (type.kind == TypeKind::String) {
-                        builder.addStringLiteral(literal.type, literal.bytes);
+                        next.addStringLiteral(literal.type, literal.bytes);
                     } else {
-                        builder.addBitLiteral(literal.type, literal.words);
+                        next.addBitLiteral(literal.type, literal.words);
+                    }
+                }
+
+                // Roles with the interface-visibility carry, computed before
+                // the variables are created so each variable lands with its
+                // final facts: interface visibility roles move from aliased
+                // variables to their alias representatives so the roles stay
+                // consistent with the re-pointed ProgramInterface.
+                std::vector<VariableRole> roles;
+                roles.reserve(oldVariableCount_ + newConstants_.size());
+                for (uint32_t index = 0; index < oldVariableCount_; ++index) {
+                    roles.push_back(roleOf(VariableId{index}));
+                }
+                roles.resize(oldVariableCount_ + newConstants_.size(), VariableRole::None);
+                constexpr uint8_t kInterfaceRoleBits =
+                    static_cast<uint8_t>(VariableRole::ExternalOutput) |
+                    static_cast<uint8_t>(VariableRole::Observable);
+                for (uint32_t index = 0; index < oldVariableCount_; ++index) {
+                    if (!alias_[index].valid()) {
+                        continue;
+                    }
+                    const uint8_t role = static_cast<uint8_t>(roles[index]);
+                    const uint8_t carried = role & kInterfaceRoleBits;
+                    if (carried == 0) {
+                        continue;
+                    }
+                    roles[index] = static_cast<VariableRole>(role & ~kInterfaceRoleBits);
+                    const uint32_t resolved = resolveVariable(index);
+                    if (resolved < roles.size()) {
+                        roles[resolved] = static_cast<VariableRole>(
+                            static_cast<uint8_t>(roles[resolved]) | carried);
                     }
                 }
 
@@ -1309,31 +1335,38 @@ namespace wolvrix::lib::grhsim::am {
                     InitId init;
                     switch (descriptor.kind) {
                     case InitKind::Undef:
-                        init = builder.undefInit();
+                        init = next.undefInit();
                         break;
                     case InitKind::Zero:
-                        init = builder.zeroInit();
+                        init = next.zeroInit();
                         break;
                     case InitKind::Constant:
-                        init = builder.addConstantInit(LiteralId{descriptor.payload});
+                        init = next.addConstantInit(LiteralId{descriptor.payload});
                         break;
                     case InitKind::Actions:
-                        init = builder.addActionsInit(view_.initActions(record.init));
+                        init = next.addActionsInit(view_.initActions(record.init));
                         break;
                     }
-                    builder.addVariable(record.type, init,
-                                        view_.variableLabel(VariableId{index}));
+                    AmValueFacts facts = graph_.valueFacts(VariableId{index});
+                    facts.roles = roles[index];
+                    next.addVariable(record.type, init,
+                                     view_.variableLabel(VariableId{index}), facts);
                 }
-                for (const ConstantSlot &constant : newConstants_) {
+                for (std::size_t index = 0; index < newConstants_.size(); ++index) {
+                    const ConstantSlot &constant = newConstants_[index];
                     const LiteralId literal =
-                        builder.addBitLiteral(constant.typeId, constant.words);
-                    builder.addVariable(constant.typeId, builder.addConstantInit(literal));
+                        next.addBitLiteral(constant.typeId, constant.words);
+                    AmValueFacts facts;
+                    facts.kind = AmValueKind::Constant;
+                    facts.roles = roles[oldVariableCount_ + index];
+                    next.addVariable(constant.typeId, next.addConstantInit(literal),
+                                     std::nullopt, facts);
                 }
 
                 for (uint32_t index = 0; index < view_.dpiImportCount(); ++index) {
                     const DpiImportView import = view_.dpiImport(DpiImportId{index});
-                    builder.addDpiImport(import.symbol, import.parameters,
-                                         import.returnValue);
+                    next.addDpiImport(import.symbol, import.parameters,
+                                      import.returnValue);
                 }
 
                 for (uint32_t index = 0; index < oldInstructionCount_; ++index) {
@@ -1350,31 +1383,32 @@ namespace wolvrix::lib::grhsim::am {
                                                : operand);
                     }
                     const InstructionId rebuilt =
-                        builder.addInstruction(view_.opcode(instruction),
-                                               view_.results(instruction), operands);
+                        next.addInstruction(view_.opcode(instruction),
+                                            view_.results(instruction), operands);
                     if (rebuilt.value != instructionRemap[index]) {
                         diagnostics_.error("AM optimize lost dense instruction alignment",
                                            std::string(kDiagnosticContext));
                         return false;
                     }
                     if (const auto attributes = view_.sliceStaticAttributes(instruction)) {
-                        builder.setSliceStaticAttributes(rebuilt, attributes->lsb);
+                        next.setSliceStaticAttributes(rebuilt, attributes->lsb);
                     }
                     if (const auto attributes = view_.systemFunctionAttributes(instruction)) {
-                        builder.setSystemFunctionAttributes(rebuilt, *attributes);
+                        next.setSystemFunctionAttributes(rebuilt, *attributes);
                     }
                     if (const auto attributes = view_.systemTaskAttributes(instruction)) {
-                        builder.setSystemTaskAttributes(rebuilt, *attributes);
+                        next.setSystemTaskAttributes(rebuilt, *attributes);
                     }
                     if (const auto attributes = view_.dpiCallAttributes(instruction)) {
-                        builder.setDpiCallAttributes(rebuilt, *attributes);
+                        next.setDpiCallAttributes(rebuilt, *attributes);
                     }
+                    next.setInstructionEffect(rebuilt, expectedEffect(instruction));
                 }
 
                 // Interface entries keep referring to the eliminated
                 // duplicates unless re-pointed to their alias representatives
                 // (values are identical by construction).
-                ProgramInterface rebuiltInterface = artifact_.interface;
+                ProgramInterface rebuiltInterface = graph_.interface();
                 for (PortBinding &port : rebuiltInterface.ports) {
                     if (port.input.valid()) {
                         port.input = VariableId{resolveVariable(port.input.value)};
@@ -1393,60 +1427,13 @@ namespace wolvrix::lib::grhsim::am {
                             VariableId{resolveVariable(declared.variable.value)};
                     }
                 }
+                next.mutableInterface() = std::move(rebuiltInterface);
 
-                LinearProgramArtifact optimized{
-                    .program = builder.finish(),
-                    .interface = std::move(rebuiltInterface),
-                    .schedulingFacts = {},
-                };
-                optimized.schedulingFacts.variableRoles.reserve(oldVariableCount_ +
-                                                                newConstants_.size());
-                for (uint32_t index = 0; index < oldVariableCount_; ++index) {
-                    optimized.schedulingFacts.variableRoles.push_back(
-                        roleOf(VariableId{index}));
-                }
-                optimized.schedulingFacts.variableRoles.resize(
-                    oldVariableCount_ + newConstants_.size(), VariableRole::None);
-                // Transfer interface visibility roles from aliased variables
-                // to their alias representatives so the roles stay consistent
-                // with the re-pointed ProgramInterface.
-                constexpr uint8_t kInterfaceRoleBits =
-                    static_cast<uint8_t>(VariableRole::ExternalOutput) |
-                    static_cast<uint8_t>(VariableRole::Observable);
-                for (uint32_t index = 0; index < oldVariableCount_; ++index) {
-                    if (!alias_[index].valid()) {
-                        continue;
-                    }
-                    const uint8_t role =
-                        static_cast<uint8_t>(optimized.schedulingFacts.variableRoles[index]);
-                    const uint8_t carried = role & kInterfaceRoleBits;
-                    if (carried == 0) {
-                        continue;
-                    }
-                    optimized.schedulingFacts.variableRoles[index] =
-                        static_cast<VariableRole>(role & ~kInterfaceRoleBits);
-                    const uint32_t resolved = resolveVariable(index);
-                    if (resolved < optimized.schedulingFacts.variableRoles.size()) {
-                        optimized.schedulingFacts.variableRoles[resolved] =
-                            static_cast<VariableRole>(
-                                static_cast<uint8_t>(
-                                    optimized.schedulingFacts.variableRoles[resolved]) |
-                                carried);
-                    }
-                }
-                optimized.schedulingFacts.instructionEffects.reserve(keptInstructions);
-                for (uint32_t index = 0; index < oldInstructionCount_; ++index) {
-                    if (live_[index] != 0) {
-                        optimized.schedulingFacts.instructionEffects.push_back(
-                            expectedEffect(InstructionId{index}));
-                    }
-                }
-                for (const OrderedEffect &effect :
-                     artifact_.schedulingFacts.orderedEffects) {
+                for (const OrderedEffect &effect : graph_.orderedEffects()) {
                     if (effect.instruction.valid() &&
                         effect.instruction.value < oldInstructionCount_ &&
                         instructionRemap[effect.instruction.value] != kInvalidIndex) {
-                        optimized.schedulingFacts.orderedEffects.push_back(OrderedEffect{
+                        next.orderedEffects().push_back(OrderedEffect{
                             .instruction =
                                 InstructionId{instructionRemap[effect.instruction.value]},
                             .group = effect.group,
@@ -1455,7 +1442,7 @@ namespace wolvrix::lib::grhsim::am {
                     }
                 }
 
-                if (!validateSelf(optimized)) {
+                if (!validateSelf(next)) {
                     return false;
                 }
                 const std::size_t removed = oldInstructionCount_ - keptInstructions;
@@ -1470,11 +1457,11 @@ namespace wolvrix::lib::grhsim::am {
                                                 aliasCount_ - memFoldCount_) +
                         ") constants_added=" + std::to_string(newConstants_.size()),
                     std::string(kDiagnosticContext));
-                artifact_ = std::move(optimized);
+                graph_ = std::move(next);
                 return true;
             }
 
-            LinearProgramArtifact &artifact_;
+            AmGraph &graph_;
             const AmOptimizeOptions &options_;
             diag::Diagnostics &diagnostics_;
             ProgramView view_;
@@ -1497,15 +1484,15 @@ namespace wolvrix::lib::grhsim::am {
 
     } // namespace
 
-    bool optimizeLinearProgram(LinearProgramArtifact &artifact,
-                               const AmOptimizeOptions &options,
-                               wolvrix::lib::diag::Diagnostics &diagnostics) {
+    bool optimizeAmGraph(AmGraph &graph,
+                         const AmOptimizeOptions &options,
+                         wolvrix::lib::diag::Diagnostics &diagnostics) {
         if (!options.dce && !options.constFold && !options.cse && !options.assignAlias &&
             !options.constMemFold) {
             return true;
         }
         try {
-            LinearProgramOptimizer optimizer(artifact, options, diagnostics);
+            AmGraphOptimizer optimizer(graph, options, diagnostics);
             return optimizer.run();
         } catch (const std::exception &error) {
             diagnostics.error(std::string("AM optimize failed: ") + error.what(),

@@ -1,6 +1,6 @@
-#include "grhsim/am/builder.hpp"
-#include "grhsim/am/graph.hpp"
-#include "grhsim/am/pipeline.hpp"
+#include "grhsim/am/grhsim_am_program.hpp"
+#include "grhsim/am/grhsim_am_graph.hpp"
+#include "grhsim/am/grh_ir_to_grhsim_am_program.hpp"
 
 #include <cstdint>
 #include <iostream>

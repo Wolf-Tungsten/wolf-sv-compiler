@@ -1,7 +1,7 @@
-#ifndef WOLVRIX_GRHSIM_AM_INTERPRETER_HPP
-#define WOLVRIX_GRHSIM_AM_INTERPRETER_HPP
+#ifndef WOLVRIX_GRHSIM_AM_GRHSIM_AM_PROGRAM_INTERPRETER_HPP
+#define WOLVRIX_GRHSIM_AM_GRHSIM_AM_PROGRAM_INTERPRETER_HPP
 
-#include "grhsim/am/pipeline.hpp"
+#include "grhsim/am/grh_ir_to_grhsim_am_program.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -149,4 +149,4 @@ namespace wolvrix::lib::grhsim::am {
 
 } // namespace wolvrix::lib::grhsim::am
 
-#endif // WOLVRIX_GRHSIM_AM_INTERPRETER_HPP
+#endif // WOLVRIX_GRHSIM_AM_GRHSIM_AM_PROGRAM_INTERPRETER_HPP

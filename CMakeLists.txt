@@ -110,17 +110,20 @@ set(WOLVRIX_LIB_SOURCES
     lib/core/load.cpp
     lib/core/emit.cpp
     lib/core/toposort.cpp
-    lib/grhsim/am/program.cpp
-    lib/grhsim/am/builder.cpp
-    lib/grhsim/am/graph.cpp
-    lib/grhsim/am/validate.cpp
-    lib/grhsim/am/pipeline.cpp
-    lib/grhsim/am/lowering.cpp
-    lib/grhsim/am/activity_schedule.cpp
-    lib/grhsim/am/production_activity_schedule.cpp
-    lib/grhsim/am/optimize.cpp
-    lib/grhsim/am/interpreter.cpp
-    lib/grhsim/am/cpp_emitter.cpp
+    lib/grhsim/am/grhsim_am_program.cpp
+    lib/grhsim/am/grhsim_am_graph.cpp
+    lib/grhsim/am/grhsim_am_program_validate.cpp
+    lib/grhsim/am/grh_ir_to_grhsim_am_program.cpp
+    lib/grhsim/am/grh_ir_to_grhsim_am_graph.cpp
+    lib/grhsim/am/grhsim_am_graph_partition.cpp
+    lib/grhsim/am/grhsim_am_graph_split.cpp
+    lib/grhsim/am/grhsim_am_compute_graph_optimize.cpp
+    lib/grhsim/am/grhsim_am_compute_graph_partition.cpp
+    lib/grhsim/am/grhsim_am_commit_graph_partition.cpp
+    lib/grhsim/am/grhsim_am_graph_to_program.cpp
+    lib/grhsim/am/grhsim_am_graph_optimize.cpp
+    lib/grhsim/am/grhsim_am_program_interpreter.cpp
+    lib/grhsim/am/grhsim_am_program_cpp_emitter.cpp
     lib/emit/grhsim_cpp.cpp
     lib/emit/system_verilog.cpp
     lib/emit/verilator_repcut_package.cpp

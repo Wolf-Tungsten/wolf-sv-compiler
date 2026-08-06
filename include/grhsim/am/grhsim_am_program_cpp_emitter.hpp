@@ -1,7 +1,7 @@
-#ifndef WOLVRIX_GRHSIM_AM_CPP_EMITTER_HPP
-#define WOLVRIX_GRHSIM_AM_CPP_EMITTER_HPP
+#ifndef WOLVRIX_GRHSIM_AM_GRHSIM_AM_PROGRAM_CPP_EMITTER_HPP
+#define WOLVRIX_GRHSIM_AM_GRHSIM_AM_PROGRAM_CPP_EMITTER_HPP
 
-#include "grhsim/am/pipeline.hpp"
+#include "grhsim/am/grh_ir_to_grhsim_am_program.hpp"
 
 namespace wolvrix::lib::grhsim::am
 {
@@ -17,4 +17,4 @@ namespace wolvrix::lib::grhsim::am
 
 } // namespace wolvrix::lib::grhsim::am
 
-#endif // WOLVRIX_GRHSIM_AM_CPP_EMITTER_HPP
+#endif // WOLVRIX_GRHSIM_AM_GRHSIM_AM_PROGRAM_CPP_EMITTER_HPP

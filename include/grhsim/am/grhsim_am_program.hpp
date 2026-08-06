@@ -1,5 +1,5 @@
-#ifndef WOLVRIX_GRHSIM_AM_PROGRAM_HPP
-#define WOLVRIX_GRHSIM_AM_PROGRAM_HPP
+#ifndef WOLVRIX_GRHSIM_AM_GRHSIM_AM_PROGRAM_HPP
+#define WOLVRIX_GRHSIM_AM_GRHSIM_AM_PROGRAM_HPP
 
 #include <array>
 #include <compare>
@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <vector>
 
 namespace wolvrix::lib::grhsim::am
 {
@@ -402,8 +403,88 @@ namespace wolvrix::lib::grhsim::am
 
     namespace detail
     {
-        struct ProgramStorage;
-    }
+        struct LiteralRecord
+        {
+            TypeId type;
+            Range32 words;
+            Range32 bytes;
+        };
+
+        struct SliceStaticAttributeRecord
+        {
+            InstructionId instruction;
+            SliceStaticAttributes attributes;
+        };
+
+        struct SystemFunctionAttributeRecord
+        {
+            InstructionId instruction;
+            SystemFunctionAttributes attributes;
+        };
+
+        struct SystemTaskAttributeRecord
+        {
+            InstructionId instruction;
+            SystemTaskAttributes attributes;
+        };
+
+        struct DpiCallAttributeRecord
+        {
+            InstructionId instruction;
+            DpiCallAttributes attributes;
+        };
+
+        struct ActivationAttributeRecord
+        {
+            InstructionId instruction;
+            Range32 targets;
+        };
+
+        struct DpiImportRecord
+        {
+            StringId symbol;
+            Range32 parameters;
+            DpiReturn returnValue;
+        };
+
+        struct ProgramStorage
+        {
+            ProgramStorage();
+
+            std::vector<Type> types;
+
+            std::vector<uint32_t> stringOffsets;
+            std::vector<char> stringBytes;
+
+            std::vector<InitDescriptor> initDescriptors;
+            std::vector<InitAction> initActions;
+            std::vector<LiteralRecord> literals;
+            std::vector<uint64_t> literalWords;
+            std::vector<char> literalBytes;
+
+            std::vector<VariableRecord> variables;
+            std::vector<VariableLabel> variableLabels;
+
+            std::vector<Opcode> opcodes;
+            std::vector<uint32_t> operandOffsets;
+            std::vector<VariableId> operands;
+            std::vector<uint32_t> resultOffsets;
+            std::vector<VariableId> results;
+
+            std::vector<SliceStaticAttributeRecord> sliceStaticAttributes;
+            std::vector<SystemFunctionAttributeRecord> systemFunctionAttributes;
+            std::vector<SystemTaskAttributeRecord> systemTaskAttributes;
+            std::vector<DpiCallAttributeRecord> dpiCallAttributes;
+            std::vector<ActivationAttributeRecord> activationAttributes;
+            std::vector<BlockId> activationTargets;
+
+            std::vector<DpiImportRecord> dpiImports;
+            std::vector<DpiParameter> dpiParameters;
+
+            std::vector<uint32_t> blockOffsets;
+            std::vector<InstructionId> blockInstructions;
+        };
+    } // namespace detail
 
     class ProgramView
     {
@@ -500,6 +581,242 @@ namespace wolvrix::lib::grhsim::am
         friend class ScheduledProgramBuilder;
     };
 
+    enum class PortDirection : uint8_t
+    {
+        Input = 0,
+        Output = 1,
+        Inout = 2,
+    };
+
+    struct PortBinding
+    {
+        StringId name;
+        PortDirection direction = PortDirection::Input;
+        VariableId input;
+        VariableId output;
+        VariableId outputEnable;
+    };
+
+    struct ProgramInterface
+    {
+        std::vector<PortBinding> ports;
+        std::vector<VariableLabel> declaredVariables;
+    };
+
+    enum class VariableRole : uint8_t
+    {
+        None = 0,
+        ExternalInput = 1U << 0U,
+        ExternalOutput = 1U << 1U,
+        State = 1U << 2U,
+        Observable = 1U << 3U,
+    };
+
+    constexpr VariableRole operator|(VariableRole lhs, VariableRole rhs) noexcept
+    {
+        return static_cast<VariableRole>(static_cast<uint8_t>(lhs) | static_cast<uint8_t>(rhs));
+    }
+
+    constexpr bool hasRole(VariableRole value, VariableRole role) noexcept
+    {
+        return (static_cast<uint8_t>(value) & static_cast<uint8_t>(role)) != 0;
+    }
+
+    enum class InstructionEffect : uint8_t
+    {
+        Pure = 0,
+        StateRead = 1,
+        StateWrite = 2,
+        StateReadWrite = 3,
+        HostRead = 4,
+        HostEffect = 5,
+    };
+
+    struct OrderedEffect
+    {
+        InstructionId instruction;
+        uint32_t group = 0;
+        uint32_t ordinal = 0;
+    };
+
+    // These arrays are indexed by dense AM IDs and are consumed by scheduling.
+    // They are analysis input, not part of the executable Program contract.
+    struct SchedulingFacts
+    {
+        std::vector<VariableRole> variableRoles;
+        std::vector<InstructionEffect> instructionEffects;
+        std::vector<OrderedEffect> orderedEffects;
+
+        void clearAndRelease();
+    };
+
+    struct LinearProgramArtifact
+    {
+        LinearProgram program;
+        ProgramInterface interface;
+        SchedulingFacts schedulingFacts;
+    };
+
+    struct ExecutableModel
+    {
+        ScheduledProgram program;
+        ProgramInterface interface;
+        // Commit Blocks form one contiguous suffix of the Block space and are
+        // activation-filtered like compute Blocks: each runs only when one of
+        // its gate-detector variables activated it (the initial eval activates
+        // every Block). Zero denotes a schedule without commit Blocks;
+        // otherwise this is a half-open Block range that ends at the
+        // Program's Block count.
+        uint32_t commitBlockBegin = 0;
+        uint32_t commitBlockEnd = 0;
+    };
+
+    struct ProgramReserve
+    {
+        std::size_t types = 0;
+        std::size_t strings = 0;
+        std::size_t stringBytes = 0;
+        std::size_t initDescriptors = 0;
+        std::size_t initActions = 0;
+        std::size_t literals = 0;
+        std::size_t literalWords = 0;
+        std::size_t literalBytes = 0;
+        std::size_t variables = 0;
+        std::size_t variableLabels = 0;
+        std::size_t instructions = 0;
+        std::size_t operands = 0;
+        std::size_t results = 0;
+        std::size_t sliceStaticAttributes = 0;
+        std::size_t systemFunctionAttributes = 0;
+        std::size_t systemTaskAttributes = 0;
+        std::size_t dpiCallAttributes = 0;
+        std::size_t dpiImports = 0;
+        std::size_t dpiParameters = 0;
+    };
+
+    struct ScheduledProgramReserve
+    {
+        // Every count is additional to the builder's current scheduled storage/layout.
+        std::size_t additionalTypes = 0;
+        std::size_t additionalStrings = 0;
+        std::size_t additionalStringBytes = 0;
+        std::size_t additionalVariables = 0;
+        std::size_t additionalVariableLabels = 0;
+        std::size_t additionalInstructions = 0;
+        std::size_t additionalOperands = 0;
+        std::size_t additionalResults = 0;
+        std::size_t additionalSliceStaticAttributes = 0;
+        std::size_t additionalSystemFunctionAttributes = 0;
+        std::size_t additionalSystemTaskAttributes = 0;
+        std::size_t additionalDpiCallAttributes = 0;
+        std::size_t blocks = 0;
+        std::size_t blockInstructionIds = 0;
+        std::size_t activationInstructions = 0;
+        std::size_t activationTargets = 0;
+    };
+
+    class LinearProgramBuilder
+    {
+    public:
+        LinearProgramBuilder();
+        ~LinearProgramBuilder();
+        LinearProgramBuilder(LinearProgramBuilder &&) noexcept;
+        LinearProgramBuilder &operator=(LinearProgramBuilder &&) noexcept;
+        LinearProgramBuilder(const LinearProgramBuilder &) = delete;
+        LinearProgramBuilder &operator=(const LinearProgramBuilder &) = delete;
+
+        void reserve(const ProgramReserve &reserve);
+
+        TypeId addType(const Type &type);
+        StringId addString(std::string_view text);
+
+        InitId undefInit() const noexcept;
+        InitId zeroInit() const noexcept;
+        LiteralId addBitLiteral(TypeId type, std::span<const uint64_t> words);
+        LiteralId addStringLiteral(TypeId type, std::string_view bytes);
+        InitId addConstantInit(LiteralId literal);
+        InitId addActionsInit(std::span<const InitAction> actions);
+
+        VariableId addVariable(TypeId type,
+                               InitId init,
+                               std::optional<StringId> label = std::nullopt);
+        InstructionId addInstruction(Opcode opcode,
+                                     std::span<const VariableId> results,
+                                     std::span<const VariableId> operands);
+
+        void setSliceStaticAttributes(InstructionId instruction, uint32_t lsb);
+        void setSystemFunctionAttributes(InstructionId instruction,
+                                         const SystemFunctionAttributes &attributes);
+        void setSystemTaskAttributes(InstructionId instruction,
+                                     const SystemTaskAttributes &attributes);
+        void setDpiCallAttributes(InstructionId instruction,
+                                  const DpiCallAttributes &attributes);
+
+        DpiImportId addDpiImport(StringId symbol,
+                                 std::span<const DpiParameter> parameters,
+                                 DpiReturn returnValue = {});
+
+        ProgramView view() const noexcept;
+        LinearProgram finish();
+
+    private:
+        std::unique_ptr<detail::ProgramStorage> storage_;
+        bool finished_ = false;
+    };
+
+    class ScheduledProgramBuilder
+    {
+    public:
+        explicit ScheduledProgramBuilder(LinearProgram &&linearProgram);
+        ~ScheduledProgramBuilder();
+        ScheduledProgramBuilder(ScheduledProgramBuilder &&) noexcept;
+        ScheduledProgramBuilder &operator=(ScheduledProgramBuilder &&) noexcept;
+        ScheduledProgramBuilder(const ScheduledProgramBuilder &) = delete;
+        ScheduledProgramBuilder &operator=(const ScheduledProgramBuilder &) = delete;
+
+        void reserve(const ScheduledProgramReserve &reserve);
+
+        TypeId addType(const Type &type);
+        StringId addString(std::string_view text);
+        InitId undefInit() const noexcept;
+        InitId zeroInit() const noexcept;
+        VariableId addVariable(TypeId type,
+                               InitId init,
+                               std::optional<StringId> label = std::nullopt);
+        InstructionId addInstruction(Opcode opcode,
+                                     std::span<const VariableId> results,
+                                     std::span<const VariableId> operands);
+        void setInstructionOperand(InstructionId instruction,
+                                   std::size_t position,
+                                   VariableId operand);
+        void setSliceStaticAttributes(InstructionId instruction, uint32_t lsb);
+        void setSystemFunctionAttributes(InstructionId instruction,
+                                         const SystemFunctionAttributes &attributes);
+        void setSystemTaskAttributes(InstructionId instruction,
+                                     const SystemTaskAttributes &attributes);
+        void setDpiCallAttributes(InstructionId instruction,
+                                  const DpiCallAttributes &attributes);
+        void setActivationTargets(InstructionId instruction,
+                                  std::span<const BlockId> targets);
+
+        void beginBlock();
+        void appendBlockInstruction(InstructionId instruction);
+        void endBlock();
+        void addBlock(std::span<const InstructionId> instructions);
+
+        ProgramView view() const noexcept;
+        std::size_t pendingBlockCount() const noexcept;
+        ScheduledProgram finish();
+
+    private:
+        std::unique_ptr<detail::ProgramStorage> storage_;
+        bool finished_ = false;
+        bool blockOpen_ = false;
+        bool blockLayoutIdentity_ = true;
+        uint32_t layoutInstructionCount_ = 0;
+        std::size_t blockInstructionReserve_ = 0;
+    };
+
 } // namespace wolvrix::lib::grhsim::am
 
-#endif // WOLVRIX_GRHSIM_AM_PROGRAM_HPP
+#endif // WOLVRIX_GRHSIM_AM_GRHSIM_AM_PROGRAM_HPP

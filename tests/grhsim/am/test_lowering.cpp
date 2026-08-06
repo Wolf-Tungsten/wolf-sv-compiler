@@ -1,8 +1,8 @@
 #include "core/grh.hpp"
-#include "grhsim/am/interpreter.hpp"
-#include "grhsim/am/lowering.hpp"
-#include "grhsim/am/production_activity_schedule.hpp"
-#include "grhsim/am/validate.hpp"
+#include "grhsim/am/grhsim_am_program_interpreter.hpp"
+#include "grhsim/am/grh_ir_to_grhsim_am_graph.hpp"
+#include "grhsim/am/grh_ir_to_grhsim_am_program.hpp"
+#include "grhsim/am/grhsim_am_program_validate.hpp"
 
 #include <algorithm>
 #include <array>
@@ -229,7 +229,7 @@ namespace
 
         graph.freeze();
         diag::Diagnostics diagnostics;
-        GrhToAmLowering lowering;
+        GrhIRToGrhSimAMGraphLowering lowering;
         auto artifact = lowering.lower(graph, diagnostics);
         if (!artifact || diagnostics.hasError())
         {
@@ -246,7 +246,7 @@ namespace
             return fail(validation.errors.front());
         }
 
-        const ProgramView program = artifact->program.view();
+        const ProgramView program = artifact->program();
         // cond/mask folds into a merged nextValue expression for register,
         // latch and fill writes (one Mux per folded write), but NOT for
         // memory element writes: those keep [cond, addr, mask, data, target,
@@ -340,8 +340,8 @@ namespace
         {
             return fail("missing shared edge detector or latch write");
         }
-        if (artifact->interface.ports.size() != 8 ||
-            artifact->schedulingFacts.orderedEffects.size() != 4)
+        if (artifact->interface().ports.size() != 8 ||
+            artifact->orderedEffects().size() != 4)
         {
             return fail("interface or ordered-effect facts are incomplete");
         }
@@ -374,7 +374,7 @@ namespace
             return fail("representative lowering did not contain four ordinary host interactions");
         }
 
-        for (const OrderedEffect &effect : artifact->schedulingFacts.orderedEffects)
+        for (const OrderedEffect &effect : artifact->orderedEffects())
         {
             const Opcode opcode = program.opcode(effect.instruction);
             if (std::find(ordinaryHostInstructions.begin(), ordinaryHostInstructions.end(),
@@ -471,14 +471,14 @@ namespace
         graph.freeze();
 
         diag::Diagnostics diagnostics;
-        GrhToAmLowering lowering;
+        GrhIRToGrhSimAMGraphLowering lowering;
         auto artifact = lowering.lower(graph, diagnostics);
         if (!artifact || diagnostics.hasError())
         {
             return fail("explicit external DPI order did not lower");
         }
 
-        const ProgramView program = artifact->program.view();
+        const ProgramView program = artifact->program();
         std::vector<InstructionId> dpiCalls;
         for (uint32_t index = 0; index < program.instructionCount(); ++index)
         {
@@ -488,7 +488,7 @@ namespace
                 dpiCalls.push_back(instruction);
             }
         }
-        const auto &ordered = artifact->schedulingFacts.orderedEffects;
+        const auto &ordered = artifact->orderedEffects();
         if (dpiCalls.size() != 2 || ordered.size() != 2 ||
             ordered[0].group != ordered[1].group || ordered[0].ordinal != 0 ||
             ordered[1].ordinal != 1 || ordered[0].instruction != dpiCalls[1] ||
@@ -583,14 +583,14 @@ namespace
         graph.freeze();
 
         diag::Diagnostics diagnostics;
-        GrhToAmLowering lowering;
-        std::optional<LinearProgramArtifact> artifact = lowering.lower(graph, diagnostics);
+        GrhIRToGrhSimAMGraphLowering lowering;
+        std::optional<AmGraph> artifact = lowering.lower(graph, diagnostics);
         if (!artifact || diagnostics.hasError())
         {
             return fail("memory fill and priority writes did not lower");
         }
 
-        const ProgramView program = artifact->program.view();
+        const ProgramView program = artifact->program();
         VariableId memoryVariable = VariableId::invalid();
         std::vector<InstructionId> fills;
         std::vector<InstructionId> writes;
@@ -617,7 +617,7 @@ namespace
             }
         }
         const std::vector<OrderedEffect> &ordered =
-            artifact->schedulingFacts.orderedEffects;
+            artifact->orderedEffects();
         // The lowering emits the writes in execution order: priority 1
         // (low_write) first, priority 0 (high_write) last, so writes[0] is
         // low_write and writes[1] is high_write, and the read-old threading
@@ -636,7 +636,7 @@ namespace
         }
 
         const auto findPort = [&](std::string_view name) {
-            for (const PortBinding &port : artifact->interface.ports)
+            for (const PortBinding &port : artifact->interface().ports)
             {
                 if (port.direction == PortDirection::Input &&
                     program.string(port.name) == name)
@@ -659,8 +659,7 @@ namespace
             return fail("memory priority runtime fixture has an invalid interface");
         }
 
-        ProductionActivityScheduleStage scheduler;
-        std::optional<ExecutableModel> model = scheduler.schedule(
+        std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
             std::move(*artifact),
             ActivityScheduleOptions{
                 .maxInstructionsPerBlock = 8,
@@ -766,8 +765,8 @@ namespace
         graph.freeze();
 
         diag::Diagnostics diagnostics;
-        GrhToAmLowering lowering;
-        std::optional<LinearProgramArtifact> artifact = lowering.lower(graph, diagnostics);
+        GrhIRToGrhSimAMGraphLowering lowering;
+        std::optional<AmGraph> artifact = lowering.lower(graph, diagnostics);
         if (!artifact || diagnostics.hasError())
         {
             for (const auto &message : diagnostics.messages())
@@ -777,8 +776,8 @@ namespace
             return fail("register-chain graph did not lower");
         }
         const auto findPort = [&](std::string_view name, PortDirection direction) {
-            const ProgramView program = artifact->program.view();
-            for (const PortBinding &port : artifact->interface.ports)
+            const ProgramView program = artifact->program();
+            for (const PortBinding &port : artifact->interface().ports)
             {
                 if (port.direction == direction && program.string(port.name) == name)
                 {
@@ -797,8 +796,7 @@ namespace
             return fail("register-chain lowering produced an invalid interface");
         }
 
-        ProductionActivityScheduleStage scheduler;
-        std::optional<ExecutableModel> model = scheduler.schedule(
+        std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
             std::move(*artifact),
             ActivityScheduleOptions{
                 .maxInstructionsPerBlock = 8,
@@ -900,21 +898,21 @@ namespace
         graph.freeze();
 
         diag::Diagnostics diagnostics;
-        GrhToAmLowering lowering;
-        std::optional<LinearProgramArtifact> artifact =
+        GrhIRToGrhSimAMGraphLowering lowering;
+        std::optional<AmGraph> artifact =
             lowering.lower(graph, diagnostics);
         if (!artifact || diagnostics.hasError())
         {
             return fail("wide-result shift graph did not lower");
         }
 
-        const ProgramView program = artifact->program.view();
+        const ProgramView program = artifact->program();
         VariableId inputVariable = VariableId::invalid();
         VariableId signedInputVariable = VariableId::invalid();
         VariableId shiftedVariable = VariableId::invalid();
         VariableId logicalShiftedVariable = VariableId::invalid();
         VariableId arithmeticShiftedVariable = VariableId::invalid();
-        for (const PortBinding &port : artifact->interface.ports)
+        for (const PortBinding &port : artifact->interface().ports)
         {
             const std::string_view name = program.string(port.name);
             if (port.direction == PortDirection::Input && name == "input")
@@ -1002,8 +1000,7 @@ namespace
             return fail("wide-result shift fixture has an invalid interface or program");
         }
 
-        ProductionActivityScheduleStage scheduler;
-        std::optional<ExecutableModel> model = scheduler.schedule(
+        std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
             std::move(*artifact),
             ActivityScheduleOptions{
                 .maxInstructionsPerBlock = 8,
@@ -1071,7 +1068,7 @@ namespace
             graph.addResult(op, value);
             graph.setAttr(op, "constValue", std::string("4'b10xz"));
             diag::Diagnostics diagnostics;
-            GrhToAmLowering lowering;
+            GrhIRToGrhSimAMGraphLowering lowering;
             if (lowering.lower(graph, diagnostics) || !diagnostics.hasError())
             {
                 return fail("X/Z Logic literal was not rejected");
@@ -1086,7 +1083,7 @@ namespace
             graph.addResult(op, value);
             graph.setAttr(op, "constValue", std::string("4'b10xz"));
             diag::Diagnostics diagnostics;
-            GrhToAmLowering lowering(GrhToAmLoweringOptions{
+            GrhIRToGrhSimAMGraphLowering lowering(GrhIRToGrhSimAMGraphLoweringOptions{
                 .unknownLogic = UnknownLogicPolicy::FlattenToZero,
             });
             auto artifact = lowering.lower(graph, diagnostics);
@@ -1094,7 +1091,7 @@ namespace
             {
                 return fail("explicit two-state X/Z policy did not lower");
             }
-            const ProgramView program = artifact->program.view();
+            const ProgramView program = artifact->program();
             const InitDescriptor &init =
                 program.init(program.variable(VariableId{0}).init);
             const LiteralView literal = program.literal(LiteralId{init.payload});
@@ -1111,7 +1108,7 @@ namespace
                                                   graph.internSymbol("u_child"));
             graph.setAttr(op, "moduleName", std::string("child"));
             diag::Diagnostics diagnostics;
-            GrhToAmLowering lowering;
+            GrhIRToGrhSimAMGraphLowering lowering;
             if (lowering.lower(graph, diagnostics) || !diagnostics.hasError())
             {
                 return fail("residual hierarchy was not rejected");
@@ -1264,7 +1261,7 @@ namespace
 
         graph.freeze();
         diag::Diagnostics diagnostics;
-        GrhToAmLowering lowering;
+        GrhIRToGrhSimAMGraphLowering lowering;
         auto artifact = lowering.lower(graph, diagnostics);
         if (!artifact || diagnostics.hasError())
         {
@@ -1281,7 +1278,7 @@ namespace
             return fail(validation.errors.front());
         }
 
-        const ProgramView program = artifact->program.view();
+        const ProgramView program = artifact->program();
         if (countOpcode(program, Opcode::MemoryReadAll) != 1 ||
             countOpcode(program, Opcode::MemoryWriteLanes) != 1 ||
             countOpcode(program, Opcode::ArrayMux) != 2 ||
@@ -1406,7 +1403,7 @@ namespace
         // The priority attribute is accepted on kMemoryWriteLanesPort and recorded
         // as a state ordered effect.
         bool checkedOrderedEffect = false;
-        for (const OrderedEffect &effect : artifact->schedulingFacts.orderedEffects)
+        for (const OrderedEffect &effect : artifact->orderedEffects())
         {
             if (program.opcode(effect.instruction) == Opcode::MemoryWriteLanes)
             {
@@ -1478,14 +1475,13 @@ namespace
         graph.freeze();
 
         diag::Diagnostics diagnostics;
-        GrhToAmLowering lowering;
-        std::optional<LinearProgramArtifact> artifact = lowering.lower(graph, diagnostics);
+        GrhIRToGrhSimAMGraphLowering lowering;
+        std::optional<AmGraph> artifact = lowering.lower(graph, diagnostics);
         if (!artifact || diagnostics.hasError())
         {
             return fail("register-swap graph did not lower");
         }
-        ProductionActivityScheduleStage scheduler;
-        std::optional<ExecutableModel> model = scheduler.schedule(
+        std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
             std::move(*artifact),
             ActivityScheduleOptions{
                 .maxInstructionsPerBlock = 8,

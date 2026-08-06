@@ -4,14 +4,18 @@
 [GRHSIM-AM 规范](grhsim-am.md)的语义修订。规范中的 `Program` 始终表示可以交给
 `Machine` 执行、已经具有 `B0`/`B1+`、`changed`/`act` 和完整 `eval()` 语义的最终程序。
 
-目标流水线是：
+目标流水线是（阶段术语以 NO0004 框架为准）：
 
 ```text
 normalized GRH
-    -> am::LinearProgram          // 单一线性构建区，不可执行
-    -> AM activity scheduler
-    -> am::ScheduledProgram       // 对应规范中的最终 Program
-    -> AM C++ emitter
+    -- lowering-to-am-graph        --> am::AmGraph（GRHSIM AM Graph，一等工作 IR，原生建图）
+    -- opt-am-graph                --> optimizeAmGraph（fold/assign-alias/memfold/cse 不动点 + DCE）
+    -- split-am-graph              --> am::AmComputeGraph + am::AmCommitGraph（atom 级诱导子图）
+    -- opt-am-compute-graph        --> （空阶段，预留 compute 图优化）
+    -- partition-am-compute-graph  --> am::AmComputeActivityGraph（活动度划分）
+    -- partition-am-commit-graph   --> am::AmCommitEventGraph（事件聚类）
+    -- materialize                 --> am::ScheduledProgram（GRHSIM AM Program）
+    -- emit                        --> C++ 模型
 ```
 
 设计目标有三个：
@@ -41,6 +45,28 @@ normalized GRH
 > B0 activation target 到实际 reader 的完整性、边沿分支的联合完备性和
 > ordered-effect 完整性证明。
 
+> 实现进展（2026-08-06，NO0004）：流程框架与术语统一。阶段命名以
+> `pdocs/grh-notepad/am-graph/NO0004` 为准：lowering-to-am-graph → opt-am-graph →
+> split-am-graph → opt-am-compute-graph（空阶段预留）→ partition-am-compute-graph /
+> partition-am-commit-graph → materialize → emit；产物类型对应为 `AmGraph` /
+> `AmComputeGraph`+`AmCommitGraph` / `AmComputeActivityGraph` / `AmCommitEventGraph` /
+> `ScheduledProgram`（GRHSIM AM Program）。
+>
+> 实现进展（2026-08-06）：转换方向修正落地（NO0003）——AmGraph 升为阶段间一等 IR。
+> lowering 原生建图（不再先产 LinearProgram 再转换）；optimize 移植到图上；
+> scheduler 直接消费图，线性 AM Program 只在 finalize 由 `toLinearProgram()` 物化。
+> `fromLinearProgram`/`toLinearProgram` 保留用于测试与物化。香山指令图导出、
+> block assignment、C++ 发射三份产物与改造前逐字节一致，AM 套件 10/10。
+>
+> 实现进展（2026-08-05）：AM 执行模型五条升级与转换路径重构已落地（香山 difftest
+> 73,580/49,996 通过，host 324-326s vs opt1 基线 317.6s）。lower 校验后的
+> `LinearProgramArtifact` 先经 `AmGraph` 无损往返 + 语义校验再进 optimize；
+> production scheduler 入口即把产物摄入 `AmGraph`（见 2.4），全部分析只读图存储。
+> `reg.write/latch.write` 的 cond/mask 合并进 nextValue；`mem.write` 保留
+> cond/mask 操作数（禁用写整体抑制，无 read-old 链）；commit 块按事件签名聚合、
+> 首部 gate detector 合并为一次 if 门控、按激活位过滤执行；commit 锥打包短寿后即
+> 移除。完整经过见 `pdocs/grh-notepad/am-graph/NO0001`。
+>
 > 实现进展（2026-07-28）：运行时调度模型已从“epoch + `act.f`/`act.b` 双缓冲 +
 > commit 双通道”整体替换为与 legacy 对齐的两阶段 round 模型：compute Block 按
 > BlockId 升序、以单一 active 位图过滤执行；commit Block 构成连续后缀，每轮总是
@@ -201,12 +227,14 @@ instruction region：
 禁止提供“把 LinearProgram 当作单 Block 运行”的 fallback。它会让测试在小设计上偶然
 通过，却掩盖 B0、event、state visibility 和 side effect 顺序尚未完成的事实。
 
-## 2. 三个长期数据契约
+## 2. 长期数据契约与工作图形式
 
 ### 2.1 `am::LinearProgram`
 
-`LinearProgram` 是 normalized GRH 与 AM scheduler 之间的唯一 instruction 载体。它与
-只供调度使用的 facts 一起组成 lowering 产物：
+`LinearProgram` 是 AM 指令的线性载体。自 2026-08-06 起，阶段间的流通货币是
+`AmGraph`（2.4）：lowering 原生建图、optimize 在图上改写、scheduler 全程读图；
+`LinearProgram`（连同 `ProgramInterface` 与 facts）是图在 finalize 时刻的物化形式，
+`LinearProgramArtifact` 类型保留给物化产物与测试构造：
 
 ```text
 LinearProgramArtifact
@@ -353,6 +381,29 @@ JIT 和 C++ emitter 都只能按同一规范观察它。
 Scheduler 可以选择不同的 Block 粒度或合法拓扑序。只要 `changed`/`act`、effect order、
 状态可见性和最终可观察行为一致，这种差异不是新的 Program 语义。
 
+### 2.4 `am::AmGraph`（一等工作图 IR）
+
+`AmGraph`（`include/grhsim/am/grhsim_am_graph.hpp`）是 lowering 与 emission 之间的一等工作
+IR，也是阶段间的流通货币：instruction 为 op、Variable 为 value。**lowering 原生建图**
+（`GrhIRToGrhSimAMGraphLowering::lower` 直接返回 `AmGraph`，构建路径上不存在线性中间体）；
+optimize 在图上就地改写；scheduler 全程读图，只在 finalize 时刻经
+`toLinearProgram()` 物化出线性 `LinearProgram` 再构造 `ScheduledProgram`。
+`fromLinearProgram`/`toLinearProgram` 是无损转换（node/variable id 一一保留，未经
+改写的图往返字节级一致），保留给测试构造与 finalize 物化。图的特性：
+
+- Variable 原生携带声明语义：`AmValueKind` 区分 Comb/Constant/Input/State，State 再以
+  `AmStateKind` 细分 Register/Latch/Memory；init、role 不再只存于调度侧表；
+- 引用 State 的操作数边带 `AmStateAccess` 分类（`PreCommit` 读本轮 commit 前快照，
+  `Live` 读在飞值、只在属主 commit 锥内合法）——破环点在 IR 上显式可见，不再是
+  隐式调度约定；未标记的边一律视为 PreCommit；
+- 支持增删指令（删除打墓碑、id 稳定）、操作数重连、墓碑压缩与 per-instruction
+  effect/role 视图；ordered-effect 组作为图级事实随行，供合并/复制类 pass 改写；
+- 构建面与 `LinearProgramBuilder` 平价（reserve/init 系列/literal/DPI/Attribute），
+  lowering 与 optimize 的 compact 重建都直接用它。
+
+校验路径与线性时代一致：`validate(const AmGraph&)` 在图存储上跑同一套 linear 级
+语义检查（`validate(ProgramView)`）加 interface/facts 对齐检查。
+
 ## 3. AM activity scheduler
 
 ### 3.1 输入为何更适合访存分析
@@ -416,23 +467,36 @@ Scheduler 按以下阶段工作，每一阶段只保留下一阶段需要的事�
 也不能把 `changed.old = current` 的初始化偷偷加入 Program；规范要求 old 使用
 `undef`，首次 event 及其影响可能是 AM 层未定义行为。
 
-当前 production scheduler 只采用 compute 和 commit 两类 Block。Scheduling atom 严格等于
+当前 production scheduler 只采用 compute 和 commit 两类 Block。scheduler 入口直接
+消费 `AmGraph`（2.4， lowering/optimize 的产物就是图），下文所述 def-use、ordered effect、
+SCC、coarsen/segment DP、门控与激活分析全部读图存储；Scheduling atom 严格等于
 instruction dependency graph 的一个 SCC；singleton SCC 就是一个 atom。纯计算、state read、
 raw `changed`、DPI/system call 和 `SystemFunction` 都属于 compute；带 state target 的
 reg/latch/memory write 属于 commit。DPI/system/effect 顺序和同 target 多写 priority 只形成
 有向边，不会把有序序列或 writers 收缩为一个 atom。
 
-分块实现全仓唯一（`lib/grhsim/am/activity_schedule.cpp`，从 legacy 逐行移植）：先对
-atom DAG 做 out1/in1/sibling 三路迭代 coarsen（`enableCoarsening` 控制，cluster 指令上限
-为 `dpCoarsenBudget`，0 表示自动取 1.5 × `maxInstructionsPerBlock`），再在确定性拓扑
-序列上做 segment DP，以“跨段 incoming 激活 value 数加每段 `dpSegmentPenalty`（默认
-1.0）”为代价切成 compute Block。compute Block 受 `maxInstructionsPerBlock`（默认 128）
-限制；commit 侧只按事件签名聚合分块——每个 event 经其定义 `changed` 规范化为
-（边沿种类, 被观测 Variable），排序去重后作为分块键；update guard 已删除，不再是
-分块分量（`reg.write/latch.write` 的 cond/mask 折叠进 nextValue，`mem.write` 自带的
-cond/mask 由指令自身判定，均不参与分块）——受 `maxCommitInstructionsPerBlock`
-（默认 4096）限制；真正的 SCC atom 超限时保留为一个 oversized Block 并报告诊断。
-commit 跨 target 合并只改变活动粒度，不改变 Block 内拓扑/effect 次序。
+分块实现全仓唯一（`lib/grhsim/am/grhsim_am_graph_split.cpp` 与
+`lib/grhsim/am/grhsim_am_{compute,commit}_graph_partition.cpp`，从 legacy 逐行移植）。AM 图
+摄入并完成 atom（SCC）分类后，先做一次 **compute/commit 分图**
+（**split-am-graph**，`splitAmGraph`）：atom DAG 拆成两张诱导子图（局部 id 保持全局相对
+次序，跨类边不属于任一子图），commit→compute 的依赖在此判非法；之后两个分区 pass
+各自独立处理一张子图：
+
+- **compute 子图按活动度划分**（**partition-am-compute-graph**，`partitionAmComputeGraph`）：对 compute atom
+  DAG 做 out1/in1/sibling 三路迭代 coarsen（`enableCoarsening` 控制，cluster 指令上限
+  为 `dpCoarsenBudget`，0 表示自动取 1.5 × `maxInstructionsPerBlock`），再在确定性拓扑
+  序列上做 segment DP，以“跨段 incoming 激活 value 数加每段 `dpSegmentPenalty`（默认
+  1.0）”为代价切成 compute Block，受 `maxInstructionsPerBlock`（默认 128）限制；
+- **commit 子图按事件聚类**（**partition-am-commit-graph**，`partitionAmCommitGraph`）：commit atom 只按事件
+  签名聚合——每个 event 经其定义 `changed` 规范化为（边沿种类, 被观测 Variable），
+  排序去重后作为分块键，同键 atom 在 `maxCommitInstructionsPerBlock`（默认 4096）限制
+  内合并；update guard 已删除，不再是分块分量（`reg.write/latch.write` 的 cond/mask
+  折叠进 nextValue，`mem.write` 自带的 cond/mask 由指令自身判定，均不参与分块）。
+
+两路结果随后在 materialize 阶段合并回全局 atom 编号（commit Block 序接在 compute 段
+之后，中间留 input sink 位）。真正的 SCC atom 超限时保留为一个 oversized Block 并报
+告诊断。commit 跨 target 合并只改变活动粒度，不改变 Block 内拓扑/effect 次序。
+合并逻辑全仓唯一（materialize 内），不设组合包装入口。
 
 commit Block 不再常扫描：每轮 compute 阶段结束后，commit 阶段按 BlockId 升序、以与
 compute 相同的激活位图过滤执行 commit Block（首次 `eval()` 激活全部 Block）。块首部
@@ -587,7 +651,7 @@ instruction/cycle 计数与旧功能基线完全一致；但 host time 为 4,178
 
 ### 3.2.4 指令图研究导出（JSONL，2026-07-30）
 
-`ProductionActivityScheduleStage::schedule` 支持把**调度前**的指令图导出为 JSONL，
+`AmActivityScheduler::schedule` 支持把**调度前**的指令图导出为 JSONL，
 供 topo-partition-proj 的离线分区研究（harness/打分/搜索/训练）使用。设置环境变量即触发，
 不影响正常调度流程；导出失败（路径不可写等）会使调度报错退出，不会静默跳过：
 
@@ -654,11 +718,11 @@ header 中的三个对账指标在生产内部按如下口径计算（harness  s
 
 ### 3.2.5 AM 指令流优化（DCE / const-fold / CSE / assign 别名 / ROM 折叠，2026-07-31 初版，2026-08-04 扩展）
 
-`grhsim/am/optimize.{hpp,cpp}` 在 lowering 与 schedule 之间提供可选的指令流优化：
-`optimizeLinearProgram(LinearProgramArtifact&, AmOptimizeOptions{dce, constFold, cse, assignAlias, constMemFold, interfaceAlias},
-Diagnostics&)`。`grhsim-am-lower-json` 经 `--am-optimize=dce,fold,cse,alias,memfold,ifacealias`（默认全开）/
+`grhsim/am/grhsim_am_graph_optimize.{hpp,cpp}` 在 lowering 与 schedule 之间提供可选的指令流优化：
+`optimizeAmGraph(AmGraph&, AmOptimizeOptions{dce, constFold, cse, assignAlias, constMemFold, interfaceAlias},
+Diagnostics&)`（自 2026-08-06 起在图上就地重建，前身为线性版的 `optimizeLinearProgram`）。`grhsim-am-lower-json` 经 `--am-optimize=dce,fold,cse,alias,memfold,ifacealias`（默认全开）/
 `--no-am-optimize` 控制；实验路径与生产路径均默认开启——生产路径由
-`GrhSimAmPipeline::run` 在 lower 校验后、schedule 前调用，可用
+`GrhIRToGrhSimAMProgram::run` 在 lower 校验后、graphToProgram 前调用，可用
 `setAmOptimizeOptions` 改配或全关。
 动机与两级（GRH 层 + AM 层）实验设计见 topo-partition-proj `docs/20`；2026-08-04
 扩展的动机与实测见 pdocs/grh-notepad/supernode-align NO0011。
@@ -743,8 +807,8 @@ session key，再让 emitter 拼回执行模型。那会保留两份事实来源
 - builder 提供 `ProgramReserve`，优先通过预扫描精确 reserve，freeze 后只读；不能因
   `vector` 扩容同时保留数 GiB 新旧 buffer。无法预估的超大输入才采用 chunk staging，
   freeze 时仍只形成一份最终 dense arena；
-- scheduler 接受 `LinearProgramArtifact&&` 并消费所有权，`ScheduledProgramBuilder` 再
-  接管其中的 `LinearProgram&&`；能复用的 Variables、Type、Attribute、Init 和 instruction
+- scheduler 接受 `AmGraph&&` 并消费所有权，finalize 时物化出 `LinearProgram` 交给
+  `ScheduledProgramBuilder`；能复用的 Variables、Type、Attribute、Init 和 instruction
   arena 直接转入 ScheduledProgram，生产模式不在 session 同时保留两份完整 IR。
 
 当前 `ProgramReserve` 已覆盖 linear 主表和现有 typed attribute arena，
@@ -906,7 +970,7 @@ Session 仍可作为 orchestration 和所有权容器，但不再充当语义拼
 large design 默认 move/consume 前一阶段产物。为了 A/B 对比而同时保留旧 Graph schedule
 与新 Program 只允许在小型测试或显式 profiling 模式中进行。
 
-`GrhToAmLoweringStage::lower()` 返回的 artifact 不能保存 Graph pointer/reference。100M
+`GrhIRToGrhSimAMGraphLoweringStage::lower()` 返回的 artifact 不能保存 Graph pointer/reference。100M
 生产入口必须分阶段调用：lower 返回 owned artifact 后先从 Session/Design 移除 GRH，再进入
 schedule 和 emit。贯穿一个 `run(const Graph&)` 调用的 convenience pipeline 不能让调用方在
 中途释放 Graph，只适合小设计；若保留该入口，其 Graph RSS 必须计入峰值，不能作为
@@ -923,18 +987,27 @@ ScheduledProgram 作为长期实现：旧 session key 只是 emitter side table�
 
 | 责任 | 位置 |
 | --- | --- |
-| AM dense ID、SoA storage、Linear/ScheduledProgram 与只读 view | `include/grhsim/am/program.hpp`、`lib/grhsim/am/program.cpp` |
-| move-only builders 与 reserve API | `include/grhsim/am/builder.hpp`、`lib/grhsim/am/builder.cpp` |
-| linear/scheduled validator | `include/grhsim/am/validate.hpp`、`lib/grhsim/am/validate.cpp` |
-| ProgramInterface、SchedulingFacts、stage/pipeline API | `include/grhsim/am/pipeline.hpp`、`lib/grhsim/am/pipeline.cpp` |
-| opcode 分类 helper | `include/grhsim/am/opcode_traits.hpp` |
-| coarsen + segment DP 分块实现（全仓唯一） | `include/grhsim/am/activity_schedule.hpp`、`lib/grhsim/am/activity_schedule.cpp` |
-| concrete lowering/scheduler/emitter 私有实现 | `lib/grhsim/am/` 下按职责拆分的 `.cpp` |
+| AM dense ID、SoA storage、Linear/ScheduledProgram、ProgramView、move-only builders、reserve API、ProgramInterface/SchedulingFacts/LinearProgramArtifact/ExecutableModel | `include/grhsim/am/grhsim_am_program.hpp`、`lib/grhsim/am/grhsim_am_program.cpp` |
+| linear/scheduled validator | `include/grhsim/am/grhsim_am_program_validate.hpp`、`lib/grhsim/am/grhsim_am_program_validate.cpp` |
+| AmGraph 一等工作 IR | `include/grhsim/am/grhsim_am_graph.hpp`、`lib/grhsim/am/grhsim_am_graph.cpp` |
+| 总流程 GrhIRToGrhSimAMProgram（含 static `graphToProgram()` 编排：split → opt → 两路 partition → materialize）、stage 接口与 validate 组合 | `include/grhsim/am/grh_ir_to_grhsim_am_program.hpp`、`lib/grhsim/am/grh_ir_to_grhsim_am_program.cpp` |
+| opcode 分类 helper | `include/grhsim/am/grhsim_am_opcode_traits.hpp` |
+| lowering-to-am-graph | `include/grhsim/am/grh_ir_to_grhsim_am_graph.hpp`、`lib/grhsim/am/grh_ir_to_grhsim_am_graph.cpp` |
+| opt-am-graph | `include/grhsim/am/grhsim_am_graph_optimize.hpp`、`lib/grhsim/am/grhsim_am_graph_optimize.cpp` |
+| split-am-graph 阶段（含指令图导出） | `include/grhsim/am/grhsim_am_graph_split.hpp`、`lib/grhsim/am/grhsim_am_graph_split.cpp` |
+| 分区家族共享类型与低层 splitAmGraph | `include/grhsim/am/grhsim_am_graph_partition.hpp`、`lib/grhsim/am/grhsim_am_graph_partition.cpp` |
+| opt-am-compute-graph（空阶段预留） | `include/grhsim/am/grhsim_am_compute_graph_optimize.hpp`、`lib/grhsim/am/grhsim_am_compute_graph_optimize.cpp` |
+| partition-am-compute-graph（coarsen + segment DP） | `include/grhsim/am/grhsim_am_compute_graph_partition.hpp`、`lib/grhsim/am/grhsim_am_compute_graph_partition.cpp` |
+| partition-am-commit-graph（事件聚类） | `include/grhsim/am/grhsim_am_commit_graph_partition.hpp`、`lib/grhsim/am/grhsim_am_commit_graph_partition.cpp` |
+| materialize 阶段（含 block assignment 导出与 finalize） | `include/grhsim/am/grhsim_am_graph_to_program.hpp`、`lib/grhsim/am/grhsim_am_graph_to_program.cpp` |
+| AM Program 参考解释器 | `include/grhsim/am/grhsim_am_program_interpreter.hpp`、`lib/grhsim/am/grhsim_am_program_interpreter.cpp` |
+| AM Program C++ 发射器 | `include/grhsim/am/grhsim_am_program_cpp_emitter.hpp`、`lib/grhsim/am/grhsim_am_program_cpp_emitter.cpp` |
+| 调度阶段共享内部助手 | `lib/grhsim/am/grhsim_am_common.hpp`（lib 内部） |
 | 单元与 contract tests | `tests/grhsim/am/` |
 
 不要把 IR 定义塞进旧 `transform/activity_schedule.cpp` 或 `emit/grhsim_cpp.cpp`。`program`
-与 builder 不依赖 GRH transform 或 C++ emitter；pipeline API 声明单向的
-`GRH -> LinearProgramArtifact -> ExecutableModel -> C++` stage；emitter 只读取 core AM
+与 builder 不依赖 GRH transform 或 C++ emitter；总流程 API 声明单向的
+`GRH -> AmGraph -> ExecutableModel -> C++` stage；emitter 只读取 core AM
 artifact。具体实现增长后可拆私有 `.cpp`，但公共所有权方向保持不变。
 
 每个 Phase 开始、关键决策改变和 Gate 关闭时，都要在 `pdocs/grh_notepad` 更新同一推进

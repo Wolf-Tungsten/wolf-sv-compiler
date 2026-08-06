@@ -1,4 +1,4 @@
-#include "grhsim/am/validate.hpp"
+#include "grhsim/am/grhsim_am_program_validate.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -1572,8 +1572,12 @@ namespace wolvrix::lib::grhsim::am
 
     ValidationResult validate(const LinearProgram &program, const ValidationOptions &options)
     {
+        return validate(program.view(), options);
+    }
+
+    ValidationResult validate(ProgramView view, const ValidationOptions &options)
+    {
         Validator validator(options);
-        const ProgramView view = program.view();
         validateCommon(view, validator, true);
         if (view.valid())
         {

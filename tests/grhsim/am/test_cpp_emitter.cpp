@@ -1,7 +1,7 @@
-#include "grhsim/am/builder.hpp"
-#include "grhsim/am/cpp_emitter.hpp"
-#include "grhsim/am/interpreter.hpp"
-#include "grhsim/am/production_activity_schedule.hpp"
+#include "grhsim/am/grhsim_am_program.hpp"
+#include "grhsim/am/grhsim_am_program_cpp_emitter.hpp"
+#include "grhsim/am/grhsim_am_program_interpreter.hpp"
+#include "grhsim/am/grh_ir_to_grhsim_am_program.hpp"
 
 #include <algorithm>
 #include <array>
@@ -437,10 +437,10 @@ namespace
     {
         std::filesystem::remove_all(outputDirectory);
         WidePureFixture fixture = makeWidePureProgram();
-        ProductionActivityScheduleStage scheduler;
         wolvrix::lib::diag::Diagnostics diagnostics;
-        std::optional<ExecutableModel> model = scheduler.schedule(
-            std::move(fixture.artifact), ActivityScheduleOptions{}, diagnostics);
+        std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
+            AmGraph::fromLinearProgram(fixture.artifact), ActivityScheduleOptions{},
+            diagnostics);
         if (!model || diagnostics.hasError())
         {
             return fail("failed to build the wide AM emitter fixture");
@@ -1487,10 +1487,10 @@ namespace
     {
         std::filesystem::remove_all(outputDirectory);
         ArrayInitFixture fixture = makeArrayInitFixture();
-        ProductionActivityScheduleStage scheduler;
         wolvrix::lib::diag::Diagnostics diagnostics;
-        std::optional<ExecutableModel> model = scheduler.schedule(
-            std::move(fixture.artifact), ActivityScheduleOptions{}, diagnostics);
+        std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
+            AmGraph::fromLinearProgram(fixture.artifact), ActivityScheduleOptions{},
+            diagnostics);
         if (!model || diagnostics.hasError())
         {
             return fail("failed to build the Array Fill initialization fixture");
@@ -2800,10 +2800,9 @@ int main()
     int testProductionCommitCycleRuntime(const std::filesystem::path &outputDirectory)
     {
         std::filesystem::remove_all(outputDirectory);
-        ProductionActivityScheduleStage scheduler;
         wolvrix::lib::diag::Diagnostics diagnostics;
-        std::optional<ExecutableModel> model = scheduler.schedule(
-            makeProductionCommitCycleProgram(),
+        std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
+            AmGraph::fromLinearProgram(makeProductionCommitCycleProgram()),
             ActivityScheduleOptions{
                 .maxInstructionsPerBlock = 1,
                 .maxCommitInstructionsPerBlock = 1,
@@ -2896,10 +2895,10 @@ int main()
         std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) / "cpp-emitter";
     std::filesystem::remove_all(outputDirectory);
 
-    ProductionActivityScheduleStage scheduler;
     wolvrix::lib::diag::Diagnostics diagnostics;
     std::optional<ExecutableModel> model =
-        scheduler.schedule(makeAddProgram(), ActivityScheduleOptions{}, diagnostics);
+        GrhIRToGrhSimAMProgram::graphToProgram(AmGraph::fromLinearProgram(makeAddProgram()),
+                           ActivityScheduleOptions{}, diagnostics);
     if (!model || diagnostics.hasError())
     {
         return fail("failed to build the scalar AM emitter fixture");

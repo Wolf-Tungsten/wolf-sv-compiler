@@ -1,8 +1,9 @@
 #include "core/diagnostics.hpp"
-#include "grhsim/am/builder.hpp"
-#include "grhsim/am/opcode_traits.hpp"
-#include "grhsim/am/optimize.hpp"
-#include "grhsim/am/pipeline.hpp"
+#include "grhsim/am/grhsim_am_program.hpp"
+#include "grhsim/am/grhsim_am_graph.hpp"
+#include "grhsim/am/grhsim_am_opcode_traits.hpp"
+#include "grhsim/am/grhsim_am_graph_optimize.hpp"
+#include "grhsim/am/grh_ir_to_grhsim_am_program.hpp"
 
 #include <array>
 #include <cstdint>
@@ -30,8 +31,8 @@ namespace {
         return 1;
     }
 
-    ValidationResult validateSemantic(const LinearProgramArtifact &artifact) {
-        return validate(artifact, ValidationOptions{.level = ValidationLevel::Semantic});
+    ValidationResult validateSemantic(const AmGraph &graph) {
+        return validate(graph, ValidationOptions{.level = ValidationLevel::Semantic});
     }
 
     // Mirrors the mechanical effect-table fill in lowering.cpp.
@@ -182,16 +183,16 @@ namespace {
         fixture.emit(Opcode::Add, {output}, {input, live});
         fixture.emit(Opcode::Xor, {deadA}, {live, input});
         fixture.emit(Opcode::Or, {deadB}, {deadA, input});
-        LinearProgramArtifact artifact = fixture.finish();
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        AmGraph graph = AmGraph::fromLinearProgram(fixture.finish());
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("dead-cone fixture is invalid", result);
         }
 
         diag::Diagnostics diagnostics;
-        if (!optimizeLinearProgram(artifact, AmOptimizeOptions{}, diagnostics)) {
+        if (!optimizeAmGraph(graph, AmOptimizeOptions{}, diagnostics)) {
             return fail("dead-cone optimize reported failure");
         }
-        const ProgramView program = artifact.program.view();
+        const ProgramView program = graph.program();
         if (program.instructionCount() != 2) {
             return fail("dead cone was not removed");
         }
@@ -207,15 +208,15 @@ namespace {
         if (addResults.size() != 1 || addResults[0] != output) {
             return fail("output producer lost its result variable");
         }
-        if (artifact.schedulingFacts.instructionEffects.size() != 2 ||
-            artifact.schedulingFacts.instructionEffects[0] != InstructionEffect::Pure ||
-            artifact.schedulingFacts.instructionEffects[1] != InstructionEffect::Pure) {
+        if (graph.instructionEffects().size() != 2 ||
+            graph.instructionEffects()[0] != InstructionEffect::Pure ||
+            graph.instructionEffects()[1] != InstructionEffect::Pure) {
             return fail("instruction effects were not compacted with the program");
         }
-        if (artifact.schedulingFacts.variableRoles.size() != program.variableCount()) {
+        if (graph.variableRoles().size() != program.variableCount()) {
             return fail("variable roles lost dense alignment");
         }
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("dead-cone optimized artifact is invalid", result);
         }
         return 0;
@@ -242,16 +243,16 @@ namespace {
         fixture.emit(Opcode::Sub, {sub1}, {in1, in0});
         fixture.emit(Opcode::Or, {out0}, {first, duplicate});
         fixture.emit(Opcode::Or, {out1}, {sub0, sub1});
-        LinearProgramArtifact artifact = fixture.finish();
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        AmGraph graph = AmGraph::fromLinearProgram(fixture.finish());
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("CSE fixture is invalid", result);
         }
 
         diag::Diagnostics diagnostics;
-        if (!optimizeLinearProgram(artifact, AmOptimizeOptions{}, diagnostics)) {
+        if (!optimizeAmGraph(graph, AmOptimizeOptions{}, diagnostics)) {
             return fail("CSE optimize reported failure");
         }
-        const ProgramView program = artifact.program.view();
+        const ProgramView program = graph.program();
         if (program.instructionCount() != 5 || countOpcode(program, Opcode::And) != 1 ||
             countOpcode(program, Opcode::Sub) != 2 || countOpcode(program, Opcode::Or) != 2) {
             return fail("commutative CSE removed the wrong instructions");
@@ -274,7 +275,7 @@ namespace {
         if (!checkedAlias) {
             return fail("CSE output producer is missing");
         }
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("CSE optimized artifact is invalid", result);
         }
         return 0;
@@ -293,27 +294,27 @@ namespace {
         fixture.emit(Opcode::Add, {sum}, {two, three});
         fixture.emit(Opcode::Mul, {product}, {sum, two});
         fixture.emit(Opcode::Assign, {output}, {product});
-        LinearProgramArtifact artifact = fixture.finish();
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        AmGraph graph = AmGraph::fromLinearProgram(fixture.finish());
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("fold fixture is invalid", result);
         }
 
         diag::Diagnostics diagnostics;
-        if (!optimizeLinearProgram(artifact, AmOptimizeOptions{}, diagnostics)) {
+        if (!optimizeAmGraph(graph, AmOptimizeOptions{}, diagnostics)) {
             for (const auto &message : diagnostics.messages()) {
                 std::cerr << "  diag: " << message.message << '\n';
             }
             return fail("fold optimize reported failure");
         }
-        const ProgramView program = artifact.program.view();
+        const ProgramView program = graph.program();
         if (program.instructionCount() != 0) {
             return fail("fold cascade did not collapse the constant chain");
         }
-        if (artifact.interface.ports.size() != 1 ||
-            artifact.interface.ports[0].direction != PortDirection::Output) {
+        if (graph.interface().ports.size() != 1 ||
+            graph.interface().ports[0].direction != PortDirection::Output) {
             return fail("fold cascade lost the output port");
         }
-        const VariableId portOutput = artifact.interface.ports[0].output;
+        const VariableId portOutput = graph.interface().ports[0].output;
         const std::optional<uint64_t> folded = constantValue(program, portOutput);
         if (!folded || *folded != 10) {
             return fail("fold cascade produced the wrong constant value");
@@ -323,14 +324,14 @@ namespace {
         if (constantType.kind != TypeKind::BitVector || constantType.bitWidth != 64) {
             return fail("folded multiply did not keep the widened result type");
         }
-        if (!hasRole(artifact.schedulingFacts.variableRoles[portOutput.value],
+        if (!hasRole(graph.valueFacts(portOutput).roles,
                      VariableRole::ExternalOutput)) {
             return fail("fold cascade did not transfer the external-output role");
         }
         if (program.variableCount() != 7) {
             return fail("fold did not intern exactly the two new constants");
         }
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("fold optimized artifact is invalid", result);
         }
         return 0;
@@ -366,16 +367,16 @@ namespace {
             Opcode::MemoryWrite, {}, {oneBit, address, fullMask, dataIn, memory, event});
         fixture.addOrderedEffect(orderedRead, 0, 0);
         fixture.addOrderedEffect(write, 0, 1);
-        LinearProgramArtifact artifact = fixture.finish();
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        AmGraph graph = AmGraph::fromLinearProgram(fixture.finish());
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("ordered-effects fixture is invalid", result);
         }
 
         diag::Diagnostics diagnostics;
-        if (!optimizeLinearProgram(artifact, AmOptimizeOptions{}, diagnostics)) {
+        if (!optimizeAmGraph(graph, AmOptimizeOptions{}, diagnostics)) {
             return fail("ordered-effects optimize reported failure");
         }
-        const ProgramView program = artifact.program.view();
+        const ProgramView program = graph.program();
         if (program.instructionCount() != 2) {
             return fail("unordered dead MemoryRead was not removed");
         }
@@ -383,17 +384,18 @@ namespace {
             program.opcode(InstructionId{1}) != Opcode::MemoryWrite) {
             return fail("ordered MemoryRead was dropped or reordered");
         }
-        const SchedulingFacts &facts = artifact.schedulingFacts;
-        if (facts.instructionEffects.size() != 2 ||
-            facts.instructionEffects[0] != InstructionEffect::StateRead ||
-            facts.instructionEffects[1] != InstructionEffect::StateReadWrite) {
+        const std::vector<InstructionEffect> &instructionEffects = graph.instructionEffects();
+        if (instructionEffects.size() != 2 ||
+            instructionEffects[0] != InstructionEffect::StateRead ||
+            instructionEffects[1] != InstructionEffect::StateReadWrite) {
             return fail("instruction effects were not remapped to the dense ids");
         }
-        if (facts.orderedEffects.size() != 2 ||
-            facts.orderedEffects[0].instruction != InstructionId{0} ||
-            facts.orderedEffects[0].group != 0 || facts.orderedEffects[0].ordinal != 0 ||
-            facts.orderedEffects[1].instruction != InstructionId{1} ||
-            facts.orderedEffects[1].group != 0 || facts.orderedEffects[1].ordinal != 1) {
+        const std::vector<OrderedEffect> &orderedEffects = graph.orderedEffects();
+        if (orderedEffects.size() != 2 ||
+            orderedEffects[0].instruction != InstructionId{0} ||
+            orderedEffects[0].group != 0 || orderedEffects[0].ordinal != 0 ||
+            orderedEffects[1].instruction != InstructionId{1} ||
+            orderedEffects[1].group != 0 || orderedEffects[1].ordinal != 1) {
             return fail("ordered effects were not remapped to the dense ids");
         }
         const auto readOperands = program.operands(InstructionId{0});
@@ -410,18 +412,19 @@ namespace {
             writeOperands[5] != event) {
             return fail("MemoryWrite operands were not remapped");
         }
-        if (facts.variableRoles.size() != program.variableCount() ||
-            !hasRole(facts.variableRoles[memory.value], VariableRole::State) ||
-            !hasRole(facts.variableRoles[memory.value], VariableRole::Observable) ||
-            facts.variableRoles[dataIn.value] != VariableRole::ExternalInput) {
+        const std::vector<VariableRole> roles = graph.variableRoles();
+        if (roles.size() != program.variableCount() ||
+            !hasRole(roles[memory.value], VariableRole::State) ||
+            !hasRole(roles[memory.value], VariableRole::Observable) ||
+            roles[dataIn.value] != VariableRole::ExternalInput) {
             return fail("variable roles were not preserved by compaction");
         }
-        if (artifact.interface.ports.size() != 2 ||
-            artifact.interface.declaredVariables.size() != 1 ||
-            artifact.interface.declaredVariables[0].variable != memory) {
+        if (graph.interface().ports.size() != 2 ||
+            graph.interface().declaredVariables.size() != 1 ||
+            graph.interface().declaredVariables[0].variable != memory) {
             return fail("interface bindings were not preserved by compaction");
         }
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("ordered-effects optimized artifact is invalid", result);
         }
         return 0;
@@ -441,20 +444,20 @@ namespace {
         fixture.emit(Opcode::MemoryRead, {read0}, {memory, address});
         fixture.emit(Opcode::MemoryRead, {read1}, {memory, address});
         fixture.emit(Opcode::Or, {output}, {read0, read1});
-        LinearProgramArtifact artifact = fixture.finish();
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        AmGraph graph = AmGraph::fromLinearProgram(fixture.finish());
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("memory-CSE fixture is invalid", result);
         }
 
         diag::Diagnostics diagnostics;
-        if (!optimizeLinearProgram(artifact, AmOptimizeOptions{}, diagnostics)) {
+        if (!optimizeAmGraph(graph, AmOptimizeOptions{}, diagnostics)) {
             return fail("memory-CSE optimize reported failure");
         }
-        const ProgramView program = artifact.program.view();
+        const ProgramView program = graph.program();
         if (program.instructionCount() != 3 || countOpcode(program, Opcode::MemoryRead) != 2) {
             return fail("MemoryRead instructions must never be CSE'd or folded");
         }
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("memory-CSE optimized artifact is invalid", result);
         }
         return 0;
@@ -471,37 +474,37 @@ namespace {
         fixture.addOutputPort("out", output);
         fixture.emit(Opcode::Add, {observed}, {one, two});
         fixture.emit(Opcode::Assign, {output}, {observed});
-        LinearProgramArtifact artifact = fixture.finish();
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        AmGraph graph = AmGraph::fromLinearProgram(fixture.finish());
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("observable fixture is invalid", result);
         }
 
         diag::Diagnostics diagnostics;
-        if (!optimizeLinearProgram(artifact, AmOptimizeOptions{}, diagnostics)) {
+        if (!optimizeAmGraph(graph, AmOptimizeOptions{}, diagnostics)) {
             return fail("observable optimize reported failure");
         }
         // The observable producer may be folded/aliased away as long as the
         // interface is re-pointed to a variable carrying the same value and
         // the visibility roles move with it.
-        const ProgramView program = artifact.program.view();
-        if (artifact.interface.declaredVariables.size() != 1) {
+        const ProgramView program = graph.program();
+        if (graph.interface().declaredVariables.size() != 1) {
             return fail("declared variable binding was not preserved");
         }
-        const VariableId declared = artifact.interface.declaredVariables[0].variable;
+        const VariableId declared = graph.interface().declaredVariables[0].variable;
         const std::optional<uint64_t> declaredValue = constantValue(program, declared);
         if (!declaredValue || *declaredValue != 3) {
             return fail("declared variable does not observe the folded value");
         }
-        if (!hasRole(artifact.schedulingFacts.variableRoles[declared.value],
+        if (!hasRole(graph.valueFacts(declared).roles,
                      VariableRole::Observable)) {
             return fail("observable role was not transferred to the representative");
         }
-        if (artifact.interface.ports.size() != 1 ||
-            constantValue(program, artifact.interface.ports[0].output) !=
+        if (graph.interface().ports.size() != 1 ||
+            constantValue(program, graph.interface().ports[0].output) !=
                 std::optional<uint64_t>(3)) {
             return fail("output port does not observe the folded value");
         }
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("observable optimized artifact is invalid", result);
         }
         return 0;
@@ -525,16 +528,16 @@ namespace {
         fixture.emit(Opcode::Or, {computed}, {plain, plain});
         fixture.emit(Opcode::Assign, {out0}, {snapshot});
         fixture.emit(Opcode::Assign, {out1}, {computed});
-        LinearProgramArtifact artifact = fixture.finish();
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        AmGraph graph = AmGraph::fromLinearProgram(fixture.finish());
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("assign-alias fixture is invalid", result);
         }
 
         diag::Diagnostics diagnostics;
-        if (!optimizeLinearProgram(artifact, AmOptimizeOptions{}, diagnostics)) {
+        if (!optimizeAmGraph(graph, AmOptimizeOptions{}, diagnostics)) {
             return fail("assign-alias optimize reported failure");
         }
-        const ProgramView program = artifact.program.view();
+        const ProgramView program = graph.program();
         // The state snapshot Assign must survive; the plain value assigns are
         // bypassed, so only the snapshot Assign and the Or remain.
         if (program.instructionCount() != 2 ||
@@ -547,11 +550,11 @@ namespace {
         if (operands.size() != 1 || operands[0] != state) {
             return fail("state snapshot assign did not keep its state operand");
         }
-        if (artifact.interface.ports[2].output != snapshot &&
-            artifact.interface.ports[1].output != snapshot) {
+        if (graph.interface().ports[2].output != snapshot &&
+            graph.interface().ports[1].output != snapshot) {
             return fail("snapshot consumer was not preserved");
         }
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("assign-alias optimized artifact is invalid", result);
         }
         return 0;
@@ -598,16 +601,16 @@ namespace {
         fixture.emit(Opcode::Assign, {out1}, {readUndef});
         fixture.emit(Opcode::Assign, {out2}, {readRange});
         fixture.emit(Opcode::Assign, {out3}, {readRam});
-        LinearProgramArtifact artifact = fixture.finish();
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        AmGraph graph = AmGraph::fromLinearProgram(fixture.finish());
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("const-mem-fold fixture is invalid", result);
         }
 
         diag::Diagnostics diagnostics;
-        if (!optimizeLinearProgram(artifact, AmOptimizeOptions{}, diagnostics)) {
+        if (!optimizeAmGraph(graph, AmOptimizeOptions{}, diagnostics)) {
             return fail("const-mem-fold optimize reported failure");
         }
-        const ProgramView program = artifact.program.view();
+        const ProgramView program = graph.program();
         // Zero/Undef-init never-written reads fold to zero (storage is
         // zero-initialized); out-of-range reads fold to zero. Only the read
         // of the written memory and the write itself survive.
@@ -616,11 +619,11 @@ namespace {
             return fail("const-mem-fold eliminated the wrong instructions");
         }
         const std::optional<uint64_t> foldedZero =
-            constantValue(program, artifact.interface.ports[1].output);
+            constantValue(program, graph.interface().ports[1].output);
         const std::optional<uint64_t> foldedUndef =
-            constantValue(program, artifact.interface.ports[2].output);
+            constantValue(program, graph.interface().ports[2].output);
         const std::optional<uint64_t> foldedRange =
-            constantValue(program, artifact.interface.ports[3].output);
+            constantValue(program, graph.interface().ports[3].output);
         if (!foldedZero || *foldedZero != 0) {
             return fail("const-mem-fold did not zero never-written reads");
         }
@@ -630,7 +633,7 @@ namespace {
         if (!foldedRange || *foldedRange != 0) {
             return fail("const-mem-fold did not zero out-of-range reads");
         }
-        if (const ValidationResult result = validateSemantic(artifact); !result.success()) {
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("const-mem-fold optimized artifact is invalid", result);
         }
         return 0;

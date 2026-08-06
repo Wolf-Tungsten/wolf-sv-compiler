@@ -1,9 +1,11 @@
-#include "grhsim/am/graph.hpp"
+#include "grhsim/am/grhsim_am_graph.hpp"
 
-#include "grhsim/am/opcode_traits.hpp"
-#include "program_internal.hpp"
+#include "grhsim/am/grhsim_am_program.hpp"
+#include "grhsim/am/grhsim_am_opcode_traits.hpp"
+#include "grhsim/am/grhsim_am_program.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <unordered_map>
 #include <utility>
 
@@ -50,6 +52,21 @@ namespace wolvrix::lib::grhsim::am
         {
             return (static_cast<uint64_t>(instruction.value) << 32U) |
                    static_cast<uint64_t>(position);
+        }
+
+        template <typename T>
+        bool aliasesArena(std::span<const T> values, const std::vector<T> &arena) noexcept
+        {
+            if (values.empty() || arena.empty())
+            {
+                return false;
+            }
+            const T *valueBegin = values.data();
+            const T *valueEnd = valueBegin + values.size();
+            const T *arenaBegin = arena.data();
+            const T *arenaEnd = arenaBegin + arena.size();
+            const std::less<const T *> less;
+            return less(valueBegin, arenaEnd) && less(arenaBegin, valueEnd);
         }
 
         template <typename Record, typename Attr>
@@ -496,6 +513,77 @@ namespace wolvrix::lib::grhsim::am
             .kind = InitKind::Constant,
             .payload = literal.value,
             .count = 0,
+        });
+        return id;
+    }
+
+    void AmGraph::reserve(const ProgramReserve &reserve)
+    {
+        detail::ProgramStorage &storage = impl_->storage;
+        storage.types.reserve(reserve.types);
+        storage.stringOffsets.reserve(reserve.strings + 1);
+        storage.stringBytes.reserve(reserve.stringBytes);
+        storage.initDescriptors.reserve(std::max<std::size_t>(reserve.initDescriptors, 2));
+        storage.initActions.reserve(reserve.initActions);
+        storage.literals.reserve(reserve.literals);
+        storage.literalWords.reserve(reserve.literalWords);
+        storage.literalBytes.reserve(reserve.literalBytes);
+        storage.variables.reserve(reserve.variables);
+        storage.variableLabels.reserve(reserve.variableLabels);
+        storage.opcodes.reserve(reserve.instructions);
+        storage.operandOffsets.reserve(reserve.instructions + 1);
+        storage.operands.reserve(reserve.operands);
+        storage.resultOffsets.reserve(reserve.instructions + 1);
+        storage.results.reserve(reserve.results);
+        storage.sliceStaticAttributes.reserve(reserve.sliceStaticAttributes);
+        storage.systemFunctionAttributes.reserve(reserve.systemFunctionAttributes);
+        storage.systemTaskAttributes.reserve(reserve.systemTaskAttributes);
+        storage.dpiCallAttributes.reserve(reserve.dpiCallAttributes);
+        storage.dpiImports.reserve(reserve.dpiImports);
+        storage.dpiParameters.reserve(reserve.dpiParameters);
+        impl_->valueFacts.reserve(reserve.variables);
+        impl_->effects.reserve(reserve.instructions);
+        impl_->removed.reserve(reserve.instructions);
+    }
+
+    LiteralId AmGraph::addStringLiteral(TypeId type, std::string_view bytes)
+    {
+        detail::ProgramStorage &storage = impl_->storage;
+        std::string stableBytes;
+        if (aliasesArena(std::span<const char>(bytes.data(), bytes.size()),
+                         storage.literalBytes))
+        {
+            stableBytes.assign(bytes);
+            bytes = stableBytes;
+        }
+        const LiteralId id{static_cast<uint32_t>(storage.literals.size())};
+        const uint32_t begin = static_cast<uint32_t>(storage.literalBytes.size());
+        storage.literalBytes.insert(storage.literalBytes.end(), bytes.begin(), bytes.end());
+        storage.literals.push_back(detail::LiteralRecord{
+            .type = type,
+            .words = Range32{},
+            .bytes = Range32{.offset = begin,
+                             .count = static_cast<uint32_t>(storage.literalBytes.size() - begin)},
+        });
+        return id;
+    }
+
+    InitId AmGraph::addActionsInit(std::span<const InitAction> actions)
+    {
+        detail::ProgramStorage &storage = impl_->storage;
+        std::vector<InitAction> stableActions;
+        if (aliasesArena(actions, storage.initActions))
+        {
+            stableActions.assign(actions.begin(), actions.end());
+            actions = stableActions;
+        }
+        const InitId id{static_cast<uint32_t>(storage.initDescriptors.size())};
+        const uint32_t offset = static_cast<uint32_t>(storage.initActions.size());
+        storage.initActions.insert(storage.initActions.end(), actions.begin(), actions.end());
+        storage.initDescriptors.push_back(InitDescriptor{
+            .kind = InitKind::Actions,
+            .payload = offset,
+            .count = static_cast<uint32_t>(actions.size()),
         });
         return id;
     }
