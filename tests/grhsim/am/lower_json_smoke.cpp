@@ -110,9 +110,9 @@ int main(int argc, char **argv)
         std::cerr << "usage: grhsim-am-lower-json <design.json> [top] [--schedule] "
                      "[--emit <output-directory>] [--blocks-per-source <count>] "
                      "[--max-source-bytes <count>] [--max-commit-source-bytes <count>] "
-                     "[--max-instructions-per-block <count>] "
-                     "[--dp-segment-penalty <value>] "
-                     "[--dp-coarsen-budget <count>] [--disable-coarsening] "
+                     "[--max-atoms-per-block <count>] "
+                     "[--dp-segment-penalty <value>] [--mux-atom-max <count>] "
+                     "[--dp-coarsen-atom-budget <count>] [--disable-coarsening] "
                      "[--runtime-profile] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
@@ -124,9 +124,10 @@ int main(int argc, char **argv)
     std::optional<std::string> blocksPerSource;
     std::optional<std::string> maxSourceBytes;
     std::optional<std::string> maxCommitSourceBytes;
-    std::size_t maxInstructionsPerBlock = 128;
+    std::size_t maxAtomsPerBlock = 128;
     double dpSegmentPenalty = 1.0;
-    std::size_t dpCoarsenBudget = 0;
+    std::size_t dpCoarsenAtomBudget = 0;
+    std::size_t muxAtomMax = 512;
     bool enableCoarsening = true;
     bool runtimeProfile = false;
     AmOptimizeOptions amOptimize;
@@ -181,7 +182,7 @@ int main(int argc, char **argv)
             }
             maxCommitSourceBytes = std::to_string(value);
         }
-        else if (argument == "--max-instructions-per-block" && index + 1 < argc)
+        else if (argument == "--max-atoms-per-block" && index + 1 < argc)
         {
             const std::string_view text(argv[++index]);
             std::size_t value = 0;
@@ -189,10 +190,10 @@ int main(int argc, char **argv)
                 std::from_chars(text.data(), text.data() + text.size(), value);
             if (error != std::errc{} || end != text.data() + text.size() || value == 0)
             {
-                std::cerr << "invalid --max-instructions-per-block value: " << text << '\n';
+                std::cerr << "invalid --max-atoms-per-block value: " << text << '\n';
                 return 2;
             }
-            maxInstructionsPerBlock = value;
+            maxAtomsPerBlock = value;
         }
         else if (argument == "--dp-segment-penalty" && index + 1 < argc)
         {
@@ -207,7 +208,7 @@ int main(int argc, char **argv)
                 return 2;
             }
         }
-        else if (argument == "--dp-coarsen-budget" && index + 1 < argc)
+        else if (argument == "--dp-coarsen-atom-budget" && index + 1 < argc)
         {
             const std::string_view text(argv[++index]);
             std::size_t value = 0;
@@ -215,10 +216,23 @@ int main(int argc, char **argv)
                 std::from_chars(text.data(), text.data() + text.size(), value);
             if (error != std::errc{} || end != text.data() + text.size())
             {
-                std::cerr << "invalid --dp-coarsen-budget value: " << text << '\n';
+                std::cerr << "invalid --dp-coarsen-atom-budget value: " << text << '\n';
                 return 2;
             }
-            dpCoarsenBudget = value;
+            dpCoarsenAtomBudget = value;
+        }
+        else if (argument == "--mux-atom-max" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            std::size_t value = 0;
+            const auto [end, error] =
+                std::from_chars(text.data(), text.data() + text.size(), value);
+            if (error != std::errc{} || end != text.data() + text.size())
+            {
+                std::cerr << "invalid --mux-atom-max value: " << text << '\n';
+                return 2;
+            }
+            muxAtomMax = value;
         }
         else if (argument == "--disable-coarsening")
         {
@@ -440,17 +454,19 @@ int main(int argc, char **argv)
         uint64_t commitBlocks = 0;
         uint64_t emitMs = 0;
         uint64_t emittedArtifacts = 0;
+        uint64_t muxAtomFused = 0;
         if (runSchedule)
         {
             phaseStart = std::chrono::steady_clock::now();
             model = GrhIRToGrhSimAMProgram::graphToProgram(
                 std::move(*amGraph),
                 ActivityScheduleOptions{
-                    .maxInstructionsPerBlock = maxInstructionsPerBlock,
+                    .maxAtomsPerBlock = maxAtomsPerBlock,
                     .enableCoarsening = enableCoarsening,
                     .collectStats = true,
                     .dpSegmentPenalty = dpSegmentPenalty,
-                    .dpCoarsenBudget = dpCoarsenBudget,
+                    .dpCoarsenAtomBudget = dpCoarsenAtomBudget,
+                    .muxAtomMax = muxAtomMax,
                 },
                 diagnostics);
             scheduleMs = elapsedMilliseconds(phaseStart);
@@ -511,6 +527,7 @@ int main(int argc, char **argv)
                     return 1;
                 }
                 emittedArtifacts = emitResult.artifacts.size();
+                muxAtomFused = emitResult.muxAtomFused;
             }
         }
         std::cout << "{\n"
@@ -540,6 +557,7 @@ int main(int argc, char **argv)
                   << "  \"schedule_ms\": " << scheduleMs << ",\n"
                   << "  \"emit_ms\": " << emitMs << ",\n"
                   << "  \"emitted_artifacts\": " << emittedArtifacts << ",\n"
+                  << "  \"mux_atom_fused\": " << muxAtomFused << ",\n"
                   << "  \"current_rss_kib\": " << currentRssKiB() << ",\n"
                   << "  \"peak_rss_kib\": " << peakRssKiB() << '\n'
                   << "}\n";

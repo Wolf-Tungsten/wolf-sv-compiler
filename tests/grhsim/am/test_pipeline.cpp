@@ -196,8 +196,8 @@ namespace
         wolvrix::lib::grh::Graph &graph = design.createGraph("pipeline_top");
         wolvrix::lib::diag::Diagnostics diagnostics;
         const ActivityScheduleOptions scheduleOptions{
-            .maxInstructionsPerBlock = 17,
-            .maxCommitInstructionsPerBlock = 23,
+            .maxAtomsPerBlock = 17,
+            .maxCommitAtomsPerBlock = 23,
             .enableCoarsening = false,
             .collectStats = true,
         };
@@ -269,8 +269,8 @@ namespace
         }
 
         const ActivityScheduleOptions scheduleOptions{
-            .maxInstructionsPerBlock = 17,
-            .maxCommitInstructionsPerBlock = 23,
+            .maxAtomsPerBlock = 17,
+            .maxCommitAtomsPerBlock = 23,
             .enableCoarsening = false,
             .collectStats = true,
         };
@@ -950,7 +950,7 @@ namespace
             wolvrix::lib::grh::Graph &graph = design.createGraph("pipeline_top");
             wolvrix::lib::diag::Diagnostics diagnostics;
             const ActivityScheduleOptions scheduleOptions{
-                .maxInstructionsPerBlock = 0,
+                .maxAtomsPerBlock = 0,
             };
             const GrhIRToGrhSimAMProgramResult result = pipeline.run(
                 graph,

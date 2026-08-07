@@ -32,29 +32,40 @@ namespace wolvrix::lib::grhsim::am
 
     struct ActivityScheduleOptions
     {
-        // Aligns with the legacy maxOpInComputeSupernode limit.
-        std::size_t maxInstructionsPerBlock = 128;
-        // Commit blocks may carry a longer ordered state-write chain than a
+        // Compute 块容量上限，按 atom 计（NO0007 P3：atom 是分区大小的
+        // 单位；单超 cap 的 atom 自成一块）。对齐 legacy
+        // maxOpInComputeSupernode 的数值默认值。
+        std::size_t maxAtomsPerBlock = 128;
+        // Commit Blocks may carry a longer ordered state-write chain than a
         // compute block, but never split an indivisible effect atom.
-        // Aligns with the legacy maxOpInCommitSupernode limit.
-        std::size_t maxCommitInstructionsPerBlock = 4096;
+        // 按 commit atom 计数；另有指令数护栏 kMaxGuardEventMergeOps
+        // （commit 分区内部）。对齐 legacy maxOpInCommitSupernode。
+        std::size_t maxCommitAtomsPerBlock = 4096;
         // Aligns with the legacy enableCoarsen/enableChainMerge switches; the
         // out1/in1 and sibling merge stages are both built in.
         bool enableCoarsening = true;
         bool collectStats = false;
         // DP fixed cost per segment boundary; legacy hard-codes +1 per segment.
         double dpSegmentPenalty = 1.0;
-        // Merge host member instruction limit for the out1/in1/sibling merge
-        // sweeps. 0 selects the default 256: larger values cut fewer
-        // cross-block values but grow an oversized-block tail that re-executes
-        // wholesale on activation (XiangShan: 7000 -> +6% host time, 256 ->
-        // -3% host time vs the legacy partitioner; see compute-partition
-        // NO0004).
-        std::size_t dpCoarsenBudget = 0;
+        // Merge host member limit for the out1/in1/sibling merge sweeps, in
+        // atoms (P3: formerly an instruction count). 0 selects the default
+        // 256: larger values cut fewer cross-block values but grow an
+        // oversized-block tail that re-executes wholesale on activation
+        // (XiangShan: 7000 -> +6% host time, 256 -> -3% host time vs the
+        // legacy partitioner; see compute-partition NO0004).
+        std::size_t dpCoarsenAtomBudget = 0;
         // Post-DP local-move refinement rounds for the compute partition
         // (0 = off). Deterministic, monotone cost decrease; see
         // grhsim_am_compute_graph_partition.cpp.
         std::size_t dpRefinementRounds = 10;
+        // mux-merge atom cap (opt-am-compute-graph): same-select compute mux
+        // groups plus their exclusively-used producer cones merge into
+        // indivisible scheduling atoms when the total instruction count does
+        // not exceed this threshold. Larger groups are left as-is (emitter
+        // 端无兜底，atom 是融合的唯一事实源). 0 disables the pass.
+        // Activation-granularity guard, not a partition feasibility limit
+        // (see am-graph NO0006 §10).
+        std::size_t muxAtomMax = 512;
     };
 
     struct AmOptimizeOptions
@@ -116,6 +127,10 @@ namespace wolvrix::lib::grhsim::am
     {
         bool success = true;
         std::vector<std::string> artifacts;
+        // Same-select mux fusion (NO0006/NO0007 P2, atom-driven): number of
+        // mux assignments covered by fused if/else segments (MuxMerge atoms)
+        // in the emitted sources.
+        uint64_t muxAtomFused = 0;
     };
 
     // The pipeline currency is the AmGraph: lowering builds the graph

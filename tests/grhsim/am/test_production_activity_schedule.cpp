@@ -13,6 +13,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <charconv>
 #include <string>
 #include <utility>
 #include <vector>
@@ -238,7 +239,7 @@ namespace
         wolvrix::lib::diag::Diagnostics diagnostics;
         std::optional<ExecutableModel> model = schedule(std::move(linear),
                                                         ActivityScheduleOptions{
-                                                            .maxInstructionsPerBlock = 1,
+                                                            .maxAtomsPerBlock = 1,
                                                             .enableCoarsening = false,
                                                         },
                                                         diagnostics);
@@ -271,7 +272,7 @@ namespace
     int testEffectfulChangedDetectorsCoarsenAsCompute()
     {
         constexpr uint32_t detectorCount = 12;
-        constexpr uint32_t maxInstructionsPerBlock = 4;
+        constexpr uint32_t maxAtomsPerBlock = 4;
         constexpr std::array<Opcode, 3> detectorOpcodes = {
             Opcode::ChangedPos,
             Opcode::ChangedNeg,
@@ -318,7 +319,7 @@ namespace
         std::optional<ExecutableModel> model = schedule(
             std::move(linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = maxInstructionsPerBlock,
+                .maxAtomsPerBlock = maxAtomsPerBlock,
                 .enableCoarsening = true,
             },
             diagnostics);
@@ -355,8 +356,8 @@ namespace
             return fail("independent changed detectors did not pack into cap-bounded Blocks");
         }
         for (uint32_t block = 1; block < model->program.blockCount(); ++block) {
-            if (model->program.blockSize(BlockId{block}) > maxInstructionsPerBlock) {
-                return fail("changed-detector Block exceeded the configured instruction cap");
+            if (model->program.blockSize(BlockId{block}) > maxAtomsPerBlock) {
+                return fail("changed-detector Block exceeded the configured atom cap");
             }
         }
         if (!validate(*model, ValidationOptions{.level = ValidationLevel::Semantic}).success()) {
@@ -420,7 +421,7 @@ namespace
         wolvrix::lib::diag::Diagnostics diagnostics;
         std::optional<ExecutableModel> model = schedule(std::move(linear),
                                                         ActivityScheduleOptions{
-                                                            .maxInstructionsPerBlock = 8,
+                                                            .maxAtomsPerBlock = 8,
                                                             .enableCoarsening = false,
                                                         },
                                                         diagnostics);
@@ -489,7 +490,7 @@ namespace
         std::optional<ExecutableModel> model = schedule(
             std::move(linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 8,
+                .maxAtomsPerBlock = 8,
                 .enableCoarsening = true,
             },
             diagnostics);
@@ -540,12 +541,12 @@ namespace
         std::optional<ExecutableModel> model = schedule(
             std::move(linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 8,
+                .maxAtomsPerBlock = 8,
                 .enableCoarsening = true,
                 .collectStats = true,
                 // Explicit budget so this scenario does not depend on the
                 // automatic coarsen-budget default.
-                .dpCoarsenBudget = 256,
+                .dpCoarsenAtomBudget = 256,
             },
             diagnostics);
         // The chain stays 64 separate atoms, but the coarsen budget
@@ -659,7 +660,7 @@ namespace
         std::optional<ExecutableModel> model = schedule(
             std::move(linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 2,
+                .maxAtomsPerBlock = 2,
                 .enableCoarsening = true,
             },
             diagnostics);
@@ -794,8 +795,8 @@ namespace
         std::optional<ExecutableModel> model = schedule(
             std::move(linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 2,
-                .maxCommitInstructionsPerBlock = 1,
+                .maxAtomsPerBlock = 2,
+                .maxCommitAtomsPerBlock = 1,
                 .enableCoarsening = true,
             },
             diagnostics);
@@ -879,8 +880,8 @@ namespace
         std::optional<ExecutableModel> model = schedule(
             std::move(linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 1,
-                .maxCommitInstructionsPerBlock = 1,
+                .maxAtomsPerBlock = 1,
+                .maxCommitAtomsPerBlock = 1,
                 .enableCoarsening = false,
             },
             diagnostics);
@@ -936,7 +937,7 @@ namespace
         wolvrix::lib::diag::Diagnostics diagnostics;
         std::optional<ExecutableModel> model = schedule(std::move(linear),
                                                         ActivityScheduleOptions{
-                                                            .maxInstructionsPerBlock = 8,
+                                                            .maxAtomsPerBlock = 8,
                                                             .enableCoarsening = false,
                                                         },
                                                         diagnostics);
@@ -1024,8 +1025,8 @@ namespace
         std::optional<ExecutableModel> model = schedule(
             std::move(fixture.linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 8,
-                .maxCommitInstructionsPerBlock = 8,
+                .maxAtomsPerBlock = 8,
+                .maxCommitAtomsPerBlock = 8,
                 .enableCoarsening = false,
             },
             diagnostics);
@@ -1052,8 +1053,8 @@ namespace
         std::optional<ExecutableModel> coarsened = schedule(
             std::move(coarsenedFixture.linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 1,
-                .maxCommitInstructionsPerBlock = 2,
+                .maxAtomsPerBlock = 1,
+                .maxCommitAtomsPerBlock = 2,
                 .enableCoarsening = true,
             },
             coarsenedDiagnostics);
@@ -1062,8 +1063,8 @@ namespace
         std::optional<ExecutableModel> split = schedule(
             std::move(splitFixture.linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 1,
-                .maxCommitInstructionsPerBlock = 1,
+                .maxAtomsPerBlock = 1,
+                .maxCommitAtomsPerBlock = 1,
                 .enableCoarsening = true,
             },
             splitDiagnostics);
@@ -1182,8 +1183,8 @@ namespace
         return schedule(
             std::move(fixture.linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 8,
-                .maxCommitInstructionsPerBlock = 3,
+                .maxAtomsPerBlock = 8,
+                .maxCommitAtomsPerBlock = 3,
                 .enableCoarsening = true,
             },
             diagnostics);
@@ -1280,8 +1281,8 @@ namespace
         std::optional<ExecutableModel> model = schedule(
             std::move(fixture.linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 1,
-                .maxCommitInstructionsPerBlock = 1,
+                .maxAtomsPerBlock = 1,
+                .maxCommitAtomsPerBlock = 1,
                 .enableCoarsening = true,
                 .collectStats = true,
             },
@@ -1381,7 +1382,7 @@ namespace
         std::optional<ExecutableModel> model = schedule(
             std::move(fixture.linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 1,
+                .maxAtomsPerBlock = 1,
                 .enableCoarsening = false,
             },
             diagnostics);
@@ -1467,7 +1468,7 @@ namespace
         std::optional<ExecutableModel> model = schedule(
             std::move(linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 1,
+                .maxAtomsPerBlock = 1,
                 .enableCoarsening = false,
             },
             diagnostics);
@@ -1571,8 +1572,8 @@ namespace
         std::optional<ExecutableModel> model = schedule(
             std::move(linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 1,
-                .maxCommitInstructionsPerBlock = 2,
+                .maxAtomsPerBlock = 1,
+                .maxCommitAtomsPerBlock = 2,
                 .enableCoarsening = true,
             },
             diagnostics);
@@ -1685,8 +1686,8 @@ namespace
         std::optional<ExecutableModel> model = schedule(
             std::move(linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 1,
-                .maxCommitInstructionsPerBlock = 2,
+                .maxAtomsPerBlock = 1,
+                .maxCommitAtomsPerBlock = 2,
                 .enableCoarsening = true,
             },
             diagnostics);
@@ -1789,7 +1790,7 @@ namespace
         wolvrix::lib::diag::Diagnostics diagnostics;
         std::optional<ExecutableModel> model = schedule(std::move(linear),
                                                         ActivityScheduleOptions{
-                                                            .maxInstructionsPerBlock = 1,
+                                                            .maxAtomsPerBlock = 1,
                                                             .enableCoarsening = false,
                                                         },
                                                         diagnostics);
@@ -1881,8 +1882,8 @@ namespace
         std::optional<ExecutableModel> model = schedule(
             std::move(linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 1,
-                .maxCommitInstructionsPerBlock = 2,
+                .maxAtomsPerBlock = 1,
+                .maxCommitAtomsPerBlock = 2,
                 .enableCoarsening = true,
             },
             diagnostics);
@@ -2003,8 +2004,8 @@ namespace
     int testCommitCycleResolvesAcrossRoundsInStaticOrder()
     {
         const ActivityScheduleOptions options{
-            .maxInstructionsPerBlock = 1,
-            .maxCommitInstructionsPerBlock = 1,
+            .maxAtomsPerBlock = 1,
+            .maxCommitAtomsPerBlock = 1,
             .enableCoarsening = false,
         };
         CommitCycleFixture firstFixture = makeCommitCycleFixture();
@@ -2103,11 +2104,11 @@ namespace
     {
         constexpr uint32_t instructionCount = 5;
         const ActivityScheduleOptions coarsenedOptions{
-            .maxInstructionsPerBlock = 2,
+            .maxAtomsPerBlock = 2,
             .enableCoarsening = true,
             // Explicit budget so this scenario does not depend on the
             // automatic coarsen-budget default.
-            .dpCoarsenBudget = 64,
+            .dpCoarsenAtomBudget = 64,
         };
         wolvrix::lib::diag::Diagnostics firstDiagnostics;
         std::optional<ExecutableModel> first =
@@ -2119,7 +2120,7 @@ namespace
         std::optional<ExecutableModel> uncoarsened = schedule(
             makePureChain(instructionCount),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 2,
+                .maxAtomsPerBlock = 2,
                 .enableCoarsening = false,
             },
             uncoarsenedDiagnostics);
@@ -2237,7 +2238,7 @@ namespace
     int testMixedForwardBackwardActivationIsDeterministic()
     {
         const ActivityScheduleOptions options{
-            .maxInstructionsPerBlock = 1,
+            .maxAtomsPerBlock = 1,
             .enableCoarsening = false,
         };
         MixedActivationFixture firstFixture = makeMixedActivationProgram();
@@ -2276,7 +2277,7 @@ namespace
     int testPureSccFormsOneDeterministicBlock()
     {
         const ActivityScheduleOptions options{
-            .maxInstructionsPerBlock = 8,
+            .maxAtomsPerBlock = 8,
             .enableCoarsening = false,
         };
         wolvrix::lib::diag::Diagnostics firstDiagnostics;
@@ -2304,7 +2305,7 @@ namespace
     int testOversizedIndivisibleAtomFormsOneBlock()
     {
         const ActivityScheduleOptions options{
-            .maxInstructionsPerBlock = 1,
+            .maxAtomsPerBlock = 1,
             .enableCoarsening = true,
             .collectStats = true,
         };
@@ -2432,7 +2433,7 @@ namespace
         std::optional<ExecutableModel> model =
             schedule(std::move(linear),
                      ActivityScheduleOptions{
-                         .maxInstructionsPerBlock = 8,
+                         .maxAtomsPerBlock = 8,
                          .enableCoarsening = false,
                      },
                      diagnostics);
@@ -2531,7 +2532,7 @@ namespace
         std::optional<ExecutableModel> model =
             schedule(makePureCycle(),
                      ActivityScheduleOptions{
-                         .maxInstructionsPerBlock = 8,
+                         .maxAtomsPerBlock = 8,
                          .enableCoarsening = false,
                      },
                      diagnostics);
@@ -2595,7 +2596,7 @@ namespace
         std::optional<ExecutableModel> model =
             schedule(std::move(linear),
                      ActivityScheduleOptions{
-                         .maxInstructionsPerBlock = 8,
+                         .maxAtomsPerBlock = 8,
                          .enableCoarsening = false,
                      },
                      diagnostics);
@@ -2629,20 +2630,40 @@ namespace
         if (lines.front() != expectedHeader) {
             return fail("block assignment export header mismatch: " + lines.front());
         }
-        if (lines[1] != "{\"record\":\"block\",\"id\":1,\"kind\":\"compute\",\"size\":4}" ||
-            lines[2] != "{\"record\":\"block\",\"id\":2,\"kind\":\"commit\",\"size\":1}") {
+        // Block records carry the post-merge atom count: block 1 packs the
+        // comb-loop assign pair as one CombLoopScc atom plus two singleton
+        // producers (3 atoms); block 2 is the single CommitEvent write atom.
+        if (lines[1] != "{\"record\":\"block\",\"id\":1,\"kind\":\"compute\",\"size\":4,\"atoms\":3}" ||
+            lines[2] != "{\"record\":\"block\",\"id\":2,\"kind\":\"commit\",\"size\":1,\"atoms\":1}") {
             return fail("block assignment export block records mismatch");
         }
         const std::array<uint32_t, 5> expectedBlocks = {1, 1, 1, 1, 2};
+        std::vector<uint32_t> recordAtoms(5, UINT32_MAX);
         for (uint32_t instruction = 0; instruction < 5; ++instruction) {
-            const std::string expected =
-                std::string("{\"record\":\"assign\",\"instr\":") +
-                std::to_string(instruction) +
-                ",\"block\":" + std::to_string(expectedBlocks[instruction]) + "}";
-            if (lines[3 + instruction] != expected) {
-                return fail("block assignment export assign record mismatch: " +
-                            lines[3 + instruction]);
+            const std::string &line = lines[3 + instruction];
+            const std::string prefix = std::string("{\"record\":\"assign\",\"instr\":") +
+                                       std::to_string(instruction) + ",\"block\":" +
+                                       std::to_string(expectedBlocks[instruction]) +
+                                       ",\"atom\":";
+            if (!line.starts_with(prefix) || line.back() != '}') {
+                return fail("block assignment export assign record mismatch: " + line);
             }
+            const std::string atomText =
+                line.substr(prefix.size(), line.size() - prefix.size() - 1);
+            uint32_t atom = UINT32_MAX;
+            const auto [end, error] =
+                std::from_chars(atomText.data(), atomText.data() + atomText.size(), atom);
+            if (error != std::errc{} || end != atomText.data() + atomText.size()) {
+                return fail("block assignment export atom field is not a number: " + line);
+            }
+            recordAtoms[instruction] = atom;
+        }
+        // The comb-loop pair shares one atom; the two chain producers are
+        // distinct singletons; the write is its own commit atom.
+        if (recordAtoms[2] != recordAtoms[3] || recordAtoms[0] == recordAtoms[2] ||
+            recordAtoms[1] == recordAtoms[2] || recordAtoms[0] == recordAtoms[1] ||
+            recordAtoms[4] == recordAtoms[2]) {
+            return fail("block assignment export atom fields do not reflect the SCC packing");
         }
         return 0;
     }
@@ -2698,7 +2719,7 @@ namespace
             .useOffsets = useOffsets,
             .uses = uses,
             .instructionAtom = instructionAtom,
-            .maxInstructionsPerBlock = 60,
+            .maxAtomsPerBlock = 60,
             .enableCoarsening = false,
             .segmentPenalty = 1.0,
         };
@@ -2814,7 +2835,7 @@ namespace
                 .useOffsets = useOffsets,
                 .uses = uses,
                 .instructionAtom = instructionAtom,
-                .maxInstructionsPerBlock = 2,
+                .maxAtomsPerBlock = 2,
                 .enableCoarsening = false,
                 .segmentPenalty = 1.0,
                 .refinementRounds = refinementRounds,

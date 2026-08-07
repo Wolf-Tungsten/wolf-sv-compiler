@@ -171,7 +171,7 @@ namespace
         std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
             std::move(*linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 8,
+                .maxAtomsPerBlock = 8,
                 .enableCoarsening = false,
             },
             diagnostics);
@@ -531,7 +531,7 @@ namespace
         std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
             std::move(*linear),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 8,
+                .maxAtomsPerBlock = 8,
                 .enableCoarsening = true,
             },
             diagnostics);
@@ -664,7 +664,7 @@ int main()
     std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
         std::move(*linear),
         ActivityScheduleOptions{
-            .maxInstructionsPerBlock = 8,
+            .maxAtomsPerBlock = 8,
             .enableCoarsening = false,
         },
         diagnostics);

@@ -28,10 +28,10 @@ namespace wolvrix::lib::grhsim::am
         std::span<const uint32_t> useOffsets;  // variable -> using instructions CSR
         std::span<const uint32_t> uses;
         std::span<const uint32_t> instructionAtom; // instruction -> atom
-        std::size_t maxInstructionsPerBlock = 128;
-        std::size_t maxCommitInstructionsPerBlock = 4096;
+        std::size_t maxAtomsPerBlock = 128;      // compute 块 atom 数上限
+        std::size_t maxCommitAtomsPerBlock = 4096; // commit 块 atom 数上限
         bool enableCoarsening = true;   // out1/in1/sibling merge sweeps
-        std::size_t coarsenBudget = 256; // merge host member instruction limit
+        std::size_t coarsenAtomBudget = 256; // merge host member atom limit
         double segmentPenalty = 1.0;    // DP fixed cost per segment boundary
         // Post-DP local-move refinement rounds (0 = off). Each round scans
         // clusters in topo order and moves a cluster to a neighbor block when

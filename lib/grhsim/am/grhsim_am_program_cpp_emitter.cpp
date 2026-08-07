@@ -333,6 +333,29 @@ namespace wolvrix::lib::grhsim::am
             // Mutable emission context (same pattern as arrayWriteAccum): the
             // current RegisterWrite position's raise flag, -1 when none.
             mutable int32_t scalarWriteRaise = -1;
+            // Atom-driven same-select mux fusion (NO0006 pass, NO0007 P2):
+            // a MuxMerge atom emits its non-arm members (the cone) normally
+            // in atom member order, then one fused if/else over the arm
+            // members (the same-select muxes, also in member order, so
+            // chained arms read the earlier branch assignment). The atom is
+            // the single source of truth -- no block-level run pattern
+            // matching remains. instructionMuxAtom maps an instruction to
+            // its MuxMerge atom plan id (-1 when not a member); the head
+            // member (first in atom member order) emits the atom's whole
+            // code, the other members emit nothing.
+            struct MuxAtomPlan
+            {
+                uint32_t head = 0; // first member instruction value
+                VariableId select;
+                std::vector<InstructionId> preamble; // non-arm members, atom order
+                std::vector<InstructionId> arms;     // same-select muxes, atom order
+            };
+            std::vector<int32_t> instructionMuxAtom;
+            std::vector<MuxAtomPlan> muxAtomPlans;
+            uint64_t muxAtomFusedCount = 0;
+            // Re-entrancy guard: emitMuxAtom emits its members through
+            // emitInstruction, which must not re-enter the atom hook.
+            mutable bool muxAtomEmissionActive = false;
         };
 
         constexpr uint8_t kEscapeGlobal = 1U << 0U;
@@ -1493,6 +1516,116 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
+        // One fused if/else for a same-select mux arm list (NO0006/NO0007
+        // P2): the select evaluates once per structure and each branch
+        // carries every member's arm assignment in list order, so a chained
+        // arm simply reads the earlier branch assignment. Arm rendering
+        // mirrors the standalone Mux cases: narrow values use the masked
+        // scalar assignment, wide values use the same assignVariableStatement
+        // form as the wide Mux case.
+        std::optional<std::string> emitMuxRun(const EmitState &state,
+                                              const std::vector<InstructionId> &members,
+                                              std::string &error)
+        {
+            (void)error;
+            const VariableId select = state.program.operands(members.front())[0];
+            std::string trueBody;
+            std::string falseBody;
+            for (const InstructionId member : members)
+            {
+                const auto operands = state.program.operands(member);
+                const auto results = state.program.results(member);
+                const auto isNonScalar = [&](VariableId variable) {
+                    const Type &type = variableType(state, variable);
+                    return type.kind != TypeKind::BitVector || type.bitWidth > 64;
+                };
+                const bool wide =
+                    std::any_of(operands.begin(), operands.end(), isNonScalar) ||
+                    std::any_of(results.begin(), results.end(), isNonScalar);
+                if (wide)
+                {
+                    const Type &trueType = variableType(state, operands[1]);
+                    const Type &falseType = variableType(state, operands[2]);
+                    const Signedness common =
+                        trueType.signedness == Signedness::Signed &&
+                                falseType.signedness == Signedness::Signed
+                            ? Signedness::Signed
+                            : Signedness::Unsigned;
+                    trueBody += assignVariableStatement(state, results.front(), operands[1],
+                                                        common);
+                    falseBody += assignVariableStatement(state, results.front(), operands[2],
+                                                         common);
+                }
+                else
+                {
+                    const Type &resultType = variableType(state, results.front());
+                    trueBody += valueExpr(state, results.front()) + " = (" +
+                                resizedExpr(state, operands[1], resultType.bitWidth,
+                                            resultType.signedness) +
+                                ") & " + maskExpr(resultType.bitWidth) + ";\n";
+                    falseBody += valueExpr(state, results.front()) + " = (" +
+                                 resizedExpr(state, operands[2], resultType.bitWidth,
+                                             resultType.signedness) +
+                                 ") & " + maskExpr(resultType.bitWidth) + ";\n";
+                }
+            }
+            return "if (" + boolExpr(state, select) + ") { " + trueBody + "} else { " +
+                   falseBody + "}\n";
+        }
+
+        std::optional<std::string> emitInstruction(const EmitState &state,
+                                                   InstructionId instruction,
+                                                   std::string &error);
+
+        // MuxMerge atom two-phase emission (NO0007 P2): the non-arm members
+        // (the absorbed cone) emit normally in atom member order, then one
+        // fused if/else covers the arm members. The pass guarantees arms
+        // only depend on the cone, state reads, or earlier arms, so this
+        // order is def-before-use by construction.
+        std::optional<std::string> emitMuxAtom(const EmitState &state,
+                                               const EmitState::MuxAtomPlan &plan,
+                                               std::string &error)
+        {
+            state.muxAtomEmissionActive = true;
+            std::string code;
+            for (const InstructionId member : plan.preamble)
+            {
+                std::optional<std::string> emitted =
+                    emitInstruction(state, member, error);
+                if (!emitted)
+                {
+                    state.muxAtomEmissionActive = false;
+                    return std::nullopt;
+                }
+                code += *emitted;
+            }
+            if (plan.arms.size() >= 2)
+            {
+                std::optional<std::string> fused = emitMuxRun(state, plan.arms, error);
+                if (!fused)
+                {
+                    state.muxAtomEmissionActive = false;
+                    return std::nullopt;
+                }
+                code += *fused;
+            }
+            else if (!plan.arms.empty())
+            {
+                // Degenerate single-arm atom (validate forbids it in
+                // production): keep the plain emission.
+                std::optional<std::string> emitted =
+                    emitInstruction(state, plan.arms.front(), error);
+                if (!emitted)
+                {
+                    state.muxAtomEmissionActive = false;
+                    return std::nullopt;
+                }
+                code += *emitted;
+            }
+            state.muxAtomEmissionActive = false;
+            return code;
+        }
+
         std::optional<std::string> emitInstruction(const EmitState &state,
                                                    InstructionId instruction,
                                                    std::string &error)
@@ -1512,6 +1645,22 @@ namespace wolvrix::lib::grhsim::am
                     state, operands[1], resultType.bitWidth, resultType.signedness);
                 return std::array<std::string, 2>{lhs, rhs};
             };
+
+            if (!state.muxAtomEmissionActive &&
+                instruction.value < state.instructionMuxAtom.size())
+            {
+                const int32_t muxAtom = state.instructionMuxAtom[instruction.value];
+                if (muxAtom >= 0)
+                {
+                    const EmitState::MuxAtomPlan &plan = state.muxAtomPlans[muxAtom];
+                    if (plan.head != instruction.value)
+                    {
+                        // The atom head emitted the whole two-phase code.
+                        return std::string();
+                    }
+                    return emitMuxAtom(state, plan, error);
+                }
+            }
 
             if (opcode == Opcode::Assign &&
                 (isWideBitVector(state, results.front()) ||
@@ -3907,6 +4056,73 @@ namespace wolvrix::lib::grhsim::am
                 }
             }
         }
+
+        // NO0006/NO0007 P2 atom-driven mux fusion: MuxMerge atoms carry the
+        // pass-recorded same-select mux group. The head member (first in
+        // atom member order) emits the two-phase code for the whole atom;
+        // the other members emit nothing. Atoms of any other kind fall
+        // through to the plain per-instruction emission, so no block-level
+        // run pattern matching remains.
+        void planMuxMergeAtoms(const ExecutableModel &model, EmitState &state)
+        {
+            state.instructionMuxAtom.assign(state.program.instructionCount(), -1);
+            state.muxAtomPlans.clear();
+            state.muxAtomFusedCount = 0;
+            for (uint32_t blockIndex = 0; blockIndex < state.blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                for (std::size_t atomIndex = 0;
+                     atomIndex < model.program.blockAtomCount(block); ++atomIndex)
+                {
+                    const AtomId atom = model.program.blockAtom(block, atomIndex);
+                    if (model.program.atomKind(atom) != AmAtomKind::MuxMerge)
+                    {
+                        continue;
+                    }
+                    const std::size_t memberCount = model.program.atomInstructionCount(atom);
+                    if (memberCount == 0)
+                    {
+                        continue;
+                    }
+                    EmitState::MuxAtomPlan plan;
+                    plan.head = model.program.atomInstruction(atom, 0).value;
+                    plan.select = VariableId{model.program.atomSignature(atom)};
+                    for (std::size_t member = 0; member < memberCount; ++member)
+                    {
+                        const InstructionId instruction =
+                            model.program.atomInstruction(atom, member);
+                        const auto operands = state.program.operands(instruction);
+                        if (state.program.opcode(instruction) == Opcode::Mux &&
+                            operands.size() == 3 && operands[0] == plan.select)
+                        {
+                            plan.arms.push_back(instruction);
+                        }
+                        else
+                        {
+                            plan.preamble.push_back(instruction);
+                        }
+                    }
+                    if (plan.arms.size() < 2)
+                    {
+                        // Degenerate atom (validate forbids it in
+                        // production): emit members plainly.
+                        continue;
+                    }
+                    const int32_t planId =
+                        static_cast<int32_t>(state.muxAtomPlans.size());
+                    for (const InstructionId member : plan.preamble)
+                    {
+                        state.instructionMuxAtom[member.value] = planId;
+                    }
+                    for (const InstructionId member : plan.arms)
+                    {
+                        state.instructionMuxAtom[member.value] = planId;
+                    }
+                    state.muxAtomFusedCount += plan.arms.size();
+                    state.muxAtomPlans.push_back(std::move(plan));
+                }
+            }
+        }
     } // namespace
 
     GrhSimAmCppResult
@@ -4446,6 +4662,9 @@ namespace wolvrix::lib::grhsim::am
         // RegisterWrite sites. Planned after ST00010 (emission consults its
         // group assignments).
         planScalarWatchGroups(model, state);
+        // NO0006/NO0007 P2 same-select mux fusion: MuxMerge atoms emit one
+        // fused if/else over their arm members.
+        planMuxMergeAtoms(model, state);
 
         if (statsAttribute != options.attributes.end() && statsAttribute->second == "true")
         {
@@ -4472,7 +4691,9 @@ namespace wolvrix::lib::grhsim::am
                                  " commit_gated_blocks=" +
                                  std::to_string(state.commitGateBlockCount) +
                                  " scalar_watch_fused=" +
-                                 std::to_string(state.scalarWatchFusedCount),
+                                 std::to_string(state.scalarWatchFusedCount) +
+                                 " mux_atom_fused=" +
+                                 std::to_string(state.muxAtomFusedCount),
                              std::string(kContext));
         }
 
@@ -6539,6 +6760,7 @@ namespace
         discardStaging();
 
         result.success = true;
+        result.muxAtomFused = state.muxAtomFusedCount;
         result.artifacts.reserve(stagedArtifacts.size());
         for (const StagedArtifact &artifact : stagedArtifacts)
         {

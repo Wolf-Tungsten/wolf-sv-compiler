@@ -41,6 +41,8 @@ namespace wolvrix::lib::grhsim::am
 
         bool exportBlockAssignmentJsonl(ProgramView program, const DefUseIndex &defUse,
                                         std::span<const uint32_t> instructionBlock,
+                                        std::span<const uint32_t> instructionAtom,
+                                        std::span<const uint32_t> blockAtomCounts,
                                         uint32_t normalBlockCount, uint32_t computeBlockCount,
                                         uint32_t commitBlockBegin, uint32_t commitBlockEnd,
                                         uint32_t inputSinkBlock,
@@ -146,6 +148,8 @@ namespace wolvrix::lib::grhsim::am
                                               : std::string_view("compute"))
                     .raw("\",\"size\":")
                     .number(blockInstructionCounts[block])
+                    .raw(",\"atoms\":")
+                    .number(blockAtomCounts[block])
                     .raw("}");
                 writer.endLine();
             }
@@ -155,6 +159,8 @@ namespace wolvrix::lib::grhsim::am
                     .number(instruction)
                     .raw(",\"block\":")
                     .number(instructionBlock[instruction])
+                    .raw(",\"atom\":")
+                    .number(instructionAtom[instruction])
                     .raw("}");
                 writer.endLine();
             }
@@ -284,7 +290,8 @@ namespace wolvrix::lib::grhsim::am
         // intra-Block instruction order.
         std::optional<ExecutableModel> finalizeScheduledModel(
             AmGraph &graph, ProgramView program, const DefUseIndex &defUse,
-            const std::vector<std::vector<uint32_t>> &blockNodes,
+            const std::vector<std::vector<uint32_t>> &blockAtoms,
+            const AmGraphSplitContext &context,
             const std::vector<std::vector<CommitEventPart>> &commitGateParts,
             std::vector<ActivationEdge> &activationEdges, uint32_t normalBlockCount,
             uint32_t commitBlockBegin, uint32_t commitBlockEnd, TypeId eventType,
@@ -352,27 +359,34 @@ namespace wolvrix::lib::grhsim::am
                             gateEvents.emplace(part, event);
                         }
                     }
-                    for (const uint32_t instructionValue : blockNodes[block]) {
-                        const InstructionId instruction{instructionValue};
-                        if (isCommitBlock(block) && !gateEvents.empty()) {
-                            // Re-point the write's event operands at the in-Block
-                            // detector results so the Block-level gate and the
-                            // writes observe one shared detector set.
-                            const auto operands = program.operands(instruction);
-                            const std::size_t eventBegin = stateWriteEventBegin(
-                                program.opcode(instruction), operands.size());
-                            for (std::size_t index = eventBegin; index < operands.size();
-                                 ++index) {
-                                const CommitEventPart part =
-                                    canonicalCommitEvent(program, defUse, operands[index]);
-                                const auto found = gateEvents.find(part);
-                                if (found != gateEvents.end()) {
-                                    builder.setInstructionOperand(instruction, index,
-                                                                  found->second);
+                    for (const uint32_t atom : blockAtoms[block]) {
+                        builder.beginAtom(
+                            static_cast<AmAtomKind>(context.atomKinds[atom]),
+                            context.atomSignatures[atom]);
+                        for (uint32_t offset = context.atomMemberOffsets[atom];
+                             offset < context.atomMemberOffsets[atom + 1]; ++offset) {
+                            const InstructionId instruction{context.atomMembers[offset]};
+                            if (isCommitBlock(block) && !gateEvents.empty()) {
+                                // Re-point the write's event operands at the in-Block
+                                // detector results so the Block-level gate and the
+                                // writes observe one shared detector set.
+                                const auto operands = program.operands(instruction);
+                                const std::size_t eventBegin = stateWriteEventBegin(
+                                    program.opcode(instruction), operands.size());
+                                for (std::size_t index = eventBegin; index < operands.size();
+                                     ++index) {
+                                    const CommitEventPart part =
+                                        canonicalCommitEvent(program, defUse, operands[index]);
+                                    const auto found = gateEvents.find(part);
+                                    if (found != gateEvents.end()) {
+                                        builder.setInstructionOperand(instruction, index,
+                                                                      found->second);
+                                    }
                                 }
                             }
+                            builder.appendBlockInstruction(instruction);
                         }
-                        builder.appendBlockInstruction(instruction);
+                        builder.endAtom();
                     }
                     appendWatchGroups(builder, block, activationEdges, edgeCursor, eventType);
                     builder.endBlock();
@@ -515,10 +529,14 @@ namespace wolvrix::lib::grhsim::am
         // Per-Block ordered node lists: the graph-level block assignment.
         // Block membership and intra-Block order live here (not in a flat
         // layout array) so passes annotate and the finalizer serializes once.
+        // blockAtoms keeps the atom segmentation of each Block (atomTopo
+        // order) so the finalizer can serialize the atom layer verbatim.
         std::vector<std::vector<uint32_t>> blockNodes(normalBlockCount + 1);
+        std::vector<std::vector<uint32_t>> blockAtoms(normalBlockCount + 1);
         for (uint32_t atom : atomTopo) {
             const uint32_t block = atomBlock[atom];
             auto &nodes = blockNodes[block];
+            blockAtoms[block].push_back(atom);
             nodes.reserve(nodes.size() + atomInstructions[atom]);
             for (uint32_t offset = atomMemberOffsets[atom]; offset < atomMemberOffsets[atom + 1];
                  ++offset) {
@@ -687,10 +705,15 @@ namespace wolvrix::lib::grhsim::am
         }
 
         if (const char *exportPath = std::getenv(kBlockAssignmentExportEnv)) {
+            std::vector<uint32_t> blockAtomCounts(normalBlockCount + 1, 0);
+            for (uint32_t block = 0; block <= normalBlockCount; ++block) {
+                blockAtomCounts[block] = static_cast<uint32_t>(blockAtoms[block].size());
+            }
             if (exportPath[0] == '\0' ||
-                !exportBlockAssignmentJsonl(program, defUse, instructionBlock, normalBlockCount,
-                                            computeBlockCount, commitBlockBegin, commitBlockEnd,
-                                            inputSinkBlock, semanticBlockCounts,
+                !exportBlockAssignmentJsonl(program, defUse, instructionBlock,
+                                            context.instructionAtom, blockAtomCounts,
+                                            normalBlockCount, computeBlockCount, commitBlockBegin,
+                                            commitBlockEnd, inputSinkBlock, semanticBlockCounts,
                                             std::filesystem::path(exportPath), diagnostics)) {
                 diagnostics.error("AM block assignment export failed",
                                   std::string(kDiagnosticContext));
@@ -850,9 +873,9 @@ namespace wolvrix::lib::grhsim::am
         }
 
         std::optional<ExecutableModel> finalized = finalizeScheduledModel(
-            graph, program, defUse, blockNodes, commitGateParts, activationEdges,
-            normalBlockCount, commitBlockBegin, commitBlockEnd, eventType, needsEventType,
-            materialization, headDetectorCount, instructionCount, diagnostics);
+            graph, program, defUse, blockAtoms, context, commitGateParts,
+            activationEdges, normalBlockCount, commitBlockBegin, commitBlockEnd, eventType,
+            needsEventType, materialization, headDetectorCount, instructionCount, diagnostics);
         if (!finalized) {
             return std::nullopt;
         }

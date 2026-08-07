@@ -1600,6 +1600,110 @@ namespace wolvrix::lib::grhsim::am
                 }
             }
         }
+        // Atom-layer invariants (NO0007): atoms tile every Block's
+        // instruction range seamlessly and in dense ascending order, the
+        // per-atom iteration yields the same instruction sequence as the
+        // flat Block layout, and each kind carries its required shape.
+        void validateScheduledAtoms(const ScheduledProgram &program, Validator &validator)
+        {
+            const ProgramView view = program.view();
+            uint32_t nextAtom = 0;
+            for (uint32_t blockIndex = 0;
+                 blockIndex < program.blockCount() && !validator.full(); ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                std::size_t flatPosition = 0;
+                for (std::size_t atomIndex = 0;
+                     atomIndex < program.blockAtomCount(block) && !validator.full(); ++atomIndex)
+                {
+                    const AtomId atom = program.blockAtom(block, atomIndex);
+                    if (!atom.valid() || atom.value != nextAtom)
+                    {
+                        validator.error("ScheduledProgram block atom ranges are not dense ascending: block=" +
+                                        std::to_string(blockIndex));
+                        break;
+                    }
+                    ++nextAtom;
+                    const AmAtomKind kind = program.atomKind(atom);
+                    if (static_cast<uint8_t>(kind) >
+                        static_cast<uint8_t>(AmAtomKind::CommitEvent))
+                    {
+                        validator.error("ScheduledProgram atom has an invalid kind: atom=" +
+                                        std::to_string(atom.value));
+                        continue;
+                    }
+                    const std::size_t count = program.atomInstructionCount(atom);
+                    if (count == 0)
+                    {
+                        validator.error("ScheduledProgram atom is empty: atom=" +
+                                        std::to_string(atom.value));
+                        continue;
+                    }
+                    bool shapeValid = true;
+                    switch (kind)
+                    {
+                    case AmAtomKind::Singleton:
+                        shapeValid = count == 1;
+                        break;
+                    case AmAtomKind::CombLoopScc:
+                        shapeValid = count > 1;
+                        break;
+                    case AmAtomKind::CommitEvent:
+                        shapeValid = true;
+                        break;
+                    case AmAtomKind::MuxMerge:
+                    {
+                        uint32_t selectMuxes = 0;
+                        for (std::size_t member = 0; member < count; ++member)
+                        {
+                            const InstructionId instruction =
+                                program.atomInstruction(atom, member);
+                            if (!instruction.valid() ||
+                                instruction.value >= view.instructionCount())
+                            {
+                                continue;
+                            }
+                            const auto operands = view.operands(instruction);
+                            if (view.opcode(instruction) == Opcode::Mux &&
+                                operands.size() == 3 && operands[0].valid() &&
+                                operands[0].value == program.atomSignature(atom))
+                            {
+                                ++selectMuxes;
+                            }
+                        }
+                        shapeValid = count >= 2 && selectMuxes >= 2;
+                        break;
+                    }
+                    }
+                    if (!shapeValid)
+                    {
+                        validator.error("ScheduledProgram atom kind/signature does not match its members: atom=" +
+                                        std::to_string(atom.value));
+                    }
+                    for (std::size_t member = 0; member < count; ++member)
+                    {
+                        const InstructionId viaAtom = program.atomInstruction(atom, member);
+                        if (flatPosition >= program.blockSize(block) ||
+                            viaAtom != program.blockInstruction(block, flatPosition))
+                        {
+                            validator.error("ScheduledProgram atom does not tile its Block: atom=" +
+                                            std::to_string(atom.value));
+                            break;
+                        }
+                        ++flatPosition;
+                    }
+                }
+                if (flatPosition != program.blockSize(block))
+                {
+                    validator.error("ScheduledProgram atoms do not cover the whole Block: block=" +
+                                    std::to_string(blockIndex));
+                }
+            }
+            if (nextAtom != program.atomCount())
+            {
+                validator.error("ScheduledProgram atom count disagrees with the block atom ranges");
+            }
+        }
     } // namespace
 
     ValidationResult validate(const LinearProgram &program, const ValidationOptions &options)
@@ -1632,6 +1736,7 @@ namespace wolvrix::lib::grhsim::am
         if (!validator.full() && program.valid())
         {
             validateScheduledBlocks(program, validator);
+            validateScheduledAtoms(program, validator);
         }
         return validator.finish();
     }

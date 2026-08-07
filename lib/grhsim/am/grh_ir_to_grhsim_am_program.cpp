@@ -12,6 +12,8 @@
 #include "grhsim_am_common.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <filesystem>
 #include <iterator>
 #include <span>
 #include <string>
@@ -854,6 +856,35 @@ namespace wolvrix::lib::grhsim::am
                 }
             }
 
+            // Atom-kind placement: CommitEvent atoms only inside the commit
+            // Block range; MuxMerge/CombLoopScc only outside it.
+            for (uint32_t block = 0; block < blockCount; ++block)
+            {
+                const BlockId blockId{block};
+                const bool isCommitBlock = commitBegin != blockCount && block >= commitBegin;
+                for (std::size_t atomIndex = 0;
+                     atomIndex < model.program.blockAtomCount(blockId); ++atomIndex)
+                {
+                    const AtomId atom = model.program.blockAtom(blockId, atomIndex);
+                    const AmAtomKind kind = model.program.atomKind(atom);
+                    if (kind == AmAtomKind::CommitEvent && !isCommitBlock)
+                    {
+                        addError(result, options,
+                                 "AM CommitEvent atom is outside the commit Block range: atom=" +
+                                     std::to_string(atom.value) +
+                                     " block=" + std::to_string(block));
+                    }
+                    if ((kind == AmAtomKind::MuxMerge || kind == AmAtomKind::CombLoopScc) &&
+                        isCommitBlock)
+                    {
+                        addError(result, options,
+                                 "AM compute atom kind is inside the commit Block range: atom=" +
+                                     std::to_string(atom.value) +
+                                     " block=" + std::to_string(block));
+                    }
+                }
+            }
+
             // A Changed result consumed across Blocks must flow strictly forward.
             for (uint32_t block = 0; block < blockCount; ++block)
             {
@@ -992,7 +1023,7 @@ namespace wolvrix::lib::grhsim::am
         if (diagnostics.hasError()) {
             return std::nullopt;
         }
-        if (options.maxInstructionsPerBlock == 0 || options.maxCommitInstructionsPerBlock == 0) {
+        if (options.maxAtomsPerBlock == 0 || options.maxCommitAtomsPerBlock == 0) {
             diagnostics.error("AM activity scheduling limits must be non-zero",
                               std::string(detail::kDiagnosticContext));
             return std::nullopt;
@@ -1009,10 +1040,33 @@ namespace wolvrix::lib::grhsim::am
         if (!context) {
             return std::nullopt;
         }
-        const AmGraphPartitionInput blockInput = context->partitionInput();
 
         // ---- stage: opt-am-compute-graph --------------------------------
-        // Reserved compute-graph optimization stage (currently a no-op).
+        // mux-merge atom pass: same-select compute mux groups merge into
+        // indivisible scheduling atoms (0 disables); rewrites the split
+        // context's atom tables and rebuilds the induced subgraphs on the
+        // merged atom DAG. Runs before partitionInput() assembly because the
+        // partition input spans address the context storage.
+        if (options.muxAtomMax != 0 &&
+            !mergeMuxSelectAtoms(graph, *context, options.muxAtomMax, diagnostics)) {
+            return std::nullopt;
+        }
+
+        // Research export of the instruction graph: after the mux-merge pass
+        // so the atom fields are the post-merge split-context values.
+        if (const char *exportPath = std::getenv("WOLVRIX_GRHSIM_AM_INSTRUCTION_GRAPH_JSONL")) {
+            if (exportPath[0] == '\0' ||
+                !exportInstructionGraphJsonl(graph.program(), *context,
+                                             std::filesystem::path(exportPath), diagnostics)) {
+                diagnostics.error("AM instruction graph export failed",
+                                  std::string(detail::kDiagnosticContext));
+                return std::nullopt;
+            }
+        }
+
+        const AmGraphPartitionInput blockInput = context->partitionInput();
+
+        // Reserved compute-graph optimization stage boundary (currently a no-op).
         optAmComputeGraph(context->split.computeGraph, blockInput);
 
         // ---- stage: partition-am-compute-graph --------------------------

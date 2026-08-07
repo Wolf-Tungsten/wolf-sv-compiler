@@ -31,6 +31,7 @@ namespace wolvrix::lib::grhsim::am
     struct VariableIdTag;
     struct InstructionIdTag;
     struct BlockIdTag;
+    struct AtomIdTag;
     struct TypeIdTag;
     struct StringIdTag;
     struct InitIdTag;
@@ -40,6 +41,7 @@ namespace wolvrix::lib::grhsim::am
     using VariableId = DenseId<VariableIdTag>;
     using InstructionId = DenseId<InstructionIdTag>;
     using BlockId = DenseId<BlockIdTag>;
+    using AtomId = DenseId<AtomIdTag>;
     using TypeId = DenseId<TypeIdTag>;
     using StringId = DenseId<StringIdTag>;
     using InitId = DenseId<InitIdTag>;
@@ -49,11 +51,24 @@ namespace wolvrix::lib::grhsim::am
     static_assert(sizeof(VariableId) == sizeof(uint32_t));
     static_assert(sizeof(InstructionId) == sizeof(uint32_t));
     static_assert(sizeof(BlockId) == sizeof(uint32_t));
+    static_assert(sizeof(AtomId) == sizeof(uint32_t));
     static_assert(sizeof(TypeId) == sizeof(uint32_t));
     static_assert(sizeof(StringId) == sizeof(uint32_t));
     static_assert(sizeof(InitId) == sizeof(uint32_t));
     static_assert(sizeof(LiteralId) == sizeof(uint32_t));
     static_assert(sizeof(DpiImportId) == sizeof(uint32_t));
+
+    // ScheduledProgram atom 层次：Block 内指令的不可再分结构/元数据分组
+    // （纯结构层，不承载语义；解释器按指令流执行时无视它）。signature 的
+    // 含义按 kind 解释：MuxMerge 为组内共享的 select 变量 id，CommitEvent
+    // 为 commit 事件签名 rank，Singleton/CombLoopScc 不用（置 0）。
+    enum class AmAtomKind : uint8_t
+    {
+        Singleton = 0,
+        MuxMerge = 1,
+        CombLoopScc = 2,
+        CommitEvent = 3,
+    };
 
     struct Range32
     {
@@ -370,6 +385,10 @@ namespace wolvrix::lib::grhsim::am
         DpiParameters,
         BlockOffsets,
         BlockInstructions,
+        BlockAtomOffsets,
+        AtomInstructionOffsets,
+        AtomKinds,
+        AtomSignatures,
         Count,
     };
 
@@ -394,6 +413,7 @@ namespace wolvrix::lib::grhsim::am
         uint64_t results = 0;
         uint64_t blocks = 0;
         uint64_t blockInstructionIds = 0;
+        uint64_t atoms = 0;
         uint64_t instructionBytes = 0;
         uint64_t variableBytes = 0;
         uint64_t initAndLiteralBytes = 0;
@@ -492,6 +512,14 @@ namespace wolvrix::lib::grhsim::am
 
             std::vector<uint32_t> blockOffsets;
             std::vector<InstructionId> blockInstructions;
+            // Atom 层次（ScheduledProgram）：blockAtomOffsets 把每个 Block
+            // 映射到 atom 区间，atomInstructionOffsets 把 atom 映射到全局
+            // blockInstructions 布局区间——atom 恰好无缝铺满所属 Block 的
+            // 指令区间。
+            std::vector<uint32_t> blockAtomOffsets;
+            std::vector<uint32_t> atomInstructionOffsets;
+            std::vector<uint8_t> atomKinds;
+            std::vector<uint32_t> atomSignatures;
         };
     } // namespace detail
 
@@ -581,6 +609,15 @@ namespace wolvrix::lib::grhsim::am
         std::size_t blockCount() const noexcept;
         std::size_t blockSize(BlockId block) const;
         InstructionId blockInstruction(BlockId block, std::size_t index) const;
+        // Atom 层次视图：Block 的指令区间按 atom 顺序无缝切分；atom 内的
+        // 指令顺序与块内平铺顺序一致。
+        std::size_t atomCount() const noexcept;
+        std::size_t blockAtomCount(BlockId block) const;
+        AtomId blockAtom(BlockId block, std::size_t index) const;
+        std::size_t atomInstructionCount(AtomId atom) const;
+        InstructionId atomInstruction(AtomId atom, std::size_t index) const;
+        AmAtomKind atomKind(AtomId atom) const;
+        uint32_t atomSignature(AtomId atom) const;
 
     private:
         explicit ScheduledProgram(std::unique_ptr<detail::ProgramStorage> storage);
@@ -812,6 +849,11 @@ namespace wolvrix::lib::grhsim::am
         void appendBlockInstruction(InstructionId instruction);
         void endBlock();
         void addBlock(std::span<const InstructionId> instructions);
+        // beginBlock/endBlock 之间可显式包 atom；未显式打开的指令由
+        // appendBlockInstruction 自动包成 Singleton atom（signature=0），
+        // 因此 addBlock 与逐条 append 的旧调用点保持合法。
+        void beginAtom(AmAtomKind kind, uint32_t signature);
+        void endAtom();
 
         ProgramView view() const noexcept;
         std::size_t pendingBlockCount() const noexcept;
@@ -821,6 +863,8 @@ namespace wolvrix::lib::grhsim::am
         std::unique_ptr<detail::ProgramStorage> storage_;
         bool finished_ = false;
         bool blockOpen_ = false;
+        bool atomOpen_ = false;
+        uint32_t atomStart_ = 0;
         bool blockLayoutIdentity_ = true;
         uint32_t layoutInstructionCount_ = 0;
         std::size_t blockInstructionReserve_ = 0;

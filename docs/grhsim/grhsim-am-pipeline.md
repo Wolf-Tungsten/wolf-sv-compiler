@@ -11,7 +11,7 @@ normalized GRH
     -- lowering-to-am-graph        --> am::AmGraph（GRHSIM AM Graph，一等工作 IR，原生建图）
     -- opt-am-graph                --> optimizeAmGraph（fold/assign-alias/memfold/cse 不动点 + DCE）
     -- split-am-graph              --> am::AmComputeGraph + am::AmCommitGraph（atom 级诱导子图）
-    -- opt-am-compute-graph        --> （空阶段，预留 compute 图优化）
+    -- opt-am-compute-graph        --> mux-merge atom pass（NO0006：同 select mux 组 + 独占锥 atom 化）
     -- partition-am-compute-graph  --> am::AmComputeActivityGraph（活动度划分）
     -- partition-am-commit-graph   --> am::AmCommitEventGraph（事件聚类）
     -- materialize                 --> am::ScheduledProgram（GRHSIM AM Program）
@@ -45,6 +45,39 @@ normalized GRH
 > B0 activation target 到实际 reader 的完整性、边沿分支的联合完备性和
 > ordered-effect 完整性证明。
 
+> 实现进展（2026-08-07，NO0007 P3）：分区经济模型换 atom 计权——compute 分区
+> `member[rid]=1`（atom 即尺寸单位，mergeLimit/DP maxNodes/refinement 块尺寸随之
+> 全部按 atom 计），commit 桶合并主限改 `maxCommitAtomsPerBlock`（atom 计）并保留
+> `kMaxGuardEventMergeOps=4096` 指令数二级护栏（emitter guard/event merge op 语义）。
+> 全链路命名诚实化：`maxAtomsPerBlock`/`maxCommitAtomsPerBlock`/`dpCoarsenAtomBudget`
+> （默认值 128/4096/256 不变），CLI 对应 `--max-atoms-per-block`/`--dp-coarsen-atom-budget`，
+> Makefile `XS_WOLF_GRHSIM_AM_MAX_ATOMS_PER_BLOCK`/`XS_WOLF_GRHSIM_AM_DP_COARSEN_ATOM_BUDGET`。
+> 指令图 JSONL 导出上移到编排器（mux-merge pass 之后，`atom`/`comb_loop_atom` 为
+> 后 merge 口径）；块归属导出 assign 记录加 `atom` 字段、block 记录加 `atoms` 字段。
+>
+> 实现进展（2026-08-07，NO0007 P1+P2）：atom 升为一等公民。P1：
+> `ScheduledProgram` 新增 atom 层（block→atom→instruction 三层视图 +
+> kind/signature 元数据；`AtomId`、`AmAtomKind`、四个 atom arena），builder
+> `beginAtom/endAtom` + 隐式 Singleton 兜底（现存调用点零改动），split 阶段
+> 标注 Singleton/CombLoopScc/CommitEvent，`mergeMuxSelectAtoms` 重建携带
+> kind/signature（MuxMerge+select id），materialize 按 atom 写入，
+> validate 新增 atom 不变量（tiling/kind 形状/范围放置）；发射产物字节级
+> 不变（T512 diff 全同）。P2：emitter 直消费 atom 层——MuxMerge atom 两相
+> 发射（cone 成员按成员序普通发射，臂成员归入单 if-else），删除
+> `planMuxRuns` 块内模式识别与兜底（cap 跳过/未归组的相邻同 select mux
+> 不再融合，行为变化已钉测试）；统计口径更名 `mux_atom_fused`。
+>
+> 实现进展（2026-08-07，NO0006）：opt-am-compute-graph 迎来首位住户——mux-merge
+> atom pass（`mergeMuxSelectAtoms`）：compute 侧同 select 的 mux 组（成员均为单
+> 指令 atom）连同其独占使用的生产者锥合并为不可分割的调度 atom，吸收锥按拓扑
+> 序在前、组内 mux 连续在后；cap（`ActivityScheduleOptions.muxAtomMax`，默认
+> 512，0 关闭）限制 atom 总尺寸、超限整组放弃（激活粒度保护，非分区可行性）；
+> comb-loop atom 不可拆、select 的锥不吸收；合并后重建 atom 表/atom DAG 并做
+> SCC 解合并兜底。C++ emitter 新增块内同 select 连续 mux 段的 if-else 融合
+> （select 只求值一次，宽/窄两臂都支持），cap 跳过或被分区拆散的组自然退化为
+> 逐条三元。CLI `grhsim-am-lower-json --mux-atom-max` 与 Makefile
+> `XS_WOLF_GRHSIM_AM_MUX_ATOM_MAX` 透传。
+>
 > 实现进展（2026-08-07，NO0005）：状态写指令改为 cond/mask 变体族，勘误 NO0001 的
 > 「reg.write/latch.write cond/mask 数据化」决策。`reg.write/latch.write/mem.write`
 > 各派生 `.c/.m/.cm` 三个显式 opcode 变体（共 12 个），操作数布局统一为
@@ -497,16 +530,18 @@ reg/latch/memory write 属于 commit。DPI/system/effect 顺序和同 target 多
   自 2026-08-06 起为 gsim 风格连通性算法，前身是 out1/in1/sibling 迭代 coarsen +
   activation-cost segment DP）：三个阶段——①coarsen：`mergeOut1` 逆序单遍（出度 1 并入
   最早后继）、`mergeIn1` 正序单遍（入度 1 并入最晚前驱）、`mergeSublings`（前驱集完全相等
-  分组合并、宿主上限 30），宿主成员上限取 `dpCoarsenBudget`（0=默认 256，上限越大跨边
-  越少但超大块运行时尾巴越重，见 compute-partition NO0004 §8），合并后确定性
+  分组合并、宿主上限 30），宿主成员上限取 `dpCoarsenAtomBudget`（0=默认 256，**atom 计**，
+  上限越大跨边越少但超大块运行时尾巴越重，见 compute-partition NO0004 §8），合并后确定性
   拓扑重排；②Kernighan 边割 DP：cluster 拓扑序列上以每边界 `dpSegmentPenalty`（默认 1.0）
-  罚项最小化边割切分，块指令数受 `maxInstructionsPerBlock`（默认 128）限制，单超 cap 的
+  罚项最小化边割切分，块容量受 `maxAtomsPerBlock`（默认 128，**atom 计**，NO0007 P3 起
+  atom 是分区大小单位）限制，单超 cap 的
   cluster 自成一块；③**局部移动精化**（`refineClusterBlocks`，`dpRefinementRounds` 默认
   10、0 关闭）：按精确块级 incoming-copy 成本增量把 cluster 移向邻接块，单调降本、
   全确定性，候选须保持跨块 def-before-use（拓扑硬约束）；
 - **commit 子图按事件聚类**（**partition-am-commit-graph**，`partitionAmCommitGraph`）：commit atom 只按事件
   签名聚合——每个 event 经其定义 `changed` 规范化为（边沿种类, 被观测 Variable），
-  排序去重后作为分块键，同键 atom 在 `maxCommitInstructionsPerBlock`（默认 4096）限制
+  排序去重后作为分块键，同键 atom 在 `maxCommitAtomsPerBlock`（默认 4096，**atom 计**）
+  且指令数不超 `kMaxGuardEventMergeOps`（4096，指令口径护栏）的限制
   内合并；事件签名只含 event operand——`reg.write/latch.write/mem.write` 各变体的
   cond/mask 是写指令自身的门控操作数，不参与分块。
 

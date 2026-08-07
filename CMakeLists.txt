@@ -538,6 +538,28 @@ target_link_libraries(grhsim-am-lowering
 
 register_test_exe(grhsim-am-lowering)
 
+add_executable(grhsim-am-mux-atom
+    tests/grhsim/am/test_mux_atom.cpp
+)
+
+target_link_libraries(grhsim-am-mux-atom
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(grhsim-am-mux-atom)
+
+add_executable(grhsim-am-program-atoms
+    tests/grhsim/am/test_program_atoms.cpp
+)
+
+target_link_libraries(grhsim-am-program-atoms
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(grhsim-am-program-atoms)
+
 add_executable(grhsim-am-optimize
     tests/grhsim/am/test_optimize.cpp
 )

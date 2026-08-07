@@ -17,7 +17,10 @@ namespace wolvrix::lib::grhsim::am
 
     namespace
     {
-        // Aligns with the legacy guard/event merge op cap for one commit block.
+        // Instruction-count secondary guard (P3): the atom count is the
+        // primary bucket-merge limit (maxCommitAtomsPerBlock), but the
+        // emitter-side guard/event merge op ceiling is an instruction
+        // semantic, so an over-long instruction tail still splits the bucket.
         constexpr std::size_t kMaxGuardEventMergeOps = 4096;
     } // namespace
 
@@ -56,9 +59,8 @@ namespace wolvrix::lib::grhsim::am
                                   atom);
                 }
             }
-            const std::size_t commitMergeLimit =
-                std::min(input.maxCommitInstructionsPerBlock, kMaxGuardEventMergeOps);
             bool haveCurrent = false;
+            std::size_t currentAtoms = 0;
             std::size_t currentInstructions = 0;
             uint32_t currentBucketAtom = kInvalidIndex;
             while (!ready.empty()) {
@@ -68,11 +70,14 @@ namespace wolvrix::lib::grhsim::am
                 if (haveCurrent &&
                     (input.commitEventRank[global] !=
                          input.commitEventRank[commitGraph.globalOfAtom[currentBucketAtom]] ||
-                     currentInstructions + input.atomInstructions[global] > commitMergeLimit)) {
+                     currentAtoms + 1 > input.maxCommitAtomsPerBlock ||
+                     currentInstructions + input.atomInstructions[global] >
+                         kMaxGuardEventMergeOps)) {
                     haveCurrent = false;
                 }
                 if (!haveCurrent) {
                     ++result.blockCount;
+                    currentAtoms = 0;
                     currentInstructions = 0;
                     currentBucketAtom = atom;
                     haveCurrent = true;
@@ -80,6 +85,7 @@ namespace wolvrix::lib::grhsim::am
                 ready.pop();
                 result.atomBlock[atom] = result.blockCount;
                 result.atomTopo.push_back(atom);
+                ++currentAtoms;
                 currentInstructions += input.atomInstructions[global];
                 for (uint32_t offset = commitGraph.offsets[atom];
                      offset < commitGraph.offsets[atom + 1]; ++offset) {

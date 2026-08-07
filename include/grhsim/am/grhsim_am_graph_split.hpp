@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <vector>
 
@@ -54,14 +55,20 @@ namespace wolvrix::lib::grhsim::am
         std::vector<uint8_t> atomIsCommit;
         std::vector<uint32_t> atomMinInstruction;
         std::vector<uint32_t> commitEventRank;
+        // Atom 分类学（NO0007 P1）：Singleton/CombLoopScc/CommitEvent 由
+        // split 阶段标注（CommitEvent 的 signature 为 commitEventRank），
+        // MuxMerge 由 mux-merge atom pass 在重建时标注（signature 为组内
+        // 共享的 select 变量 id）。
+        std::vector<uint8_t> atomKinds;
+        std::vector<uint32_t> atomSignatures;
         std::size_t oversizedAtomCount = 0;
         std::size_t maxAtomInstructions = 0;
         std::size_t maxAtomStateWrites = 0;
         // Scheduling limits folded into the assembled partition input.
-        std::size_t maxInstructionsPerBlock = 128;
-        std::size_t maxCommitInstructionsPerBlock = 4096;
+        std::size_t maxAtomsPerBlock = 128;
+        std::size_t maxCommitAtomsPerBlock = 4096;
         bool enableCoarsening = true;
-        std::size_t coarsenBudget = 256;
+        std::size_t coarsenAtomBudget = 256;
         double segmentPenalty = 1.0;
         std::size_t refinementRounds = 10;
         AmGraphSplit split;
@@ -80,6 +87,15 @@ namespace wolvrix::lib::grhsim::am
     splitAmGraphStage(AmGraph &graph,
                       const ActivityScheduleOptions &options,
                       wolvrix::lib::diag::Diagnostics &diagnostics);
+
+    // Research export of the pre-scheduling instruction graph (def-use +
+    // ordered-effect edges plus the atom packing) as JSONL. Atom fields come
+    // from the split context, so the export reflects the mux-merge atom pass
+    // when the orchestrator ran it (post-merge 口径).
+    bool exportInstructionGraphJsonl(ProgramView program,
+                                     const AmGraphSplitContext &context,
+                                     const std::filesystem::path &path,
+                                     wolvrix::lib::diag::Diagnostics &diagnostics);
 
 } // namespace wolvrix::lib::grhsim::am
 

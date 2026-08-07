@@ -491,6 +491,7 @@ namespace wolvrix::lib::grhsim::am
         stats.results = storage_->results.size();
         stats.blocks = storage_->blockOffsets.empty() ? 0 : storage_->blockOffsets.size() - 1;
         stats.blockInstructionIds = storage_->blockInstructions.size();
+        stats.atoms = storage_->atomKinds.size();
         const auto setArena = [&](ProgramArena kind, const auto &arena) {
             ArenaStorageStats &arenaStats = stats.arenas[static_cast<std::size_t>(kind)];
             using Element = typename std::decay_t<decltype(arena)>::value_type;
@@ -523,6 +524,10 @@ namespace wolvrix::lib::grhsim::am
         setArena(ProgramArena::DpiParameters, storage_->dpiParameters);
         setArena(ProgramArena::BlockOffsets, storage_->blockOffsets);
         setArena(ProgramArena::BlockInstructions, storage_->blockInstructions);
+        setArena(ProgramArena::BlockAtomOffsets, storage_->blockAtomOffsets);
+        setArena(ProgramArena::AtomInstructionOffsets, storage_->atomInstructionOffsets);
+        setArena(ProgramArena::AtomKinds, storage_->atomKinds);
+        setArena(ProgramArena::AtomSignatures, storage_->atomSignatures);
         stats.instructionBytes =
             vectorBytes(storage_->opcodes) + vectorBytes(storage_->operandOffsets) +
             vectorBytes(storage_->operands) + vectorBytes(storage_->resultOffsets) +
@@ -541,7 +546,12 @@ namespace wolvrix::lib::grhsim::am
         stats.stringAndLabelBytes = vectorBytes(storage_->stringOffsets) +
                                     vectorBytes(storage_->stringBytes) +
                                     vectorBytes(storage_->variableLabels);
-        stats.blockBytes = vectorBytes(storage_->blockOffsets) + vectorBytes(storage_->blockInstructions);
+        stats.blockBytes = vectorBytes(storage_->blockOffsets) +
+                           vectorBytes(storage_->blockInstructions) +
+                           vectorBytes(storage_->blockAtomOffsets) +
+                           vectorBytes(storage_->atomInstructionOffsets) +
+                           vectorBytes(storage_->atomKinds) +
+                           vectorBytes(storage_->atomSignatures);
         stats.estimatedBytes = stats.instructionBytes + stats.variableBytes +
                                stats.initAndLiteralBytes + stats.attributeBytes +
                                stats.stringAndLabelBytes + stats.blockBytes;
@@ -600,6 +610,77 @@ namespace wolvrix::lib::grhsim::am
             return InstructionId{flatIndex};
         }
         return storage_->blockInstructions[flatIndex];
+    }
+
+    std::size_t ScheduledProgram::atomCount() const noexcept
+    {
+        return storage_ ? storage_->atomKinds.size() : 0;
+    }
+
+    std::size_t ScheduledProgram::blockAtomCount(BlockId block) const
+    {
+        if (!storage_ || !block.valid() || static_cast<std::size_t>(block.value) >= blockCount())
+        {
+            throw std::out_of_range("invalid AM BlockId");
+        }
+        const std::size_t index = block.value;
+        return static_cast<std::size_t>(storage_->blockAtomOffsets[index + 1] -
+                                        storage_->blockAtomOffsets[index]);
+    }
+
+    AtomId ScheduledProgram::blockAtom(BlockId block, std::size_t index) const
+    {
+        if (index >= blockAtomCount(block))
+        {
+            throw std::out_of_range("invalid AM block atom index");
+        }
+        return AtomId{storage_->blockAtomOffsets[block.value] +
+                      static_cast<uint32_t>(index)};
+    }
+
+    std::size_t ScheduledProgram::atomInstructionCount(AtomId atom) const
+    {
+        if (!storage_ || !atom.valid() || static_cast<std::size_t>(atom.value) >= atomCount())
+        {
+            throw std::out_of_range("invalid AM AtomId");
+        }
+        const std::size_t index = atom.value;
+        return static_cast<std::size_t>(storage_->atomInstructionOffsets[index + 1] -
+                                        storage_->atomInstructionOffsets[index]);
+    }
+
+    InstructionId ScheduledProgram::atomInstruction(AtomId atom, std::size_t index) const
+    {
+        const std::size_t count = atomInstructionCount(atom);
+        if (index >= count)
+        {
+            throw std::out_of_range("invalid AM atom instruction index");
+        }
+        const uint32_t flatIndex =
+            storage_->atomInstructionOffsets[atom.value] + static_cast<uint32_t>(index);
+        if (storage_->blockInstructions.empty())
+        {
+            return InstructionId{flatIndex};
+        }
+        return storage_->blockInstructions[flatIndex];
+    }
+
+    AmAtomKind ScheduledProgram::atomKind(AtomId atom) const
+    {
+        if (!storage_ || !atom.valid() || static_cast<std::size_t>(atom.value) >= atomCount())
+        {
+            throw std::out_of_range("invalid AM AtomId");
+        }
+        return static_cast<AmAtomKind>(storage_->atomKinds[atom.value]);
+    }
+
+    uint32_t ScheduledProgram::atomSignature(AtomId atom) const
+    {
+        if (!storage_ || !atom.valid() || static_cast<std::size_t>(atom.value) >= atomCount())
+        {
+            throw std::out_of_range("invalid AM AtomId");
+        }
+        return storage_->atomSignatures[atom.value];
     }
 
     namespace
@@ -1370,7 +1451,13 @@ namespace wolvrix::lib::grhsim::am
         }
         storage_->blockOffsets.clear();
         storage_->blockInstructions.clear();
+        storage_->blockAtomOffsets.clear();
+        storage_->atomInstructionOffsets.clear();
+        storage_->atomKinds.clear();
+        storage_->atomSignatures.clear();
         storage_->blockOffsets.push_back(0);
+        storage_->blockAtomOffsets.push_back(0);
+        storage_->atomInstructionOffsets.push_back(0);
     }
 
     ScheduledProgramBuilder::~ScheduledProgramBuilder() = default;
@@ -1426,6 +1513,12 @@ namespace wolvrix::lib::grhsim::am
         storage.dpiCallAttributes.reserve(storage.dpiCallAttributes.size() +
                                           reserve.additionalDpiCallAttributes);
         storage.blockOffsets.reserve(storage.blockOffsets.size() + reserve.blocks);
+        storage.blockAtomOffsets.reserve(storage.blockAtomOffsets.size() + reserve.blocks);
+        storage.atomInstructionOffsets.reserve(storage.atomInstructionOffsets.size() +
+                                               reserve.blockInstructionIds);
+        storage.atomKinds.reserve(storage.atomKinds.size() + reserve.blockInstructionIds);
+        storage.atomSignatures.reserve(storage.atomSignatures.size() +
+                                       reserve.blockInstructionIds);
         blockInstructionReserve_ =
             std::max(blockInstructionReserve_,
                      static_cast<std::size_t>(layoutInstructionCount_) +
@@ -1587,6 +1680,13 @@ namespace wolvrix::lib::grhsim::am
         requireId(instruction, storage.opcodes, "AM block InstructionId");
         requireRoom(layoutInstructionCount_, 1, "block instruction arena");
 
+        // Implicit Singleton atom: instruction appended outside any explicit
+        // beginAtom/endAtom pair.
+        const bool implicitAtom = !atomOpen_;
+        if (implicitAtom)
+        {
+            beginAtom(AmAtomKind::Singleton, 0);
+        }
         if (blockLayoutIdentity_ && instruction.value != layoutInstructionCount_)
         {
             const std::size_t reserveCount =
@@ -1605,6 +1705,10 @@ namespace wolvrix::lib::grhsim::am
             storage.blockInstructions.push_back(instruction);
         }
         ++layoutInstructionCount_;
+        if (implicitAtom)
+        {
+            endAtom();
+        }
     }
 
     void ScheduledProgramBuilder::endBlock()
@@ -1614,10 +1718,58 @@ namespace wolvrix::lib::grhsim::am
         {
             throw std::logic_error("AM block construction is not open");
         }
+        if (atomOpen_)
+        {
+            throw std::logic_error("AM block closed with an unfinished atom");
+        }
         requireOffsetTableRoom(storage.blockOffsets.size() - 1, 1, "block table");
         ensureAppendCapacity(storage.blockOffsets, 1);
         storage.blockOffsets.push_back(layoutInstructionCount_);
+        requireOffsetTableRoom(storage.blockAtomOffsets.size() - 1, 1, "block atom table");
+        ensureAppendCapacity(storage.blockAtomOffsets, 1);
+        storage.blockAtomOffsets.push_back(static_cast<uint32_t>(storage.atomKinds.size()));
         blockOpen_ = false;
+    }
+
+    void ScheduledProgramBuilder::beginAtom(AmAtomKind kind, uint32_t signature)
+    {
+        auto &storage = requireStorage(storage_, finished_);
+        if (!blockOpen_)
+        {
+            throw std::logic_error("AM atom construction requires an open block");
+        }
+        if (atomOpen_)
+        {
+            throw std::logic_error("AM atom construction is already open");
+        }
+        if (static_cast<uint8_t>(kind) > static_cast<uint8_t>(AmAtomKind::CommitEvent))
+        {
+            throw std::invalid_argument("invalid AM atom kind");
+        }
+        ensureAppendCapacity(storage.atomKinds, 1);
+        ensureAppendCapacity(storage.atomSignatures, 1);
+        storage.atomKinds.push_back(static_cast<uint8_t>(kind));
+        storage.atomSignatures.push_back(signature);
+        atomStart_ = layoutInstructionCount_;
+        atomOpen_ = true;
+    }
+
+    void ScheduledProgramBuilder::endAtom()
+    {
+        auto &storage = requireStorage(storage_, finished_);
+        if (!atomOpen_)
+        {
+            throw std::logic_error("AM atom construction is not open");
+        }
+        if (layoutInstructionCount_ == atomStart_)
+        {
+            throw std::logic_error("AM atom must contain at least one instruction");
+        }
+        requireOffsetTableRoom(storage.atomInstructionOffsets.size() - 1, 1,
+                               "atom instruction table");
+        ensureAppendCapacity(storage.atomInstructionOffsets, 1);
+        storage.atomInstructionOffsets.push_back(layoutInstructionCount_);
+        atomOpen_ = false;
     }
 
     void ScheduledProgramBuilder::addBlock(std::span<const InstructionId> instructions)
@@ -1635,6 +1787,9 @@ namespace wolvrix::lib::grhsim::am
         const bool originalIdentity = blockLayoutIdentity_;
         const uint32_t originalInstructionCount = layoutInstructionCount_;
         const std::size_t originalExplicitSize = storage.blockInstructions.size();
+        const std::size_t originalAtomCount = storage.atomKinds.size();
+        const std::size_t originalAtomOffsetSize = storage.atomInstructionOffsets.size();
+        const std::size_t originalBlockAtomOffsetSize = storage.blockAtomOffsets.size();
         beginBlock();
         try
         {
@@ -1647,9 +1802,14 @@ namespace wolvrix::lib::grhsim::am
         catch (...)
         {
             storage.blockInstructions.resize(originalExplicitSize);
+            storage.atomKinds.resize(originalAtomCount);
+            storage.atomSignatures.resize(originalAtomCount);
+            storage.atomInstructionOffsets.resize(originalAtomOffsetSize);
+            storage.blockAtomOffsets.resize(originalBlockAtomOffsetSize);
             blockLayoutIdentity_ = originalIdentity;
             layoutInstructionCount_ = originalInstructionCount;
             blockOpen_ = false;
+            atomOpen_ = false;
             throw;
         }
     }
@@ -1671,6 +1831,10 @@ namespace wolvrix::lib::grhsim::am
         if (blockOpen_)
         {
             throw std::logic_error("ScheduledProgram has an unfinished Block");
+        }
+        if (atomOpen_)
+        {
+            throw std::logic_error("ScheduledProgram has an unfinished atom");
         }
         if (storage.blockOffsets.size() < 2)
         {

@@ -26,12 +26,6 @@ namespace wolvrix::lib::grhsim::am
     namespace
     {
         // Research export switch (topo-partition-proj harness): when
-        // WOLVRIX_GRHSIM_AM_INSTRUCTION_GRAPH_JSONL names a path, schedule()
-        // dumps the pre-scheduling instruction graph (def-use + ordered-effect
-        // edges plus the comb-loop SCC packing) as JSONL before block
-        // formation, reusing the exact graph/SCC built above.
-        constexpr char kInstructionGraphExportEnv[] =
-            "WOLVRIX_GRHSIM_AM_INSTRUCTION_GRAPH_JSONL";
         constexpr std::string_view kInstructionGraphFormat =
             "wolvrix.am-instruction-graph.v1";
 
@@ -62,21 +56,28 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
-        bool exportInstructionGraphJsonl(ProgramView program, const DefUseIndex &defUse,
-                                         std::span<const OrderEdge> orderedEdges,
-                                         const SccResult &scc,
-                                         const std::filesystem::path &path,
-                                         wolvrix::lib::diag::Diagnostics &diagnostics)
-        {
+    } // namespace
+
+    // Research export of the pre-scheduling instruction graph (def-use +
+    // ordered-effect edges plus the atom packing). Atom fields come from
+    // the split context, so the export reflects the mux-merge atom pass
+    // when it ran (the orchestrator invokes it after that pass).
+    bool exportInstructionGraphJsonl(ProgramView program,
+                                     const AmGraphSplitContext &context,
+                                     const std::filesystem::path &path,
+                                     wolvrix::lib::diag::Diagnostics &diagnostics)
+    {
+            const DefUseIndex &defUse = context.defUse;
+            const std::vector<OrderEdge> &orderedEdges = context.orderedEdges;
             const uint32_t instructionCount =
                 static_cast<uint32_t>(program.instructionCount());
-            std::vector<uint32_t> atomSizes(scc.count, 0);
-            for (uint32_t index = 0; index < instructionCount; ++index) {
-                ++atomSizes[scc.component[index]];
-            }
             uint32_t combLoopAtomCount = 0;
-            for (const uint32_t size : atomSizes) {
-                combLoopAtomCount += size > 1 ? 1U : 0U;
+            for (uint32_t atom = 0; atom < context.atomCount; ++atom) {
+                combLoopAtomCount +=
+                    context.atomKinds[atom] ==
+                            static_cast<uint8_t>(AmAtomKind::CombLoopScc)
+                        ? 1U
+                        : 0U;
             }
 
             uint64_t defUseEdgeCount = 0;
@@ -119,7 +120,7 @@ namespace wolvrix::lib::grhsim::am
                 .raw(",\"variables\":")
                 .number(static_cast<uint64_t>(program.variableCount()))
                 .raw(",\"atoms\":")
-                .number(scc.count)
+                .number(context.atomCount)
                 .raw(",\"comb_loop_atoms\":")
                 .number(combLoopAtomCount)
                 .raw(",\"def_use_edges\":")
@@ -137,7 +138,7 @@ namespace wolvrix::lib::grhsim::am
                 for (const VariableId result : program.results(instruction)) {
                     width += exportedVariableWidth(program, result);
                 }
-                const uint32_t atom = scc.component[index];
+                const uint32_t atom = context.instructionAtom[index];
                 writer.raw("{\"record\":\"node\",\"id\":")
                     .number(index)
                     .raw(",\"op\":")
@@ -151,7 +152,8 @@ namespace wolvrix::lib::grhsim::am
                     .raw(",\"atom\":")
                     .number(atom)
                     .raw(",\"comb_loop_atom\":")
-                    .boolean(atomSizes[atom] > 1)
+                    .boolean(context.atomKinds[atom] ==
+                             static_cast<uint8_t>(AmAtomKind::CombLoopScc))
                     .raw("}");
                 writer.endLine();
             }
@@ -210,6 +212,8 @@ namespace wolvrix::lib::grhsim::am
             return true;
         }
 
+    namespace
+    {
         // Third research export: the split-am-graph stage product itself.
         // WOLVRIX_GRHSIM_AM_SPLIT_GRAPH_JSONL=<prefix> writes two files,
         // <prefix>.compute.jsonl (the GRHSIM AM Compute Graph) and
@@ -378,8 +382,19 @@ namespace wolvrix::lib::grhsim::am
                             .raw(",\\\"var\\\":")
                             .number(variable)
                             .raw(",\\\"width\\\":")
-                            .number(width)
-                            .raw("}");
+                            .number(width);
+                        // Operand slot of the read inside the target
+                        // instruction (first match); -1 when not found.
+                        const auto targetOperands =
+                            program.operands(InstructionId{target});
+                        int64_t operandSlot = -1;
+                        for (std::size_t slot = 0; slot < targetOperands.size(); ++slot) {
+                            if (targetOperands[slot].value == variable) {
+                                operandSlot = static_cast<int64_t>(slot);
+                                break;
+                            }
+                        }
+                        writer.raw(",\\\"operand\\\":").number(operandSlot).raw("}");
                         writer.endLine();
                         return;
                     }
@@ -443,10 +458,10 @@ namespace wolvrix::lib::grhsim::am
             .useOffsets = defUse.useOffsets,
             .uses = defUse.uses,
             .instructionAtom = instructionAtom,
-            .maxInstructionsPerBlock = maxInstructionsPerBlock,
-            .maxCommitInstructionsPerBlock = maxCommitInstructionsPerBlock,
+            .maxAtomsPerBlock = maxAtomsPerBlock,
+            .maxCommitAtomsPerBlock = maxCommitAtomsPerBlock,
             .enableCoarsening = enableCoarsening,
-            .coarsenBudget = coarsenBudget,
+            .coarsenAtomBudget = coarsenAtomBudget,
             .segmentPenalty = segmentPenalty,
             .refinementRounds = refinementRounds,
         };
@@ -566,18 +581,7 @@ namespace wolvrix::lib::grhsim::am
             instructionAtom[index] = scc.component[index];
         }
 
-        if (const char *exportPath = std::getenv(kInstructionGraphExportEnv)) {
-            if (exportPath[0] == '\0' ||
-                !exportInstructionGraphJsonl(program, defUse, orderedEdges, scc,
-                                             std::filesystem::path(exportPath), diagnostics)) {
-                diagnostics.error("AM instruction graph export failed",
-                                  std::string(kDiagnosticContext));
-                return std::nullopt;
-            }
-        }
-
-        std::vector<uint32_t> atomMemberOffsets(atomCount + 1, 0);
-        for (uint32_t atom : instructionAtom) {
+        std::vector<uint32_t> atomMemberOffsets(atomCount + 1, 0);        for (uint32_t atom : instructionAtom) {
             ++atomMemberOffsets[atom + 1];
         }
         std::partial_sum(atomMemberOffsets.begin(), atomMemberOffsets.end(),
@@ -650,8 +654,8 @@ namespace wolvrix::lib::grhsim::am
             maxAtomInstructions = std::max(maxAtomInstructions, cost.instructions);
             maxAtomStateWrites = std::max(maxAtomStateWrites, cost.stateWrites);
             const std::size_t instructionLimit =
-                cost.blockClass == BlockClass::Commit ? options.maxCommitInstructionsPerBlock
-                                                       : options.maxInstructionsPerBlock;
+                cost.blockClass == BlockClass::Commit ? options.maxCommitAtomsPerBlock
+                                                      : options.maxAtomsPerBlock;
             if (cost.instructions > instructionLimit) {
                 if (firstOversizedAtom == kInvalidIndex) {
                     firstOversizedAtom = atom;
@@ -707,6 +711,23 @@ namespace wolvrix::lib::grhsim::am
             atomIsCommit[atom] = atomCosts[atom].blockClass == BlockClass::Commit ? 1 : 0;
         }
 
+        // Atom taxonomy (NO0007): commit atoms carry their event-signature
+        // rank, multi-instruction SCC packings are comb-loop atoms, and
+        // everything else is a singleton; the mux-merge atom pass may later
+        // re-tag compute atoms as MuxMerge with the select variable id.
+        std::vector<uint8_t> atomKinds(atomCount, 0);
+        std::vector<uint32_t> atomSignatures(atomCount, 0);
+        for (uint32_t atom = 0; atom < atomCount; ++atom) {
+            if (atomIsCommit[atom] != 0) {
+                atomKinds[atom] = static_cast<uint8_t>(AmAtomKind::CommitEvent);
+                atomSignatures[atom] = commitEventRank[atom];
+            } else if (atomInstructions[atom] > 1) {
+                atomKinds[atom] = static_cast<uint8_t>(AmAtomKind::CombLoopScc);
+            } else {
+                atomKinds[atom] = static_cast<uint8_t>(AmAtomKind::Singleton);
+            }
+        }
+
         AmGraphSplitContext context;
         context.instructionCount = instructionCount;
         context.variableCount = variableCount;
@@ -722,16 +743,18 @@ namespace wolvrix::lib::grhsim::am
         context.atomIsCommit = std::move(atomIsCommit);
         context.atomMinInstruction = std::move(atomMinInstruction);
         context.commitEventRank = std::move(commitEventRank);
+        context.atomKinds = std::move(atomKinds);
+        context.atomSignatures = std::move(atomSignatures);
         context.oversizedAtomCount = oversizedAtomCount;
         context.maxAtomInstructions = maxAtomInstructions;
         context.maxAtomStateWrites = maxAtomStateWrites;
-        context.maxInstructionsPerBlock = options.maxInstructionsPerBlock;
-        context.maxCommitInstructionsPerBlock = options.maxCommitInstructionsPerBlock;
+        context.maxAtomsPerBlock = options.maxAtomsPerBlock;
+        context.maxCommitAtomsPerBlock = options.maxCommitAtomsPerBlock;
         context.enableCoarsening = options.enableCoarsening;
-        // Merge host member instruction limit for the out1/in1/sibling merge
-        // sweeps (gsim MAX_NODES_PER_SUPER); 0 selects the 7000 default.
-        context.coarsenBudget =
-            options.dpCoarsenBudget != 0 ? options.dpCoarsenBudget : 256;
+        // Merge host member atom limit for the out1/in1/sibling merge
+        // sweeps (gsim MAX_NODES_PER_SUPER); 0 selects the 256 default.
+        context.coarsenAtomBudget =
+            options.dpCoarsenAtomBudget != 0 ? options.dpCoarsenAtomBudget : 256;
         context.segmentPenalty = options.dpSegmentPenalty;
         context.refinementRounds = options.dpRefinementRounds;
 

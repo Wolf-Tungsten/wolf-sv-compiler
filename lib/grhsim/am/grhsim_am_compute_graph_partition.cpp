@@ -405,14 +405,16 @@ namespace wolvrix::lib::grhsim::am
         }
 
         // Per-node state in topo-id (rid) space; the rid edge list is kept for
-        // the post-merge adjacency rebuild.
+        // the post-merge adjacency rebuild. NO0007 P3: the atom IS the size
+        // unit -- one per atom -- so the coarsen budget, the DP per-block
+        // node cap, and the refinement block sizes all count atoms.
         std::vector<uint32_t> member(n, 0);
         std::vector<uint32_t> edgeSrc;
         std::vector<uint32_t> edgeDst;
         edgeSrc.reserve(computeGraph.offsets.back());
         edgeDst.reserve(computeGraph.offsets.back());
         for (uint32_t rid = 0; rid < n; ++rid) {
-            member[rid] = input.atomInstructions[computeGraph.globalOfAtom[atomOfRid[rid]]];
+            member[rid] = 1;
         }
         std::vector<std::vector<uint32_t>> nexts(n);
         std::vector<std::vector<uint32_t>> prevs(n);
@@ -473,7 +475,7 @@ namespace wolvrix::lib::grhsim::am
 
         // Merge sweeps (gsim mergeNodes.cpp): one pass per rule, no fixpoint;
         // the live rewiring below collapses whole chains within the pass.
-        const std::size_t mergeLimit = input.coarsenBudget;
+        const std::size_t mergeLimit = input.coarsenAtomBudget;
         std::vector<uint8_t> alive(n, 1);
         std::vector<uint32_t> parent(n, 0);
         std::iota(parent.begin(), parent.end(), uint32_t{0});
@@ -673,8 +675,8 @@ namespace wolvrix::lib::grhsim::am
         // resort'ed sequence, T[j] = min over jumps i->j of T[i] + Cij +
         // segmentPenalty, where Cij is the cut size behind sequence position
         // j (accumulated out-degree minus the in-edges from positions >= i)
-        // and the jump stays within maxInstructionsPerBlock of cumulative
-        // member instructions (a single oversized cluster forms its own
+        // and the jump stays within maxAtomsPerBlock of cumulative
+        // member atoms (a single oversized cluster forms its own
         // segment).
         std::vector<uint32_t> sequenceSizes(clusterCount, 0);
         std::vector<uint32_t> sequenceOutDegree(clusterCount, 0);
@@ -706,7 +708,7 @@ namespace wolvrix::lib::grhsim::am
                       prevPositions.begin() + prevOffsets[pos + 1]);
         }
 
-        const std::size_t maxNodes = input.maxInstructionsPerBlock;
+        const std::size_t maxNodes = input.maxAtomsPerBlock;
         constexpr double kInf = std::numeric_limits<double>::infinity();
         std::vector<double> best(static_cast<std::size_t>(clusterCount) + 1, kInf);
         std::vector<uint32_t> back(static_cast<std::size_t>(clusterCount) + 1, 0);
@@ -816,7 +818,7 @@ namespace wolvrix::lib::grhsim::am
             refinement =
                 refineClusterBlocks(graph, input, computeGraph, clusterWeights, clusterOrder,
                                     topoPos, segmentOfPos, computeBlockCount,
-                                    input.maxInstructionsPerBlock, input.refinementRounds);
+                                    input.maxAtomsPerBlock, input.refinementRounds);
         }
         const uint64_t refinementMs = elapsedMs(refineStart);
 

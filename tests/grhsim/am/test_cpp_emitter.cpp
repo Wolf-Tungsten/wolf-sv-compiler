@@ -2804,8 +2804,8 @@ int main()
         std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
             AmGraph::fromLinearProgram(makeProductionCommitCycleProgram()),
             ActivityScheduleOptions{
-                .maxInstructionsPerBlock = 1,
-                .maxCommitInstructionsPerBlock = 1,
+                .maxAtomsPerBlock = 1,
+                .maxCommitAtomsPerBlock = 1,
                 .enableCoarsening = false,
             },
             diagnostics);
@@ -3097,6 +3097,526 @@ int main()
         if (std::system(runCommand.c_str()) != 0)
         {
             return fail("generated cond-gated model violated the cond gating semantics");
+        }
+        return 0;
+    }
+
+    // NO0006/NO0007 P2 same-select mux fusion: one compute Block holds two
+    // explicit MuxMerge atoms (a narrow one with a cone member and a chained
+    // mux, a wide one), separated by a singleton assign; a lone
+    // different-select singleton mux keeps the standalone ternary form.
+    ExecutableModel makeMuxRunEmitterModel()
+    {
+        LinearProgramBuilder linear;
+        const TypeId u1Type = linear.addType(Type::bitVector(1));
+        const TypeId u8Type = linear.addType(Type::bitVector(8));
+        const TypeId u72Type = linear.addType(Type::bitVector(72));
+
+        ProgramInterface interface;
+        const auto addInput = [&](TypeId type, std::string_view name) {
+            const VariableId variable = linear.addVariable(type, linear.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Input,
+                .input = variable,
+            });
+            return variable;
+        };
+        const auto addOutput = [&](TypeId type, std::string_view name) {
+            const VariableId variable = linear.addVariable(type, linear.undefInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Output,
+                .output = variable,
+            });
+            return variable;
+        };
+        const auto addInstruction = [&](Opcode opcode,
+                                        std::initializer_list<VariableId> results,
+                                        std::initializer_list<VariableId> operands) {
+            return linear.addInstruction(
+                opcode,
+                std::span<const VariableId>(results.begin(), results.size()),
+                std::span<const VariableId>(operands.begin(), operands.size()));
+        };
+
+        const VariableId sel = addInput(u1Type, "sel");
+        const VariableId sel2 = addInput(u1Type, "sel2");
+        const VariableId a = addInput(u8Type, "a");
+        const VariableId b = addInput(u8Type, "b");
+        const VariableId c = addInput(u8Type, "c");
+        const VariableId d = addInput(u8Type, "d");
+        const VariableId wideA = addInput(u72Type, "wide_a");
+        const VariableId wideB = addInput(u72Type, "wide_b");
+        const VariableId r1 = addOutput(u8Type, "r1");
+        const VariableId r2 = addOutput(u8Type, "r2");
+        const VariableId r3 = addOutput(u8Type, "r3");
+        const VariableId w2 = addOutput(u72Type, "w2");
+        const VariableId mo = addOutput(u8Type, "mo");
+        const VariableId tmp = linear.addVariable(u8Type, linear.undefInit());
+        const VariableId w1 = linear.addVariable(u72Type, linear.undefInit());
+        const VariableId cone = linear.addVariable(u8Type, linear.undefInit());
+
+        const InstructionId coneAnd = addInstruction(Opcode::And, {cone}, {a, d});
+        const InstructionId mux1 = addInstruction(Opcode::Mux, {r1}, {sel, cone, b});
+        const InstructionId mux2 = addInstruction(Opcode::Mux, {r2}, {sel, c, r1});
+        const InstructionId mux3 = addInstruction(Opcode::Mux, {r3}, {sel, a, d});
+        const InstructionId separator = addInstruction(Opcode::Assign, {tmp}, {a});
+        const InstructionId wide1 = addInstruction(Opcode::Mux, {w1}, {sel, wideA, wideB});
+        const InstructionId wide2 = addInstruction(Opcode::Mux, {w2}, {sel, wideB, wideA});
+        const InstructionId other = addInstruction(Opcode::Mux, {mo}, {sel2, a, b});
+
+        const std::array<VariableId, 8> watched = {sel, sel2, a, b, c, d, wideA, wideB};
+        ScheduledProgramBuilder scheduled(linear.finish());
+        std::vector<InstructionId> entry;
+        for (VariableId input : watched)
+        {
+            const TypeId type = scheduled.view().variable(input).type;
+            const VariableId oldValue = scheduled.addVariable(type, scheduled.undefInit());
+            const VariableId inputChanged =
+                scheduled.addVariable(u1Type, scheduled.zeroInit());
+            entry.push_back(scheduled.addInstruction(
+                Opcode::ChangedAny, std::array{inputChanged}, std::array{input, oldValue}));
+            const InstructionId activate = scheduled.addInstruction(
+                Opcode::ActForward, {}, std::array{inputChanged});
+            scheduled.setActivationTargets(activate, std::array{BlockId{1}});
+            entry.push_back(activate);
+        }
+        scheduled.addBlock(std::span<const InstructionId>(entry.data(), entry.size()));
+        // Two MuxMerge atoms with singleton instructions in between and a
+        // singleton different-select mux at the tail.
+        scheduled.beginBlock();
+        scheduled.beginAtom(AmAtomKind::MuxMerge, sel.value);
+        scheduled.appendBlockInstruction(coneAnd);
+        scheduled.appendBlockInstruction(mux1);
+        scheduled.appendBlockInstruction(mux2);
+        scheduled.appendBlockInstruction(mux3);
+        scheduled.endAtom();
+        scheduled.appendBlockInstruction(separator);
+        scheduled.beginAtom(AmAtomKind::MuxMerge, sel.value);
+        scheduled.appendBlockInstruction(wide1);
+        scheduled.appendBlockInstruction(wide2);
+        scheduled.endAtom();
+        scheduled.appendBlockInstruction(other);
+        scheduled.endBlock();
+
+        return ExecutableModel{
+            .program = scheduled.finish(),
+            .interface = std::move(interface),
+            .commitBlockBegin = 0,
+            .commitBlockEnd = 0,
+        };
+    }
+
+    int testMuxRunFusion(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        ExecutableModel model = makeMuxRunEmitterModel();
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "MuxRunTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the mux-run model");
+        }
+        const std::optional<std::string> blocksText =
+            readTextFile(outputDirectory / "grhsim_MuxRunTop_blocks_0.cpp");
+        if (!blocksText)
+        {
+            return fail("AM C++ emitter produced no mux-run blocks source");
+        }
+        const ProgramView program = model.program.view();
+        const auto findPort = [&](std::string_view name) {
+            for (const PortBinding &port : model.interface.ports)
+            {
+                if (program.string(port.name) == name)
+                {
+                    return port.direction == PortDirection::Input ? port.input : port.output;
+                }
+            }
+            return VariableId::invalid();
+        };
+        const VariableId sel = findPort("sel");
+        const VariableId sel2 = findPort("sel2");
+        const VariableId a = findPort("a");
+        const VariableId c = findPort("c");
+        const VariableId d = findPort("d");
+        const VariableId r1 = findPort("r1");
+        const VariableId r2 = findPort("r2");
+        if (!sel.valid() || !sel2.valid() || !a.valid() || !c.valid() || !d.valid() ||
+            !r1.valid() || !r2.valid())
+        {
+            return fail("mux-run model lost its interface bindings");
+        }
+        // Two fused if/else structures share one select evaluation each: one
+        // for the narrow atom, one for the wide atom. The trailing space
+        // after '{' keeps activation-merge ifs out of the count. The cone
+        // member (a & d) must be emitted before the fused gate it feeds, and
+        // the singleton different-select mux keeps the plain ternary form
+        // (no block-level fallback fusion any more).
+        const std::string fusedGate = "if ((v" + std::to_string(sel.value) + " != 0)) { ";
+        const std::string singletonGate = "if ((v" + std::to_string(sel2.value) + " != 0)) { ";
+        const std::string chainTrue = "v" + std::to_string(r2.value) +
+                                      " = (resize_value(v" + std::to_string(c.value) +
+                                      ", 8, false, 8))";
+        const std::string chainFalse = "v" + std::to_string(r2.value) +
+                                       " = (resize_value(v" + std::to_string(r1.value) +
+                                       ", 8, false, 8))";
+        const std::string coneAssign = "resize_value(v" + std::to_string(a.value) +
+                                       ", 8, false, 8) & resize_value(v" +
+                                       std::to_string(d.value) + ", 8, false, 8)";
+        const std::string loneTernary = "= ((v" + std::to_string(sel2.value) + " != 0) ? ";
+        const std::size_t firstGate = blocksText->find(fusedGate);
+        const std::size_t conePosition = blocksText->find(coneAssign);
+        if (firstGate == std::string::npos ||
+            countOccurrences(*blocksText, fusedGate) != 2 ||
+            blocksText->find(chainTrue) == std::string::npos ||
+            blocksText->find(chainFalse) == std::string::npos ||
+            conePosition == std::string::npos || conePosition > firstGate ||
+            countOccurrences(*blocksText, singletonGate) != 0 ||
+            countOccurrences(*blocksText, "assign_words(") < 4 ||
+            blocksText->find(loneTernary) == std::string::npos)
+        {
+            return fail("AM C++ emitter did not fuse the MuxMerge atoms");
+        }
+
+        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << R"CPP(#include "grhsim_MuxRunTop.hpp"
+int main()
+{
+    GrhSIM_MuxRunTop model;
+    model.init();
+    model.sel = 0;
+    model.sel2 = 0;
+    model.a = 0x11;
+    model.b = 0x22;
+    model.c = 0x33;
+    model.d = 0x44;
+    model.wide_a = {UINT64_C(0xaaaabbbbccccdddd), UINT64_C(0x12)};
+    model.wide_b = {UINT64_C(0x1111222233334444), UINT64_C(0x56)};
+    model.eval();
+    if (model.r1 != 0x22 || model.r2 != 0x22 || model.r3 != 0x44 || model.mo != 0x22)
+        return 1;
+    if (model.w2[0] != UINT64_C(0xaaaabbbbccccdddd) || model.w2[1] != UINT64_C(0x12))
+        return 2;
+    model.sel = 1;
+    model.sel2 = 1;
+    model.eval();
+    // cone = a & d = 0x00 feeds r1's true arm inside the fused if/else.
+    if (model.r1 != 0x00 || model.r2 != 0x33 || model.r3 != 0x11 || model.mo != 0x11)
+        return 3;
+    if (model.w2[0] != UINT64_C(0x1111222233334444) || model.w2[1] != UINT64_C(0x56))
+        return 4;
+    return 0;
+}
+)CPP";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the mux-run model harness");
+        }
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated mux-run model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (outputDirectory / "libgrhsim_MuxRunTop.a").string() + "' -o '" +
+            harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated mux-run model harness failed to compile");
+        }
+        const std::string runCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(runCommand.c_str()) != 0)
+        {
+            return fail("generated mux-run model violated the fused select semantics");
+        }
+        return 0;
+    }
+
+    // NO0006 production-form fusion: same-select muxes lowered into an
+    // AmGraph, scheduled through graphToProgram (split -> mux-merge atom ->
+    // partition -> materialize), then emitted. The merged atom must surface
+    // as one fused if/else segment in the generated compute Block.
+    int testMuxMergeAtomPipelineFusion(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        LinearProgramBuilder builder;
+        const TypeId u1Type = builder.addType(Type::bitVector(1));
+        const TypeId u8Type = builder.addType(Type::bitVector(8));
+        ProgramInterface interface;
+        const auto addInput = [&](std::string_view name) {
+            const VariableId variable = builder.addVariable(u8Type, builder.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = builder.addString(name),
+                .direction = PortDirection::Input,
+                .input = variable,
+            });
+            return variable;
+        };
+        const auto addOutput = [&](std::string_view name) {
+            const VariableId variable = builder.addVariable(u8Type, builder.undefInit());
+            interface.ports.push_back(PortBinding{
+                .name = builder.addString(name),
+                .direction = PortDirection::Output,
+                .output = variable,
+            });
+            return variable;
+        };
+        const VariableId sel = builder.addVariable(u1Type, builder.zeroInit());
+        interface.ports.push_back(PortBinding{
+            .name = builder.addString("sel"),
+            .direction = PortDirection::Input,
+            .input = sel,
+        });
+        const VariableId a = addInput("a");
+        const VariableId b = addInput("b");
+        const VariableId c = addInput("c");
+        const VariableId d = addInput("d");
+        const VariableId e = addInput("e");
+        const VariableId r1 = addOutput("r1");
+        const VariableId r2 = addOutput("r2");
+        const VariableId r3 = addOutput("r3");
+        const auto mux = [&](VariableId result, VariableId whenTrue,
+                             VariableId whenFalse) {
+            builder.addInstruction(Opcode::Mux, std::array{result},
+                                   std::array{sel, whenTrue, whenFalse});
+        };
+        mux(r1, a, b);
+        mux(r2, c, d);
+        mux(r3, a, e);
+
+        SchedulingFacts facts;
+        facts.variableRoles = {
+            VariableRole::ExternalInput,  // sel
+            VariableRole::ExternalInput,  // a
+            VariableRole::ExternalInput,  // b
+            VariableRole::ExternalInput,  // c
+            VariableRole::ExternalInput,  // d
+            VariableRole::ExternalInput,  // e
+            VariableRole::ExternalOutput, // r1
+            VariableRole::ExternalOutput, // r2
+            VariableRole::ExternalOutput, // r3
+        };
+
+        AmGraph graph = AmGraph::fromLinearProgram(LinearProgramArtifact{
+            .program = builder.finish(),
+            .interface = std::move(interface),
+            .schedulingFacts = std::move(facts),
+        });
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        std::optional<ExecutableModel> model =
+            GrhIRToGrhSimAMProgram::graphToProgram(std::move(graph),
+                                                   ActivityScheduleOptions{}, diagnostics);
+        if (!model || diagnostics.hasError())
+        {
+            for (const auto &message : diagnostics.messages())
+            {
+                std::cerr << message.message << " [" << message.context << "]\n";
+            }
+            return fail("same-select mux graph did not schedule");
+        }
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            *model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "MuxPipeTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the mux-pipeline model");
+        }
+        if (emitResult.muxAtomFused != 3)
+        {
+            return fail("mux-merge atom did not surface as one fused run of three");
+        }
+        const std::optional<std::string> blocksText =
+            readTextFile(outputDirectory / "grhsim_MuxPipeTop_blocks_0.cpp");
+        if (!blocksText)
+        {
+            return fail("AM C++ emitter produced no mux-pipeline blocks source");
+        }
+        const std::string fusedHead =
+            "if ((v" + std::to_string(sel.value) + " != 0)) { v" +
+            std::to_string(r1.value) + " = (resize_value(v" + std::to_string(a.value) +
+            ", 8, false, 8)) & ((UINT64_C(1) << 8) - UINT64_C(1));";
+        const std::string secondAssign =
+            "v" + std::to_string(r2.value) + " = (resize_value(v" +
+            std::to_string(c.value) + ", 8, false, 8)) & ((UINT64_C(1) << 8) - UINT64_C(1));";
+        if (blocksText->find(fusedHead) == std::string::npos ||
+            blocksText->find(secondAssign) == std::string::npos)
+        {
+            return fail("scheduled same-select muxes were not emitted as one if/else run");
+        }
+
+        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << R"CPP(#include "grhsim_MuxPipeTop.hpp"
+int main()
+{
+    GrhSIM_MuxPipeTop model;
+    model.init();
+    model.sel = 0;
+    model.a = 0x11;
+    model.b = 0x22;
+    model.c = 0x33;
+    model.d = 0x44;
+    model.e = 0x55;
+    model.eval();
+    if (model.r1 != 0x22 || model.r2 != 0x44 || model.r3 != 0x55) return 1;
+    model.sel = 1;
+    model.eval();
+    if (model.r1 != 0x11 || model.r2 != 0x33 || model.r3 != 0x11) return 2;
+    return 0;
+}
+)CPP";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the mux-pipeline model harness");
+        }
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated mux-pipeline model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (outputDirectory / "libgrhsim_MuxPipeTop.a").string() + "' -o '" +
+            harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated mux-pipeline model harness failed to compile");
+        }
+        const std::string runCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(runCommand.c_str()) != 0)
+        {
+            return fail("generated mux-pipeline model violated the fused select semantics");
+        }
+        return 0;
+    }
+
+    // NO0007 P2 behavior change, pinned: a cap-skipped same-select group
+    // stays singleton atoms, and the emitter no longer fuses it through the
+    // block-level run fallback -- plain ternaries only.
+    int testCapSkippedMuxGroupStaysUnfused(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        LinearProgramBuilder builder;
+        const TypeId u1Type = builder.addType(Type::bitVector(1));
+        const TypeId u8Type = builder.addType(Type::bitVector(8));
+        ProgramInterface interface;
+        const auto addInput = [&](std::string_view name) {
+            const VariableId variable = builder.addVariable(u8Type, builder.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = builder.addString(name),
+                .direction = PortDirection::Input,
+                .input = variable,
+            });
+            return variable;
+        };
+        const auto addOutput = [&](std::string_view name) {
+            const VariableId variable = builder.addVariable(u8Type, builder.undefInit());
+            interface.ports.push_back(PortBinding{
+                .name = builder.addString(name),
+                .direction = PortDirection::Output,
+                .output = variable,
+            });
+            return variable;
+        };
+        const VariableId sel = builder.addVariable(u1Type, builder.zeroInit());
+        interface.ports.push_back(PortBinding{
+            .name = builder.addString("sel"),
+            .direction = PortDirection::Input,
+            .input = sel,
+        });
+        const VariableId a = addInput("a");
+        const VariableId b = addInput("b");
+        const VariableId c = addInput("c");
+        const VariableId d = addInput("d");
+        const VariableId e = addInput("e");
+        const VariableId r1 = addOutput("r1");
+        const VariableId r2 = addOutput("r2");
+        const VariableId r3 = addOutput("r3");
+        const auto mux = [&](VariableId result, VariableId whenTrue,
+                             VariableId whenFalse) {
+            builder.addInstruction(Opcode::Mux, std::array{result},
+                                   std::array{sel, whenTrue, whenFalse});
+        };
+        mux(r1, a, b);
+        mux(r2, c, d);
+        mux(r3, a, e);
+
+        SchedulingFacts facts;
+        facts.variableRoles = {
+            VariableRole::ExternalInput, VariableRole::ExternalInput,
+            VariableRole::ExternalInput, VariableRole::ExternalInput,
+            VariableRole::ExternalInput, VariableRole::ExternalInput,
+            VariableRole::ExternalOutput, VariableRole::ExternalOutput,
+            VariableRole::ExternalOutput,
+        };
+
+        AmGraph graph = AmGraph::fromLinearProgram(LinearProgramArtifact{
+            .program = builder.finish(),
+            .interface = std::move(interface),
+            .schedulingFacts = std::move(facts),
+        });
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
+            std::move(graph), ActivityScheduleOptions{.muxAtomMax = 2}, diagnostics);
+        if (!model || diagnostics.hasError())
+        {
+            return fail("cap-skipped mux graph did not schedule");
+        }
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            *model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "MuxCapTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the cap-skipped model");
+        }
+        const std::optional<std::string> blocksText =
+            readTextFile(outputDirectory / "grhsim_MuxCapTop_blocks_0.cpp");
+        if (!blocksText)
+        {
+            return fail("AM C++ emitter produced no cap-skipped blocks source");
+        }
+        const std::string fusedGate =
+            "if ((v" + std::to_string(sel.value) + " != 0)) { ";
+        const std::string ternaryHead =
+            " = ((v" + std::to_string(sel.value) + " != 0) ? ";
+        if (emitResult.muxAtomFused != 0 ||
+            countOccurrences(*blocksText, fusedGate) != 0 ||
+            countOccurrences(*blocksText, ternaryHead) != 3)
+        {
+            return fail("cap-skipped mux group was still fused by the emitter fallback");
         }
         return 0;
     }
@@ -3397,6 +3917,27 @@ int main()
     if (const int result = testCondGatedWriteEmission(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-cond-gate");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testMuxRunFusion(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-mux-run");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testMuxMergeAtomPipelineFusion(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-mux-pipeline");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testCapSkippedMuxGroupStaysUnfused(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-mux-cap-skip");
         result != 0)
     {
         return result;
