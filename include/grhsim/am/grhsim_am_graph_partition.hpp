@@ -30,14 +30,13 @@ namespace wolvrix::lib::grhsim::am
         std::span<const uint32_t> instructionAtom; // instruction -> atom
         std::size_t maxInstructionsPerBlock = 128;
         std::size_t maxCommitInstructionsPerBlock = 4096;
-        bool enableCoarsening = true;   // out1/in1/sibling coarsen stages
-        std::size_t coarsenBudget = 64; // coarsen cluster instruction cap
+        bool enableCoarsening = true;   // out1/in1/sibling merge sweeps
+        std::size_t coarsenBudget = 256; // merge host member instruction limit
         double segmentPenalty = 1.0;    // DP fixed cost per segment boundary
-        // Optional per-variable incoming-copy weight (e.g. ceil(bitWidth/64),
-        // matching the runtime copy count). Empty span = unit weight per
-        // variable (legacy behavior). When non-empty, size must be
-        // variableCount.
-        std::span<const uint32_t> variableCopyWeights;
+        // Post-DP local-move refinement rounds (0 = off). Each round scans
+        // clusters in topo order and moves a cluster to a neighbor block when
+        // the move strictly reduces the exact block-level incoming-copy cost.
+        std::size_t refinementRounds = 10;
     };
 
     // ------------------------------------------------------------------
@@ -100,12 +99,17 @@ namespace wolvrix::lib::grhsim::am
         std::size_t coarsenIn1Merges = 0;
         std::size_t coarsenSiblingMerges = 0;
         std::string initialDegreeHistogram;
+        // Post-DP local-move refinement stats (0 when disabled).
+        std::size_t refinementRounds = 0;
+        std::size_t refinementMoves = 0;
+        uint64_t refinementMs = 0;
+        double refinementCostBefore = 0.0;
+        double refinementCostAfter = 0.0;
     };
 
-    // partition-am-compute-graph（活动度划分）：compute 子图上做
-    // out1/in1/sibling 迭代 coarsen、确定性拓扑、segment DP（最小化跨段
-    // incoming 激活成本 + 每段 segmentPenalty）。def-use 成本仍读全局变量
-    // 空间，commit atom 内的 use 经分图表跳过。
+    // partition-am-compute-graph（活动度划分）：compute 子图上做 gsim 风格
+    // 单遍 out1/in1/sibling 合并、确定性 LIFO Kahn 重排、Kernighan DP
+    // （最小化边界出边割数 + 每边界 segmentPenalty），DP 后接局部移动精化。
     std::optional<AmComputeActivityGraph>
     partitionAmComputeGraph(const AmGraphPartitionInput &input,
                             const AmGraphSplit &split, std::string &error);

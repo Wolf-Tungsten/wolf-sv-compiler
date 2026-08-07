@@ -113,8 +113,8 @@ int main(int argc, char **argv)
                      "[--max-instructions-per-block <count>] "
                      "[--dp-segment-penalty <value>] "
                      "[--dp-coarsen-budget <count>] [--disable-coarsening] "
-                     "[--dp-width-weighted-cost] [--runtime-profile] "
-                     "[--am-optimize=<dce,fold,cse,alias,memfold,ifacealias>] [--no-am-optimize]\n";
+                     "[--runtime-profile] "
+                     "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
     const std::string path = argv[1];
@@ -128,7 +128,6 @@ int main(int argc, char **argv)
     double dpSegmentPenalty = 1.0;
     std::size_t dpCoarsenBudget = 0;
     bool enableCoarsening = true;
-    bool dpWidthWeightedCopyCost = false;
     bool runtimeProfile = false;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
@@ -225,37 +224,41 @@ int main(int argc, char **argv)
         {
             enableCoarsening = false;
         }
-        else if (argument == "--dp-width-weighted-cost")
-        {
-            dpWidthWeightedCopyCost = true;
-        }
         else if (argument == "--runtime-profile")
         {
             runtimeProfile = true;
         }
         else if (argument == "--no-am-optimize")
         {
-            amOptimize = AmOptimizeOptions{
-                .dce = false,
-                .constFold = false,
-                .cse = false,
-                .assignAlias = false,
-                .constMemFold = false,
-                .interfaceAlias = false,
-            };
+            amOptimize = AmOptimizeOptions{};
+            amOptimize.dce = false;
+            amOptimize.constFold = false;
+            amOptimize.cse = false;
+            amOptimize.assignAlias = false;
+            amOptimize.stateReadAlias = false;
+            amOptimize.logicUnify = false;
+            amOptimize.muxNotAbsorb = false;
+            amOptimize.notUnify = false;
+            amOptimize.sliceFuse = false;
+            amOptimize.constMemFold = false;
+            amOptimize.interfaceAlias = false;
         }
         else if (argument.starts_with("--am-optimize="))
         {
             const std::string_view list =
                 argument.substr(std::string_view("--am-optimize=").size());
-            AmOptimizeOptions parsed{
-                .dce = false,
-                .constFold = false,
-                .cse = false,
-                .assignAlias = false,
-                .constMemFold = false,
-                .interfaceAlias = false,
-            };
+            AmOptimizeOptions parsed{};
+            parsed.dce = false;
+            parsed.constFold = false;
+            parsed.cse = false;
+            parsed.assignAlias = false;
+            parsed.stateReadAlias = false;
+            parsed.logicUnify = false;
+            parsed.muxNotAbsorb = false;
+            parsed.notUnify = false;
+            parsed.sliceFuse = false;
+            parsed.constMemFold = false;
+            parsed.interfaceAlias = false;
             bool valid = true;
             std::size_t begin = 0;
             while (valid && begin <= list.size())
@@ -280,6 +283,26 @@ int main(int argc, char **argv)
                 else if (token == "alias")
                 {
                     parsed.assignAlias = true;
+                }
+                else if (token == "statealias")
+                {
+                    parsed.stateReadAlias = true;
+                }
+                else if (token == "unify")
+                {
+                    parsed.logicUnify = true;
+                }
+                else if (token == "muxabsorb")
+                {
+                    parsed.muxNotAbsorb = true;
+                }
+                else if (token == "notunify")
+                {
+                    parsed.notUnify = true;
+                }
+                else if (token == "slicefuse")
+                {
+                    parsed.sliceFuse = true;
                 }
                 else if (token == "memfold")
                 {
@@ -380,7 +403,11 @@ int main(int argc, char **argv)
                       << " peak_rss_kib=" << peakRssKiB() << '\n';
             return 1;
         }
-        if (amOptimize.dce || amOptimize.constFold || amOptimize.cse)
+        if (amOptimize.dce || amOptimize.constFold || amOptimize.cse ||
+            amOptimize.assignAlias || amOptimize.stateReadAlias ||
+            amOptimize.logicUnify || amOptimize.muxNotAbsorb ||
+            amOptimize.notUnify || amOptimize.sliceFuse ||
+            amOptimize.constMemFold)
         {
             phaseStart = std::chrono::steady_clock::now();
             const bool optimized =
@@ -423,7 +450,6 @@ int main(int argc, char **argv)
                     .enableCoarsening = enableCoarsening,
                     .collectStats = true,
                     .dpSegmentPenalty = dpSegmentPenalty,
-                    .dpWidthWeightedCopyCost = dpWidthWeightedCopyCost,
                     .dpCoarsenBudget = dpCoarsenBudget,
                 },
                 diagnostics);

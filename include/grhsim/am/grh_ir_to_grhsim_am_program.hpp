@@ -44,16 +44,17 @@ namespace wolvrix::lib::grhsim::am
         bool collectStats = false;
         // DP fixed cost per segment boundary; legacy hard-codes +1 per segment.
         double dpSegmentPenalty = 1.0;
-        // When true, the segment DP charges each incoming variable by
-        // ceil(bitWidth/64) copies (runtime copy count) instead of a unit
-        // cost per variable. The reported scoreboard cost already uses the
-        // width-folded formula either way.
-        bool dpWidthWeightedCopyCost = false;
-        // 0 = automatic (1.5 * maxInstructionsPerBlock). The legacy 32x factor
-        // lets AM's single-instruction-atom coarsen converge into
-        // DP-indivisible oversized clusters far above the segment cap; 1.5x
-        // keeps the legacy block granularity (XiangShan ~33.7k vs 31.5k).
+        // Merge host member instruction limit for the out1/in1/sibling merge
+        // sweeps. 0 selects the default 256: larger values cut fewer
+        // cross-block values but grow an oversized-block tail that re-executes
+        // wholesale on activation (XiangShan: 7000 -> +6% host time, 256 ->
+        // -3% host time vs the legacy partitioner; see compute-partition
+        // NO0004).
         std::size_t dpCoarsenBudget = 0;
+        // Post-DP local-move refinement rounds for the compute partition
+        // (0 = off). Deterministic, monotone cost decrease; see
+        // grhsim_am_compute_graph_partition.cpp.
+        std::size_t dpRefinementRounds = 10;
     };
 
     struct AmOptimizeOptions
@@ -62,9 +63,34 @@ namespace wolvrix::lib::grhsim::am
         bool constFold = true;
         bool cse = true;
         // Bypass single-operand Assign instructions (alias the result to the
-        // operand). Assigns reading a state variable are commit read-old
-        // snapshots (lowering preCommitValue) and are never bypassed.
+        // operand). Assigns reading a state variable are kept by default:
+        // commit-side instructions must observe the pre-commit value through
+        // the snapshot (lowering preCommitValue). See stateReadAlias for the
+        // refined rule.
         bool assignAlias = true;
+        // Refined form of assignAlias: an Assign reading a state variable
+        // may still be bypassed when no commit-side instruction (state
+        // write, change detector, host effect; transitively through
+        // single-operand Assign chains) references its result. Only the
+        // preCommit snapshots that actually feed commit operands are kept.
+        bool stateReadAlias = true;
+        // Rewrite 1-bit LogicAnd/LogicOr/LogicNot to the bitwise And/Or/Not
+        // (identical semantics on 1-bit operands) so CSE can merge the two
+        // forms instead of keeping parallel guard-logic copies.
+        bool logicUnify = true;
+        // Absorb a Not/LogicNot that feeds only Mux selects (single-use or
+        // shared): mux(!c, a, b) == mux(c, b, a) with the arms swapped, and
+        // the Not instruction is removed. Restricted to 1-bit inverted
+        // operands because the IR requires a 1-bit Mux select.
+        bool muxNotAbsorb = true;
+        // Fuse SliceStatic chains (slice(slice(x, l1), l2) -> slice(x,
+        // l1+l2)) and bypass identity slices (lsb 0, identical type).
+        bool sliceFuse = true;
+        // Canonicalize 1-bit Not to Eq(x, 0): matches the reference flow's
+        // negation form and lets CSE merge it with an explicit x == 0.
+        // Measured on XiangShan (compute-partition NO0005): pure bucket
+        // shift, no ge2/sum_outdeg gain (CSE merged 6 pairs) — default off.
+        bool notUnify = false;
         // Fold MemoryRead instructions with a constant address on memories
         // that are never written. Emitted/interpreted storage is
         // zero-initialized, so Undef/Zero init reads as zero and Constant

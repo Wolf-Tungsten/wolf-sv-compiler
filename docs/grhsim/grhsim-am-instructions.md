@@ -58,19 +58,29 @@ Operand 排布遵循以下约定：
 | --- | --- |
 | 纯计算 | 数据源按表达式顺序排列。二元指令固定为 lhs、rhs。 |
 | 选择/寻址 | `mux` 固定为 cond、true、false；slice/memory read 固定为 base/target 在前，随后是 address/index。 |
-| 状态写 | `mem.write` 固定为 `%cond, %addr, %mask, %data, %target`；`mem.write_lanes` 的 laneMask 在最前；`reg.write/latch.write/mem.fill` 为已合并写入条件与掩码的 payload 在前、`%target` 随后；variadic event 始终位于末尾（`latch.write` 无 event）。 |
+| 状态写 | 写指令按 `%cond?、%addr?（仅 mem）、%mask?、%data、%target` 排列：cond 在最前（若有），随后是地址（仅 mem）、掩码（若有）、数据、目标；`mem.write_lanes` 的 laneMask 在最前；`mem.fill` 为 packed payload 在前、`%target` 随后；variadic event 始终位于末尾（`latch.write` 各变体无 event）。 |
 | 外部调用 | `system.function` 的 Operand 全是参数；有条件的 `system.task/dpi.call` 把 `%cond` 放在最前。输入参数按调用 schema 排列，variadic event 始终位于末尾；返回值和 output/inout 参数写在 Result 列表。 |
 | Block 激活 | `%event` 是唯一 Operand，目标 Block 集合放在 `targets` Attribute。 |
 
-`reg.write/latch.write/mem.fill` 不再有 `%cond/%mask` 操作数：写入条件与掩码在 lowering
-时合并进 payload（见第 12 节）；`mem.write` 保留 `%cond/%mask` 操作数，写使能与逐 bit
-掩码由指令自身判定。当前状态写的规范排列为：
+`reg.write/latch.write/mem.write` 是 cond × mask 的显式变体族：lowering 按写入条件
+与掩码的常量性把每个写选型到最简变体——常量 1 的 `%cond` 与全 1 的 `%mask` 不占
+操作数位，常量 0 的 `%cond`/`%mask` 使整条写被消除（见第 12 节）；`mem.fill` 的
+fill 条件仍合并进 packed payload。当前状态写的规范排列为：
 
 ```text
-reg.write       %nextValue, %target, %event0, ...
-mem.write       %cond, %addr, %mask, %data, %target, %event0, ...
+reg.write       %data, %target, %event0, ...
+reg.write.c     %cond, %data, %target, %event0, ...
+reg.write.m     %mask, %data, %target, %event0, ...
+reg.write.cm    %cond, %mask, %data, %target, %event0, ...
+mem.write       %addr, %data, %target, %event0, ...
+mem.write.c     %cond, %addr, %data, %target, %event0, ...
+mem.write.m     %addr, %mask, %data, %target, %event0, ...
+mem.write.cm    %cond, %addr, %mask, %data, %target, %event0, ...
 mem.fill        %data, %target, %event0, ...
-latch.write     %nextValue, %target
+latch.write     %data, %target
+latch.write.c   %cond, %data, %target
+latch.write.m   %mask, %data, %target
+latch.write.cm  %cond, %mask, %data, %target
 mem.write_lanes %laneMask, %data, %target, %event0, ...
 ```
 
@@ -123,11 +133,11 @@ Variable 自身的结构化 metadata，不属于 Instruction Attribute。
 | `slice_dynamic` | `%d` | `%base, %start` | - |
 | `slice_array` | `%d` | `%base, %index` | - |
 | `changed.any/pos/neg` | `%res` | `%new, %old (rw)` | - |
-| `reg.write` | - | `%nextValue, %target (rw), %event0, ..., %eventE-1` | - |
+| `reg.write/reg.write.c/reg.write.m/reg.write.cm` | - | `%cond?, %mask?, %data, %target (rw), %event0, ..., %eventE-1` | - |
 | `mem.read` | `%res` | `%target, %addr` | - |
-| `mem.write` | - | `%cond, %addr, %mask, %data, %target (rw), %event0, ..., %eventE-1` | - |
+| `mem.write/mem.write.c/mem.write.m/mem.write.cm` | - | `%cond?, %addr, %mask?, %data, %target (rw), %event0, ..., %eventE-1` | - |
 | `mem.fill` | - | `%data, %target (rw), %event0, ..., %eventE-1` | - |
-| `latch.write` | - | `%nextValue, %target (rw)` | - |
+| `latch.write/latch.write.c/latch.write.m/latch.write.cm` | - | `%cond?, %mask?, %data, %target (rw)` | - |
 | `system.function` | `%res` | `%arg0, ..., %argA-1` | `has_side_effects: Bool, name: String, schedule: Enum` |
 | `system.task` | - | `%cond, %arg0, ..., %argA-1, %event0, ..., %eventE-1` | `event_count: Nat, event_mode: Enum, name: String, schedule: Enum` |
 | `dpi.call` | `%return?, %out0, ..., %outO-1, %inout0, ..., %inoutQ-1` | `%cond, %in0, ..., %inI-1, %inout0, ..., %inoutQ-1, %event0, ..., %eventE-1` | `event_count: Nat, event_mode: Enum, import: String` |
@@ -422,53 +432,58 @@ Variable 的宽度和 Signedness 来自 `kRegister.width/isSigned`；`initValue`
 `Init = undef`。`kRegisterReadPort` 直接映射到该 VarId，对 register 的读取就是读取
 `%target`，不生成指令。
 
-`kRegisterWritePort` lower 为：
+`kRegisterWritePort` 按 cond/mask 的常量性 lower 为 4 个变体之一：
 
 ```text
-reg.write %nextValue, %target, %event0, ..., %eventE-1
+reg.write       %data, %target, %event0, ..., %eventE-1
+reg.write.c     %cond, %data, %target, %event0, ..., %eventE-1
+reg.write.m     %mask, %data, %target, %event0, ..., %eventE-1
+reg.write.cm    %cond, %mask, %data, %target, %event0, ..., %eventE-1
 ```
 
 各 operand 定义如下：
 
 | Operand | Type | 含义 |
 | --- | --- | --- |
-| `%nextValue` | 与 `%target` 完全相同 | 已合并全部写入条件与掩码的新值；指令把它原样写入 `%target`。 |
+| `%cond`（仅 `.c/.cm`） | `BV<1, SignC>` | 写入条件；为 0 时整写抑制。Signedness 被忽略。 |
+| `%mask`（仅 `.m/.cm`） | 与 `%target` 完全相同 | 逐 bit 写掩码。 |
+| `%data` | 与 `%target` 完全相同 | 写数据。 |
 | `%target` | `BV<W, Sign>` | 对应 `kRegister` 的可写 Variable，同时是本指令的读写目标。 |
 | `%event0...E-1` | `BV<1, unsigned>` | 声明该写所属事件签名的触发事件；`E >= 0`（当前 GRH lowering 要求每个 register 写口至少一个 event）。 |
 
-指令先同时读取全部 operand 的原值，再一次写回：
+指令先同时读取全部 operand 的原值。带 `%cond` 的变体仅在 `cond = 1` 时执行写，
+`cond = 0` 时 `%target` 完全不变（不发生任何读旧值/混合，也不做判变比较）。执行
+写时：
 
 ```text
-target' = nextValue
+无 mask 变体：  target' = data
+带 mask 变体：  target' = (target & ~mask) | (data & mask)
 ```
 
-写指令自身没有 cond/mask/event 判定：源设计的写使能、逐 bit 掩码和多写优先级已由
-lowering 折叠进 `%nextValue`（read-old 链式规则见下）；是否执行写由所在 commit
-Block 的 gate 决定（块首部 gate detector 结果的 OR，整块只判一次，见
+mask 混合是 commit 局部的读旧值行为（读取执行点可见的 live 值做位混合后写回），不
+作为图值跨 compute→commit 边界。"所有分支不触发 → 保持旧值"由**不写**保证，不再
+依赖 read-old 快照或自 mux。是否执行写同时仍受所在 commit Block 的 gate 决定（块
+首部 gate detector 结果的 OR，整块只判一次，见
 [执行模型第 4.4 节](grhsim-am.md#44-state-write-与-reader-重激活)）。`%event`
 operand 声明该写所属的事件签名：scheduler 把每个 event 经其定义 `changed` 规范化为
 （边沿种类, 被观测 Variable），按签名集合划分 commit Block，并把 event operand 重
-指向块内克隆的 gate detector 结果；它不再逐指令参与触发判定。
+指向块内克隆的 gate detector 结果；它不再逐指令参与触发判定。`%cond/%mask` 是写
+指令自身的门控操作数，不进入事件签名。
 
-`%target` 必须与所有 event 使用不同 VarId；它可以在 Type 允许时与 `%nextValue`
+`%target` 必须与所有 event 使用不同 VarId；它可以在 Type 允许时与 `%data`
 使用相同 VarId，上述"先读后写"规则保证别名时仍使用指令开始时读到的值。
-`reg.write` 不产生 result。`reg.write` 只位于 commit Block：commit Block 与 compute
+`reg.write` 各变体不产生 result，只位于 commit Block：commit Block 与 compute
 Block 一样按激活位执行，只在其 gate detector watch 的变量变化后被激活。
 `reg.write` 也不隐式激活读取 `%target` 的 Block；使 `%target` 实际变化且存在
 reader 时，由块尾共享判变 detector 激活 reader compute Block，因此 scheduler 在同一
 commit Block 的最终写回之后物化一条共享的 `changed.any %target, %targetOld`，再通过
 `act.b` 传播。
 
-cond/mask 折叠规则：同一 `%target`、同一事件签名的写链折叠为单条 `reg.write`。令
-链中第 i 条写的 GRH 条件为 cond_i、掩码为 mask_i、数据为 next_i，acc 初值为
-`%target` 自身（read-old：读取本轮 commit 相位开始前的状态值），按链序：
-
-```text
-blend_i = (acc & ~mask_i) | (next_i & mask_i)
-acc     = mux(cond_i, blend_i, acc)
-```
-
-链尾的 acc 即为 `%nextValue`；无掩码的写其 blend_i 退化为 `next_i`。
+变体选择规则（lowering）：`cond` 为常量 0 或 `mask` 为常量 0 的写整条消除；`cond`
+为常量 1 时选无 `.c` 变体（`%cond` 不占操作数位）；`mask` 为全 1 时选无 `.m` 变体
+（`%mask` 不占操作数位）。同一 `%target`、同一事件签名的多条写按链序逐条发射
+（每条独立选变体，不做 OR/mux 合并），commit Block 内按 ordinal 顺序执行、后写覆盖
+先写（带 mask 的后写只混合自己的掩码位），与逐写口依次生效的旧折叠链语义等价。
 
 GRH `eventEdge[i]` 与 `events[i]` 在 lower 时先转换成 event：`posedge` 使用
 `changed.pos`，`negedge` 使用 `changed.neg`。同一 (边沿种类, 被观测 Variable) 的
@@ -476,17 +491,16 @@ event 在一次 Graph lowering 内共享一条 `changed.pos/changed.neg` 指令�
 old/event Variable，不为每个写口分别创建 detector；各消费方读到的是同一 detector 的
 观测历史。同一写口的多个 event 构成一个事件签名，任一 event 命中都打开所在块的
 gate（效果同旧的逐指令 OR 触发）；event 列表不表示事件优先级，也不根据触发来源选择
-nextValue；同步/异步 reset、enable 等优先级由 lowering 折叠 `%nextValue` 时按链序
-嵌套 mux 显式编码。例如：
+data；同步/异步 reset、enable 等优先级由 GRH IR 的写口规范化（guard 的 OR 与按链序
+嵌套的优先级 mux）在进入 AM 前编码进 `%cond/%data`。例如：
 
 ```text
-reg.write %mergedNext, %q, %clkpos, %rstneg
+reg.write.c %en, %d, %q, %clkpos
 ```
 
-`%clkpos` 或 `%rstneg` 任一个命中都打开所在 commit Block 的 gate，最终写入的 data
-由 `%mergedNext` 决定（例如先折叠 reset 分支、再折叠 enable 分支）。同一原始信号同时
-需要 posedge 和 negedge 时，可以按第 11 节示例只执行一次 `changed.any`，再在 B0 或
-compute Block 中根据当前单 bit 值派生 `%event`。
+`%clkpos` 命中打开所在 commit Block 的 gate，`%en = 1` 时把 `%d` 写入 `%q`。同一
+原始信号同时需要 posedge 和 negedge 时，可以按第 11 节示例只执行一次 `changed.any`，
+再在 B0 或 compute Block 中根据当前单 bit 值派生 `%event`。
 
 例如：
 
@@ -496,31 +510,32 @@ B0:
     %clkpos = logic_and %clkchanged, %clk
     act.f %clkchanged {targets = [3, 7]}
 
-B3:  // compute Block：读取 %q 等，计算 %d 并按上式折叠出 %next
+B3:  // compute Block：读取 %q 等，计算 %d、%en
     ...
 
 B7:  // commit Block
     %g = changed.pos %clk, %gclk_old   // 首部 gate detector（scheduler 克隆）
-    reg.write %next, %q, %g
+    reg.write.c %en, %next, %q, %g
     %qchanged = changed.any %q, %qold  // 尾部 watch
     act.b %qchanged {targets = [3]}
 ```
 
-这等价于在 `%clk` 上升沿把折叠后的 `%next` 写入 `%q`：`%clk` 是 B7 首部 gate
-detector watch 的变量，B0 对它的判变经 `act.f` 激活 B7（commit Block 的激活只允许
-携带 gate detector watch 的变量，def-use 数据边不激活 commit Block）。块首部
+这等价于在 `%clk` 上升沿且 `%en` 为 1 时把 `%next` 写入 `%q`：`%clk` 是 B7 首部
+gate detector watch 的变量，B0 对它的判变经 `act.f` 激活 B7（commit Block 的激活
+只允许携带 gate detector watch 的变量，def-use 数据边不激活 commit Block）。块首部
 detector 在块被激活时先执行并更新基线；gate（全部首部 detector 结果的 OR）为假时
-跳过块内全部写与尾部 watch——例如下降沿轮次中 `%g = 0`，B7 被激活但不写 `%q`。
-只有 `%q` 的最终位模式实际变化时 `%qchanged` 才为 1，`act.b` 激发并要求下一轮重新
-执行 reader compute Block B3。
+跳过块内全部写与尾部 watch——例如下降沿轮次中 `%g = 0`，B7 被激活但不写 `%q`；
+`%en = 0` 的轮次 gate 打开但写被 `%cond` 抑制，`%q` 保持且不做判变比较。只有 `%q`
+的最终位模式实际变化时 `%qchanged` 才为 1，`act.b` 激发并要求下一轮重新执行 reader
+compute Block B3。
 
-lowering 把同一 `%target`、同一事件签名的写链折叠为单条 `reg.write`，因此一个
-commit Block 内同一 target 至多一条写。同一 target 的多写只能来自不同事件签名的
-commit Block，由 commit 段静态 BlockId 顺序表达优先级：后执行的块读取前一块写后的
-target。每个 commit Block 对自身写入的每个 state target 在块尾物化共享的
-`changed.any %target, %targetOld`，reader 一律在下一轮执行，只看到本轮最终值。需要与
-源设计一致的优先级时，lower 必须通过写链折叠顺序和 commit 段块序显式编码，不得依赖
-GRH Operation 的原始遍历顺序。
+同一 `%target`、同一事件签名的写链按链序逐条发射（canonical 输入已规范化为单写口，
+组内通常只有一条写）；组内多写按 ordinal 顺序执行，后写观察到先写的结果。同一
+target 的多写也可以来自不同事件签名的 commit Block，由 commit 段静态 BlockId 顺序
+表达优先级：后执行的块读取前一块写后的 target。每个 commit Block 对自身写入的每个
+state target 在块尾物化共享的 `changed.any %target, %targetOld`，reader 一律在下一轮
+执行，只看到本轮最终值。需要与源设计一致的优先级时，lower 必须通过写口顺序和 commit
+段块序显式编码，不得依赖 GRH Operation 的原始遍历顺序。
 
 ### 12.2 Memory
 
@@ -561,24 +576,34 @@ event operand，而是由上层 Register 捕获 `%res`。
 
 #### 12.2.2 `mem.write`
 
-GRH `kMemoryWritePort` lower 为：
+GRH `kMemoryWritePort` 按 cond/mask 的常量性 lower 为 4 个变体之一：
 
 ```text
-mem.write %cond, %addr, %mask, %data, %target, %event0, ..., %eventE-1
+mem.write       %addr, %data, %target, %event0, ..., %eventE-1
+mem.write.c     %cond, %addr, %data, %target, %event0, ..., %eventE-1
+mem.write.m     %addr, %mask, %data, %target, %event0, ..., %eventE-1
+mem.write.cm    %cond, %addr, %mask, %data, %target, %event0, ..., %eventE-1
 ```
 
 | Operand | Type | 含义 |
 | --- | --- | --- |
-| `%cond` | `BV<1, SignC>` | 写使能；为 0 时整写抑制。Signedness 被忽略。 |
+| `%cond`（仅 `.c/.cm`） | `BV<1, SignC>` | 写使能；为 0 时整写抑制。Signedness 被忽略。 |
 | `%addr` | `BV<A, SignA>` | 写地址；`A >= 1`，Signedness 被忽略。 |
-| `%mask` | `BV<W, SignM>` | 逐 bit 写掩码，宽度等于元素宽度 `W`；Signedness 被忽略。 |
+| `%mask`（仅 `.m/.cm`） | `BV<W, SignM>` | 逐 bit 写掩码，宽度等于元素宽度 `W`；Signedness 被忽略。 |
 | `%data` | `BV<W, Sign>` | 写数据，与 memory 元素 Type 完全相同。 |
 | `%target` | `Array<N, BV<W, Sign>>` | 被写入的 memory Variable。 |
-| `%event0...E-1` | `BV<1, unsigned>` | 声明该写所属事件签名的触发事件；`E >= 1`（operand 总数至少 6）。 |
+| `%event0...E-1` | `BV<1, unsigned>` | 声明该写所属事件签名的触发事件；`E >= 1`（当前 GRH lowering 要求每个写口至少一个 event）。 |
 
 `Sign`、`SignC`、`SignA` 和 `SignM` 分别取 `signed` 或 `unsigned`。指令先同时读取全部
-operand 的原值。仅当 `cond = 1` 且 `U(addr) < N` 时执行写，此时只更新地址
-`r = U(addr)` 对应的 row，对每个 `j in [0, W)`：
+operand 的原值。仅当（无 `%cond` 或 `cond = 1`）且 `U(addr) < N` 时执行写，此时只
+更新地址 `r = U(addr)` 对应的 row。无 mask 变体整元素覆盖，不读旧值：
+
+```text
+target'[r] = data
+target'[k] = target[k]    for k != r
+```
+
+带 mask 变体对每个 `j in [0, W)` 做 commit 局部的位混合：
 
 ```text
 mask[j] = 1 → target'[r][j] = data[j]
@@ -587,22 +612,26 @@ target'[k] = target[k]    for k != r
 ```
 
 否则（`cond = 0` 或地址越界）整个 `%target` 保持不变——cond 抑制与越界抑制是
-`mem.write` 自身保留的判定；被抑制的写不发生任何读旧值/混合，`%target` 完全不变。
-`%mask` 全 0 的写不改变任何 bit，效果等同整写抑制。写指令自身没有 event 判定：是否
-执行写由所在 commit Block 的 gate 决定；event operand 的事件签名声明与重指向规则与
-`reg.write` 相同。`mem.write` 不产生 result，也不隐式激活读取 `%target` 的 Block；
-`mem.write` 只位于 commit Block，需要传播实际 memory 变化时，scheduler 使用同块尾部
-`changed.any` 检测最终 Array Value，再通过 `act.b` 激活相关 reader compute Block；
-被抑制的写不改变 Array Value，不会触发该 detector。eventEdge lowering 与 `reg.write`
-相同。
+`mem.write` 各变体自身保留的判定；被抑制的写不发生任何读旧值/混合，`%target` 完全
+不变。`%mask` 全 0 的写不改变任何 bit，效果等同整写抑制。写指令自身没有 event 判定：
+是否执行写由所在 commit Block 的 gate 决定；event operand 的事件签名声明与重指向规则
+与 `reg.write` 相同，`%cond/%mask` 不进入事件签名。`mem.write` 各变体不产生
+result，也不隐式激活读取 `%target` 的 Block；它们只位于 commit Block，需要传播实际
+memory 变化时，scheduler 使用同块尾部 `changed.any` 检测最终 Array Value，再通过
+`act.b` 激活相关 reader compute Block；被抑制的写不改变 Array Value，不会触发该
+detector。eventEdge lowering 与 `reg.write` 相同。
 
-多写规则：同一 `%target`、同一事件签名内的每条元素写保留为一条 `mem.write`，lowering
-不为元素写插入 read-old `mem.read`，也不做跨写合并。块内多条写按指令顺序依次生效：
-每条写直接作用在执行点可见的 live memory image 上，同地址碰撞由后写覆盖先写，部分
-掩码的后写也不会破坏更早写更新的其他 bit。例如：
+变体选择规则（lowering）：`cond` 为常量 0 或 `mask` 为常量 0 的写整条消除；`cond`
+为常量 1 时选无 `.c` 变体；`mask` 为全 1 时选无 `.m` 变体。选中的常量 `%cond/%mask`
+操作数不下移；保留在 `.m/.cm` 上的常量 `%mask` 在 C++ emitter 端折叠为立即数。
+
+多写规则：同一 `%target`、同一事件签名内的每条元素写保留为一条 `mem.write` 变体，
+lowering 不为元素写插入 read-old `mem.read`，也不做跨写合并。块内多条写按指令顺序
+依次生效：每条写直接作用在执行点可见的 live memory image 上，同地址碰撞由后写覆盖
+先写，部分掩码的后写也不会破坏更早写更新的其他 bit。例如：
 
 ```text
-mem.write %wen, %waddr, %wmask, %wdata, %mem, %clkpos
+mem.write.cm %wen, %waddr, %wmask, %wdata, %mem, %clkpos
 ```
 
 仅当所在块 gate 打开、`%wen = 1` 且 `U(waddr) < N` 时，把 `%wdata` 按 `%wmask` 写入
@@ -675,35 +704,41 @@ write 可以覆盖选中 row；write 后的 fill 会覆盖整个 memory。需要
 的宽度和 Signedness 来自 `kLatch.width/isSigned`，并使用 `Init = undef`。
 `kLatchReadPort` 直接映射到该 VarId，对 stored latch value 的读取不生成指令。
 
-GRH `kLatchWritePort` lower 为：
+GRH `kLatchWritePort` 按 cond/mask 的常量性 lower 为 4 个变体之一：
 
 ```text
-latch.write %nextValue, %target
+latch.write     %data, %target
+latch.write.c   %cond, %data, %target
+latch.write.m   %mask, %data, %target
+latch.write.cm  %cond, %mask, %data, %target
 ```
 
 | Operand | Type | 含义 |
 | --- | --- | --- |
-| `%nextValue` | 与 `%target` 完全相同 | 已合并透明条件与掩码的新值。 |
+| `%cond`（仅 `.c/.cm`） | `BV<1, SignC>` | 透明/写使能条件；为 0 时整写抑制。Signedness 被忽略。 |
+| `%mask`（仅 `.m/.cm`） | 与 `%target` 完全相同 | 逐 bit 写掩码。 |
+| `%data` | 与 `%target` 完全相同 | 写数据。 |
 | `%target` | `BV<W, Sign>` | 对应 `kLatch` 的可写 Variable，同时是读写目标。 |
 
-`latch.write` 恰好两个 operand，没有 event。指令先同时读取全部 operand，再无判定地
-一次写回：
+`latch.write` 各变体恰好携带上表列出的 operand，没有 event。指令先同时读取全部
+operand。带 `%cond` 的变体仅在 `cond = 1` 时执行写，`cond = 0` 时 `%target` 完全
+不变（不发生任何读旧值/混合）。执行写时：
 
 ```text
-target' = nextValue
+无 mask 变体：  target' = data
+带 mask 变体：  target' = (target & ~mask) | (data & mask)
 ```
 
-源设计的透明/写使能条件与逐 bit 掩码由 lowering 按与 `reg.write` 相同的 read-old
-链式规则折叠进 `%nextValue`：acc 初值为 `%target`，按链序
-`acc = mux(cond_i, (acc & ~mask_i) | (next_i & mask_i), acc)`（无掩码时 blend 退化为
-`next_i`）。`latch.write` 是 level-sensitive 的：折叠后的 `%nextValue` 在条件不成立
-时等于 `%target` 当前值，因此写回总是安全；纯 latch commit Block 的 gate 由每条
-latch 写一条 `changed.any %nextValue` 构成，只有 nextValue 实际变化才激活块并执行
-写回。
+变体选择规则与 `reg.write` 相同：常量 0 的 `cond`/`mask` 使整条写消除，常量 1 的
+`cond` 与全 1 的 `mask` 不占操作数位。"条件不成立 → 保持 stored value"由**不写**
+保证。`latch.write` 是 level-sensitive 的：纯 latch commit Block 的 gate 由每条
+latch 写的门控/数据 operand（`%cond?/%mask?/%data`）各一条 `changed.any` 构成，
+任一变化都激活块并重新求值写回——`cond` 由 0 变 1 唤醒写回，`cond = 0` 时
+`%data` 的变化只激活块而不写。
 
-`%target` 可以在 Type 允许时与 `%nextValue` 使用相同 VarId，结果仍基于指令开始时
-读取的值。`latch.write` 不产生 result，也不隐式激活读取 `%target` 的 Block；
-`latch.write` 只位于 commit Block，最终 stored value 的实际变化由同块尾部共享的
+`%target` 可以在 Type 允许时与 `%data` 使用相同 VarId，结果仍基于指令开始时
+读取的值。`latch.write` 各变体不产生 result，也不隐式激活读取 `%target` 的 Block；
+它们只位于 commit Block，最终 stored value 的实际变化由同块尾部共享的
 `changed.any %target, %targetOld` 检测并经 `act.b` 传播。
 
 建议在 lower 到 GRHSIM-AM 前运行 GRH
@@ -731,17 +766,16 @@ transform 后，原 `kLatchReadPort` 仍映射到 `%target`，新增的 `not/and
 
 ```text
 // commit Block（纯 latch 块）
-%g = changed.any %mergedNext, %gold   // 首部 gate detector：nextValue 判变
-latch.write %mergedNext, %q
-%qchanged = changed.any %q, %qold     // 尾部 watch
+%g = changed.any %en, %gold2      // 首部 gate detector：cond 判变
+%h = changed.any %d, %gold3       // 首部 gate detector：data 判变
+latch.write.c %en, %d, %q
+%qchanged = changed.any %q, %qold  // 尾部 watch
 act.b %qchanged {targets = [5]}
 ```
 
-其中 `%mergedNext` 由 lowering 折叠产生，例如
-`%mergedNext = mux %gate, (or (and %d, %allMask), (and %q, (not %allMask))), %q`。
-`%gate = 0` 时 `%mergedNext = %q`，块不被激活或 gate 关闭，`%q` 保持。只有 stored
-`%q` 的位模式实际变化时 `%qchanged` 才为 1，`act.b` 激发并在下一轮激活 reader
-compute Block B5。
+`%en` 或 `%d` 任一变化都激活该块；`%en = 1` 时把 `%d` 写入 `%q`，`%en = 0` 时
+`%q` 保持。只有 stored `%q` 的位模式实际变化时 `%qchanged` 才为 1，`act.b` 激发
+并在下一轮激活 reader compute Block B5。
 
 ### 12.4 数组视图（Array View）
 
@@ -1280,11 +1314,12 @@ Backward 依赖。
 - 每次 `eval()` 开始和每轮结束时，存在跨 Block 消费者的 `changed` res 均被清零；
   跨块消费的 res 其生产 Block 的 BlockId 必须小于消费 Block；act 使用的
   组合派生 event 在 act 所在 Block 中先行计算；
-- `reg.write` 的 nextValue、target 和 event 数量及 Type 满足第 12.1 节；target 不是
-  constant，且与每个 event 使用不同 VarId；
+- `reg.write` 各变体的 cond（若有）、mask（若有）、data、target 和 event 数量及 Type
+  满足第 12.1 节；target 不是 constant，且与每个 event 使用不同 VarId；
 - `mem.read` 的 target/addr/res Type 满足第 12.2.1 节，res 不是 constant；
-- `mem.write` 的 cond、addr、mask、data、target 和 event 数量及 Type 满足第 12.2.2 节，
-  target 不是 constant；带 priority 的写组完整且按规定顺序 lower；
+- `mem.write` 各变体的 cond（若有）、addr、mask（若有）、data、target 和 event 数量
+  及 Type 满足第 12.2.2 节，target 不是 constant；带 priority 的写组完整且按规定顺序
+  lower；
 - `mem.fill` 的 data、target 和 event 数量及 Type 满足第 12.2.3 节；data 宽度恒等于
   数学整数 `N*W`（整片 packed 图像），target 不是 constant；
 - `mem.read_all` 的 target/res Type 满足第 12.4.1 节，res 不是 constant；
@@ -1292,9 +1327,10 @@ Backward 依赖。
   target 不是 constant；带 priority 的写组完整且按规定顺序 lower；
 - `array.mux/array.broadcast/array.onehot` 的 operand/result 宽度整除关系满足
   第 12.4 节；`array.reduce_*` 的 result 是 `BV<1, unsigned>`；
-- `latch.write` 恰好两个 operand，nextValue 和 target Type 满足第 12.3 节，target
-  不是 constant；若未运行 `latch-transparent-read`，每个 latch read 的透明旁路已由其他
-  等价 GRH 组合逻辑显式表达；
+- `latch.write` 各变体恰好携带第 12.3 节列出的 operand（无 event），cond（若有）、
+  mask（若有）、data 和 target 的 Type 满足第 12.3 节，target 不是 constant；若未运行
+  `latch-transparent-read`，每个 latch read 的透明旁路已由其他等价 GRH 组合逻辑显式
+  表达；
 - 输入 lowering 的 GRH 不包含 `kInstance/kXMRRead/kXMRWrite`，这些结构操作已按第 13 节
   展开或消解；输入也不包含任何 `kBlackbox`，且不得通过 HostEnvironment 或外部模型
   binding 绕过该限制；
@@ -1311,7 +1347,8 @@ Backward 依赖。
 - `slice_static.lsb` 是满足第 10 节范围约束的 Nat，且该指令没有其他 Attribute；
 - `targets` 是静态非空 BlockId set Attribute，且 act 没有其他 Attribute；commit Block
   构成 Block 空间的连续后缀 `[CommitBegin, BlockCount)`；state write
-  （`reg.write/latch.write/mem.write/mem.fill/mem.write_lanes`）只位于 commit
+  （`reg.write/latch.write/mem.write` 各变体与 `mem.fill/mem.write_lanes`）只位于
+  commit
   Block，且 commit Block 内每条 state write 之前至少有一条 `changed.*` gate
   detector；`act.f` 对所在 Block B 其每个 Target 满足 `B.BlockId < Target`（可指向
   更晚的 compute 或 commit Block）；`act.b` 只位于非 EntryBlock，其每个 Target

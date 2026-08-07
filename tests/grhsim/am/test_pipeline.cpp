@@ -1009,17 +1009,37 @@ namespace
         const OpcodeTraits registerTraits = opcodeTraits(Opcode::RegisterWrite);
         const OpcodeTraits fillTraits = opcodeTraits(Opcode::MemoryFill);
         const OpcodeTraits lanesTraits = opcodeTraits(Opcode::MemoryWriteLanes);
-        // Write operand layout is [addr?, nextValue, target, events...]: the
-        // state target sits at 1 for reg/fill, at 2 for mem.writeLanes, and
-        // at 4 for mem.write ([cond, addr, mask, data, target, events...]).
+        // Write operand layout is [cond?, addr?(mem), mask?, data, target,
+        // events...]: the state target is the last fixed operand -- 1 for
+        // reg/fill, 2 for mem.write and mem.write_lanes, 4 for mem.write.cm
+        // ([cond, addr, mask, data, target, events...]).
+        const OpcodeTraits writeCmTraits = opcodeTraits(Opcode::MemoryWriteCondMask);
         if (!readTraits.memoryAccess || readTraits.effect != OpcodeEffect::StateRead ||
             readTraits.stateTargetOperand != 0 || !writeTraits.memoryAccess ||
             writeTraits.effect != OpcodeEffect::StateReadWrite ||
-            writeTraits.stateTargetOperand != 4 || !writeTraits.hasOrderedEffect ||
+            writeTraits.stateTargetOperand != 2 || !writeTraits.hasOrderedEffect ||
+            !writeCmTraits.memoryAccess || writeCmTraits.stateTargetOperand != 4 ||
             registerTraits.stateTargetOperand != 1 ||
             fillTraits.stateTargetOperand != 1 || lanesTraits.stateTargetOperand != 2)
         {
             return fail("opcode traits must expose memory access and ordering semantics");
+        }
+        // The layout helper derives the same fixed-operand positions for all
+        // 12 reg/latch/mem write variants.
+        const StateWriteLayout regCm = stateWriteLayout(Opcode::RegisterWriteCondMask);
+        const StateWriteLayout latchC = stateWriteLayout(Opcode::LatchWriteCond);
+        const StateWriteLayout memM = stateWriteLayout(Opcode::MemoryWriteMask);
+        if (!regCm.isStateWrite || regCm.memory || !regCm.hasCond || !regCm.hasMask ||
+            regCm.fixedCount != 4 || regCm.dataIndex != 2 || regCm.targetIndex != 3 ||
+            !latchC.isStateWrite || latchC.memory || !latchC.hasCond || latchC.hasMask ||
+            latchC.fixedCount != 3 || latchC.dataIndex != 1 || latchC.targetIndex != 2 ||
+            !memM.isStateWrite || !memM.memory || memM.hasCond || !memM.hasMask ||
+            memM.fixedCount != 4 || memM.dataIndex != 2 || memM.targetIndex != 3 ||
+            !isStateWriteOpcode(Opcode::MemoryFill) ||
+            !isStateWriteOpcode(Opcode::MemoryWriteLanes) ||
+            isStateWriteOpcode(Opcode::MemoryRead))
+        {
+            return fail("state-write layout helper disagrees with the operand layouts");
         }
         return 0;
     }

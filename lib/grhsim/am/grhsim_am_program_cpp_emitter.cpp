@@ -1,5 +1,7 @@
 #include "grhsim/am/grhsim_am_program_cpp_emitter.hpp"
 
+#include "grhsim/am/grhsim_am_opcode_traits.hpp"
+
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -564,6 +566,68 @@ namespace wolvrix::lib::grhsim::am
             return (isWideBitVector(state, variable) || type.kind == TypeKind::Array)
                        ? wideDataExpr(state, variable)
                        : "&" + valueExpr(state, variable);
+        }
+
+        // The word value of a constant-initialized narrow bit-vector
+        // variable, when it is one: lets a state-write mask fold to an
+        // immediate instead of reading a state slot.
+        std::optional<uint64_t> scalarConstantWord(const EmitState &state, VariableId variable)
+        {
+            const VariableRecord &record = state.program.variable(variable);
+            if (!record.init.valid() || record.init.value >= state.program.initCount())
+            {
+                return std::nullopt;
+            }
+            const InitDescriptor &init = state.program.init(record.init);
+            if (init.kind != InitKind::Constant)
+            {
+                return std::nullopt;
+            }
+            const LiteralView literal = state.program.literal(LiteralId{init.payload});
+            const Type &literalType = state.program.type(literal.type);
+            if (literalType.kind != TypeKind::BitVector || literalType.bitWidth > 64)
+            {
+                return std::nullopt;
+            }
+            return literal.words.empty() ? uint64_t{0} : literal.words.front();
+        }
+
+        // Stack-local word-array declaration rendering a constant bit-vector
+        // variable ("const std::uint64_t <name>[N] = {...};"), so word-level
+        // helpers can take a constant mask without a state-slot read.
+        std::optional<std::string> constantWordsDecl(const EmitState &state, VariableId variable,
+                                                     const std::string &name)
+        {
+            const VariableRecord &record = state.program.variable(variable);
+            if (!record.init.valid() || record.init.value >= state.program.initCount())
+            {
+                return std::nullopt;
+            }
+            const InitDescriptor &init = state.program.init(record.init);
+            if (init.kind != InitKind::Constant)
+            {
+                return std::nullopt;
+            }
+            const LiteralView literal = state.program.literal(LiteralId{init.payload});
+            const Type &literalType = state.program.type(literal.type);
+            if (literalType.kind != TypeKind::BitVector)
+            {
+                return std::nullopt;
+            }
+            const std::size_t words =
+                (static_cast<std::size_t>(literalType.bitWidth) + 63U) / 64U;
+            std::string decl = "const std::uint64_t " + name + "[" + std::to_string(words) +
+                               "] = {";
+            for (std::size_t word = 0; word < words; ++word)
+            {
+                if (word != 0)
+                {
+                    decl += ", ";
+                }
+                decl += wordMaskLiteral(word < literal.words.size() ? literal.words[word] : 0);
+            }
+            decl += "};";
+            return decl;
         }
 
         uint64_t storedWordCount(const EmitState &state, VariableId variable)
@@ -1569,25 +1633,69 @@ namespace wolvrix::lib::grhsim::am
                 }
             }
 
-            if ((opcode == Opcode::RegisterWrite || opcode == Opcode::LatchWrite) &&
-                isWideBitVector(state, operands[1]))
+            const StateWriteLayout wideWriteLayout = stateWriteLayout(opcode);
+            if (wideWriteLayout.isStateWrite && !wideWriteLayout.memory &&
+                isWideBitVector(state, operands[wideWriteLayout.targetIndex]))
             {
-                // Merged nextValue form: operands[0] is the fully blended
-                // next value, operands[1] the state target; the Block gate
-                // already decided that this write runs.
-                const uint32_t width = variableType(state, operands[1]).bitWidth;
-                if (opcode == Opcode::RegisterWrite && state.scalarWriteRaise >= 0)
+                // Wide scalar write: target/data(/mask) share one Type, so all
+                // are wide word arrays. A present cond gates the whole
+                // statement; a present mask turns the plain copy into a
+                // read-modify-write mix at commit time.
+                const VariableId target = operands[wideWriteLayout.targetIndex];
+                const VariableId data = operands[wideWriteLayout.dataIndex];
+                const uint32_t width = variableType(state, target).bitWidth;
+                std::string body;
+                if (wideWriteLayout.hasMask)
+                {
+                    const VariableId mask =
+                        operands[wideWriteLayout.hasCond ? 1 : 0];
+                    const std::string constName =
+                        "write_mask_" + std::to_string(instruction.value);
+                    std::string maskWords;
+                    if (std::optional<std::string> decl =
+                            constantWordsDecl(state, mask, constName))
+                    {
+                        body = *decl + "\n";
+                        maskWords = constName;
+                    }
+                    else
+                    {
+                        maskWords = wideDataExpr(state, mask);
+                    }
+                    const std::string writeArgs =
+                        wideDataExpr(state, target) + ", " + wideDataExpr(state, data) +
+                        ", " + maskWords + ", " + std::to_string(width) + ")";
+                    if (isRegisterWriteOpcode(opcode) && state.scalarWriteRaise >= 0)
+                    {
+                        // ST00013: report a real change for the raise flag.
+                        body += "wrChg_" + std::to_string(state.scalarWriteRaise) +
+                                " |= masked_write_words_detect(" + writeArgs + ";\n";
+                    }
+                    else
+                    {
+                        body += "masked_write_words(" + writeArgs + ";\n";
+                    }
+                }
+                else if (isRegisterWriteOpcode(opcode) && state.scalarWriteRaise >= 0)
                 {
                     // ST00013: report a real change for the raise flag.
-                    return "wrChg_" + std::to_string(state.scalarWriteRaise) +
-                           " |= assign_words_detect(" + wideDataExpr(state, operands[1]) +
+                    body = "wrChg_" + std::to_string(state.scalarWriteRaise) +
+                           " |= assign_words_detect(" + wideDataExpr(state, target) +
                            ", " + std::to_string(width) + ", " +
-                           wideDataExpr(state, operands[0]) + ", " +
+                           wideDataExpr(state, data) + ", " +
                            std::to_string(width) + ", false);\n";
                 }
-                return "assign_words(" + wideDataExpr(state, operands[1]) + ", " +
-                       std::to_string(width) + ", " + wideDataExpr(state, operands[0]) +
-                       ", " + std::to_string(width) + ", false);\n";
+                else
+                {
+                    body = "assign_words(" + wideDataExpr(state, target) + ", " +
+                           std::to_string(width) + ", " + wideDataExpr(state, data) +
+                           ", " + std::to_string(width) + ", false);\n";
+                }
+                if (wideWriteLayout.hasCond)
+                {
+                    return "if (" + boolExpr(state, operands[0]) + ") { " + body + "}\n";
+                }
+                return body;
             }
 
             if (opcode == Opcode::ArrayMux || opcode == Opcode::ArrayReduceOr ||
@@ -1601,6 +1709,8 @@ namespace wolvrix::lib::grhsim::am
 
             const bool deferredUnsupported =
                 opcode == Opcode::MemoryRead || opcode == Opcode::MemoryWrite ||
+                opcode == Opcode::MemoryWriteCond || opcode == Opcode::MemoryWriteMask ||
+                opcode == Opcode::MemoryWriteCondMask ||
                 opcode == Opcode::MemoryFill || opcode == Opcode::MemoryReadAll ||
                 opcode == Opcode::MemoryWriteLanes || opcode == Opcode::SystemFunction ||
                 opcode == Opcode::SystemTask || opcode == Opcode::DpiCall;
@@ -1815,30 +1925,60 @@ namespace wolvrix::lib::grhsim::am
                            valueExpr(state, operands[0]) + ";\n";
                 }
                 case Opcode::RegisterWrite:
+                case Opcode::RegisterWriteCond:
+                case Opcode::RegisterWriteMask:
+                case Opcode::RegisterWriteCondMask:
+                case Opcode::LatchWrite:
+                case Opcode::LatchWriteCond:
+                case Opcode::LatchWriteMask:
+                case Opcode::LatchWriteCondMask:
                 {
-                    const VariableId target = operands[1];
+                    const StateWriteLayout layout = stateWriteLayout(opcode);
+                    const VariableId target = operands[layout.targetIndex];
+                    const VariableId data = operands[layout.dataIndex];
                     const uint32_t width = variableType(state, target).bitWidth;
-                    const std::string nextValue =
-                        valueExpr(state, operands[0]) + " & " + maskExpr(width);
-                    if (state.scalarWriteRaise >= 0)
+                    std::string nextValue =
+                        valueExpr(state, data) + " & " + maskExpr(width);
+                    if (layout.hasMask)
+                    {
+                        // Commit-local bit mix: (cur & ~mask) | (data & mask);
+                        // a constant mask folds to an immediate.
+                        const VariableId mask = operands[layout.hasCond ? 1 : 0];
+                        std::string maskText;
+                        if (const std::optional<uint64_t> constant =
+                                scalarConstantWord(state, mask))
+                        {
+                            maskText = wordMaskLiteral(*constant);
+                        }
+                        else
+                        {
+                            maskText = valueExpr(state, mask);
+                        }
+                        nextValue = "(" + valueExpr(state, target) + " & ~(" + maskText +
+                                    ")) | ((" + nextValue + ") & (" + maskText + "))";
+                    }
+                    std::string body;
+                    if (isRegisterWriteOpcode(opcode) && state.scalarWriteRaise >= 0)
                     {
                         // ST00013: compare at the write point and store only
                         // on a real change (the legacy write-point detection
                         // idiom); the tail detector reads the raise flag.
                         const std::string next =
                             "wrNext_" + std::to_string(instruction.value);
-                        return "{ const auto " + next + " = " + nextValue + ";\nif (" + next +
+                        body = "{ const auto " + next + " = " + nextValue + ";\nif (" + next +
                                " != " + valueExpr(state, target) + ") { " +
                                valueExpr(state, target) + " = " + next + "; wrChg_" +
                                std::to_string(state.scalarWriteRaise) + " = true; } }\n";
                     }
-                    return valueExpr(state, target) + " = " + nextValue + ";\n";
-                }
-                case Opcode::LatchWrite:
-                {
-                    const VariableId target = operands[1];
-                    return valueExpr(state, target) + " = " + valueExpr(state, operands[0]) +
-                           " & " + maskExpr(variableType(state, target).bitWidth) + ";\n";
+                    else
+                    {
+                        body = valueExpr(state, target) + " = " + nextValue + ";\n";
+                    }
+                    if (layout.hasCond)
+                    {
+                        return "if (" + boolExpr(state, operands[0]) + ") { " + body + "}\n";
+                    }
+                    return body;
                 }
                 case Opcode::MemoryRead:
                 {
@@ -1874,36 +2014,82 @@ namespace wolvrix::lib::grhsim::am
                     return code;
                 }
                 case Opcode::MemoryWrite:
+                case Opcode::MemoryWriteCond:
+                case Opcode::MemoryWriteMask:
+                case Opcode::MemoryWriteCondMask:
                 {
-                    const Type &memoryType = variableType(state, operands[4]);
-                    const Type &addressType = variableType(state, operands[1]);
-                    const uint32_t stride = variableStorage(state, operands[4]).wordCount;
+                    const StateWriteLayout layout = stateWriteLayout(opcode);
+                    const std::size_t addrIndex = layout.hasCond ? 1 : 0;
+                    const VariableId target = operands[layout.targetIndex];
+                    const VariableId data = operands[layout.dataIndex];
+                    const Type &memoryType = variableType(state, target);
+                    const Type &addressType = variableType(state, operands[addrIndex]);
+                    const uint32_t stride = variableStorage(state, target).wordCount;
                     const std::string suffix = std::to_string(instruction.value);
                     const std::string index = "memory_index_" + suffix;
                     std::string code = "{ const std::size_t " + index + " = index_words(" +
-                                       wordDataExpr(state, operands[1]) + ", " +
+                                       wordDataExpr(state, operands[addrIndex]) + ", " +
                                        std::to_string(addressType.bitWidth) + ", " +
                                        std::to_string(memoryType.elementCount) + ");\n";
-                    const std::string condition =
-                        boolExpr(state, operands[0]) + " && " + index + " != " +
-                        std::to_string(memoryType.elementCount);
-                    const std::string writeArgs =
-                        wordDataExpr(state, operands[4]) + " + " + index + " * " +
-                        std::to_string(stride) + ", " + wordDataExpr(state, operands[3]) +
-                        ", " + wordDataExpr(state, operands[2]) + ", " +
-                        std::to_string(memoryType.bitWidth) + ")";
-                    std::string body;
-                    if (state.arrayWriteAccum >= 0)
+                    std::string condition =
+                        index + " != " + std::to_string(memoryType.elementCount);
+                    if (layout.hasCond)
                     {
-                        // ST00011: fuse reader-activation change detection
-                        // into the element write (exact: only a real element
-                        // change raises the flag).
-                        body = "arrChg_" + std::to_string(state.arrayWriteAccum) +
-                               " |= masked_write_words_detect(" + writeArgs + ";";
+                        condition = boolExpr(state, operands[0]) + " && " + condition;
+                    }
+                    const std::string row = wordDataExpr(state, target) + " + " + index +
+                                            " * " + std::to_string(stride);
+                    std::string body;
+                    if (layout.hasMask)
+                    {
+                        const VariableId mask = operands[addrIndex + 1];
+                        const std::string constName = "write_mask_" + suffix;
+                        std::string maskWords;
+                        if (std::optional<std::string> decl =
+                                constantWordsDecl(state, mask, constName))
+                        {
+                            body = *decl + " ";
+                            maskWords = constName;
+                        }
+                        else
+                        {
+                            maskWords = wordDataExpr(state, mask);
+                        }
+                        const std::string writeArgs =
+                            row + ", " + wordDataExpr(state, data) + ", " + maskWords +
+                            ", " + std::to_string(memoryType.bitWidth) + ")";
+                        if (state.arrayWriteAccum >= 0)
+                        {
+                            // ST00011: fuse reader-activation change detection
+                            // into the element write (exact: only a real element
+                            // change raises the flag).
+                            body += "arrChg_" + std::to_string(state.arrayWriteAccum) +
+                                    " |= masked_write_words_detect(" + writeArgs + ";";
+                        }
+                        else
+                        {
+                            body += "masked_write_words(" + writeArgs + ";";
+                        }
                     }
                     else
                     {
-                        body = "masked_write_words(" + writeArgs + ";";
+                        // No mask: overwrite the whole element without reading
+                        // the old one.
+                        const std::string writeArgs =
+                            row + ", " + std::to_string(memoryType.bitWidth) + ", " +
+                            wordDataExpr(state, data) + ", " +
+                            std::to_string(memoryType.bitWidth) + ", false)";
+                        if (state.arrayWriteAccum >= 0)
+                        {
+                            // ST00011: same write-point change fusion as the
+                            // masked form, at whole-element granularity.
+                            body = "arrChg_" + std::to_string(state.arrayWriteAccum) +
+                                   " |= assign_words_detect(" + writeArgs + ";";
+                        }
+                        else
+                        {
+                            body = "assign_words(" + writeArgs + ";";
+                        }
                     }
                     code += "if (" + condition + ") { " + body + " }\n";
                     code += "}\n";
@@ -3417,9 +3603,10 @@ namespace wolvrix::lib::grhsim::am
                         model.program.blockInstruction(block, position);
                     const Opcode opcode = state.program.opcode(instruction);
                     const auto operands = state.program.operands(instruction);
-                    if (opcode == Opcode::MemoryWrite)
+                    const StateWriteLayout writeLayout = stateWriteLayout(opcode);
+                    if (writeLayout.isStateWrite && writeLayout.memory)
                     {
-                        arrayWrites[operands[4].value].push_back(
+                        arrayWrites[operands[writeLayout.targetIndex].value].push_back(
                             static_cast<uint32_t>(position));
                     }
                     else if (opcode == Opcode::MemoryFill)
@@ -3618,14 +3805,15 @@ namespace wolvrix::lib::grhsim::am
                         model.program.blockInstruction(block, position);
                     const Opcode opcode = state.program.opcode(instruction);
                     const auto operands = state.program.operands(instruction);
-                    if (opcode == Opcode::RegisterWrite)
+                    const StateWriteLayout writeLayout = stateWriteLayout(opcode);
+                    if (isRegisterWriteOpcode(opcode))
                     {
-                        registerWrites[operands[1].value].push_back(
+                        registerWrites[operands[writeLayout.targetIndex].value].push_back(
                             static_cast<uint32_t>(position));
                     }
-                    else if (opcode == Opcode::LatchWrite)
+                    else if (isLatchWriteOpcode(opcode))
                     {
-                        latchTargets.insert(operands[1].value);
+                        latchTargets.insert(operands[writeLayout.targetIndex].value);
                     }
                     for (const VariableId operand : operands)
                     {
@@ -3974,7 +4162,7 @@ namespace wolvrix::lib::grhsim::am
         if (statsAttribute != options.attributes.end() && statsAttribute->second == "true")
         {
             constexpr std::size_t opcodeCount =
-                static_cast<std::size_t>(Opcode::ArrayReduceLanesXor) + 1U;
+                static_cast<std::size_t>(Opcode::MemoryWriteCondMask) + 1U;
             std::array<uint64_t, opcodeCount> nonScalarOpcodes{};
             for (uint32_t index = 0; index < program.instructionCount(); ++index)
             {
@@ -4111,8 +4299,17 @@ namespace wolvrix::lib::grhsim::am
                         changedResultVariables[results.front().value] = true;
                         break;
                     case Opcode::RegisterWrite:
+                    case Opcode::RegisterWriteCond:
+                    case Opcode::RegisterWriteMask:
+                    case Opcode::RegisterWriteCondMask:
                     case Opcode::LatchWrite:
+                    case Opcode::LatchWriteCond:
+                    case Opcode::LatchWriteMask:
+                    case Opcode::LatchWriteCondMask:
                     case Opcode::MemoryWrite:
+                    case Opcode::MemoryWriteCond:
+                    case Opcode::MemoryWriteMask:
+                    case Opcode::MemoryWriteCondMask:
                     case Opcode::MemoryFill:
                     case Opcode::MemoryWriteLanes:
                         // State writes keep persistent slots for every operand

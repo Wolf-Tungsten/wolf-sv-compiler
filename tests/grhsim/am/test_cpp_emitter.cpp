@@ -640,7 +640,7 @@ namespace
             Opcode::MemoryFill, {},
             {fillNext, memory, gateEvents[0], gateEvents[5]});
         const InstructionId write = addInstruction(
-            Opcode::MemoryWrite,
+            Opcode::MemoryWriteCondMask,
             {},
             {writeEnable, address, writeMask, writeData, memory, gateEvents[1],
              gateEvents[2], gateEvents[3], gateEvents[4]});
@@ -2887,6 +2887,220 @@ int main()
         return 0;
     }
 
+    // reg.write.c / mem.write.c / mem.write.cm in one commit Block: the cond
+    // variants must emit an `if (cond)` gate around the write, the no-mask
+    // mem variant a plain whole-element assign_words, and the constant-mask
+    // variant a stack-local immediate mask array for masked_write_words.
+    ExecutableModel makeCondGateEmitterModel()
+    {
+        LinearProgramBuilder linear;
+        const TypeId u1Type = linear.addType(Type::bitVector(1));
+        const TypeId u8Type = linear.addType(Type::bitVector(8));
+        const TypeId memoryType = linear.addType(Type::array(4, 8));
+
+        ProgramInterface interface;
+        const auto addInput = [&](TypeId type, std::string_view name) {
+            const VariableId variable = linear.addVariable(type, linear.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Input,
+                .input = variable,
+            });
+            return variable;
+        };
+        const auto addOutput = [&](TypeId type, std::string_view name) {
+            const VariableId variable = linear.addVariable(type, linear.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Output,
+                .output = variable,
+            });
+            return variable;
+        };
+        const auto addInstruction = [&](Opcode opcode,
+                                        std::initializer_list<VariableId> results,
+                                        std::initializer_list<VariableId> operands) {
+            return linear.addInstruction(
+                opcode,
+                std::span<const VariableId>(results.begin(), results.size()),
+                std::span<const VariableId>(operands.begin(), operands.size()));
+        };
+
+        const VariableId clock = addInput(u1Type, "clock");
+        const VariableId cond = addInput(u1Type, "cond");
+        const VariableId data = addInput(u8Type, "data");
+        const VariableId state = addOutput(u8Type, "state");
+        const VariableId address = linear.addVariable(u8Type, linear.zeroInit());
+        const VariableId memory = linear.addVariable(memoryType, linear.zeroInit());
+        const VariableId clockOld = linear.addVariable(u1Type, linear.undefInit());
+        const VariableId clockEvent = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId commitClockOld =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId clockPos = linear.addVariable(u1Type, linear.zeroInit());
+        const std::array<uint64_t, 1> maskWords = {0xf0};
+        const VariableId maskConst = linear.addVariable(
+            u8Type,
+            linear.addConstantInit(linear.addBitLiteral(u8Type, maskWords)));
+
+        const InstructionId watchClock =
+            addInstruction(Opcode::ChangedAny, {clockEvent}, {clock, clockOld});
+        const InstructionId gateDetect =
+            addInstruction(Opcode::ChangedPos, {clockPos}, {clock, commitClockOld});
+        const InstructionId writeReg = addInstruction(
+            Opcode::RegisterWriteCond, {}, {cond, data, state, clockPos});
+        const InstructionId writeMem = addInstruction(
+            Opcode::MemoryWriteCond, {}, {cond, address, data, memory, clockPos});
+        const InstructionId writeMemCm =
+            addInstruction(Opcode::MemoryWriteCondMask, {},
+                           {cond, address, maskConst, data, memory, clockPos});
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        const auto addScheduled = [&](Opcode opcode,
+                                      std::initializer_list<VariableId> operands) {
+            return scheduled.addInstruction(
+                opcode, {},
+                std::span<const VariableId>(operands.begin(), operands.size()));
+        };
+        const InstructionId enterClock = addScheduled(Opcode::ActForward, {clockEvent});
+        scheduled.setActivationTargets(enterClock, std::array{BlockId{1}});
+        scheduled.addBlock(std::array{watchClock, enterClock});
+        scheduled.addBlock(std::array{gateDetect, writeReg, writeMem, writeMemCm});
+
+        return ExecutableModel{
+            .program = scheduled.finish(),
+            .interface = std::move(interface),
+            .commitBlockBegin = 1,
+            .commitBlockEnd = 2,
+        };
+    }
+
+    int testCondGatedWriteEmission(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        ExecutableModel model = makeCondGateEmitterModel();
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "CondGateTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the cond-gated model");
+        }
+        const std::optional<std::string> blocksText =
+            readTextFile(outputDirectory / "grhsim_CondGateTop_blocks_0.cpp");
+        if (!blocksText)
+        {
+            return fail("AM C++ emitter produced no cond-gated blocks source");
+        }
+        const ProgramView program = model.program.view();
+        VariableId cond;
+        VariableId data;
+        VariableId state;
+        for (const PortBinding &port : model.interface.ports)
+        {
+            const std::string_view name = program.string(port.name);
+            if (port.direction == PortDirection::Input && name == "cond")
+            {
+                cond = port.input;
+            }
+            else if (port.direction == PortDirection::Input && name == "data")
+            {
+                data = port.input;
+            }
+            else if (port.direction == PortDirection::Output && name == "state")
+            {
+                state = port.output;
+            }
+        }
+        if (!cond.valid() || !data.valid() || !state.valid())
+        {
+            return fail("cond-gated model lost its interface bindings");
+        }
+        // reg.write.c: the plain store is wrapped in an if (cond) gate.
+        const std::string gatedStore = "if ((v" + std::to_string(cond.value) +
+                                       " != 0)) { v" + std::to_string(state.value) +
+                                       " = v" + std::to_string(data.value) + " & ";
+        if (blocksText->find(gatedStore) == std::string::npos ||
+            countOccurrences(*blocksText, "assign_words(") != 1 ||
+            countOccurrences(*blocksText, "masked_write_words(") != 1 ||
+            blocksText->find("write_mask_") == std::string::npos ||
+            blocksText->find("UINT64_C(0xf0)") == std::string::npos)
+        {
+            return fail("AM C++ emitter did not emit the cond-gated write forms");
+        }
+
+        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << R"CPP(#include "grhsim_CondGateTop.hpp"
+int main()
+{
+    GrhSIM_CondGateTop model;
+    model.init();
+    model.clock = 0;
+    model.cond = 0;
+    model.data = 0xa5;
+    model.eval();
+    if (model.state != 0) return 1;
+    model.clock = 1;
+    model.eval();
+    // posedge with cond=0: the gated write stays dormant.
+    if (model.state != 0) return 2;
+    model.cond = 1;
+    model.clock = 0;
+    model.eval();
+    // negedge: no commit.
+    if (model.state != 0) return 3;
+    model.clock = 1;
+    model.eval();
+    if (model.state != 0xa5) return 4;
+    model.data = 0x5a;
+    model.eval();
+    // No fresh edge: nothing re-fires.
+    if (model.state != 0xa5) return 5;
+    model.clock = 0;
+    model.eval();
+    model.clock = 1;
+    model.eval();
+    if (model.state != 0x5a) return 6;
+    return 0;
+}
+)CPP";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the cond-gated model harness");
+        }
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated cond-gated model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (outputDirectory / "libgrhsim_CondGateTop.a").string() + "' -o '" +
+            harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated cond-gated model harness failed to compile");
+        }
+        const std::string runCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(runCommand.c_str()) != 0)
+        {
+            return fail("generated cond-gated model violated the cond gating semantics");
+        }
+        return 0;
+    }
+
 } // namespace
 
 int main()
@@ -3176,6 +3390,13 @@ int main()
     if (const int result = testPhasedCommitRuntime(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-phased-commit");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testCondGatedWriteEmission(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-cond-gate");
         result != 0)
     {
         return result;

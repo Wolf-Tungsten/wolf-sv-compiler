@@ -393,28 +393,20 @@ namespace wolvrix::lib::grhsim::am::detail
     inline std::size_t stateWriteEventBegin(Opcode opcode, std::size_t operandCount) noexcept
     {
         std::size_t eventBegin = operandCount;
-        switch (opcode) {
-        case Opcode::RegisterWrite:
+        const StateWriteLayout layout = stateWriteLayout(opcode);
+        if (layout.isStateWrite) {
+            eventBegin = layout.fixedCount;
+        } else if (opcode == Opcode::MemoryFill) {
             eventBegin = 2;
-            break;
-        case Opcode::MemoryWrite:
-            eventBegin = 5;
-            break;
-        case Opcode::MemoryFill:
-            eventBegin = 2;
-            break;
-        case Opcode::MemoryWriteLanes:
+        } else if (opcode == Opcode::MemoryWriteLanes) {
             eventBegin = 3;
-            break;
-        default:
-            break;
         }
         return std::min(eventBegin, operandCount);
     }
 
     // The commit bucket key of a state write is its canonical event
-    // signature; the update condition is folded into nextValue and no
-    // longer exists as an operand, so there is no guard component.
+    // signature: only the trailing event operands take part. cond/mask are
+    // gating operands of the write itself and never join the signature.
     inline CommitInstructionEventKey commitInstructionEventKey(ProgramView program,
                                                                const DefUseIndex &defUse,
                                                                InstructionId instruction)
@@ -601,9 +593,7 @@ namespace wolvrix::lib::grhsim::am::detail
             input.atomMinInstruction.size() != atomCount ||
             input.commitEventRank.size() != atomCount ||
             input.definitions.size() != input.variableCount ||
-            input.useOffsets.size() != static_cast<std::size_t>(input.variableCount) + 1 ||
-            (!input.variableCopyWeights.empty() &&
-             input.variableCopyWeights.size() != input.variableCount)) {
+            input.useOffsets.size() != static_cast<std::size_t>(input.variableCount) + 1) {
             error = "internal error: malformed coarsen-dp block formation input";
             return false;
         }

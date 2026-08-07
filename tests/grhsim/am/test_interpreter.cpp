@@ -317,7 +317,7 @@ namespace {
         const InstructionId detect = addInstruction(
             linear, Opcode::ChangedPos, {posedge}, {clock, clockOldCommit});
         const InstructionId write =
-            addInstruction(linear, Opcode::MemoryWrite, {},
+            addInstruction(linear, Opcode::MemoryWriteCondMask, {},
                            {enable, address, mask, data, memory, posedge});
         const InstructionId read = addInstruction(
             linear, Opcode::MemoryRead, {readData}, {memory, address});
@@ -1406,6 +1406,148 @@ namespace {
         return 0;
     }
 
+    struct CondMaskFixture {
+        ExecutableModel model;
+        VariableId clock;
+        VariableId cond;
+        VariableId mask;
+        VariableId data;
+        VariableId address;
+        VariableId state;
+        VariableId maskState;
+        VariableId memory;
+    };
+
+    // Same clocking scheme as the register model; the commit Block holds one
+    // reg.write.c, one reg.write.cm, one mem.write.c, and one mem.write.m so
+    // the cond gate and the commit-local mask mix are exercised directly.
+    CondMaskFixture makeCondMaskModel() {
+        LinearProgramBuilder linear;
+        const TypeId u1Type = linear.addType(Type::bitVector(1));
+        const TypeId u4Type = linear.addType(Type::bitVector(4));
+        const TypeId u8Type = linear.addType(Type::bitVector(8));
+        const TypeId memoryType = linear.addType(Type::array(4, 8));
+        const VariableId clock = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId clockOld =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId clockEvent =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId clockOldCommit =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId posedge =
+            linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId cond = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId mask = linear.addVariable(u8Type, linear.zeroInit());
+        const VariableId data = linear.addVariable(u8Type, linear.zeroInit());
+        const VariableId address = linear.addVariable(u4Type, linear.zeroInit());
+        const VariableId state = linear.addVariable(u8Type, linear.zeroInit());
+        const VariableId maskState =
+            linear.addVariable(u8Type, linear.zeroInit());
+        const VariableId memory =
+            linear.addVariable(memoryType, linear.zeroInit());
+
+        const InstructionId watch = addInstruction(
+            linear, Opcode::ChangedAny, {clockEvent}, {clock, clockOld});
+        const InstructionId detect = addInstruction(
+            linear, Opcode::ChangedPos, {posedge}, {clock, clockOldCommit});
+        const InstructionId writeCond = addInstruction(
+            linear, Opcode::RegisterWriteCond, {}, {cond, data, state, posedge});
+        const InstructionId writeCondMask =
+            addInstruction(linear, Opcode::RegisterWriteCondMask, {},
+                           {cond, mask, data, maskState, posedge});
+        const InstructionId writeMem =
+            addInstruction(linear, Opcode::MemoryWriteCond, {},
+                           {cond, address, data, memory, posedge});
+        const InstructionId writeMemMask =
+            addInstruction(linear, Opcode::MemoryWriteMask, {},
+                           {address, mask, data, memory, posedge});
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        const InstructionId activate =
+            addInstruction(scheduled, Opcode::ActForward, {}, {clockEvent});
+        setTargets(scheduled, activate, {BlockId{1}});
+        addBlock(scheduled, {watch, activate});
+        addBlock(scheduled, {detect, writeCond, writeCondMask, writeMem,
+                             writeMemMask});
+        return CondMaskFixture{
+            .model =
+                ExecutableModel{
+                    .program = scheduled.finish(),
+                    .interface = {},
+                    .commitBlockBegin = 1,
+                    .commitBlockEnd = 2,
+                },
+            .clock = clock,
+            .cond = cond,
+            .mask = mask,
+            .data = data,
+            .address = address,
+            .state = state,
+            .maskState = maskState,
+            .memory = memory,
+        };
+    }
+
+    int testCondMaskWriteVariants() {
+        CondMaskFixture fixture = makeCondMaskModel();
+        Interpreter interpreter(fixture.model);
+        if (!interpreter.ready() || !interpreter.eval().success()) {
+            return fail("cond/mask model failed its initial eval");
+        }
+        const auto pulse = [&](uint64_t level) {
+            return interpreter.write(fixture.clock, u1(level)).success() &&
+                   interpreter.eval().success();
+        };
+        const auto setInputs = [&](uint64_t cond, uint64_t mask, uint64_t data,
+                                   uint64_t address) {
+            const std::array<uint64_t, 1> addressWords = {address};
+            return interpreter.write(fixture.cond, u1(cond)).success() &&
+                   interpreter.write(fixture.mask, u8(mask)).success() &&
+                   interpreter.write(fixture.data, u8(data)).success() &&
+                   interpreter
+                       .write(fixture.address,
+                              InterpreterValue::bitVector(4, Signedness::Unsigned,
+                                                          addressWords))
+                       .success();
+        };
+        // cond=0: the reg.write.c / reg.write.cm / mem.write.c stay dormant;
+        // the mask=0 mem.write.m mixes nothing in.
+        if (!setInputs(0, 0x00, 0xa5, 1) || !pulse(1) ||
+            interpreter.value(fixture.state).lowWord() != 0 ||
+            interpreter.value(fixture.maskState).lowWord() != 0 ||
+            interpreter.value(fixture.memory).arrayElementWords(1).front() != 0) {
+            return fail("cond-gated writes fired while the cond was false");
+        }
+        // cond=1 with a full mask: every variant commits the plain data.
+        if (!pulse(0) || !setInputs(1, 0xff, 0xa5, 1) || !pulse(1) ||
+            interpreter.value(fixture.state).lowWord() != 0xa5 ||
+            interpreter.value(fixture.maskState).lowWord() != 0xa5 ||
+            interpreter.value(fixture.memory).arrayElementWords(1).front() !=
+                0xa5) {
+            return fail("cond-gated writes did not commit on a true cond");
+        }
+        // cond=0 again: only the cond-free mem.write.m runs and mixes
+        // (0xa5 & ~0x0f) | (0x5a & 0x0f) = 0xaa into element 1.
+        if (!pulse(0) || !setInputs(0, 0x0f, 0x5a, 1) || !pulse(1) ||
+            interpreter.value(fixture.state).lowWord() != 0xa5 ||
+            interpreter.value(fixture.maskState).lowWord() != 0xa5 ||
+            interpreter.value(fixture.memory).arrayElementWords(1).front() !=
+                0xaa) {
+            return fail("masked memory write did not mix against the old element");
+        }
+        // cond=1 with a partial mask: reg.write.cm mixes
+        // (0xa5 & ~0x0f) | (0x3c & 0x0f) = 0xac; address 9 is out of range, so
+        // both memory writes skip the commit entirely.
+        if (!pulse(0) || !setInputs(1, 0x0f, 0x3c, 9) || !pulse(1) ||
+            interpreter.value(fixture.state).lowWord() != 0x3c ||
+            interpreter.value(fixture.maskState).lowWord() != 0xac ||
+            interpreter.value(fixture.memory).arrayElementWords(1).front() !=
+                0xaa) {
+            return fail("mask mix or out-of-range suppression is wrong");
+        }
+        return 0;
+    }
+
 } // namespace
 
 int main() {
@@ -1414,6 +1556,8 @@ int main() {
     if (testEventDrivenRegister() != 0)
         return 1;
     if (testMemoryWriteRead() != 0)
+        return 1;
+    if (testCondMaskWriteVariants() != 0)
         return 1;
     if (testMemoryReadAllWriteLanesLoopback() != 0)
         return 1;

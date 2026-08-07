@@ -1,5 +1,7 @@
 #include "grhsim/am/grhsim_am_program_validate.hpp"
 
+#include "grhsim/am/grhsim_am_opcode_traits.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -61,7 +63,7 @@ namespace wolvrix::lib::grhsim::am
 
         bool validOpcode(Opcode opcode) noexcept
         {
-            return opcode <= Opcode::ArrayReduceLanesXor;
+            return opcode <= Opcode::MemoryWriteCondMask;
         }
 
         bool validString(ProgramView view, StringId id)
@@ -510,19 +512,29 @@ namespace wolvrix::lib::grhsim::am
                     shapeValid = resultCount == 1 && operandCount == 2;
                     break;
                 case Opcode::RegisterWrite:
-                    shapeValid = resultCount == 0 && operandCount >= 2;
+                case Opcode::RegisterWriteCond:
+                case Opcode::RegisterWriteMask:
+                case Opcode::RegisterWriteCondMask:
+                case Opcode::MemoryWrite:
+                case Opcode::MemoryWriteCond:
+                case Opcode::MemoryWriteMask:
+                case Opcode::MemoryWriteCondMask:
+                    shapeValid = resultCount == 0 &&
+                                 operandCount >= stateWriteLayout(opcode).fixedCount;
+                    break;
+                case Opcode::LatchWrite:
+                case Opcode::LatchWriteCond:
+                case Opcode::LatchWriteMask:
+                case Opcode::LatchWriteCondMask:
+                    // Latch writes are eventless: exactly the fixed operands.
+                    shapeValid = resultCount == 0 &&
+                                 operandCount == stateWriteLayout(opcode).fixedCount;
                     break;
                 case Opcode::MemoryRead:
                     shapeValid = resultCount == 1 && operandCount == 2;
                     break;
-                case Opcode::MemoryWrite:
-                    shapeValid = resultCount == 0 && operandCount >= 6;
-                    break;
                 case Opcode::MemoryFill:
                     shapeValid = resultCount == 0 && operandCount >= 2;
-                    break;
-                case Opcode::LatchWrite:
-                    shapeValid = resultCount == 0 && operandCount == 2;
                     break;
                 case Opcode::SystemFunction:
                     shapeValid = resultCount == 1;
@@ -956,19 +968,74 @@ namespace wolvrix::lib::grhsim::am
             switch (opcode)
             {
             case Opcode::RegisterWrite:
-                if (!results.empty() || operands.size() < 2)
+            case Opcode::RegisterWriteCond:
+            case Opcode::RegisterWriteMask:
+            case Opcode::RegisterWriteCondMask:
+            case Opcode::LatchWrite:
+            case Opcode::LatchWriteCond:
+            case Opcode::LatchWriteMask:
+            case Opcode::LatchWriteCondMask:
+            case Opcode::MemoryWrite:
+            case Opcode::MemoryWriteCond:
+            case Opcode::MemoryWriteMask:
+            case Opcode::MemoryWriteCondMask:
+            {
+                const StateWriteLayout layout = stateWriteLayout(opcode);
+                if (!results.empty() || operands.size() < layout.fixedCount)
                 {
                     return;
                 }
+                const VariableId target = operands[layout.targetIndex];
+                const Type *targetType = variableType(view, target);
+                const Type *dataType = variableType(view, operands[layout.dataIndex]);
+                valid = isMutable(view, target);
+                if (layout.hasCond)
                 {
-                    const VariableId target = operands[1];
-                    const Type *targetType = variableType(view, target);
-                    valid = isBitVector(targetType) &&
-                            sameType(variableType(view, operands[0]), targetType) &&
-                            isMutable(view, target) &&
-                            validateEventRange(view, operands, 2, target);
+                    valid = valid && isBitVector1(variableType(view, operands[0]));
+                }
+                if (layout.memory)
+                {
+                    const std::size_t addrIndex = layout.hasCond ? 1 : 0;
+                    const bool targetIsArray =
+                        targetType && targetType->kind == TypeKind::Array;
+                    valid = valid && targetIsArray &&
+                            isBitVector(variableType(view, operands[addrIndex]));
+                    if (targetIsArray)
+                    {
+                        valid = valid &&
+                                matchesBitVector(dataType, targetType->bitWidth,
+                                                 targetType->signedness);
+                        if (layout.hasMask)
+                        {
+                            const Type *maskType =
+                                variableType(view, operands[addrIndex + 1]);
+                            valid = valid && isBitVector(maskType) &&
+                                    maskType->bitWidth == targetType->bitWidth;
+                        }
+                    }
+                    valid = valid &&
+                            validateEventRange(view, operands, layout.fixedCount, target);
+                }
+                else
+                {
+                    valid = valid && isBitVector(targetType) &&
+                            sameType(dataType, targetType);
+                    if (layout.hasMask)
+                    {
+                        const Type *maskType =
+                            variableType(view, operands[layout.hasCond ? 1 : 0]);
+                        valid = valid && sameType(maskType, targetType);
+                    }
+                    // Latch writes carry no events; register writes trail
+                    // theirs after the fixed operands.
+                    if (!isLatchWriteOpcode(opcode))
+                    {
+                        valid = valid &&
+                                validateEventRange(view, operands, layout.fixedCount, target);
+                    }
                 }
                 break;
+            }
             case Opcode::MemoryRead:
                 if (results.size() != 1 || operands.size() != 2)
                 {
@@ -981,25 +1048,6 @@ namespace wolvrix::lib::grhsim::am
                             isBitVector(variableType(view, operands[1])) &&
                             matchesBitVector(resultType, targetType->bitWidth,
                                              targetType->signedness);
-                }
-                break;
-            case Opcode::MemoryWrite:
-                if (!results.empty() || operands.size() < 6)
-                {
-                    return;
-                }
-                {
-                    const VariableId target = operands[4];
-                    const Type *targetType = variableType(view, target);
-                    const Type *maskType = variableType(view, operands[2]);
-                    valid = isBitVector1(variableType(view, operands[0])) &&
-                            isBitVector(variableType(view, operands[1])) && targetType &&
-                            targetType->kind == TypeKind::Array && isBitVector(maskType) &&
-                            maskType->bitWidth == targetType->bitWidth &&
-                            matchesBitVector(variableType(view, operands[3]), targetType->bitWidth,
-                                             targetType->signedness) &&
-                            isMutable(view, target) &&
-                            validateEventRange(view, operands, 5, target);
                 }
                 break;
             case Opcode::MemoryFill:
@@ -1022,19 +1070,6 @@ namespace wolvrix::lib::grhsim::am
                             dataType->bitWidth == packedWidth &&
                             isMutable(view, target) &&
                             validateEventRange(view, operands, 2, target);
-                }
-                break;
-            case Opcode::LatchWrite:
-                if (!results.empty() || operands.size() != 2)
-                {
-                    return;
-                }
-                {
-                    const VariableId target = operands[1];
-                    const Type *targetType = variableType(view, target);
-                    valid = isBitVector(targetType) &&
-                            sameType(variableType(view, operands[0]), targetType) &&
-                            isMutable(view, target);
                 }
                 break;
             case Opcode::MemoryReadAll:
@@ -1275,11 +1310,8 @@ namespace wolvrix::lib::grhsim::am
             {
                 validateChangedSemantics(view, instruction, validator);
             }
-            else if (opcode >= Opcode::RegisterWrite && opcode <= Opcode::LatchWrite)
-            {
-                validateStateSemantics(view, instruction, validator);
-            }
-            else if (opcode == Opcode::MemoryReadAll || opcode == Opcode::MemoryWriteLanes)
+            else if (isStateWriteOpcode(opcode) || opcode == Opcode::MemoryRead ||
+                     opcode == Opcode::MemoryReadAll)
             {
                 validateStateSemantics(view, instruction, validator);
             }

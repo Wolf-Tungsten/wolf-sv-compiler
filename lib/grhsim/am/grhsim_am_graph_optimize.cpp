@@ -660,12 +660,26 @@ namespace wolvrix::lib::grhsim::am {
                 }
                 analyze();
                 if (options_.constFold || options_.cse || options_.assignAlias ||
-                    options_.constMemFold) {
+                    options_.constMemFold || options_.logicUnify ||
+                    options_.muxNotAbsorb || options_.notUnify ||
+                    options_.sliceFuse) {
                     bool changed = true;
                     while (changed) {
                         changed = false;
                         if (options_.constFold) {
                             changed |= foldPass();
+                        }
+                        if (options_.logicUnify) {
+                            changed |= logicUnifyPass();
+                        }
+                        if (options_.muxNotAbsorb) {
+                            changed |= muxNotAbsorbPass();
+                        }
+                        if (options_.notUnify) {
+                            changed |= notUnifyPass();
+                        }
+                        if (options_.sliceFuse) {
+                            changed |= sliceFusePass();
                         }
                         if (options_.assignAlias) {
                             changed |= assignAliasPass();
@@ -683,7 +697,8 @@ namespace wolvrix::lib::grhsim::am {
                 for (uint8_t live : live_) {
                     kept += live != 0;
                 }
-                if (kept == live_.size() && newConstants_.empty()) {
+                if (kept == live_.size() && newConstants_.empty() &&
+                    rewrites_.empty()) {
                     // Nothing was removed or rewritten; the graph is untouched.
                     return validateSelf(graph_);
                 }
@@ -762,6 +777,70 @@ namespace wolvrix::lib::grhsim::am {
                         inOrderedEffect_[effect.instruction.value] = 1;
                     }
                 }
+
+                // Producer lookup (first def wins; the program is SSA-style
+                // single-def in practice) for local pattern passes.
+                producerOf_.assign(variableCount, kInvalidIndex);
+                for (uint32_t index = 0; index < instructionCount; ++index) {
+                    for (VariableId result : view_.results(InstructionId{index})) {
+                        if (result.valid() && result.value < variableCount &&
+                            producerOf_[result.value] == kInvalidIndex) {
+                            producerOf_[result.value] = index;
+                        }
+                    }
+                }
+
+                // Commit-referenced variables: operands of any instruction
+                // that is neither pure nor a plain state read (state writes,
+                // change detectors, host effects, activation), closed
+                // transitively over single-operand Assign forwarding
+                // (result -> operand). A state-read Assign whose result is in
+                // this set is a genuine commit read-old snapshot and must
+                // stay; anything else is a compute-side wire that may be
+                // bypassed (stateReadAlias). The closure is conservative:
+                // some chained Assigns may ultimately not alias, which only
+                // keeps a snapshot that could have been bypassed.
+                commitOperand_.assign(variableCount, 0);
+                std::vector<uint32_t> forward(variableCount, kInvalidIndex);
+                for (uint32_t index = 0; index < instructionCount; ++index) {
+                    const InstructionId instruction{index};
+                    if (view_.opcode(instruction) == Opcode::Assign) {
+                        const auto results = view_.results(instruction);
+                        const auto operands = view_.operands(instruction);
+                        if (results.size() == 1 && operands.size() == 1 &&
+                            results.front().valid() && operands.front().valid() &&
+                            results.front().value < variableCount &&
+                            forward[results.front().value] == kInvalidIndex) {
+                            forward[results.front().value] = operands.front().value;
+                        }
+                    }
+                    const InstructionEffect effect = expectedEffect(instruction);
+                    if (effect == InstructionEffect::Pure ||
+                        effect == InstructionEffect::StateRead) {
+                        continue;
+                    }
+                    for (VariableId operand : view_.operands(instruction)) {
+                        if (operand.valid() && operand.value < variableCount) {
+                            commitOperand_[operand.value] = 1;
+                        }
+                    }
+                }
+                // Close over Assign forwarding chains: a commit operand V is
+                // ultimately read as resolve(V) = V, forward[V], ... so every
+                // variable on the forward chain of a commit-referenced
+                // variable is itself commit-referenced. Chains share
+                // suffixes; stop a walk at the first already-marked link.
+                for (uint32_t variable = 0; variable < variableCount; ++variable) {
+                    if (commitOperand_[variable] == 0) {
+                        continue;
+                    }
+                    uint32_t link = forward[variable];
+                    while (link != kInvalidIndex && link < variableCount &&
+                           commitOperand_[link] == 0) {
+                        commitOperand_[link] = 1;
+                        link = forward[link];
+                    }
+                }
             }
 
             // A variable may be aliased to a variable with an identical value
@@ -796,6 +875,103 @@ namespace wolvrix::lib::grhsim::am {
                 }
                 const auto canonical = canonicalConst_.find(resolved);
                 return canonical != canonicalConst_.end() ? canonical->second : resolved;
+            }
+
+            // Local rewrites recorded by the pattern passes (logic
+            // unification, mux select-not absorption). Rewrites keep the
+            // result variable and the pure effect; only the opcode and/or
+            // the operand list change. Every consumer-facing read below
+            // (fold, CSE, alias, compact) must go through these accessors so
+            // rewrites recorded in an earlier fixpoint round are visible.
+            struct InstructionRewrite {
+                Opcode opcode;
+                std::vector<VariableId> operands;
+                std::optional<uint32_t> staticLsb;
+            };
+
+            Opcode effectiveOpcode(uint32_t index) const {
+                const auto found = rewrites_.find(index);
+                return found != rewrites_.end()
+                           ? found->second.opcode
+                           : view_.opcode(InstructionId{index});
+            }
+
+            // SliceStatic lsb honoring rewrites (slice fusion rewrites the
+            // lsb); nullopt when the instruction carries no slice attribute.
+            std::optional<uint32_t> effectiveStaticLsb(uint32_t index) const {
+                const auto found = rewrites_.find(index);
+                if (found != rewrites_.end()) {
+                    return found->second.staticLsb;
+                }
+                const auto attributes =
+                    view_.sliceStaticAttributes(InstructionId{index});
+                if (!attributes) {
+                    return std::nullopt;
+                }
+                return attributes->lsb;
+            }
+
+            // Resolved (alias-chased) operands honoring rewrites.
+            void effectiveOperands(uint32_t index,
+                                   std::vector<VariableId> &out) const {
+                out.clear();
+                const auto found = rewrites_.find(index);
+                if (found != rewrites_.end()) {
+                    for (VariableId operand : found->second.operands) {
+                        out.push_back(operand.valid() ? VariableId{resolveVariable(
+                                                            operand.value)}
+                                                      : operand);
+                    }
+                    return;
+                }
+                for (VariableId operand : view_.operands(InstructionId{index})) {
+                    out.push_back(operand.valid()
+                                      ? VariableId{resolveVariable(operand.value)}
+                                      : operand);
+                }
+            }
+
+            uint32_t bitWidthOf(VariableId variable) const {
+                if (!variable.valid()) {
+                    return 0;
+                }
+                if (variable.value < oldVariableCount_) {
+                    const VariableRecord &record = view_.variable(variable);
+                    if (!record.type.valid() ||
+                        record.type.value >= view_.typeCount()) {
+                        return 0;
+                    }
+                    const Type &type = view_.type(record.type);
+                    return type.kind == TypeKind::BitVector ? type.bitWidth : 0;
+                }
+                const std::size_t slot = variable.value - oldVariableCount_;
+                if (slot >= newConstants_.size()) {
+                    return 0;
+                }
+                const Type &type = newConstants_[slot].type;
+                return type.kind == TypeKind::BitVector ? type.bitWidth : 0;
+            }
+
+            bool isOneBit(VariableId variable) const {
+                if (!variable.valid()) {
+                    return false;
+                }
+                if (variable.value < oldVariableCount_) {
+                    const VariableRecord &record = view_.variable(variable);
+                    if (!record.type.valid() ||
+                        record.type.value >= view_.typeCount()) {
+                        return false;
+                    }
+                    const Type &type = view_.type(record.type);
+                    return type.kind == TypeKind::BitVector && type.bitWidth == 1;
+                }
+                const std::size_t slot = variable.value - oldVariableCount_;
+                if (slot >= newConstants_.size()) {
+                    return false;
+                }
+                const ConstantSlot &constant = newConstants_[slot];
+                return constant.type.kind == TypeKind::BitVector &&
+                       constant.type.bitWidth == 1;
             }
 
             std::optional<ConstOperand> constantWordsOf(uint32_t variable) const {
@@ -852,12 +1028,13 @@ namespace wolvrix::lib::grhsim::am {
 
             bool foldPass() {
                 bool changed = false;
+                std::vector<VariableId> operands;
                 for (uint32_t index = 0; index < oldInstructionCount_; ++index) {
                     if (transformDead_[index] != 0) {
                         continue;
                     }
                     const InstructionId instruction{index};
-                    const Opcode opcode = view_.opcode(instruction);
+                    const Opcode opcode = effectiveOpcode(index);
                     if (opcodeTraits(opcode).effect != OpcodeEffect::Pure) {
                         continue;
                     }
@@ -866,7 +1043,7 @@ namespace wolvrix::lib::grhsim::am {
                         continue;
                     }
                     const VariableId result = results.front();
-                    const auto operands = view_.operands(instruction);
+                    effectiveOperands(index, operands);
                     std::vector<ConstOperand> values;
                     values.reserve(operands.size());
                     bool allConstant = !operands.empty();
@@ -876,7 +1053,7 @@ namespace wolvrix::lib::grhsim::am {
                             break;
                         }
                         const std::optional<ConstOperand> value =
-                            constantWordsOf(resolveVariable(operand.value));
+                            constantWordsOf(operand.value);
                         if (!value) {
                             allConstant = false;
                             break;
@@ -896,11 +1073,12 @@ namespace wolvrix::lib::grhsim::am {
                     }
                     uint32_t staticLsb = 0;
                     if (opcode == Opcode::SliceStatic) {
-                        const auto attributes = view_.sliceStaticAttributes(instruction);
-                        if (!attributes) {
+                        const std::optional<uint32_t> lsb =
+                            effectiveStaticLsb(index);
+                        if (!lsb) {
                             continue;
                         }
-                        staticLsb = attributes->lsb;
+                        staticLsb = *lsb;
                     }
                     std::vector<uint64_t> folded;
                     if (!evaluatePure(opcode, resultType, values, staticLsb, folded)) {
@@ -917,13 +1095,14 @@ namespace wolvrix::lib::grhsim::am {
 
             bool csePass() {
                 std::unordered_map<CseKey, uint32_t, CseKeyHash> representatives;
+                std::vector<VariableId> operands;
                 bool changed = false;
                 for (uint32_t index = 0; index < oldInstructionCount_; ++index) {
                     if (transformDead_[index] != 0) {
                         continue;
                     }
                     const InstructionId instruction{index};
-                    const Opcode opcode = view_.opcode(instruction);
+                    const Opcode opcode = effectiveOpcode(index);
                     if (opcodeTraits(opcode).effect != OpcodeEffect::Pure) {
                         continue;
                     }
@@ -939,20 +1118,21 @@ namespace wolvrix::lib::grhsim::am {
                     key.opcode = opcode;
                     key.resultType = view_.type(record.type);
                     if (opcode == Opcode::SliceStatic) {
-                        const auto attributes = view_.sliceStaticAttributes(instruction);
-                        if (!attributes) {
+                        const std::optional<uint32_t> lsb =
+                            effectiveStaticLsb(index);
+                        if (!lsb) {
                             continue;
                         }
-                        key.staticLsb = attributes->lsb;
+                        key.staticLsb = *lsb;
                     }
                     bool validOperands = true;
-                    for (VariableId operand : view_.operands(instruction)) {
+                    effectiveOperands(index, operands);
+                    for (VariableId operand : operands) {
                         if (!operand.valid()) {
                             validOperands = false;
                             break;
                         }
-                        key.operands.push_back(
-                            VariableId{resolveVariable(operand.value)});
+                        key.operands.push_back(operand);
                     }
                     if (!validOperands) {
                         continue;
@@ -980,10 +1160,15 @@ namespace wolvrix::lib::grhsim::am {
             }
 
             // Bypass single-operand Assign instructions: the result aliases
-            // the (resolved) operand directly. Assigns reading a state
-            // variable are commit read-old snapshots (see lowering
-            // preCommitValue) and must stay, or commit blocks would observe
-            // this round's committed value instead of the pre-commit value.
+            // the (resolved) operand directly. An Assign reading a state
+            // variable whose result can reach a commit-side operand (the
+            // commitOperand_ closure) is a commit read-old snapshot (see
+            // lowering preCommitValue) and must stay, or commit blocks would
+            // observe this round's committed value instead of the pre-commit
+            // value. State reads that only feed compute logic are bypassed
+            // when stateReadAlias is on: consumers then read the state
+            // variable directly, which is value-identical (Assign is a pure
+            // identity) and only shortens the activation chain.
             bool assignAliasPass() {
                 bool changed = false;
                 for (uint32_t index = 0; index < oldInstructionCount_; ++index) {
@@ -1004,7 +1189,10 @@ namespace wolvrix::lib::grhsim::am {
                     if (!operand.valid() || !aliasable(result)) {
                         continue;
                     }
-                    if (hasRole(roleOf(operand), VariableRole::State)) {
+                    if (hasRole(roleOf(operand), VariableRole::State) &&
+                        (!options_.stateReadAlias ||
+                         (result.value < commitOperand_.size() &&
+                          commitOperand_[result.value] != 0))) {
                         continue;
                     }
                     const VariableRecord &resultRecord = view_.variable(result);
@@ -1028,6 +1216,293 @@ namespace wolvrix::lib::grhsim::am {
                 }
                 return changed;
             }
+
+            // Rewrite 1-bit LogicAnd/LogicOr/LogicNot to the bitwise
+            // And/Or/Not. On 1-bit operands truth(x) is x itself, so the
+            // forms are semantically identical; unifying them lets CSE merge
+            // the parallel copies that Chisel's `&`/`&&` distinction
+            // otherwise keeps alive.
+            bool logicUnifyPass() {
+                bool changed = false;
+                std::vector<VariableId> operands;
+                for (uint32_t index = 0; index < oldInstructionCount_; ++index) {
+                    if (transformDead_[index] != 0) {
+                        continue;
+                    }
+                    Opcode target;
+                    switch (effectiveOpcode(index)) {
+                    case Opcode::LogicAnd:
+                        target = Opcode::And;
+                        break;
+                    case Opcode::LogicOr:
+                        target = Opcode::Or;
+                        break;
+                    case Opcode::LogicNot:
+                        target = Opcode::Not;
+                        break;
+                    default:
+                        continue;
+                    }
+                    const auto results =
+                        view_.results(InstructionId{index});
+                    if (results.size() != 1 || !isOneBit(results.front())) {
+                        continue;
+                    }
+                    effectiveOperands(index, operands);
+                    bool allOneBit = !operands.empty();
+                    for (VariableId operand : operands) {
+                        if (!isOneBit(operand)) {
+                            allOneBit = false;
+                            break;
+                        }
+                    }
+                    if (!allOneBit) {
+                        continue;
+                    }
+                    rewrites_[index] = InstructionRewrite{
+                        .opcode = target,
+                        .operands = operands,
+                    };
+                    ++logicUnifyCount_;
+                    changed = true;
+                }
+                return changed;
+            }
+
+            // Absorb Not/LogicNot driving Mux selects:
+            // mux(!c, a, b) == mux(c, b, a). Both forms are only absorbed
+            // when the inverted operand is 1 bit wide: the IR requires a
+            // 1-bit Mux select (a wider c would need a ne(c, 0) per Mux,
+            // which is worse than keeping one shared Not). The absorption
+            // applies when the inverted value feeds ONLY Mux selects
+            // (single-use or shared across any number of Muxes): every
+            // consumer Mux gets its data arms swapped and the Not
+            // instruction is removed. A select that is (directly or through
+            // aliases) referenced by the interface keeps its producer alive.
+            bool muxNotAbsorbPass() {
+                const std::size_t variableSlots =
+                    oldVariableCount_ + newConstants_.size();
+                std::vector<uint8_t> pinned(variableSlots, 0);
+                for (uint32_t variable = 0; variable < oldVariableCount_;
+                     ++variable) {
+                    const VariableRole role = roleOf(VariableId{variable});
+                    if (hasRole(role, VariableRole::ExternalOutput) ||
+                        hasRole(role, VariableRole::Observable)) {
+                        const uint32_t resolved = resolveVariable(variable);
+                        if (resolved < pinned.size()) {
+                            pinned[resolved] = 1;
+                        }
+                    }
+                }
+                // Consumer lists over the effective (rewritten, resolved)
+                // operand view.
+                std::vector<std::vector<uint32_t>> consumers(variableSlots);
+                std::vector<VariableId> operands;
+                for (uint32_t index = 0; index < oldInstructionCount_; ++index) {
+                    if (transformDead_[index] != 0) {
+                        continue;
+                    }
+                    effectiveOperands(index, operands);
+                    for (VariableId operand : operands) {
+                        if (operand.valid() && operand.value < consumers.size()) {
+                            consumers[operand.value].push_back(index);
+                        }
+                    }
+                }
+                std::vector<VariableId> notOperands;
+                std::vector<VariableId> muxOperands;
+                bool changed = false;
+                for (uint32_t producer = 0; producer < oldInstructionCount_;
+                     ++producer) {
+                    if (transformDead_[producer] != 0) {
+                        continue;
+                    }
+                    const Opcode notOpcode = effectiveOpcode(producer);
+                    if (notOpcode != Opcode::Not &&
+                        notOpcode != Opcode::LogicNot) {
+                        continue;
+                    }
+                    const auto producerResults =
+                        view_.results(InstructionId{producer});
+                    if (producerResults.size() != 1) {
+                        continue;
+                    }
+                    const VariableId select = producerResults.front();
+                    if (!select.valid() || select.value >= consumers.size() ||
+                        pinned[select.value] != 0 ||
+                        consumers[select.value].empty()) {
+                        continue;
+                    }
+                    effectiveOperands(producer, notOperands);
+                    if (notOperands.size() != 1 || !notOperands.front().valid()) {
+                        continue;
+                    }
+                    if (!isOneBit(select) || !isOneBit(notOperands.front())) {
+                        continue;
+                    }
+                    bool allMuxSelects = true;
+                    for (uint32_t consumer : consumers[select.value]) {
+                        if (effectiveOpcode(consumer) != Opcode::Mux) {
+                            allMuxSelects = false;
+                            break;
+                        }
+                        effectiveOperands(consumer, muxOperands);
+                        if (muxOperands.size() != 3 || muxOperands[0] != select) {
+                            allMuxSelects = false;
+                            break;
+                        }
+                    }
+                    if (!allMuxSelects) {
+                        continue;
+                    }
+                    for (uint32_t consumer : consumers[select.value]) {
+                        effectiveOperands(consumer, muxOperands);
+                        rewrites_[consumer] = InstructionRewrite{
+                            .opcode = Opcode::Mux,
+                            .operands = {notOperands.front(), muxOperands[2],
+                                         muxOperands[1]},
+                        };
+                    }
+                    transformDead_[producer] = 1;
+                    ++muxAbsorbCount_;
+                    changed = true;
+                }
+                return changed;
+            }
+            // Canonicalize 1-bit Not to Eq(x, 0): the reference flow
+            // represents boolean negation as an equality against zero, so
+            // this form both matches it and lets CSE merge the negation with
+            // an explicit x == 0 computed elsewhere. Runs after logicUnify
+            // (1-bit LogicNot has already become Not).
+            bool notUnifyPass() {
+                bool changed = false;
+                std::vector<VariableId> operands;
+                for (uint32_t index = 0; index < oldInstructionCount_; ++index) {
+                    if (transformDead_[index] != 0 ||
+                        effectiveOpcode(index) != Opcode::Not) {
+                        continue;
+                    }
+                    const auto results = view_.results(InstructionId{index});
+                    if (results.size() != 1 || !isOneBit(results.front())) {
+                        continue;
+                    }
+                    effectiveOperands(index, operands);
+                    if (operands.size() != 1 || !isOneBit(operands.front())) {
+                        continue;
+                    }
+                    const VariableRecord &record = view_.variable(results.front());
+                    if (!record.type.valid() ||
+                        record.type.value >= view_.typeCount()) {
+                        continue;
+                    }
+                    const Type &type = view_.type(record.type);
+                    const uint32_t zero = internConstant(
+                        record.type, type, std::vector<uint64_t>{UINT64_C(0)});
+                    rewrites_[index] = InstructionRewrite{
+                        .opcode = Opcode::Eq,
+                        .operands = {operands.front(), VariableId{zero}},
+                    };
+                    ++notUnifyCount_;
+                    changed = true;
+                }
+                return changed;
+            }
+
+
+            // Fuse SliceStatic chains and drop identity slices:
+            //   slice(slice(x, l1), l2) -> slice(x, l1 + l2)
+            //   slice(x, 0) with identical result/operand types -> forward
+            // Both rewrites keep the outer result variable; a fused-away
+            // intermediate slice dies via DCE once its last consumer is
+            // rewritten. The width guards keep every original slice fully
+            // in-bounds so the zero-fill semantics of out-of-range reads are
+            // preserved bit for bit.
+            bool sliceFusePass() {
+                bool changed = false;
+                std::vector<VariableId> operands;
+                std::vector<VariableId> parentOperands;
+                for (uint32_t index = 0; index < oldInstructionCount_; ++index) {
+                    if (transformDead_[index] != 0 ||
+                        effectiveOpcode(index) != Opcode::SliceStatic) {
+                        continue;
+                    }
+                    const auto results = view_.results(InstructionId{index});
+                    if (results.size() != 1) {
+                        continue;
+                    }
+                    const std::optional<uint32_t> lsb = effectiveStaticLsb(index);
+                    if (!lsb) {
+                        continue;
+                    }
+                    effectiveOperands(index, operands);
+                    if (operands.size() != 1 || !operands[0].valid()) {
+                        continue;
+                    }
+                    const VariableId source = operands[0];
+                    const uint32_t outerWidth = bitWidthOf(results.front());
+                    const uint32_t midWidth = bitWidthOf(source);
+                    if (outerWidth == 0 || midWidth == 0) {
+                        continue;
+                    }
+                    if (*lsb == 0 && midWidth == outerWidth &&
+                        aliasable(results.front()) &&
+                        source.value < oldVariableCount_ &&
+                        view_.variable(results.front()).type ==
+                            view_.variable(source).type) {
+                        // Same discipline as the state-read Assign bypass:
+                        // forwarding a state read to a commit-side consumer
+                        // would expose the post-commit value.
+                        if (hasRole(roleOf(source), VariableRole::State) &&
+                            results.front().value < commitOperand_.size() &&
+                            commitOperand_[results.front().value] != 0) {
+                            continue;
+                        }
+                        alias_[results.front().value] = VariableId{source.value};
+                        transformDead_[index] = 1;
+                        ++sliceFuseCount_;
+                        changed = true;
+                        continue;
+                    }
+                    if (source.value >= producerOf_.size()) {
+                        continue;
+                    }
+                    const uint32_t parent = producerOf_[source.value];
+                    if (parent == kInvalidIndex || transformDead_[parent] != 0 ||
+                        effectiveOpcode(parent) != Opcode::SliceStatic) {
+                        continue;
+                    }
+                    const auto parentResults =
+                        view_.results(InstructionId{parent});
+                    if (parentResults.size() != 1 ||
+                        parentResults.front() != source) {
+                        continue;
+                    }
+                    effectiveOperands(parent, parentOperands);
+                    if (parentOperands.size() != 1 ||
+                        !parentOperands.front().valid()) {
+                        continue;
+                    }
+                    const std::optional<uint32_t> parentLsb =
+                        effectiveStaticLsb(parent);
+                    if (!parentLsb) {
+                        continue;
+                    }
+                    const uint32_t baseWidth = bitWidthOf(parentOperands.front());
+                    if (baseWidth == 0 || *lsb + outerWidth > midWidth ||
+                        *parentLsb + midWidth > baseWidth) {
+                        continue;
+                    }
+                    rewrites_[index] = InstructionRewrite{
+                        .opcode = Opcode::SliceStatic,
+                        .operands = {parentOperands.front()},
+                        .staticLsb = *lsb + *parentLsb,
+                    };
+                    ++sliceFuseCount_;
+                    changed = true;
+                }
+                return changed;
+            }
+
 
             // Fold MemoryRead instructions with a constant address on memories
             // that are never written. Storage is zero-initialized (emitted
@@ -1208,17 +1683,18 @@ namespace wolvrix::lib::grhsim::am {
                     }
                 }
 
+                std::vector<VariableId> operands;
                 while (!worklist.empty()) {
                     const uint32_t index = worklist.back();
                     worklist.pop_back();
-                    for (VariableId operand : view_.operands(InstructionId{index})) {
+                    effectiveOperands(index, operands);
+                    for (VariableId operand : operands) {
                         if (!operand.valid()) {
                             continue;
                         }
-                        const uint32_t resolved = resolveVariable(operand.value);
-                        if (resolved < producer.size() &&
-                            producer[resolved] != kInvalidIndex) {
-                            mark(producer[resolved]);
+                        if (operand.value < producer.size() &&
+                            producer[operand.value] != kInvalidIndex) {
+                            mark(producer[operand.value]);
                         }
                     }
                 }
@@ -1374,24 +1850,22 @@ namespace wolvrix::lib::grhsim::am {
                         continue;
                     }
                     const InstructionId instruction{index};
+                    const Opcode opcode = effectiveOpcode(index);
                     std::vector<VariableId> operands;
-                    const auto oldOperands = view_.operands(instruction);
-                    operands.reserve(oldOperands.size());
-                    for (VariableId operand : oldOperands) {
-                        operands.push_back(operand.valid()
-                                               ? VariableId{resolveVariable(operand.value)}
-                                               : operand);
-                    }
+                    effectiveOperands(index, operands);
                     const InstructionId rebuilt =
-                        next.addInstruction(view_.opcode(instruction),
-                                            view_.results(instruction), operands);
+                        next.addInstruction(opcode, view_.results(instruction),
+                                            operands);
                     if (rebuilt.value != instructionRemap[index]) {
                         diagnostics_.error("AM optimize lost dense instruction alignment",
                                            std::string(kDiagnosticContext));
                         return false;
                     }
-                    if (const auto attributes = view_.sliceStaticAttributes(instruction)) {
-                        next.setSliceStaticAttributes(rebuilt, attributes->lsb);
+                    if (opcode == Opcode::SliceStatic) {
+                        if (const std::optional<uint32_t> lsb =
+                                effectiveStaticLsb(index)) {
+                            next.setSliceStaticAttributes(rebuilt, *lsb);
+                        }
                     }
                     if (const auto attributes = view_.systemFunctionAttributes(instruction)) {
                         next.setSystemFunctionAttributes(rebuilt, *attributes);
@@ -1446,6 +1920,9 @@ namespace wolvrix::lib::grhsim::am {
                     return false;
                 }
                 const std::size_t removed = oldInstructionCount_ - keptInstructions;
+                const std::size_t accounted =
+                    foldedCount_ + cseCount_ + aliasCount_ + memFoldCount_ +
+                    muxAbsorbCount_ + sliceFuseCount_;
                 diagnostics_.info(
                     "am.optimize: instructions " + std::to_string(oldInstructionCount_) +
                         " -> " + std::to_string(keptInstructions) +
@@ -1453,8 +1930,13 @@ namespace wolvrix::lib::grhsim::am {
                         " cse=" + std::to_string(cseCount_) +
                         " alias=" + std::to_string(aliasCount_) +
                         " memfold=" + std::to_string(memFoldCount_) +
-                        " dce=" + std::to_string(removed - foldedCount_ - cseCount_ -
-                                                aliasCount_ - memFoldCount_) +
+                        " unify=" + std::to_string(logicUnifyCount_) +
+                        " muxabsorb=" + std::to_string(muxAbsorbCount_) +
+                        " notunify=" + std::to_string(notUnifyCount_) +
+                        " slicefuse=" + std::to_string(sliceFuseCount_) +
+                        " dce=" + std::to_string(removed > accounted
+                                                    ? removed - accounted
+                                                    : std::size_t{0}) +
                         ") constants_added=" + std::to_string(newConstants_.size()),
                     std::string(kDiagnosticContext));
                 graph_ = std::move(next);
@@ -1472,6 +1954,9 @@ namespace wolvrix::lib::grhsim::am {
             std::vector<uint8_t> transformDead_;
             std::vector<uint8_t> live_;
             std::vector<uint8_t> inOrderedEffect_;
+            std::vector<uint32_t> producerOf_;
+            std::vector<uint8_t> commitOperand_;
+            std::unordered_map<uint32_t, InstructionRewrite> rewrites_;
             std::optional<std::vector<uint8_t>> writtenMemories_;
             std::vector<ConstantSlot> newConstants_;
             std::unordered_map<ConstantKey, uint32_t, ConstantKeyHash> constantVars_;
@@ -1480,6 +1965,10 @@ namespace wolvrix::lib::grhsim::am {
             std::size_t cseCount_ = 0;
             std::size_t aliasCount_ = 0;
             std::size_t memFoldCount_ = 0;
+            std::size_t logicUnifyCount_ = 0;
+            std::size_t muxAbsorbCount_ = 0;
+            std::size_t notUnifyCount_ = 0;
+            std::size_t sliceFuseCount_ = 0;
         };
 
     } // namespace
@@ -1488,7 +1977,8 @@ namespace wolvrix::lib::grhsim::am {
                          const AmOptimizeOptions &options,
                          wolvrix::lib::diag::Diagnostics &diagnostics) {
         if (!options.dce && !options.constFold && !options.cse && !options.assignAlias &&
-            !options.constMemFold) {
+            !options.constMemFold && !options.logicUnify && !options.muxNotAbsorb &&
+            !options.notUnify && !options.sliceFuse) {
             return true;
         }
         try {

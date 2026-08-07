@@ -244,6 +244,15 @@ namespace wolvrix::lib::grhsim::am
         ArrayReduceLanesOr,
         ArrayReduceLanesAnd,
         ArrayReduceLanesXor,
+        RegisterWriteCond,
+        RegisterWriteMask,
+        RegisterWriteCondMask,
+        LatchWriteCond,
+        LatchWriteMask,
+        LatchWriteCondMask,
+        MemoryWriteCond,
+        MemoryWriteMask,
+        MemoryWriteCondMask,
     };
 
     static_assert(sizeof(Opcode) == sizeof(uint8_t));

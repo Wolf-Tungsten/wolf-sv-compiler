@@ -54,8 +54,6 @@ namespace wolvrix::lib::grhsim::am
         std::vector<uint8_t> atomIsCommit;
         std::vector<uint32_t> atomMinInstruction;
         std::vector<uint32_t> commitEventRank;
-        // Optional per-variable incoming-copy weight; empty = unit weight.
-        std::vector<uint32_t> variableCopyWeights;
         std::size_t oversizedAtomCount = 0;
         std::size_t maxAtomInstructions = 0;
         std::size_t maxAtomStateWrites = 0;
@@ -63,8 +61,9 @@ namespace wolvrix::lib::grhsim::am
         std::size_t maxInstructionsPerBlock = 128;
         std::size_t maxCommitInstructionsPerBlock = 4096;
         bool enableCoarsening = true;
-        std::size_t coarsenBudget = 64;
+        std::size_t coarsenBudget = 256;
         double segmentPenalty = 1.0;
+        std::size_t refinementRounds = 10;
         AmGraphSplit split;
 
         // Assembles the span POD consumed by the partition passes; the spans

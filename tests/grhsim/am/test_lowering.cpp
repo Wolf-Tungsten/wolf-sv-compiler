@@ -2,6 +2,7 @@
 #include "grhsim/am/grhsim_am_program_interpreter.hpp"
 #include "grhsim/am/grh_ir_to_grhsim_am_graph.hpp"
 #include "grhsim/am/grh_ir_to_grhsim_am_program.hpp"
+#include "grhsim/am/grhsim_am_opcode_traits.hpp"
 #include "grhsim/am/grhsim_am_program_validate.hpp"
 
 #include <algorithm>
@@ -247,21 +248,21 @@ namespace
         }
 
         const ProgramView program = artifact->program();
-        // cond/mask folds into a merged nextValue expression for register,
-        // latch and fill writes (one Mux per folded write), but NOT for
-        // memory element writes: those keep [cond, addr, mask, data, target,
-        // events...] operands, so a disabled write simply never happens and
-        // no read-old element probe is needed. The fill still inserts one
-        // mem.read_all probe for its folded hold path, on top of the
-        // explicit memory read port.
+        // Every write selects its simplest cond/mask variant: the register,
+        // latch, and memory element writes here all have a live (dynamic)
+        // cond and an all-ones constant mask, so they become the .c forms
+        // carrying [cond, (addr), data, target, events...] with no merged
+        // self-mux and no read-old snapshot. The fill still folds its cond
+        // into the packed image, keeping one mem.read_all probe plus one
+        // hold-path Mux on top of the explicit memory read port.
         if (program.dpiImportCount() != 1 ||
-            countOpcode(program, Opcode::RegisterWrite) != 1 ||
+            countOpcode(program, Opcode::RegisterWriteCond) != 1 ||
             countOpcode(program, Opcode::MemoryRead) != 1 ||
             countOpcode(program, Opcode::MemoryReadAll) != 1 ||
-            countOpcode(program, Opcode::MemoryWrite) != 1 ||
+            countOpcode(program, Opcode::MemoryWriteCond) != 1 ||
             countOpcode(program, Opcode::MemoryFill) != 1 ||
-            countOpcode(program, Opcode::LatchWrite) != 1 ||
-            countOpcode(program, Opcode::Mux) != 3 ||
+            countOpcode(program, Opcode::LatchWriteCond) != 1 ||
+            countOpcode(program, Opcode::Mux) != 1 ||
             countOpcode(program, Opcode::SystemFunction) != 2 ||
             countOpcode(program, Opcode::SystemTask) != 1 ||
             countOpcode(program, Opcode::DpiCall) != 1 ||
@@ -274,10 +275,10 @@ namespace
         // All posedge(clk) consumers share one lowered detector instance, the
         // negedge(clk) fill shares the single ChangedNeg detector, and the
         // latch write carries no event operands at all. Event operand
-        // positions follow the new layouts: reg.write [nextValue, target,
-        // events...], mem.write [addr, nextValue, target, events...],
-        // mem.fill [packedData, target, events...], latch.write [nextValue,
-        // target].
+        // positions follow the variant layouts: reg.write.c [cond, data,
+        // target, events...], mem.write.c [cond, addr, data, target,
+        // events...], mem.fill [packedData, target, events...],
+        // latch.write.c [cond, data, target].
         VariableId sharedPosedge;
         VariableId sharedNegedge;
         bool checkedSharedPosedge = false;
@@ -298,18 +299,18 @@ namespace
                 continue;
             }
             const auto operands = program.operands(instruction);
-            if (opcode == Opcode::RegisterWrite)
+            if (opcode == Opcode::RegisterWriteCond)
             {
-                if (operands.size() != 3 || operands[2] != sharedPosedge)
+                if (operands.size() != 4 || operands[3] != sharedPosedge)
                 {
                     return fail("posedge(clk) writes did not share one lowered detector");
                 }
                 checkedSharedPosedge = true;
                 continue;
             }
-            if (opcode == Opcode::MemoryWrite)
+            if (opcode == Opcode::MemoryWriteCond)
             {
-                if (operands.size() != 6 || operands[5] != sharedPosedge)
+                if (operands.size() != 5 || operands[4] != sharedPosedge)
                 {
                     return fail("posedge(clk) writes did not share one lowered detector");
                 }
@@ -325,9 +326,9 @@ namespace
                 checkedSharedNegedge = true;
                 continue;
             }
-            if (opcode == Opcode::LatchWrite)
+            if (opcode == Opcode::LatchWriteCond)
             {
-                if (operands.size() != 2)
+                if (operands.size() != 3)
                 {
                     return fail("latch write must not carry event operands");
                 }
@@ -382,54 +383,76 @@ namespace
             {
                 return fail("ordinary host interaction was recorded as an explicit ordered effect");
             }
-            if (opcode != Opcode::RegisterWrite && opcode != Opcode::MemoryWrite &&
-                opcode != Opcode::MemoryFill && opcode != Opcode::LatchWrite)
+            if (!isStateWriteOpcode(opcode))
             {
                 return fail("unexpected instruction was recorded as an ordered effect");
             }
         }
 
         bool checkedRegisterOrder = false;
+        VariableId registerTarget;
         for (uint32_t index = 0; index < program.instructionCount(); ++index)
         {
             const InstructionId instruction{index};
-            if (program.opcode(instruction) != Opcode::RegisterWrite)
+            if (program.opcode(instruction) != Opcode::RegisterWriteCond)
             {
                 continue;
             }
             const auto operands = program.operands(instruction);
-            if (operands.size() != 3)
+            if (operands.size() != 4)
             {
-                return fail("register write did not get canonical AM operands");
+                return fail("register write did not get canonical reg.write.c operands");
             }
-            const Type &nextType = program.type(program.variable(operands[0]).type);
-            const Type &targetType = program.type(program.variable(operands[1]).type);
-            if (nextType != targetType || targetType.bitWidth != 8)
+            const Type &condType = program.type(program.variable(operands[0]).type);
+            const Type &nextType = program.type(program.variable(operands[1]).type);
+            const Type &targetType = program.type(program.variable(operands[2]).type);
+            if (condType.kind != TypeKind::BitVector || condType.bitWidth != 1 ||
+                nextType != targetType || targetType.bitWidth != 8)
             {
-                return fail("register nextValue/target order or coercion is wrong");
+                return fail("reg.write.c cond/nextValue/target order or coercion is wrong");
             }
-            // The lowering does no constant folding, so the conditional write
-            // must keep its merged nextValue as an explicit mux over the
-            // read-old target value.
+            // The live update condition stays on the write: the data operand
+            // is the raw add result, not a folded self-mux over a read-old
+            // snapshot of the target.
             bool nextIsMux = false;
             for (uint32_t probe = 0; probe < program.instructionCount(); ++probe)
             {
                 const InstructionId producer{probe};
                 const auto results = program.results(producer);
-                if (!results.empty() && results.front() == operands[0] &&
+                if (!results.empty() && results.front() == operands[1] &&
                     program.opcode(producer) == Opcode::Mux)
                 {
                     nextIsMux = true;
                     break;
                 }
             }
-            if (!nextIsMux)
+            if (nextIsMux)
             {
-                return fail("register write nextValue is not the folded cond/mask mux");
+                return fail("reg.write.c nextValue must not be a folded cond/mask mux");
             }
+            registerTarget = operands[2];
             checkedRegisterOrder = true;
         }
-        return checkedRegisterOrder ? 0 : fail("missing register write");
+        if (!checkedRegisterOrder)
+        {
+            return fail("missing cond-gated register write");
+        }
+        // No snapshot assign reads the write target: "cond missed -> keep the
+        // old value" is carried by not writing at all.
+        for (uint32_t index = 0; index < program.instructionCount(); ++index)
+        {
+            const InstructionId instruction{index};
+            if (program.opcode(instruction) != Opcode::Assign)
+            {
+                continue;
+            }
+            const auto operands = program.operands(instruction);
+            if (!operands.empty() && operands.front() == registerTarget)
+            {
+                return fail("cond-gated register write still keeps a target snapshot assign");
+            }
+        }
+        return 0;
     }
 
     int testExplicitExternalDpiOrderIsPreserved()
@@ -611,7 +634,7 @@ namespace
             {
                 fills.push_back(instruction);
             }
-            else if (program.opcode(instruction) == Opcode::MemoryWrite)
+            else if (program.opcode(instruction) == Opcode::MemoryWriteCond)
             {
                 writes.push_back(instruction);
             }
@@ -1557,6 +1580,272 @@ namespace
         }
         return 0;
     }
+    int testWriteVariantSelection()
+    {
+        grh::Design design;
+        grh::Graph &graph = design.createGraph("write_variant_selection");
+        design.markAsTop(graph.symbol());
+
+        const auto clock = logic(graph, "clock", 1);
+        const auto en = logic(graph, "en", 1);
+        const auto data = logic(graph, "data", 8);
+        const auto address = logic(graph, "address", 2);
+        const auto dynMask = logic(graph, "dyn_mask", 8);
+        graph.bindInputPort("clock", clock);
+        graph.bindInputPort("en", en);
+        graph.bindInputPort("data", data);
+        graph.bindInputPort("address", address);
+        graph.bindInputPort("dyn_mask", dynMask);
+        const auto one = constant(graph, "one_op", "one", 1, "1'h1");
+        const auto zero = constant(graph, "zero_op", "zero", 1, "1'h0");
+        const auto fullMask = constant(graph, "full_mask_op", "full_mask", 8, "8'hff");
+        const auto partMask = constant(graph, "part_mask_op", "part_mask", 8, "8'h0f");
+
+        const auto addRegister = [&](std::string_view name) {
+            const auto reg = graph.createOperation(grh::OperationKind::kRegister,
+                                                   graph.internSymbol(name));
+            graph.setAttr(reg, "width", int64_t{8});
+            graph.setAttr(reg, "isSigned", false);
+            graph.addDeclaredSymbol(graph.operationSymbol(reg));
+            return reg;
+        };
+        const auto regDyn = addRegister("reg_dyn");
+        const auto regConst = addRegister("reg_const");
+        const auto regMask = addRegister("reg_mask");
+        const auto regDynMask = addRegister("reg_dyn_mask");
+        const auto regDead = addRegister("reg_dead");
+
+        const auto addWrite = [&](grh::OperationId reg, grh::ValueId cond,
+                                  grh::ValueId mask, std::string_view name) {
+            const auto write = graph.createOperation(grh::OperationKind::kRegisterWritePort,
+                                                     graph.internSymbol(name));
+            graph.addOperand(write, cond);
+            graph.addOperand(write, data);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clock);
+            graph.setAttr(write, "regSymbol",
+                          std::string(graph.symbolText(graph.operationSymbol(reg))));
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        };
+        addWrite(regDyn, en, fullMask, "write_dyn");          // -> reg.write.c
+        addWrite(regConst, one, fullMask, "write_const");     // -> reg.write
+        addWrite(regMask, en, partMask, "write_mask");        // -> reg.write.cm
+        addWrite(regDynMask, one, dynMask, "write_dyn_mask"); // -> reg.write.m
+        addWrite(regDead, zero, fullMask, "write_dead");      // -> eliminated
+
+        const auto memory = graph.createOperation(grh::OperationKind::kMemory,
+                                                  graph.internSymbol("mem"));
+        graph.setAttr(memory, "width", int64_t{8});
+        graph.setAttr(memory, "row", int64_t{4});
+        graph.setAttr(memory, "isSigned", false);
+
+        const auto addMemWrite = [&](grh::ValueId cond, grh::ValueId mask,
+                                     std::string_view name) {
+            const auto write = graph.createOperation(grh::OperationKind::kMemoryWritePort,
+                                                     graph.internSymbol(name));
+            graph.addOperand(write, cond);
+            graph.addOperand(write, address);
+            graph.addOperand(write, data);
+            graph.addOperand(write, mask);
+            graph.addOperand(write, clock);
+            graph.setAttr(write, "memSymbol", std::string("mem"));
+            graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+        };
+        addMemWrite(one, fullMask, "mem_write_base"); // -> mem.write
+        addMemWrite(en, fullMask, "mem_write_cond");  // -> mem.write.c
+        addMemWrite(one, partMask, "mem_write_mask"); // -> mem.write.m
+        addMemWrite(en, partMask, "mem_write_cm");    // -> mem.write.cm
+        graph.freeze();
+
+        diag::Diagnostics diagnostics;
+        GrhIRToGrhSimAMGraphLowering lowering;
+        std::optional<AmGraph> artifact = lowering.lower(graph, diagnostics);
+        if (!artifact || diagnostics.hasError())
+        {
+            for (const auto &message : diagnostics.messages())
+            {
+                std::cerr << message.message << " [" << message.context << "]\n";
+            }
+            return fail("write-variant graph did not lower");
+        }
+        const ProgramView program = artifact->program();
+        if (countOpcode(program, Opcode::RegisterWrite) != 1 ||
+            countOpcode(program, Opcode::RegisterWriteCond) != 1 ||
+            countOpcode(program, Opcode::RegisterWriteMask) != 1 ||
+            countOpcode(program, Opcode::RegisterWriteCondMask) != 1 ||
+            countOpcode(program, Opcode::MemoryWrite) != 1 ||
+            countOpcode(program, Opcode::MemoryWriteCond) != 1 ||
+            countOpcode(program, Opcode::MemoryWriteMask) != 1 ||
+            countOpcode(program, Opcode::MemoryWriteCondMask) != 1 ||
+            countOpcode(program, Opcode::Mux) != 0)
+        {
+            return fail("write variant selection inventory is wrong");
+        }
+
+        const auto findDeclared = [&](std::string_view name) {
+            for (const VariableLabel &label : program.variableLabels())
+            {
+                if (program.string(label.label) == name)
+                {
+                    return label.variable;
+                }
+            }
+            return VariableId::invalid();
+        };
+        const auto findInput = [&](std::string_view name) {
+            for (const PortBinding &port : artifact->interface().ports)
+            {
+                if (port.direction == PortDirection::Input &&
+                    program.string(port.name) == name)
+                {
+                    return port.input;
+                }
+            }
+            return VariableId::invalid();
+        };
+        const VariableId regDynVar = findDeclared("reg_dyn");
+        const VariableId regConstVar = findDeclared("reg_const");
+        const VariableId regMaskVar = findDeclared("reg_mask");
+        const VariableId regDynMaskVar = findDeclared("reg_dyn_mask");
+        const VariableId regDeadVar = findDeclared("reg_dead");
+        const VariableId memVar = findDeclared("mem");
+        const VariableId dataVar = findInput("data");
+        const VariableId enVar = findInput("en");
+        const VariableId dynMaskVar = findInput("dyn_mask");
+        const auto findConstant = [&](uint32_t width, uint64_t value) {
+            for (uint32_t index = 0; index < program.variableCount(); ++index)
+            {
+                const VariableId variable{index};
+                const VariableRecord &record = program.variable(variable);
+                if (!record.init.valid() || record.init.value >= program.initCount())
+                {
+                    continue;
+                }
+                const InitDescriptor &init = program.init(record.init);
+                if (init.kind != InitKind::Constant)
+                {
+                    continue;
+                }
+                const LiteralView literal = program.literal(LiteralId{init.payload});
+                const Type &type = program.type(literal.type);
+                if (type.kind == TypeKind::BitVector && type.bitWidth == width &&
+                    !literal.words.empty() && literal.words.front() == value)
+                {
+                    return variable;
+                }
+            }
+            return VariableId::invalid();
+        };
+        const VariableId partMaskVar = findConstant(8, 0x0f);
+        if (!regDynVar.valid() || !regConstVar.valid() || !regMaskVar.valid() ||
+            !regDynMaskVar.valid() || !regDeadVar.valid() || !memVar.valid() ||
+            !dataVar.valid() || !enVar.valid() || !dynMaskVar.valid() ||
+            !partMaskVar.valid())
+        {
+            return fail("write-variant lowering produced an incomplete interface");
+        }
+
+        // Every write targets its expected variable with the exact variant
+        // layout (one trailing event each); cond/addr/mask/data are the raw
+        // input operands -- no folded mux, no blend, no read-old snapshot.
+        const auto checkWrite = [&](Opcode opcode, VariableId target,
+                                    std::size_t fixedCount, VariableId cond,
+                                    VariableId addr, VariableId mask,
+                                    VariableId data) {
+            for (uint32_t index = 0; index < program.instructionCount(); ++index)
+            {
+                const InstructionId instruction{index};
+                if (program.opcode(instruction) != opcode)
+                {
+                    continue;
+                }
+                const auto operands = program.operands(instruction);
+                if (operands.size() != fixedCount + 1 ||
+                    operands[fixedCount - 1] != target)
+                {
+                    continue;
+                }
+                std::size_t position = 0;
+                if (cond.valid() && operands[position++] != cond)
+                {
+                    return false;
+                }
+                if (addr.valid() && operands[position++] != addr)
+                {
+                    return false;
+                }
+                if (mask.valid() && operands[position++] != mask)
+                {
+                    return false;
+                }
+                return operands[position] == data;
+            }
+            return false;
+        };
+        const VariableId addressVar = findInput("address");
+        if (!addressVar.valid())
+        {
+            return fail("write-variant lowering produced an incomplete interface");
+        }
+        if (!checkWrite(Opcode::RegisterWriteCond, regDynVar, 3, enVar,
+                        VariableId::invalid(), VariableId::invalid(), dataVar) ||
+            !checkWrite(Opcode::RegisterWrite, regConstVar, 2, VariableId::invalid(),
+                        VariableId::invalid(), VariableId::invalid(), dataVar) ||
+            !checkWrite(Opcode::RegisterWriteCondMask, regMaskVar, 4, enVar,
+                        VariableId::invalid(), partMaskVar, dataVar) ||
+            !checkWrite(Opcode::RegisterWriteMask, regDynMaskVar, 3,
+                        VariableId::invalid(), VariableId::invalid(), dynMaskVar, dataVar) ||
+            !checkWrite(Opcode::MemoryWrite, memVar, 3, VariableId::invalid(),
+                        addressVar, VariableId::invalid(), dataVar) ||
+            !checkWrite(Opcode::MemoryWriteCond, memVar, 4, enVar, addressVar,
+                        VariableId::invalid(), dataVar) ||
+            !checkWrite(Opcode::MemoryWriteMask, memVar, 4, VariableId::invalid(),
+                        addressVar, partMaskVar, dataVar) ||
+            !checkWrite(Opcode::MemoryWriteCondMask, memVar, 5, enVar, addressVar,
+                        partMaskVar, dataVar))
+        {
+            return fail("a write variant has the wrong target or operand layout");
+        }
+        // The constant-0 cond write was eliminated entirely.
+        for (uint32_t index = 0; index < program.instructionCount(); ++index)
+        {
+            const InstructionId instruction{index};
+            if (!isStateWriteOpcode(program.opcode(instruction)))
+            {
+                continue;
+            }
+            const StateWriteLayout layout =
+                stateWriteLayout(program.opcode(instruction));
+            if (!layout.isStateWrite)
+            {
+                continue;
+            }
+            const auto operands = program.operands(instruction);
+            if (operands.size() >= layout.fixedCount &&
+                operands[layout.targetIndex] == regDeadVar)
+            {
+                return fail("a constant-0 cond write was not eliminated");
+            }
+        }
+        // No snapshot assign reads any register target.
+        for (uint32_t index = 0; index < program.instructionCount(); ++index)
+        {
+            const InstructionId instruction{index};
+            if (program.opcode(instruction) != Opcode::Assign)
+            {
+                continue;
+            }
+            const auto operands = program.operands(instruction);
+            if (!operands.empty() &&
+                (operands.front() == regDynVar || operands.front() == regConstVar ||
+                 operands.front() == regMaskVar || operands.front() == regDynMaskVar))
+            {
+                return fail("a register write still keeps a target snapshot assign");
+            }
+        }
+        return 0;
+    }
+
 } // namespace
 
 int main()
@@ -1578,6 +1867,10 @@ int main()
         return result;
     }
     if (const int result = testRegisterSwapStaysNonBlocking(); result != 0)
+    {
+        return result;
+    }
+    if (const int result = testWriteVariantSelection(); result != 0)
     {
         return result;
     }

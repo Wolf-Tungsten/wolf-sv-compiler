@@ -454,7 +454,18 @@ namespace wolvrix::lib::grhsim::am
                                  " in1_merges=" +
                                  std::to_string(computeActivity.coarsenIn1Merges) +
                                  " sibling_merges=" +
-                                 std::to_string(computeActivity.coarsenSiblingMerges),
+                                 std::to_string(computeActivity.coarsenSiblingMerges) +
+                                 " refine_rounds=" +
+                                 std::to_string(computeActivity.refinementRounds) +
+                                 " refine_moves=" +
+                                 std::to_string(computeActivity.refinementMoves) +
+                                 " refine_ms=" + std::to_string(computeActivity.refinementMs) +
+                                 " refine_cost=" +
+                                 std::to_string(
+                                     static_cast<long long>(computeActivity.refinementCostBefore)) +
+                                 "->" +
+                                 std::to_string(
+                                     static_cast<long long>(computeActivity.refinementCostAfter)),
                              std::string(kDiagnosticContext));
             diagnostics.info("coarsen-dp initial degree histogram: " +
                                  computeActivity.initialDegreeHistogram,
@@ -585,9 +596,10 @@ namespace wolvrix::lib::grhsim::am
         // Clock-domain view of every commit Block: the (kind, variable) parts
         // its aggregated gate detectors watch. Eventful writes contribute
         // their canonical raw event sources; latch writes are eventless and
-        // contribute their merged nextValue, so an eventless Block gates on an
-        // actual nextValue change. Every watched part becomes one in-Block
-        // changed.* detector during materialization.
+        // contribute their gating/data operands (cond?/mask?/data), so an
+        // eventless Block gates on an actual update-relevant change. Every
+        // watched part becomes one in-Block changed.* detector during
+        // materialization.
         std::vector<std::vector<CommitEventPart>> commitGateParts(normalBlockCount + 1);
         std::unordered_map<uint32_t, std::vector<uint32_t>> commitStateWriters;
         std::size_t headDetectorCount = 0;
@@ -602,13 +614,22 @@ namespace wolvrix::lib::grhsim::am
                 }
                 commitStateWriters[target->value].push_back(block);
                 const auto operands = program.operands(instruction);
-                if (program.opcode(instruction) == Opcode::LatchWrite) {
-                    parts.push_back(CommitEventPart{changedEventKind(Opcode::ChangedAny),
-                                                    operands.front().value});
+                const Opcode opcode = program.opcode(instruction);
+                if (isLatchWriteOpcode(opcode)) {
+                    const StateWriteLayout layout = stateWriteLayout(opcode);
+                    const std::size_t fixed =
+                        std::min<std::size_t>(layout.fixedCount, operands.size());
+                    for (std::size_t index = 0; index < fixed; ++index) {
+                        if (index == layout.targetIndex) {
+                            continue;
+                        }
+                        parts.push_back(CommitEventPart{changedEventKind(Opcode::ChangedAny),
+                                                        operands[index].value});
+                    }
                     continue;
                 }
                 const std::size_t eventBegin =
-                    stateWriteEventBegin(program.opcode(instruction), operands.size());
+                    stateWriteEventBegin(opcode, operands.size());
                 for (std::size_t index = eventBegin; index < operands.size(); ++index) {
                     parts.push_back(canonicalCommitEvent(program, defUse, operands[index]));
                 }

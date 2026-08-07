@@ -45,6 +45,16 @@ normalized GRH
 > B0 activation target 到实际 reader 的完整性、边沿分支的联合完备性和
 > ordered-effect 完整性证明。
 
+> 实现进展（2026-08-07，NO0005）：状态写指令改为 cond/mask 变体族，勘误 NO0001 的
+> 「reg.write/latch.write cond/mask 数据化」决策。`reg.write/latch.write/mem.write`
+> 各派生 `.c/.m/.cm` 三个显式 opcode 变体（共 12 个），操作数布局统一为
+> `[cond?, addr?（仅 mem）, mask?, data, target, events...]`；lowering 按 cond/mask
+> 常量性逐写口选型（常量 0 整条消除、常量 1/全 1 不占操作数位），`targetSnapshot`
+> 快照 assign、read-old blend 与自 mux 三件套整体删除——「条件不触发 → 保持旧值」由
+> 不写保证，mask 混合是 commit 局部的读旧值位混合。常量 mask 在 C++ emitter 端折叠为
+> 立即数。纯 latch commit Block 的 gate 改为 watch 每条 latch 写的
+> cond?/mask?/data 操作数。AM 套件 12/12。
+>
 > 实现进展（2026-08-06，NO0004）：流程框架与术语统一。阶段命名以
 > `pdocs/grh-notepad/am-graph/NO0004` 为准：lowering-to-am-graph → opt-am-graph →
 > split-am-graph → opt-am-compute-graph（空阶段预留）→ partition-am-compute-graph /
@@ -445,8 +455,9 @@ Scheduler 按以下阶段工作，每一阶段只保留下一阶段需要的事�
 6. state write 只进入 commit Block。commit Block 的结构固定为 [首部 gate detector] +
    [状态写] + [尾部 watch + act]：首部为块内每个事件签名元素 (kind, raw) 一条克隆
    `changed.*`（写指令的 event operand 重指向这些块内 detector 的结果；纯 latch 块
-   每条 latch 写一条 `ChangedAny(nextValue)`），门控为全部首部 detector 结果的 OR，
-   整块只判一次，状态写与尾部 watch/act 都在门内。同一 register/memory/latch target
+   每条 latch 写的 cond?/mask?/data 操作数各一条 `ChangedAny`），门控为全部首部
+   detector 结果的 OR，整块只判一次，状态写与尾部 watch/act 都在门内。同一
+   register/memory/latch target
    存在多个候选 write 时，由块内文本顺序和 commit 段静态 BlockId 顺序兑现
    priority/effect order；每个 commit Block 对自身写入的每个 state target 在块尾物化
    一个共享 `changed.any target,targetOld`，实际变化经 `act.b` 激活 reader compute
@@ -476,22 +487,28 @@ reg/latch/memory write 属于 commit。DPI/system/effect 顺序和同 target 多
 有向边，不会把有序序列或 writers 收缩为一个 atom。
 
 分块实现全仓唯一（`lib/grhsim/am/grhsim_am_graph_split.cpp` 与
-`lib/grhsim/am/grhsim_am_{compute,commit}_graph_partition.cpp`，从 legacy 逐行移植）。AM 图
+`lib/grhsim/am/grhsim_am_{compute,commit}_graph_partition.cpp`）。AM 图
 摄入并完成 atom（SCC）分类后，先做一次 **compute/commit 分图**
 （**split-am-graph**，`splitAmGraph`）：atom DAG 拆成两张诱导子图（局部 id 保持全局相对
 次序，跨类边不属于任一子图），commit→compute 的依赖在此判非法；之后两个分区 pass
 各自独立处理一张子图：
 
-- **compute 子图按活动度划分**（**partition-am-compute-graph**，`partitionAmComputeGraph`）：对 compute atom
-  DAG 做 out1/in1/sibling 三路迭代 coarsen（`enableCoarsening` 控制，cluster 指令上限
-  为 `dpCoarsenBudget`，0 表示自动取 1.5 × `maxInstructionsPerBlock`），再在确定性拓扑
-  序列上做 segment DP，以“跨段 incoming 激活 value 数加每段 `dpSegmentPenalty`（默认
-  1.0）”为代价切成 compute Block，受 `maxInstructionsPerBlock`（默认 128）限制；
+- **compute 子图按连通性划分**（**partition-am-compute-graph**，`partitionAmComputeGraph`，
+  自 2026-08-06 起为 gsim 风格连通性算法，前身是 out1/in1/sibling 迭代 coarsen +
+  activation-cost segment DP）：三个阶段——①coarsen：`mergeOut1` 逆序单遍（出度 1 并入
+  最早后继）、`mergeIn1` 正序单遍（入度 1 并入最晚前驱）、`mergeSublings`（前驱集完全相等
+  分组合并、宿主上限 30），宿主成员上限取 `dpCoarsenBudget`（0=默认 256，上限越大跨边
+  越少但超大块运行时尾巴越重，见 compute-partition NO0004 §8），合并后确定性
+  拓扑重排；②Kernighan 边割 DP：cluster 拓扑序列上以每边界 `dpSegmentPenalty`（默认 1.0）
+  罚项最小化边割切分，块指令数受 `maxInstructionsPerBlock`（默认 128）限制，单超 cap 的
+  cluster 自成一块；③**局部移动精化**（`refineClusterBlocks`，`dpRefinementRounds` 默认
+  10、0 关闭）：按精确块级 incoming-copy 成本增量把 cluster 移向邻接块，单调降本、
+  全确定性，候选须保持跨块 def-before-use（拓扑硬约束）；
 - **commit 子图按事件聚类**（**partition-am-commit-graph**，`partitionAmCommitGraph`）：commit atom 只按事件
   签名聚合——每个 event 经其定义 `changed` 规范化为（边沿种类, 被观测 Variable），
   排序去重后作为分块键，同键 atom 在 `maxCommitInstructionsPerBlock`（默认 4096）限制
-  内合并；update guard 已删除，不再是分块分量（`reg.write/latch.write` 的 cond/mask
-  折叠进 nextValue，`mem.write` 自带的 cond/mask 由指令自身判定，均不参与分块）。
+  内合并；事件签名只含 event operand——`reg.write/latch.write/mem.write` 各变体的
+  cond/mask 是写指令自身的门控操作数，不参与分块。
 
 两路结果随后在 materialize 阶段合并回全局 atom 编号（commit Block 序接在 compute 段
 之后，中间留 input sink 位）。真正的 SCC atom 超限时保留为一个 oversized Block 并报
@@ -501,9 +518,10 @@ reg/latch/memory write 属于 commit。DPI/system/effect 顺序和同 target 多
 commit Block 不再常扫描：每轮 compute 阶段结束后，commit 阶段按 BlockId 升序、以与
 compute 相同的激活位图过滤执行 commit Block（首次 `eval()` 激活全部 Block）。块首部
 gate detector 先执行并更新基线；门控（全部首部 detector 结果的 OR）为假时整块跳过，
-为真时写指令按文本顺序执行——写自身不再判定 event；`reg.write/latch.write` 的
-cond/mask 已在 lowering 合并进 nextValue，`mem.write` 保留 cond 门控、逐 bit mask 与
-地址越界抑制，`mem.write_lanes` 保留
+为真时写指令按文本顺序执行——写自身不再判定 event；`reg.write/latch.write/mem.write`
+的 `.c/.cm` 变体自带 cond 门控（cond 不命中则不写也不做判变比较），`.m/.cm` 变体在
+commit 局部做逐 bit mask 混合（读旧值 `v=(v&~mask)|(data&mask)`），mem 各变体保留
+地址越界抑制（无 mask 变体整元素覆盖、不读旧值），`mem.write_lanes` 保留
 `any(laneMask)` 早退。使 visible state 实际变化且存在 reader 时，尾部判变 event 激发
 `act.b`，激活该 state 的 reader compute Block 进入下一 round。没有 operand 快照、
 没有 pending event、没有跨轮保留。
@@ -651,7 +669,7 @@ instruction/cycle 计数与旧功能基线完全一致；但 host time 为 4,178
 
 ### 3.2.4 指令图研究导出（JSONL，2026-07-30）
 
-`AmActivityScheduler::schedule` 支持把**调度前**的指令图导出为 JSONL，
+`GrhIRToGrhSimAMProgram::graphToProgram` 支持把**调度前**的指令图导出为 JSONL，
 供 topo-partition-proj 的离线分区研究（harness/打分/搜索/训练）使用。设置环境变量即触发，
 不影响正常调度流程；导出失败（路径不可写等）会使调度报错退出，不会静默跳过：
 
@@ -716,29 +734,68 @@ header 中的三个对账指标在生产内部按如下口径计算（harness  s
 - `incoming_copy_cost`：上述每个对按 `max(1, ceil(width/64))` 折算的拷贝总数，
   即 topo-partition-proj 04 文档第一阶段优化目标。
 
-### 3.2.5 AM 指令流优化（DCE / const-fold / CSE / assign 别名 / ROM 折叠，2026-07-31 初版，2026-08-04 扩展）
+### 3.2.4.1 split 图导出（compute/commit 子图，2026-08-06）
+
+split-am-graph 阶段的产物本身也可以导出（成员资格、诱导边与 atom 注解全部取自
+split 上下文，与分区 pass 所见一致，不是全图导出的离线过滤）：
+
+```bash
+WOLVRIX_GRHSIM_AM_SPLIT_GRAPH_JSONL=/path/to/prefix \
+    grhsim-am-lower-json design.json SimTop --schedule
+# 产出 <prefix>.compute.jsonl 与 <prefix>.commit.jsonl
+```
+
+格式为 `wolvrix.am-split-graph.v1`，record 形状沿用指令图导出惯例：header 增加
+`side`（compute|commit）；node 记录含 `atom`（子图局部 atom id）、`min_instruction`，
+commit 侧另含 `event_rank`；commit 侧的 `external_read` 是其全部边界输入（含
+`src_side="compute"` 的 compute 产出值与真正无定义的 state/接口读）。compute 图与
+gsim 打平图（`--flatten-nodes`）语义同构，是 compute 分区算法研究的切入点
+（量化基线见 pdocs/grh-notepad/compute-partition/NO0001）。
+
+### 3.2.5 AM 指令流优化（DCE / const-fold / CSE / assign 别名 / ROM 折叠 / 逻辑统一 / mux 取反吸收 / slice 融合，2026-07-31 初版，2026-08-06 扩展）
 
 `grhsim/am/grhsim_am_graph_optimize.{hpp,cpp}` 在 lowering 与 schedule 之间提供可选的指令流优化：
-`optimizeAmGraph(AmGraph&, AmOptimizeOptions{dce, constFold, cse, assignAlias, constMemFold, interfaceAlias},
+`optimizeAmGraph(AmGraph&, AmOptimizeOptions{dce, constFold, cse, assignAlias, stateReadAlias, logicUnify, muxNotAbsorb, sliceFuse, notUnify(默认关), constMemFold, interfaceAlias},
 Diagnostics&)`（自 2026-08-06 起在图上就地重建，前身为线性版的 `optimizeLinearProgram`）。`grhsim-am-lower-json` 经 `--am-optimize=dce,fold,cse,alias,memfold,ifacealias`（默认全开）/
 `--no-am-optimize` 控制；实验路径与生产路径均默认开启——生产路径由
 `GrhIRToGrhSimAMProgram::run` 在 lower 校验后、graphToProgram 前调用，可用
 `setAmOptimizeOptions` 改配或全关。
 动机与两级（GRH 层 + AM 层）实验设计见 topo-partition-proj `docs/20`；2026-08-04
-扩展的动机与实测见 pdocs/grh-notepad/supernode-align NO0011。
+扩展的动机与实测见 pdocs/grh-notepad/supernode-align NO0011；2026-08-06 图形收敛
+pass 的归因与实测见 pdocs/grh-notepad/compute-partition NO0003/NO0005。
+
+pass 内部以"别名表 + 指令重写表"双机制工作：fold/CSE/别名类 pass 把结果变量别名到
+代表变量；形态重写类 pass（logicUnify/muxNotAbsorb/sliceFuse）记录
+(opcode, operands[, slice lsb]) 重写项，后续 pass 与 compact 一律经 effective
+访问器读取指令形态，定点迭代至不动点后一次稠密重建。
 
 - **DCE**：根集合 = effect ∈ {StateWrite, StateReadWrite, HostRead, HostEffect} 的指令
   ∪ `orderedEffects` 涉及指令 ∪ 产出 ExternalOutput/Observable 角色的指令（跟随别名
-  解析到代表变量），沿 def-use 反图标记活指令。StateRead（MemoryRead）结果无引用且
-  不在 `orderedEffects` 中时可删。
+  解析到代表变量），沿 def-use 反图（重写后的有效操作数）标记活指令。StateRead
+  （MemoryRead）结果无引用且不在 `orderedEffects` 中时可删。
 - **const-fold**：操作数全为常量的纯 op 求值进 literal 池（逐位镜像 interpreter
   语义），与 CSE、assign 别名迭代至不动点。
 - **CSE**：纯 op hash-cons，key = (opcode, result type, 规范化操作数[可交换 op
   排序], slice/system 属性)；Memory/DPI/System/Changed 一律不参与。重复指令的结果
   变量别名为首次出现的变量。
-- **assign 别名**（assignAlias）：单操作数且结果/操作数类型完全一致的 Assign 直接
-  别名其操作数；操作数为 State 角色的 Assign 是 commit read-old 快照
-  （lowering preCommitValue），永不别名。
+- **assign 别名**（assignAlias/stateReadAlias）：单操作数且结果/操作数类型完全一致
+  的 Assign 直接别名其操作数。操作数为 State 角色时按 stateReadAlias 细化判定：
+  仅当结果（沿单操作数 Assign 链闭包）可达 commit 侧指令（状态写/变化检测/宿主
+  效应）操作数时才保留——那是 commit read-old 快照（lowering preCommitValue）；
+  只喂 compute 逻辑的状态读 Assign（GRH kAssign 线网）一律旁路，消费者直读状态
+  变量（值恒等，仅缩短激活链）。
+- **逻辑统一**（logicUnify）：结果与全部操作数均为 1-bit 的 LogicAnd/LogicOr/
+  LogicNot 重写为按位 And/Or/Not（1-bit 下 truth(x)=x，两形式语义恒等），使 CSE
+  能合并 Chisel `&`/`&&` 双形式产生的平行副本。
+- **mux 取反吸收**（muxNotAbsorb）：`mux(not(c), a, b)` → `mux(c, b, a)`，要求 Not
+  单用且结果无接口可见性；LogicNot 对任意宽度成立（select 只取真值），按位 Not
+  仅 1-bit。Not 指令随删除。
+- **slice 融合**（sliceFuse）：`slice(slice(x, l1), l2)` → `slice(x, l1+l2)`（两级
+  均要求在界内以保零填充语义逐位一致）；lsb=0 且类型完全一致的恒等 slice 直接
+  别名——与状态读 Assign 同样查 commit 闭包，喂 commit 的状态恒等 slice 保留。
+  中间 slice 由 DCE 回收。
+- **not 归一**（notUnify，默认关）：1-bit Not → Eq(x, 0)，对齐参照系的否定形式。
+  香山实测纯桶间搬移（CSE 仅 +6 合并），不出力故默认关闭（NO0005 §5）。
 - **ROM 折叠**（constMemFold）：目标 memory 无任何写/填充且地址为编译期常量的
   MemoryRead 折叠为常量——存储零初始化语义下 Undef/Zero init 读出恒 0（与
   interpreter/emitter 逐位一致），越界地址按 interpreter 语义折 0；Actions init
@@ -759,8 +816,12 @@ fold 2 条、DCE 0 条（死锥已被 GRH 层收编），耗时 ~6 s；E2（L2-o
 脏图）结果见 topo-partition-proj `docs/20` 的实验矩阵。2026-08-04 扩展后实测
 （3,387,378 指令输入）：CSE 162,488 + assign 别名 185,426，指令 -9.9%，香山
 CoreMark 50k difftest 通过且仿真 host time -15.5%（supernode-align NO0011 §6）。
+2026-08-06 图形收敛 pass 后实测（3,630,947 指令输入）：CSE 163,131 + assign 别名
+354,984 + 统一 205,278 + 吸收 72 + slice 融合 4,837，指令 3,630,947 → 3,111,412；
+split 后 compute 图出度≥2 节点 599,947 → 574,724（compute-partition NO0005）。
 单测 `tests/grhsim/am/test_optimize.cpp` 覆盖死锥删除、可交换 CSE、fold 级联、
-接口重指向与角色转移、状态快照保留、ROM 折叠与根集合安全性。
+接口重指向与角色转移、状态快照保留与纯计算状态读旁路、逻辑统一、mux 取反吸收、
+slice 融合、ROM 折叠与根集合安全性。
 
 ### 3.3 临时 scheduling facts
 
@@ -1093,7 +1154,7 @@ Gate：仓库没有第二套 runtime schedule 真相；所有生产入口都经�
 | round 结构 | 旧路径按 batch 调 compute、每 round 扫 commit；AM 对齐同一两阶段 round：compute 与 commit 都按 active 过滤升序执行（commit 相位在后），任一 `act.b` 激发即要求下一轮 | feedback 收敛、写回可见时点和执行次数符合 AM |
 | 激活边 | 旧代码依赖 topo active id 和 batch 内局部传播；AM `act.f` 指向严格更大的 BlockId（compute 或 commit），`act.b` 指向非 EntryBlock 的任意 Block（scheduler 只在 commit Block 尾部产生）；指向 commit Block 的激活边只携带其 gate detector watch 的变量 | 每条激活边的放置与 target 范围经 validator 证明 |
 | event 生命周期 | 旧 event edge slot 通常按 fixed-point round 清零；AM 跨块消费的 changed result 在 round 末清零（同块消费不清），B0 每次 eval 执行 | pos/neg、同轮多消费者和跨轮 event 不丢失或重复 |
-| state write | 旧 commit supernode 每 round 扫描；AM reg/latch/mem write 位于按激活位执行的 commit Block，reg/latch 写的 cond/mask 已折叠进 nextValue，`mem.write` 保留 cond/mask 操作数与地址越界抑制；写自身无 event 判定，由块首部 gate detector 的 OR 门控整块写入 | 多写 priority、mask/fill、read-during-write 和 reader reactivation 一致 |
+| state write | 旧 commit supernode 每 round 扫描；AM reg/latch/mem write 位于按激活位执行的 commit Block，写按 cond/mask 常量性选型为 12 个显式变体（`.c/.m/.cm`），cond 门控与 commit 局部 mask 混合由指令自身判定，mem 变体保留地址越界抑制；写自身无 event 判定，由块首部 gate detector 的 OR 门控整块写入 | 多写 priority、mask/fill、read-during-write 和 reader reactivation 一致 |
 | memory 划分 | 旧 `kMemoryReadPort` 是 source-class 且可能 clone；新层看到显式 `mem.read` 和 Array | address 依赖保留；有副作用/可能 alias 的访问不被非法复制或重排 |
 | 外部输入 | 两条路径都应只观察两次 eval 间的最终值，但 seed 机制不同 | 0->1->0 后再 eval 不产生虚假变化 |
 | DPI/system | 旧 supernode/batch 和 full-pass fast path 可能改变调用次数；AM 要保持 Block、schedule、once/final 顺序 | 逐次调用 trace、参数/返回 ABI 和 finalize 顺序一致 |

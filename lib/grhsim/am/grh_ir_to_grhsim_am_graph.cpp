@@ -119,11 +119,11 @@ namespace wolvrix::lib::grhsim::am
             uint32_t ordinal = 0;
         };
 
-        // One collected state write operation before nextValue merging. The
-        // update condition and write mask are kept as expression operands and
-        // folded into the final nextValue when the writes of one (target,
-        // event signature) chain are materialized; the emitted state write
-        // instruction then carries no cond/mask operands.
+        // One collected state write operation before variant selection. The
+        // update condition and write mask stay expression operands; when the
+        // writes of one (target, event signature) group are materialized,
+        // each write independently selects the simplest cond/mask opcode
+        // variant by the constantness of its cond and mask operands.
         struct PendingStateWrite
         {
             Opcode opcode = Opcode::RegisterWrite;
@@ -2231,8 +2231,8 @@ namespace wolvrix::lib::grhsim::am
 
             // Constant classification of a lowering-time variable: only
             // Constant-initialised bit-vector literals qualify (coerced or
-            // computed values stay Dynamic). Used to fold the merged
-            // nextValue logic at construction time.
+            // computed values stay Dynamic). Drives the cond/mask variant
+            // selection of the emitted state-write instructions.
             enum class ConstClass : uint8_t
             {
                 Dynamic,
@@ -2293,42 +2293,11 @@ namespace wolvrix::lib::grhsim::am
                 return result;
             }
 
-            VariableId pureBinary(Opcode opcode, VariableId lhs, VariableId rhs,
-                                  const Type &type)
-            {
-                const std::array<VariableId, 2> operands{lhs, rhs};
-                return addPureTyped(opcode, type, operands);
-            }
-
             VariableId pureMux(VariableId cond, VariableId whenTrue,
                                VariableId whenFalse, const Type &type)
             {
                 const std::array<VariableId, 3> operands{cond, whenTrue, whenFalse};
                 return addPureTyped(Opcode::Mux, type, operands);
-            }
-
-            // (base & ~mask) | (data & mask), folded at construction:
-            // constant masks collapse outright; dynamic masks use the
-            // three-op form base ^ ((base ^ data) & mask).
-            VariableId blendValue(VariableId base, VariableId data, VariableId mask,
-                                  const Type &type)
-            {
-                if (!mask.valid())
-                {
-                    return data;
-                }
-                switch (classifyConstant(mask, type.bitWidth))
-                {
-                case ConstClass::AllOnes:
-                    return data;
-                case ConstClass::Zero:
-                    return base;
-                default:
-                    break;
-                }
-                const VariableId delta = pureBinary(Opcode::Xor, base, data, type);
-                const VariableId gated = pureBinary(Opcode::And, delta, mask, type);
-                return pureBinary(Opcode::Xor, base, gated, type);
             }
 
             void recordWriteEffect(InstructionId instruction, uint32_t group,
@@ -2363,9 +2332,15 @@ namespace wolvrix::lib::grhsim::am
                 switch (opcode)
                 {
                 case Opcode::LatchWrite:
+                case Opcode::LatchWriteCond:
+                case Opcode::LatchWriteMask:
+                case Opcode::LatchWriteCondMask:
                     facts.stateKind = AmStateKind::Latch;
                     break;
                 case Opcode::MemoryWrite:
+                case Opcode::MemoryWriteCond:
+                case Opcode::MemoryWriteMask:
+                case Opcode::MemoryWriteCondMask:
                 case Opcode::MemoryFill:
                 case Opcode::MemoryWriteLanes:
                     facts.stateKind = AmStateKind::Memory;
@@ -2377,38 +2352,23 @@ namespace wolvrix::lib::grhsim::am
                 amGraph_.setValueFacts(target, facts);
             }
 
-            // Registers/latches: fold the whole chain into a single write
-            // whose nextValue nests cond/mask over the read-old state value.
-            // The chain starts from a pre-commit snapshot of the target
-            // (settled in the compute phase), so the cone is free of direct
-            // state operands and packing can never turn a non-blocking read
-            // into a blocking one; a chain that degenerates to the identity
-            // emits no write at all.
-            VariableId targetSnapshot(VariableId target)
-            {
-                if (const auto found = targetSnapshots_.find(target.value);
-                    found != targetSnapshots_.end())
-                {
-                    return found->second;
-                }
-                const TypeId type = amGraph_.program().variable(target).type;
-                const VariableId snapshot = addVariable(type, amGraph_.undefInit());
-                targetSnapshots_.emplace(target.value, snapshot);
-                const std::array<VariableId, 1> results{snapshot};
-                const std::array<VariableId, 1> operands{target};
-                addInstruction(Opcode::Assign, results, operands);
-                return snapshot;
-            }
-
-            void emitMergedScalarWrites(
+            // Registers/latches: one write instruction per pending write,
+            // with the cond/mask kept as gating operands of the selected
+            // opcode variant. "All branches miss -> keep the old value" is
+            // carried by NOT writing (a false cond skips the commit), so no
+            // read-old snapshot, blend, or self-mux is materialized. Writes
+            // in one signature group commit in ordinal order inside their
+            // commit Block, so a later write overwrites/blends onto the
+            // earlier one's result -- the same value the old folded
+            // snapshot+blend+mux chain computed. A write that can never
+            // change the target (constant-0 cond or mask) emits nothing.
+            void emitScalarWrites(
                 const std::vector<PendingStateWrite> &signatureGroup, uint32_t group,
                 uint32_t &ordinal)
             {
                 const PendingStateWrite &head = signatureGroup.front();
                 const Type targetType =
                     amGraph_.program().type(amGraph_.program().variable(head.target).type);
-                VariableId acc = targetSnapshot(head.target);
-                const VariableId accStart = acc;
                 for (const PendingStateWrite &write : signatureGroup)
                 {
                     if (isConstantZero(write.cond))
@@ -2416,53 +2376,88 @@ namespace wolvrix::lib::grhsim::am
                         // A write that never fires has no effect, ever.
                         continue;
                     }
-                    const VariableId blended =
-                        blendValue(acc, write.data, write.mask, targetType);
-                    if (blended == acc)
+                    const ConstClass maskClass =
+                        classifyConstant(write.mask, targetType.bitWidth);
+                    if (maskClass == ConstClass::Zero)
                     {
+                        // A write that never changes a bit has no effect.
                         continue;
                     }
-                    if (isConstantOne(write.cond))
+                    const bool hasCond = !isConstantOne(write.cond);
+                    const bool hasMask = maskClass != ConstClass::AllOnes;
+                    Opcode opcode = write.opcode;
+                    if (write.opcode == Opcode::RegisterWrite)
                     {
-                        acc = blended;
-                        continue;
+                        opcode = hasCond ? (hasMask ? Opcode::RegisterWriteCondMask
+                                                    : Opcode::RegisterWriteCond)
+                                         : (hasMask ? Opcode::RegisterWriteMask
+                                                    : Opcode::RegisterWrite);
                     }
-                    acc = pureMux(write.cond, blended, acc, targetType);
+                    else
+                    {
+                        opcode = hasCond ? (hasMask ? Opcode::LatchWriteCondMask
+                                                    : Opcode::LatchWriteCond)
+                                         : (hasMask ? Opcode::LatchWriteMask
+                                                    : Opcode::LatchWrite);
+                    }
+                    std::vector<VariableId> operands;
+                    operands.reserve(4 + write.events.size());
+                    if (hasCond)
+                    {
+                        operands.push_back(write.cond);
+                    }
+                    if (hasMask)
+                    {
+                        operands.push_back(write.mask);
+                    }
+                    operands.push_back(write.data);
+                    operands.push_back(write.target);
+                    operands.insert(operands.end(), write.events.begin(),
+                                    write.events.end());
+                    const InstructionId instruction = addInstruction(opcode, {}, operands);
+                    recordWriteEffect(instruction, group, ordinal);
                 }
-                if (acc == accStart)
-                {
-                    return;
-                }
-                std::vector<VariableId> operands{acc, head.target};
-                operands.insert(operands.end(), head.events.begin(),
-                                head.events.end());
-                const InstructionId instruction =
-                    addInstruction(head.opcode, {}, operands);
-                recordWriteEffect(instruction, group, ordinal);
             }
 
             // mem.write chains: one instruction per write, cond/mask kept as
-            // operands. A disabled write is suppressed entirely, so ordered
-            // writes in the same sweep never need to read the old element
-            // value -- there is no read-old threading at all.
+            // operands of the selected variant. A disabled write is
+            // suppressed entirely, so ordered writes in the same sweep never
+            // need to read the old element value -- there is no read-old
+            // threading at all.
             InstructionId emitMemoryElementWrite(
                 VariableId target, const PendingStateWrite &write,
                 const Type &elementType)
             {
-                // mem.write keeps cond/mask as operands (reverted from the
-                // merged self-mux form): a disabled write simply never
-                // happens, so no read-old element evaluation is needed at
-                // all. Register chains can start from a scalar pre-commit
-                // snapshot, but a memory cannot be snapshotted wholesale --
-                // its merged form had to read oldValue live at commit time
-                // (the read-old mandatory pull), which is exactly the cost
-                // and the stale-hold hazard this revert removes.
-                // Layout: [cond, addr, mask, data, target, events...].
-                std::vector<VariableId> operands{write.cond, write.addr, write.mask,
-                                                 write.data, target};
+                // Variant selection folds constant gating operands away: a
+                // constant-1 cond and an all-ones mask are dropped from the
+                // operand list (constant-0 cond/mask writes were suppressed
+                // by the caller). Non-constant operands stay on the
+                // instruction; the commit side evaluates them directly.
+                const bool hasCond = !isConstantOne(write.cond);
+                const bool hasMask =
+                    classifyConstant(write.mask, elementType.bitWidth) !=
+                    ConstClass::AllOnes;
+                const Opcode opcode =
+                    hasCond ? (hasMask ? Opcode::MemoryWriteCondMask
+                                       : Opcode::MemoryWriteCond)
+                            : (hasMask ? Opcode::MemoryWriteMask
+                                       : Opcode::MemoryWrite);
+                std::vector<VariableId> operands;
+                operands.reserve(5 + write.events.size());
+                if (hasCond)
+                {
+                    operands.push_back(write.cond);
+                }
+                operands.push_back(write.addr);
+                if (hasMask)
+                {
+                    operands.push_back(write.mask);
+                }
+                operands.push_back(write.data);
+                operands.push_back(target);
                 operands.insert(operands.end(), write.events.begin(),
                                 write.events.end());
-                return addInstruction(Opcode::MemoryWrite, {}, operands);
+                return addInstruction(opcode, {}, operands);
             }
 
             const Type *variableTypeOf(VariableId variable) const
@@ -2482,7 +2477,7 @@ namespace wolvrix::lib::grhsim::am
                 if (head.opcode == Opcode::RegisterWrite ||
                     head.opcode == Opcode::LatchWrite)
                 {
-                    emitMergedScalarWrites(signatureGroup, group, ordinal);
+                    emitScalarWrites(signatureGroup, group, ordinal);
                     return;
                 }
                 if (head.opcode == Opcode::MemoryWriteLanes)
@@ -2665,7 +2660,7 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return;
                 }
-                const VariableId next = coerceToType(
+                VariableId next = coerceToType(
                     mappedValue(op.operands()[1], op), typeForValue(op.operands()[1]),
                     targetType);
                 if (!next.valid())
@@ -2673,7 +2668,8 @@ namespace wolvrix::lib::grhsim::am
                     error("latch nextValue cannot be converted to target Type", opContext(op));
                     return;
                 }
-                const VariableId mask = coerceToType(
+                next = preCommitValue(op.operands()[1], next, op);
+                VariableId mask = coerceToType(
                     mappedValue(op.operands()[2], op), typeForValue(op.operands()[2]),
                     targetType);
                 if (!mask.valid())
@@ -2682,10 +2678,12 @@ namespace wolvrix::lib::grhsim::am
                           opContext(op));
                     return;
                 }
+                mask = preCommitValue(op.operands()[2], mask, op);
                 PendingStateWrite write{
                     .opcode = Opcode::LatchWrite,
                     .target = *target,
-                    .cond = mappedValue(op.operands()[0], op),
+                    .cond = preCommitValue(op.operands()[0],
+                                           mappedValue(op.operands()[0], op), op),
                     .mask = mask,
                     .data = next,
                     .addr = VariableId::invalid(),
@@ -3427,7 +3425,6 @@ namespace wolvrix::lib::grhsim::am
             std::unordered_map<uint32_t, uint32_t> stateOrderGroups_;
             std::map<std::pair<Opcode, uint32_t>, VariableId> eventDetectorMemo_;
             std::unordered_map<uint32_t, VariableId> preCommitSnapshots_;
-            std::unordered_map<uint32_t, VariableId> targetSnapshots_;
             uint64_t freshTemporaryCount_ = 0;
             std::size_t flattenedUnknownLiterals_ = 0;
         };

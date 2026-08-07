@@ -38,8 +38,14 @@ namespace wolvrix::lib::grhsim::am
             switch (opcode)
             {
             case Opcode::LatchWrite:
+            case Opcode::LatchWriteCond:
+            case Opcode::LatchWriteMask:
+            case Opcode::LatchWriteCondMask:
                 return AmStateKind::Latch;
             case Opcode::MemoryWrite:
+            case Opcode::MemoryWriteCond:
+            case Opcode::MemoryWriteMask:
+            case Opcode::MemoryWriteCondMask:
             case Opcode::MemoryFill:
             case Opcode::MemoryWriteLanes:
                 return AmStateKind::Memory;

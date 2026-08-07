@@ -209,6 +209,222 @@ namespace wolvrix::lib::grhsim::am
                              std::string(kDiagnosticContext));
             return true;
         }
+
+        // Third research export: the split-am-graph stage product itself.
+        // WOLVRIX_GRHSIM_AM_SPLIT_GRAPH_JSONL=<prefix> writes two files,
+        // <prefix>.compute.jsonl (the GRHSIM AM Compute Graph) and
+        // <prefix>.commit.jsonl (the GRHSIM AM Commit Graph), taken directly
+        // from the split context -- node membership, induced edges and atom
+        // annotations are exactly what the partition passes see.
+        constexpr char kSplitGraphExportEnv[] = "WOLVRIX_GRHSIM_AM_SPLIT_GRAPH_JSONL";
+        constexpr std::string_view kSplitGraphFormat = "wolvrix.am-split-graph.v1";
+
+        bool exportSplitSideJsonl(ProgramView program, const AmGraphSplitContext &context,
+                                  bool commitSide, const std::filesystem::path &path,
+                                  wolvrix::lib::diag::Diagnostics &diagnostics)
+        {
+            const auto inSide = [&](uint32_t instruction) {
+                const uint32_t atom = context.instructionAtom[instruction];
+                return (context.atomIsCommit[atom] != 0) == commitSide;
+            };
+            const auto localAtomOf = [&](uint32_t instruction) {
+                const uint32_t atom = context.instructionAtom[instruction];
+                return commitSide ? context.split.commitGraph.localOfAtom[atom]
+                                  : context.split.computeGraph.localOfAtom[atom];
+            };
+            const uint32_t instructionCount = context.instructionCount;
+
+            uint32_t sideInstructions = 0;
+            uint64_t defUseEdgeCount = 0;
+            uint64_t externalReadCount = 0;
+            forEachExportedValueRead(
+                context.defUse, [&](uint32_t, uint32_t source, uint32_t target) {
+                    if (!inSide(target)) {
+                        return;
+                    }
+                    if (source != kInvalidIndex && inSide(source)) {
+                        ++defUseEdgeCount;
+                        return;
+                    }
+                    // Boundary inputs: compute side sees only truly source-less
+                    // reads (state targets, interface inputs); the commit side
+                    // additionally counts reads defined on the compute side --
+                    // its inputs are exactly those compute-produced operands.
+                    if (source == kInvalidIndex || commitSide) {
+                        ++externalReadCount;
+                    }
+                });
+            uint64_t orderEdgeCount = 0;
+            for (const OrderEdge &edge : context.orderedEdges) {
+                if (edge.source != edge.target && inSide(edge.source) && inSide(edge.target)) {
+                    ++orderEdgeCount;
+                }
+            }
+            uint32_t combLoopAtomCount = 0;
+            for (uint32_t atom = 0; atom < context.atomCount; ++atom) {
+                if ((context.atomIsCommit[atom] != 0) == commitSide &&
+                    context.atomMemberOffsets[atom + 1] - context.atomMemberOffsets[atom] > 1) {
+                    ++combLoopAtomCount;
+                }
+            }
+            const uint32_t sideAtoms =
+                commitSide ? context.split.commitGraph.atomCount
+                           : context.split.computeGraph.atomCount;
+            for (uint32_t index = 0; index < instructionCount; ++index) {
+                sideInstructions += inSide(index) ? 1U : 0U;
+            }
+
+            if (path.has_parent_path()) {
+                std::error_code error;
+                std::filesystem::create_directories(path.parent_path(), error);
+                if (error) {
+                    diagnostics.error("failed to create AM split graph export directory: " +
+                                          path.parent_path().string(),
+                                      std::string(kDiagnosticContext));
+                    return false;
+                }
+            }
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            if (!output) {
+                diagnostics.error("failed to open AM split graph export path: " + path.string(),
+                                  std::string(kDiagnosticContext));
+                return false;
+            }
+
+            JsonlGraphWriter writer(output);
+            writer.raw("{\\\"record\\\":\\\"header\\\",\\\"format\\\":\\\"")
+                .raw(kSplitGraphFormat)
+                .raw("\\\",\\\"side\\\":\\\"")
+                .raw(commitSide ? std::string_view("commit") : std::string_view("compute"))
+                .raw("\\\",\\\"instructions\\\":")
+                .number(sideInstructions)
+                .raw(",\\\"variables\\\":")
+                .number(static_cast<uint64_t>(program.variableCount()))
+                .raw(",\\\"atoms\\\":")
+                .number(sideAtoms)
+                .raw(",\\\"comb_loop_atoms\\\":")
+                .number(combLoopAtomCount)
+                .raw(",\\\"def_use_edges\\\":")
+                .number(defUseEdgeCount)
+                .raw(",\\\"external_reads\\\":")
+                .number(externalReadCount)
+                .raw(",\\\"order_edges\\\":")
+                .number(orderEdgeCount)
+                .raw("}");
+            writer.endLine();
+
+            for (uint32_t index = 0; index < instructionCount; ++index) {
+                if (!inSide(index)) {
+                    continue;
+                }
+                const InstructionId instruction{index};
+                uint64_t width = 0;
+                for (const VariableId result : program.results(instruction)) {
+                    width += exportedVariableWidth(program, result);
+                }
+                const uint32_t atom = context.instructionAtom[index];
+                writer.raw("{\\\"record\\\":\\\"node\\\",\\\"id\\\":")
+                    .number(index)
+                    .raw(",\\\"op\\\":")
+                    .number(static_cast<uint8_t>(program.opcode(instruction)))
+                    .raw(",\\\"opcode\\\":\\\"")
+                    .raw(toString(program.opcode(instruction)))
+                    .raw("\\\",\\\"width\\\":")
+                    .number(width)
+                    .raw(",\\\"state_write\\\":")
+                    .boolean(stateWriteTarget(program, instruction).has_value())
+                    .raw(",\\\"atom\\\":")
+                    .number(localAtomOf(index))
+                    .raw(",\\\"min_instruction\\\":")
+                    .number(context.atomMinInstruction[atom])
+                    .raw(",\\\"comb_loop_atom\\\":")
+                    .boolean(context.atomMemberOffsets[atom + 1] -
+                                 context.atomMemberOffsets[atom] >
+                             1);
+                for (const VariableId result : program.results(instruction)) {
+                    if (const std::optional<StringId> label = program.variableLabel(result)) {
+                        writer.raw(",\\\"name\\\":\\\"");
+                        // Minimal JSON escaping for quotes and backslashes.
+                        for (const char ch : program.string(*label)) {
+                            if (ch == '\\' || ch == '"') {
+                                writer.raw("\\");
+                            }
+                            writer.raw(std::string_view(&ch, 1));
+                        }
+                        writer.raw("\\\"");
+                        break;
+                    }
+                }
+                if (commitSide) {
+                    writer.raw(",\\\"event_rank\\\":").number(context.commitEventRank[atom]);
+                }
+                writer.raw("}");
+                writer.endLine();
+            }
+
+            forEachExportedValueRead(
+                context.defUse,
+                [&](uint32_t variable, uint32_t source, uint32_t target) {
+                    if (!inSide(target)) {
+                        return;
+                    }
+                    const uint64_t width =
+                        exportedVariableWidth(program, VariableId{variable});
+                    if (source != kInvalidIndex && inSide(source)) {
+                        writer.raw("{\\\"record\\\":\\\"edge\\\",\\\"kind\\\":\\\"def_use\\\",\\\"src\\\":")
+                            .number(source)
+                            .raw(",\\\"dst\\\":")
+                            .number(target)
+                            .raw(",\\\"var\\\":")
+                            .number(variable)
+                            .raw(",\\\"width\\\":")
+                            .number(width)
+                            .raw("}");
+                        writer.endLine();
+                        return;
+                    }
+                    if (source == kInvalidIndex || commitSide) {
+                        writer.raw("{\\\"record\\\":\\\"edge\\\",\\\"kind\\\":\\\"external_read\\\",\\\"dst\\\":")
+                            .number(target)
+                            .raw(",\\\"var\\\":")
+                            .number(variable)
+                            .raw(",\\\"width\\\":")
+                            .number(width);
+                        if (source != kInvalidIndex) {
+                            writer.raw(",\\\"src_side\\\":\\\"compute\\\",\\\"src\\\":").number(source);
+                        }
+                        writer.raw("}");
+                        writer.endLine();
+                    }
+                });
+
+            for (const OrderEdge &edge : context.orderedEdges) {
+                if (edge.source == edge.target || !inSide(edge.source) || !inSide(edge.target)) {
+                    continue;
+                }
+                writer.raw("{\\\"record\\\":\\\"edge\\\",\\\"kind\\\":\\\"order\\\",\\\"src\\\":")
+                    .number(edge.source)
+                    .raw(",\\\"dst\\\":")
+                    .number(edge.target)
+                    .raw("}");
+                writer.endLine();
+            }
+
+            if (!writer.flush()) {
+                diagnostics.error("failed while writing AM split graph export: " + path.string(),
+                                  std::string(kDiagnosticContext));
+                return false;
+            }
+            diagnostics.info(
+                std::string("exported AM split graph (") + (commitSide ? "commit" : "compute") +
+                    "): path=" + path.string() + " instructions=" +
+                    std::to_string(sideInstructions) + " atoms=" + std::to_string(sideAtoms) +
+                    " def_use_edges=" + std::to_string(defUseEdgeCount) +
+                    " external_reads=" + std::to_string(externalReadCount) +
+                    " order_edges=" + std::to_string(orderEdgeCount),
+                std::string(kDiagnosticContext));
+            return true;
+        }
     } // namespace
 
     AmGraphPartitionInput AmGraphSplitContext::partitionInput() const
@@ -232,7 +448,7 @@ namespace wolvrix::lib::grhsim::am
             .enableCoarsening = enableCoarsening,
             .coarsenBudget = coarsenBudget,
             .segmentPenalty = segmentPenalty,
-            .variableCopyWeights = variableCopyWeights,
+            .refinementRounds = refinementRounds,
         };
     }
 
@@ -490,16 +706,6 @@ namespace wolvrix::lib::grhsim::am
             atomStateWrites[atom] = static_cast<uint32_t>(atomCosts[atom].stateWrites);
             atomIsCommit[atom] = atomCosts[atom].blockClass == BlockClass::Commit ? 1 : 0;
         }
-        // Optional width-folded DP copy weights (docs/10: the runtime copy
-        // count formula, ceil(bitWidth/64) per incoming variable).
-        std::vector<uint32_t> variableCopyWeights;
-        if (options.dpWidthWeightedCopyCost) {
-            variableCopyWeights.reserve(variableCount);
-            for (uint32_t variable = 0; variable < variableCount; ++variable) {
-                variableCopyWeights.push_back(static_cast<uint32_t>(std::max<uint64_t>(
-                    1, (exportedVariableWidth(program, VariableId{variable}) + 63) / 64)));
-            }
-        }
 
         AmGraphSplitContext context;
         context.instructionCount = instructionCount;
@@ -516,25 +722,18 @@ namespace wolvrix::lib::grhsim::am
         context.atomIsCommit = std::move(atomIsCommit);
         context.atomMinInstruction = std::move(atomMinInstruction);
         context.commitEventRank = std::move(commitEventRank);
-        context.variableCopyWeights = std::move(variableCopyWeights);
         context.oversizedAtomCount = oversizedAtomCount;
         context.maxAtomInstructions = maxAtomInstructions;
         context.maxAtomStateWrites = maxAtomStateWrites;
         context.maxInstructionsPerBlock = options.maxInstructionsPerBlock;
         context.maxCommitInstructionsPerBlock = options.maxCommitInstructionsPerBlock;
         context.enableCoarsening = options.enableCoarsening;
-        // Auto budget: 1.5x the per-block instruction cap. The legacy
-        // 32x cap runs AM's single-instruction-atom DAG to full coarsen
-        // convergence, which pushes clusters into (cap, 32x cap] as
-        // DP-indivisible oversized singletons (~9.4k blocks on XiangShan,
-        // avg ~470 instructions/block). 1.5x keeps clusters at cap size
-        // so the segment DP's maxInstructionsPerBlock actually binds,
-        // landing XiangShan at ~33.7k compute blocks (legacy: 31.5k)
-        // and measurably faster host time than the old default.
-        context.coarsenBudget = options.dpCoarsenBudget != 0
-                                    ? options.dpCoarsenBudget
-                                    : (3 * options.maxInstructionsPerBlock) / 2;
+        // Merge host member instruction limit for the out1/in1/sibling merge
+        // sweeps (gsim MAX_NODES_PER_SUPER); 0 selects the 7000 default.
+        context.coarsenBudget =
+            options.dpCoarsenBudget != 0 ? options.dpCoarsenBudget : 256;
         context.segmentPenalty = options.dpSegmentPenalty;
+        context.refinementRounds = options.dpRefinementRounds;
 
         // ---- stage: split-am-graph --------------------------------------
         // The atom DAG is decomposed into the GRHSIM AM Compute Graph and
@@ -547,6 +746,19 @@ namespace wolvrix::lib::grhsim::am
             return std::nullopt;
         }
         context.split = std::move(*graphSplit);
+
+        if (const char *exportPrefix = std::getenv(kSplitGraphExportEnv)) {
+            const std::string prefix(exportPrefix);
+            if (prefix.empty() ||
+                !exportSplitSideJsonl(program, context, false, prefix + ".compute.jsonl",
+                                      diagnostics) ||
+                !exportSplitSideJsonl(program, context, true, prefix + ".commit.jsonl",
+                                      diagnostics)) {
+                diagnostics.error("AM split graph export failed",
+                                  std::string(kDiagnosticContext));
+                return std::nullopt;
+            }
+        }
         return context;
     }
 

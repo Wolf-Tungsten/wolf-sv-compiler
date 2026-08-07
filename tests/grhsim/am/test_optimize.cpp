@@ -5,6 +5,7 @@
 #include "grhsim/am/grhsim_am_graph_optimize.hpp"
 #include "grhsim/am/grh_ir_to_grhsim_am_program.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <iostream>
@@ -359,12 +360,12 @@ namespace {
         fixture.emit(Opcode::MemoryRead, {deadRead}, {memory, address});
         const InstructionId orderedRead =
             fixture.emit(Opcode::MemoryRead, {keptRead}, {memory, address});
-        // Reverted mem.write layout [cond, addr, mask, data, target,
+        // mem.write.cm layout [cond, addr, mask, data, target,
         // events...]: cond=true with a full mask writes dataIn directly.
         const VariableId oneBit = fixture.constant(bv1, 1);
         const VariableId fullMask = fixture.constant(bv32, 0xffffffff);
         const InstructionId write = fixture.emit(
-            Opcode::MemoryWrite, {}, {oneBit, address, fullMask, dataIn, memory, event});
+            Opcode::MemoryWriteCondMask, {}, {oneBit, address, fullMask, dataIn, memory, event});
         fixture.addOrderedEffect(orderedRead, 0, 0);
         fixture.addOrderedEffect(write, 0, 1);
         AmGraph graph = AmGraph::fromLinearProgram(fixture.finish());
@@ -381,7 +382,7 @@ namespace {
             return fail("unordered dead MemoryRead was not removed");
         }
         if (program.opcode(InstructionId{0}) != Opcode::MemoryRead ||
-            program.opcode(InstructionId{1}) != Opcode::MemoryWrite) {
+            program.opcode(InstructionId{1}) != Opcode::MemoryWriteCondMask) {
             return fail("ordered MemoryRead was dropped or reordered");
         }
         const std::vector<InstructionEffect> &instructionEffects = graph.instructionEffects();
@@ -513,21 +514,37 @@ namespace {
     int testAssignAliasKeepsStateSnapshot() {
         Fixture fixture;
         const TypeId bv32 = fixture.builder.addType(Type::bitVector(32));
+        const TypeId bv1 = fixture.builder.addType(Type::bitVector(1));
         const VariableId state = fixture.variable(bv32, VariableRole::State);
         const VariableId input = fixture.variable(bv32, VariableRole::ExternalInput);
+        const VariableId clock = fixture.variable(bv1, VariableRole::ExternalInput);
         const VariableId snapshot = fixture.variable(bv32);
+        const VariableId wire = fixture.variable(bv32);
         const VariableId plain = fixture.variable(bv32);
         const VariableId computed = fixture.variable(bv32);
+        const VariableId computedWire = fixture.variable(bv32);
         const VariableId out0 = fixture.variable(bv32, VariableRole::ExternalOutput);
         const VariableId out1 = fixture.variable(bv32, VariableRole::ExternalOutput);
+        const VariableId out2 = fixture.variable(bv32, VariableRole::ExternalOutput);
         fixture.addInputPort("in", input);
+        fixture.addInputPort("clk", clock);
         fixture.addOutputPort("out0", out0);
         fixture.addOutputPort("out1", out1);
+        fixture.addOutputPort("out2", out2);
         fixture.emit(Opcode::Assign, {snapshot}, {state});
+        fixture.emit(Opcode::Assign, {wire}, {state});
         fixture.emit(Opcode::Assign, {plain}, {input});
         fixture.emit(Opcode::Or, {computed}, {plain, plain});
+        fixture.emit(Opcode::Or, {computedWire}, {wire, plain});
         fixture.emit(Opcode::Assign, {out0}, {snapshot});
         fixture.emit(Opcode::Assign, {out1}, {computed});
+        fixture.emit(Opcode::Assign, {out2}, {computedWire});
+        // The snapshot feeds a commit-side state write, so it is a genuine
+        // read-old snapshot and must be kept; the compute-only wire assign
+        // reading the same state is bypassed.
+        const InstructionId write =
+            fixture.emit(Opcode::RegisterWrite, {}, {snapshot, state, clock});
+        fixture.addOrderedEffect(write, 0, 0);
         AmGraph graph = AmGraph::fromLinearProgram(fixture.finish());
         if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("assign-alias fixture is invalid", result);
@@ -538,11 +555,11 @@ namespace {
             return fail("assign-alias optimize reported failure");
         }
         const ProgramView program = graph.program();
-        // The state snapshot Assign must survive; the plain value assigns are
-        // bypassed, so only the snapshot Assign and the Or remain.
-        if (program.instructionCount() != 2 ||
-            countOpcode(program, Opcode::Assign) != 1 ||
-            countOpcode(program, Opcode::Or) != 1) {
+        // Kept: the snapshot Assign (commit read-old), the write, and the two
+        // Ors. Bypassed: the plain/wire/output assigns.
+        if (countOpcode(program, Opcode::Assign) != 1 ||
+            countOpcode(program, Opcode::RegisterWrite) != 1 ||
+            countOpcode(program, Opcode::Or) != 2) {
             return fail("assign-alias bypassed the wrong instructions");
         }
         const std::optional<uint32_t> assignIndex = findOpcode(program, Opcode::Assign);
@@ -550,12 +567,314 @@ namespace {
         if (operands.size() != 1 || operands[0] != state) {
             return fail("state snapshot assign did not keep its state operand");
         }
-        if (graph.interface().ports[2].output != snapshot &&
-            graph.interface().ports[1].output != snapshot) {
-            return fail("snapshot consumer was not preserved");
+        // The commit write still reads the snapshot, not the state directly.
+        const std::optional<uint32_t> writeIndex =
+            findOpcode(program, Opcode::RegisterWrite);
+        const auto writeOperands = program.operands(InstructionId{*writeIndex});
+        if (writeOperands.size() != 3 || writeOperands[0] != snapshot ||
+            writeOperands[1] != state) {
+            return fail("commit write does not read the snapshot");
+        }
+        // The compute-only wire assign was bypassed: its Or consumer reads the
+        // state variable directly now.
+        bool sawStateReaderOr = false;
+        for (uint32_t index = 0; index < program.instructionCount(); ++index) {
+            if (program.opcode(InstructionId{index}) != Opcode::Or) {
+                continue;
+            }
+            const auto orOperands = program.operands(InstructionId{index});
+            if (std::find(orOperands.begin(), orOperands.end(), state) !=
+                orOperands.end()) {
+                sawStateReaderOr = true;
+            }
+        }
+        if (!sawStateReaderOr) {
+            return fail("compute-only state-read assign was not bypassed");
         }
         if (const ValidationResult result = validateSemantic(graph); !result.success()) {
             return failValidation("assign-alias optimized artifact is invalid", result);
+        }
+        return 0;
+    }
+
+    int testLogicUnify() {
+        Fixture fixture;
+        const TypeId bv1 = fixture.builder.addType(Type::bitVector(1));
+        const TypeId bv2 = fixture.builder.addType(Type::bitVector(2));
+        const VariableId a = fixture.variable(bv1, VariableRole::ExternalInput);
+        const VariableId b = fixture.variable(bv1, VariableRole::ExternalInput);
+        const VariableId wide = fixture.variable(bv2, VariableRole::ExternalInput);
+        const VariableId andOut = fixture.variable(bv1);
+        const VariableId logicOut = fixture.variable(bv1);
+        const VariableId wideOut = fixture.variable(bv1);
+        const VariableId out0 = fixture.variable(bv1, VariableRole::ExternalOutput);
+        const VariableId out1 = fixture.variable(bv1, VariableRole::ExternalOutput);
+        const VariableId out2 = fixture.variable(bv1, VariableRole::ExternalOutput);
+        fixture.addInputPort("a", a);
+        fixture.addInputPort("b", b);
+        fixture.addInputPort("w", wide);
+        fixture.addOutputPort("o0", out0);
+        fixture.addOutputPort("o1", out1);
+        fixture.addOutputPort("o2", out2);
+        fixture.emit(Opcode::And, {andOut}, {a, b});
+        fixture.emit(Opcode::LogicAnd, {logicOut}, {a, b});
+        // 2-bit operand: truth(wide) is a reduction, not a bitwise op, so
+        // this LogicAnd must keep its form.
+        fixture.emit(Opcode::LogicAnd, {wideOut}, {wide, wide});
+        fixture.emit(Opcode::Assign, {out0}, {andOut});
+        fixture.emit(Opcode::Assign, {out1}, {logicOut});
+        fixture.emit(Opcode::Assign, {out2}, {wideOut});
+        AmGraph graph = AmGraph::fromLinearProgram(fixture.finish());
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
+            return failValidation("logic-unify fixture is invalid", result);
+        }
+
+        diag::Diagnostics diagnostics;
+        if (!optimizeAmGraph(graph, AmOptimizeOptions{}, diagnostics)) {
+            return fail("logic-unify optimize reported failure");
+        }
+        const ProgramView program = graph.program();
+        // The 1-bit And/LogicAnd pair unifies and CSEs into a single And;
+        // the 2-bit LogicAnd survives. Output ports: ports[3..5] (three
+        // input ports precede them); o0 and o1 must observe the unified And.
+        if (countOpcode(program, Opcode::And) != 1 ||
+            countOpcode(program, Opcode::LogicAnd) != 1) {
+            return fail("logic-unify did not merge the 1-bit copies");
+        }
+        if (graph.interface().ports[4].output != andOut ||
+            graph.interface().ports[3].output != andOut) {
+            return fail("logic-unify outputs diverged");
+        }
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
+            return failValidation("logic-unify optimized artifact is invalid", result);
+        }
+        return 0;
+    }
+
+    int testMuxNotAbsorb() {
+        Fixture fixture;
+        const TypeId bv1 = fixture.builder.addType(Type::bitVector(1));
+        const TypeId bv8 = fixture.builder.addType(Type::bitVector(8));
+        const VariableId c = fixture.variable(bv1, VariableRole::ExternalInput);
+        const VariableId c2 = fixture.variable(bv1, VariableRole::ExternalInput);
+        const VariableId c3 = fixture.variable(bv1, VariableRole::ExternalInput);
+        const VariableId d = fixture.variable(bv8, VariableRole::ExternalInput);
+        const VariableId a = fixture.variable(bv8, VariableRole::ExternalInput);
+        const VariableId b = fixture.variable(bv8, VariableRole::ExternalInput);
+        const VariableId inverted = fixture.variable(bv1);
+        const VariableId wideInverted = fixture.variable(bv1);
+        const VariableId shared = fixture.variable(bv1);
+        const VariableId mixed = fixture.variable(bv1);
+        const VariableId selected = fixture.variable(bv8);
+        const VariableId wideA = fixture.variable(bv8);
+        const VariableId wideB = fixture.variable(bv8);
+        const VariableId sharedA = fixture.variable(bv8);
+        const VariableId sharedB = fixture.variable(bv8);
+        const VariableId mixedSel = fixture.variable(bv8);
+        const VariableId mixedAnd = fixture.variable(bv1);
+        const VariableId out0 = fixture.variable(bv8, VariableRole::ExternalOutput);
+        const VariableId out1 = fixture.variable(bv8, VariableRole::ExternalOutput);
+        const VariableId out2 = fixture.variable(bv8, VariableRole::ExternalOutput);
+        const VariableId out3 = fixture.variable(bv8, VariableRole::ExternalOutput);
+        const VariableId out4 = fixture.variable(bv8, VariableRole::ExternalOutput);
+        const VariableId out5 = fixture.variable(bv8, VariableRole::ExternalOutput);
+        const VariableId out6 = fixture.variable(bv1, VariableRole::ExternalOutput);
+        fixture.addInputPort("c", c);
+        fixture.addInputPort("c2", c2);
+        fixture.addInputPort("c3", c3);
+        fixture.addInputPort("d", d);
+        fixture.addInputPort("a", a);
+        fixture.addInputPort("b", b);
+        fixture.addOutputPort("o0", out0);
+        fixture.addOutputPort("o1", out1);
+        fixture.addOutputPort("o2", out2);
+        fixture.addOutputPort("o3", out3);
+        fixture.addOutputPort("o4", out4);
+        fixture.addOutputPort("o5", out5);
+        fixture.addOutputPort("o6", out6);
+        // Single-use bitwise Not on a 1-bit select: absorbed, arms swapped.
+        fixture.emit(Opcode::Not, {inverted}, {c});
+        fixture.emit(Opcode::Mux, {selected}, {inverted, a, b});
+        // LogicNot of a wide operand shared by Mux selects: kept (a wide
+        // select would violate the 1-bit select rule).
+        fixture.emit(Opcode::LogicNot, {wideInverted}, {d});
+        fixture.emit(Opcode::Mux, {wideA}, {wideInverted, a, b});
+        fixture.emit(Opcode::Mux, {wideB}, {wideInverted, b, a});
+        // 1-bit LogicNot shared by two Mux selects: absorbed from both.
+        fixture.emit(Opcode::LogicNot, {shared}, {c3});
+        fixture.emit(Opcode::Mux, {sharedA}, {shared, a, b});
+        fixture.emit(Opcode::Mux, {sharedB}, {shared, b, a});
+        // Not feeding a Mux select AND a non-Mux consumer: must stay, and
+        // its Mux keeps the inverted select.
+        fixture.emit(Opcode::Not, {mixed}, {c2});
+        fixture.emit(Opcode::Mux, {mixedSel}, {mixed, a, b});
+        fixture.emit(Opcode::And, {mixedAnd}, {mixed, c});
+        fixture.emit(Opcode::Assign, {out0}, {selected});
+        fixture.emit(Opcode::Assign, {out1}, {wideA});
+        fixture.emit(Opcode::Assign, {out2}, {wideB});
+        fixture.emit(Opcode::Assign, {out3}, {sharedA});
+        fixture.emit(Opcode::Assign, {out4}, {sharedB});
+        fixture.emit(Opcode::Assign, {out5}, {mixedSel});
+        fixture.emit(Opcode::Assign, {out6}, {mixedAnd});
+        AmGraph graph = AmGraph::fromLinearProgram(fixture.finish());
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
+            return failValidation("mux-not-absorb fixture is invalid", result);
+        }
+
+        diag::Diagnostics diagnostics;
+        if (!optimizeAmGraph(graph, AmOptimizeOptions{}, diagnostics)) {
+            return fail("mux-not-absorb optimize reported failure");
+        }
+        const ProgramView program = graph.program();
+        // The mixed-consumer Not and the wide LogicNot survive; the six
+        // Muxes remain, three with swapped arms.
+        if (countOpcode(program, Opcode::Not) != 1 ||
+            countOpcode(program, Opcode::LogicNot) != 1 ||
+            countOpcode(program, Opcode::Mux) != 6) {
+            return fail("mux-not-absorb rewrote the wrong instructions");
+        }
+        bool sawSwapped = false;
+        bool sawSharedSwapped = false;
+        bool sawWideKept = false;
+        bool sawMixedKept = false;
+        for (uint32_t index = 0; index < program.instructionCount(); ++index) {
+            if (program.opcode(InstructionId{index}) != Opcode::Mux) {
+                continue;
+            }
+            const auto operands = program.operands(InstructionId{index});
+            if (operands.size() != 3) {
+                continue;
+            }
+            if (operands[0] == c && operands[1] == b && operands[2] == a) {
+                sawSwapped = true;
+            }
+            if (operands[0] == c3 && operands[1] == b && operands[2] == a) {
+                sawSharedSwapped = true;
+            }
+            if (operands[0] == wideInverted && operands[1] == a && operands[2] == b) {
+                sawWideKept = true;
+            }
+            if (operands[0] == mixed && operands[1] == a && operands[2] == b) {
+                sawMixedKept = true;
+            }
+        }
+        if (!sawSwapped || !sawSharedSwapped) {
+            return fail("mux-not-absorb did not swap the data arms");
+        }
+        if (!sawWideKept || !sawMixedKept) {
+            return fail("mux-not-absorb touched a mux it must keep");
+        }
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
+            return failValidation("mux-not-absorb optimized artifact is invalid", result);
+        }
+        return 0;
+    }
+
+    int testNotUnify() {
+        Fixture fixture;
+        const TypeId bv1 = fixture.builder.addType(Type::bitVector(1));
+        const VariableId x = fixture.variable(bv1, VariableRole::ExternalInput);
+        const VariableId zero = fixture.constant(bv1, 0);
+        const VariableId notOut = fixture.variable(bv1);
+        const VariableId eqOut = fixture.variable(bv1);
+        const VariableId andUse = fixture.variable(bv1);
+        const VariableId out0 = fixture.variable(bv1, VariableRole::ExternalOutput);
+        const VariableId out1 = fixture.variable(bv1, VariableRole::ExternalOutput);
+        const VariableId out2 = fixture.variable(bv1, VariableRole::ExternalOutput);
+        fixture.addInputPort("x", x);
+        fixture.addOutputPort("o0", out0);
+        fixture.addOutputPort("o1", out1);
+        fixture.addOutputPort("o2", out2);
+        // not(x) feeds a non-Mux consumer (kept as a value) while an explicit
+        // x == 0 exists: unification turns the Not into Eq(x, 0) and CSE
+        // merges the two.
+        fixture.emit(Opcode::Not, {notOut}, {x});
+        fixture.emit(Opcode::Eq, {eqOut}, {x, zero});
+        fixture.emit(Opcode::And, {andUse}, {notOut, x});
+        fixture.emit(Opcode::Assign, {out0}, {notOut});
+        fixture.emit(Opcode::Assign, {out1}, {eqOut});
+        fixture.emit(Opcode::Assign, {out2}, {andUse});
+        AmGraph graph = AmGraph::fromLinearProgram(fixture.finish());
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
+            return failValidation("not-unify fixture is invalid", result);
+        }
+
+        diag::Diagnostics diagnostics;
+        AmOptimizeOptions options;
+        options.notUnify = true;
+        if (!optimizeAmGraph(graph, options, diagnostics)) {
+            return fail("not-unify optimize reported failure");
+        }
+        const ProgramView program = graph.program();
+        if (countOpcode(program, Opcode::Not) != 0 ||
+            countOpcode(program, Opcode::Eq) != 1 ||
+            countOpcode(program, Opcode::And) != 1) {
+            return fail("not-unify kept the wrong instructions");
+        }
+        // Both outputs observe the single merged Eq.
+        if (graph.interface().ports[1].output != graph.interface().ports[2].output) {
+            return fail("not-unify outputs diverged");
+        }
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
+            return failValidation("not-unify optimized artifact is invalid", result);
+        }
+        return 0;
+    }
+
+    int testSliceFuse() {
+        Fixture fixture;
+        const TypeId bv16 = fixture.builder.addType(Type::bitVector(16));
+        const TypeId bv8 = fixture.builder.addType(Type::bitVector(8));
+        const TypeId bv4 = fixture.builder.addType(Type::bitVector(4));
+        const VariableId x = fixture.variable(bv16, VariableRole::ExternalInput);
+        const VariableId mid = fixture.variable(bv8);
+        const VariableId outer = fixture.variable(bv4);
+        const VariableId identity = fixture.variable(bv16);
+        const VariableId out0 = fixture.variable(bv4, VariableRole::ExternalOutput);
+        const VariableId out1 = fixture.variable(bv16, VariableRole::ExternalOutput);
+        fixture.addInputPort("x", x);
+        fixture.addOutputPort("o0", out0);
+        fixture.addOutputPort("o1", out1);
+        const InstructionId midSlice = fixture.emit(Opcode::SliceStatic, {mid}, {x});
+        fixture.builder.setSliceStaticAttributes(midSlice, 4);
+        const InstructionId outerSlice =
+            fixture.emit(Opcode::SliceStatic, {outer}, {mid});
+        fixture.builder.setSliceStaticAttributes(outerSlice, 2);
+        const InstructionId idSlice =
+            fixture.emit(Opcode::SliceStatic, {identity}, {x});
+        fixture.builder.setSliceStaticAttributes(idSlice, 0);
+        fixture.emit(Opcode::Assign, {out0}, {outer});
+        fixture.emit(Opcode::Assign, {out1}, {identity});
+        AmGraph graph = AmGraph::fromLinearProgram(fixture.finish());
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
+            return failValidation("slice-fuse fixture is invalid", result);
+        }
+
+        diag::Diagnostics diagnostics;
+        if (!optimizeAmGraph(graph, AmOptimizeOptions{}, diagnostics)) {
+            return fail("slice-fuse optimize reported failure");
+        }
+        const ProgramView program = graph.program();
+        // The chain fuses into a single slice(x, 6); the identity slice is
+        // bypassed entirely.
+        if (program.instructionCount() != 1 ||
+            countOpcode(program, Opcode::SliceStatic) != 1) {
+            return fail("slice-fuse kept the wrong instructions");
+        }
+        const auto operands = program.operands(InstructionId{0});
+        if (operands.size() != 1 || operands[0] != x) {
+            return fail("slice-fuse did not re-point to the chain base");
+        }
+        const auto attributes =
+            program.sliceStaticAttributes(InstructionId{0});
+        if (!attributes || attributes->lsb != 6) {
+            return fail("slice-fuse produced a wrong lsb");
+        }
+        if (graph.interface().ports[2].output != x) {
+            return fail("identity slice was not bypassed");
+        }
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
+            return failValidation("slice-fuse optimized artifact is invalid", result);
         }
         return 0;
     }
@@ -593,10 +912,10 @@ namespace {
         fixture.emit(Opcode::MemoryRead, {readUndef}, {undefMem, addr1});
         fixture.emit(Opcode::MemoryRead, {readRange}, {zeroMem, addr9});
         fixture.emit(Opcode::MemoryRead, {readRam}, {ram, addr1});
-        // Reverted mem.write layout [cond, addr, mask, data, target,
+        // mem.write.cm layout [cond, addr, mask, data, target,
         // events...]: cond=true with a full mask writes dataIn directly.
         const VariableId fullMask = fixture.constant(bv32, 0xffffffff);
-        fixture.emit(Opcode::MemoryWrite, {}, {one1, addr1, fullMask, dataIn, ram, one1});
+        fixture.emit(Opcode::MemoryWriteCondMask, {}, {one1, addr1, fullMask, dataIn, ram, one1});
         fixture.emit(Opcode::Assign, {out0}, {readZero});
         fixture.emit(Opcode::Assign, {out1}, {readUndef});
         fixture.emit(Opcode::Assign, {out2}, {readRange});
@@ -615,7 +934,7 @@ namespace {
         // zero-initialized); out-of-range reads fold to zero. Only the read
         // of the written memory and the write itself survive.
         if (countOpcode(program, Opcode::MemoryRead) != 1 ||
-            countOpcode(program, Opcode::MemoryWrite) != 1) {
+            countOpcode(program, Opcode::MemoryWriteCondMask) != 1) {
             return fail("const-mem-fold eliminated the wrong instructions");
         }
         const std::optional<uint64_t> foldedZero =
@@ -660,6 +979,18 @@ int main() {
         return result;
     }
     if (const int result = testAssignAliasKeepsStateSnapshot(); result != 0) {
+        return result;
+    }
+    if (const int result = testLogicUnify(); result != 0) {
+        return result;
+    }
+    if (const int result = testMuxNotAbsorb(); result != 0) {
+        return result;
+    }
+    if (const int result = testNotUnify(); result != 0) {
+        return result;
+    }
+    if (const int result = testSliceFuse(); result != 0) {
         return result;
     }
     return testConstMemFold();

@@ -270,11 +270,11 @@ Bc+1 .. Bn    commit Block（首部 gate detector + state write + 尾部判变 w
 ```
 
 commit Block 占据连续后缀区间，这是 validator 强制的结构不变量。commit Block 只按
-事件签名（normalized event 集合）聚合分块；update guard 概念已删除，不再是分块分量——
-`reg.write/latch.write` 的写入条件与掩码在 lowering 时合并进 nextValue，`mem.write`
-自带的 cond/mask 由指令自身判定，同样不参与分块。同一事件签名桶内同一 target 的
-register/latch 写链已折叠为单条写，memory 元素写每条保留为一条 `mem.write`；块内与
-commit 段静态顺序保持 priority/effect order。
+事件签名（normalized event 集合）聚合分块；事件签名只含 event operand——
+`reg.write/latch.write/mem.write` 各变体的 cond/mask 是写指令自身的门控操作数，
+不参与分块。同一事件签名桶内同一 target 的 register/latch 写按链序逐条发射
+（canonical 输入已规范化为单写口，桶内通常只有一条），memory 元素写每条保留为一条
+`mem.write` 变体；块内与 commit 段静态顺序保持 priority/effect order。
 
 指令放置约束（validator 强制）：
 
@@ -288,9 +288,9 @@ commit 段静态顺序保持 priority/effect order。
 `act.f` 严格前向：目标 BlockId 必须大于所在 Block，因此单趟升序扫描就能排空当轮
 全部 compute 与 commit 活动——这由 Block 编号规则结构性保证，不需要单独的校验
 pass。指向 commit Block 的 `act.f` 只允许携带被目标块首部 gate detector watch 的
-变量（时钟源/派生时钟/latch nextValue）；def-use 数据边不激活 commit Block（见
-第 4.4 节）。当前 scheduler 只在 commit Block 尾部物化 `act.b`，且目标不大于源块
-（已扫过的 compute reader 或更早的 commit Block）。
+变量（时钟源/派生时钟/latch 写的 cond/mask/data 操作数）；def-use 数据边不激活
+commit Block（见第 4.4 节）。当前 scheduler 只在 commit Block 尾部物化 `act.b`，
+且目标不大于源块（已扫过的 compute reader 或更早的 commit Block）。
 
 ### 4.2 `changed` 与 `act`
 
@@ -378,16 +378,16 @@ commit Block 不再每轮常扫：它与 compute Block 一样按激活位执行�
 ```
 
 - 首部 gate detector：块内每个事件签名元素 `(kind, raw)` 一条克隆 `changed.*`
-  （raw 为被观测的时钟源/派生时钟 Variable；纯 latch 块每条 latch 写一条
-  `ChangedAny(nextValue)`）。写指令的 event operand 已被 scheduler 重指向这些块内
-  detector 的结果。detector 在块每次被激活时先执行并更新 `old` 基线。
+  （raw 为被观测的时钟源/派生时钟 Variable；纯 latch 块每条 latch 写的
+  cond?/mask?/data 操作数各一条 `ChangedAny`）。写指令的 event operand 已被 scheduler
+  重指向这些块内 detector 的结果。detector 在块每次被激活时先执行并更新 `old` 基线。
 - 门控（gate）= 全部首部 detector 结果的 OR，整块只判一次；状态写与尾部 watch/act
   都在门内，gate 为假时整块跳过。
-- 状态写自身不做 event 判定：`reg.write/latch.write` 直接
-  `target = nextValue`（写入条件与掩码已在 lowering 折叠进 nextValue，read-old 链式
-  规则见指令集第 12 节）；`mem.write` 保留 cond/mask 操作数，仅当 cond 为真且地址在
-  界内时按 mask 写入选中 row，否则整写抑制；`mem.write_lanes` 只保留
-  `any(laneMask)` 早退；`mem.fill` 恒写整片 packed。
+- 状态写自身不做 event 判定：`reg.write/latch.write/mem.write` 的 `.c/.cm` 变体自带
+  cond 门控（cond 不命中则不写也不做判变比较），`.m/.cm` 变体在 commit 局部做逐 bit
+  mask 混合（`target = (target & ~mask) | (data & mask)`，读旧值仅限该指令执行点）；
+  无 mask 的 mem 变体整元素覆盖、不读旧值；mem 各变体保留地址越界抑制；
+  `mem.write_lanes` 只保留 `any(laneMask)` 早退；`mem.fill` 恒写整片 packed。
 - 尾部 watch：块对自身写入的每个 state target 物化一条共享
   `changed.any target, targetOld`，实际变化经 `act.b` 激活 reader compute Block
   （下一 round 执行，只看到本轮最终值）。
@@ -412,9 +412,9 @@ commit Block 的激活来源（调度不变量）：
   commit 读到的恒为本轮 commit 前的值——同轮 commit 段内先写后读不会读到新值。
   这是对 legacy"sink 数据来自 compute 已收敛值"语义的精确对齐（2026-07-28 XS
   difftest 裁决：就地 read-new 会破坏启动路径上的先写后读链）。
-- **就地读取**：compute 产生的值、lowering 折叠 nextValue 时对 target 的 read-old
-  引用（reg/latch 折叠链的 acc 初值、`mem.fill` 的 `mem.read_all`）和 event 操作数
-  按执行点读取，不做任何跨轮保留。
+- **就地读取**：compute 产生的值、mask 变体混合时对 target 的 commit 局部 read-old
+  引用（`mem.fill` 的 `mem.read_all` 同理）和 event 操作数按执行点读取，不做任何
+  跨轮保留。
 
 实际变化检测与写路径融合：写使 visible state 实际变化且存在 reader 时，由同块尾部
 `changed` 探测器产生 event，供同块 `act.b` 消费，激活该 state 的 reader compute
@@ -442,8 +442,8 @@ EntryBlock 只看到最终值 0，因此不会观察到中间变化。
 gate detector 的基线，并在 gate 下评估每个状态写一次）。这保证即使初始值没有触发
 EntryBlock，整个 Program 仍会完成一次初始求值。`changed` 在首次求值中正常产生
 event，使 backward 依赖可以跨 round 收敛；状态写不再有显式 event 判定，是否写入由块
-gate 决定——`reg.write/latch.write/mem.fill` 的写条件已折叠进 payload，`mem.write`
-保留自身 cond 与地址越界判定。由于无显式初值的状态和每条
+gate 决定——`.c/.cm` 变体另由自身 cond 门控，`mem.write` 各变体保留地址越界判定。
+由于无显式初值的状态和每条
 `changed.old` 使用 `undef`，首次 event、gate 判定、状态写和输出可能属于 AM 层未
 定义行为；调用方负责通过 reset/clock 协议建立其需要的有效状态。首次求值正常返回时
 才清除 `FirstEval`；此后只执行由变化传播激活的 Block。
@@ -608,9 +608,9 @@ temporary；端口到 VarId 的映射属于集成层契约，不能依赖不唯�
   `changed` 结果只允许前向流，生产块 BlockId 必须小于消费块；
 - commit Block 占据 BlockId 连续后缀；`reg.write/mem.write/mem.fill/latch.write`
   只能出现在 commit Block，读取执行点可见的显式 operand；commit Block 以首部 gate
-  detector 开头（`reg.write/latch.write` 的写条件/掩码已在 lowering 合并进
-  nextValue，同一 target 同一事件签名的写链折叠为单条写；`mem.write` 保留 cond/mask
-  操作数，每条元素写一条指令），状态写回后以同块尾部 `changed.any` 检测 target 的实际
+  detector 开头（`reg.write/latch.write/mem.write` 按 cond/mask 常量性选型为
+  `.c/.m/.cm` 变体，同一 target 同一事件签名的写按链序逐条发射，每条元素写一条
+  指令），状态写回后以同块尾部 `changed.any` 检测 target 的实际
   变化，经同块 `act.b` 激活读取者 compute Block；同一 target 的多写由 commit 段
   静态 BlockId 顺序保证 priority/effect order；
 - `kSystemFunction/kSystemTask` 分别映射为 `system.function/system.task`；

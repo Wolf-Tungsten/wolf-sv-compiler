@@ -1,5 +1,7 @@
 #include "grhsim/am/grhsim_am_program_interpreter.hpp"
 
+#include "grhsim/am/grhsim_am_opcode_traits.hpp"
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -1255,12 +1257,38 @@ namespace wolvrix::lib::grhsim::am {
                 values[operandIds[1].value] = operands[0];
                 return {};
             }
-            if (opcode == Opcode::RegisterWrite ||
-                opcode == Opcode::LatchWrite) {
-                // Merged nextValue form: the update condition and write mask
-                // are already folded into operands[0]; the commit Block's
-                // event gate decides whether this instruction runs at all.
-                values[operandIds[1].value] = operands[0];
+            const StateWriteLayout writeLayout = stateWriteLayout(opcode);
+            if (writeLayout.isStateWrite && !writeLayout.memory) {
+                // Register/latch write variant: cond gates the whole commit,
+                // mask mixes the data into the live old value at commit time
+                // (v = (v & ~mask) | (data & mask), truncated to the target
+                // width). Without cond the commit Block's event gate alone
+                // decides whether this instruction runs.
+                if (writeLayout.hasCond && !truth(operands[0])) {
+                    return {};
+                }
+                const InterpreterValue &data = operands[writeLayout.dataIndex];
+                if (!writeLayout.hasMask) {
+                    values[operandIds[writeLayout.targetIndex].value] = data;
+                    return {};
+                }
+                const InterpreterValue &mask =
+                    operands[writeLayout.hasCond ? 1 : 0];
+                InterpreterValue next = operands[writeLayout.targetIndex];
+                const uint32_t width = next.type().bitWidth;
+                const std::size_t words = wordCount(width);
+                next.words_.resize(words, 0);
+                for (std::size_t index = 0; index < words; ++index) {
+                    const uint64_t maskWord =
+                        index < mask.words().size() ? mask.words()[index] : 0;
+                    const uint64_t dataWord =
+                        index < data.words().size() ? data.words()[index] : 0;
+                    next.words_[index] =
+                        (next.words_[index] & ~maskWord) | (dataWord & maskWord);
+                }
+                next.words_.back() &= highWordMask(width);
+                values[operandIds[writeLayout.targetIndex].value] =
+                    std::move(next);
                 return {};
             }
             if (opcode == Opcode::MemoryRead) {
@@ -1317,26 +1345,42 @@ namespace wolvrix::lib::grhsim::am {
                 values[operandIds[targetIndex].value] = std::move(next);
                 return {};
             }
-            if (opcode == Opcode::MemoryWrite) {
-                // Reverted cond/mask form: operands = [cond, addr, mask, data,
-                // target, events...]. A disabled write never happens (no
-                // read-old needed); the commit Block's event gate decides
-                // whether this instruction runs at all.
-                const std::size_t targetIndex = 4;
+            if (writeLayout.isStateWrite && writeLayout.memory) {
+                // Memory write variant: a present cond gates the write (a
+                // disabled write never happens, no read-old needed); a
+                // present mask bit-mixes the data into the addressed element,
+                // otherwise the whole element is overwritten outright. The
+                // out-of-range address check applies to every variant.
+                const std::size_t targetIndex = writeLayout.targetIndex;
                 const Type &memoryType = operands[targetIndex].type();
+                const std::size_t addrIndex = writeLayout.hasCond ? 1 : 0;
                 const uint64_t address =
-                    shiftAmount(operands[1], memoryType.elementCount);
-                if (truth(operands[0]) && address < memoryType.elementCount) {
+                    shiftAmount(operands[addrIndex], memoryType.elementCount);
+                const bool enabled =
+                    !writeLayout.hasCond || truth(operands[0]);
+                if (enabled && address < memoryType.elementCount) {
                     InterpreterValue next = operands[targetIndex];
                     const std::size_t stride = wordCount(memoryType.bitWidth);
                     const std::size_t offset =
                         static_cast<std::size_t>(address) * stride;
-                    for (uint64_t bit = 0; bit < memoryType.bitWidth; ++bit) {
-                        if (getBit(operands[2].words(), bit)) {
-                            setBit(next.words_,
-                                   static_cast<uint64_t>(offset) * 64U + bit,
-                                   getBit(operands[3].words(), bit));
+                    const InterpreterValue &data = operands[writeLayout.dataIndex];
+                    if (writeLayout.hasMask) {
+                        const InterpreterValue &mask = operands[addrIndex + 1];
+                        for (uint64_t bit = 0; bit < memoryType.bitWidth; ++bit) {
+                            if (getBit(mask.words(), bit)) {
+                                setBit(next.words_,
+                                       static_cast<uint64_t>(offset) * 64U + bit,
+                                       getBit(data.words(), bit));
+                            }
                         }
+                    } else {
+                        for (std::size_t word = 0; word < stride; ++word) {
+                            next.words_[offset + word] =
+                                word < data.words().size() ? data.words()[word]
+                                                           : 0;
+                        }
+                        next.words_[offset + stride - 1] &=
+                            highWordMask(memoryType.bitWidth);
                     }
                     values[operandIds[targetIndex].value] = std::move(next);
                 }

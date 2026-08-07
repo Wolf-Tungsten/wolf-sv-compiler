@@ -150,34 +150,17 @@ namespace wolvrix::lib::grhsim::am
 
         std::optional<VariableId> stateTarget(ProgramView program, InstructionId instruction)
         {
-            const auto operands = program.operands(instruction);
-            std::size_t target = 0;
-            switch (program.opcode(instruction))
+            const OpcodeTraits traits = opcodeTraits(program.opcode(instruction));
+            if ((traits.effect != OpcodeEffect::StateRead &&
+                 traits.effect != OpcodeEffect::StateReadWrite) ||
+                traits.stateTargetOperand == OpcodeTraits::kNoTargetOperand)
             {
-            case Opcode::RegisterWrite:
-            case Opcode::LatchWrite:
-                target = 1;
-                break;
-            case Opcode::MemoryRead:
-                target = 0;
-                break;
-            case Opcode::MemoryReadAll:
-                target = 0;
-                break;
-            case Opcode::MemoryWriteLanes:
-                target = 2;
-                break;
-            case Opcode::MemoryWrite:
-                target = 4;
-                break;
-            case Opcode::MemoryFill:
-                target = 1;
-                break;
-            default:
                 return std::nullopt;
             }
-            return target < operands.size() ? std::optional<VariableId>(operands[target])
-                                            : std::nullopt;
+            const auto operands = program.operands(instruction);
+            return traits.stateTargetOperand < operands.size()
+                       ? std::optional<VariableId>(operands[traits.stateTargetOperand])
+                       : std::nullopt;
         }
 
         bool writesInterfaceInput(ProgramView program,
@@ -784,9 +767,7 @@ namespace wolvrix::lib::grhsim::am
         if (validCommitRange)
         {
             const auto isStateWrite = [](Opcode opcode) {
-                return opcode == Opcode::RegisterWrite || opcode == Opcode::LatchWrite ||
-                       opcode == Opcode::MemoryWrite || opcode == Opcode::MemoryFill ||
-                       opcode == Opcode::MemoryWriteLanes;
+                return isStateWriteOpcode(opcode);
             };
             std::vector<uint32_t> changedBlocks(program.variableCount(), UINT32_MAX);
             for (uint32_t block = 0; block < blockCount; ++block)

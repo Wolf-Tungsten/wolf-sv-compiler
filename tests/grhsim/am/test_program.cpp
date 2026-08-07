@@ -1033,7 +1033,7 @@ namespace
             const VariableId event = builder.addVariable(eventType, builder.zeroInit());
             addInstruction(
                 builder,
-                Opcode::RegisterWrite,
+                Opcode::RegisterWriteCondMask,
                 {},
                 {condition, mask, next, target, event});
             const LinearProgram program = builder.finish();

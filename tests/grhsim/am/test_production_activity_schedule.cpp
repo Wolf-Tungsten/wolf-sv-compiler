@@ -912,8 +912,8 @@ namespace
         const VariableId memory = builder.addVariable(memoryType, builder.zeroInit());
         const VariableId event = builder.addVariable(eventType, builder.zeroInit());
         const std::array<VariableId, 6> operands = {enable, address, mask, data, memory, event};
-        const InstructionId first = builder.addInstruction(Opcode::MemoryWrite, {}, operands);
-        const InstructionId second = builder.addInstruction(Opcode::MemoryWrite, {}, operands);
+        const InstructionId first = builder.addInstruction(Opcode::MemoryWriteCondMask, {}, operands);
+        const InstructionId second = builder.addInstruction(Opcode::MemoryWriteCondMask, {}, operands);
 
         SchedulingFacts facts;
         facts.variableRoles = {
@@ -987,7 +987,7 @@ namespace
 
         const std::array<VariableId, 6> memoryOperands = {enable, address, mask, data, memory, event};
         const InstructionId memoryWrite =
-            builder.addInstruction(Opcode::MemoryWrite, {}, memoryOperands);
+            builder.addInstruction(Opcode::MemoryWriteCondMask, {}, memoryOperands);
         const std::array<VariableId, 3> registerOperands = {data, registerTarget, event};
         const InstructionId registerWrite =
             builder.addInstruction(Opcode::RegisterWrite, {}, registerOperands);
@@ -1147,7 +1147,7 @@ namespace
             enable, address, mask, data, writeMemory, events[1],
         };
         const InstructionId memoryWrite =
-            builder.addInstruction(Opcode::MemoryWrite, {}, memoryWriteOperands);
+            builder.addInstruction(Opcode::MemoryWriteCondMask, {}, memoryWriteOperands);
         const std::array<VariableId, 3> memoryFillOperands = {
             packedData, fillMemory, events[2],
         };
@@ -1344,9 +1344,9 @@ namespace
             builder.addInstruction(Opcode::MemoryRead, readResults, readOperands);
         const std::array<VariableId, 6> writeOperands = {enable, address, mask, data, memory, event};
         const InstructionId firstWrite =
-            builder.addInstruction(Opcode::MemoryWrite, {}, writeOperands);
+            builder.addInstruction(Opcode::MemoryWriteCondMask, {}, writeOperands);
         const InstructionId finalWrite =
-            builder.addInstruction(Opcode::MemoryWrite, {}, writeOperands);
+            builder.addInstruction(Opcode::MemoryWriteCondMask, {}, writeOperands);
 
         SchedulingFacts facts;
         facts.variableRoles = {
@@ -1529,12 +1529,12 @@ namespace
             enable, address, mask, data, companionMemory, tick,
         };
         const InstructionId companionWrite =
-            builder.addInstruction(Opcode::MemoryWrite, {}, companionOperands);
+            builder.addInstruction(Opcode::MemoryWriteCondMask, {}, companionOperands);
         const std::array<VariableId, 6> earlierOperands = {enable, address, mask, data, memory, tick};
         const InstructionId earlierWrite =
-            builder.addInstruction(Opcode::MemoryWrite, {}, earlierOperands);
+            builder.addInstruction(Opcode::MemoryWriteCondMask, {}, earlierOperands);
         const InstructionId finalWrite =
-            builder.addInstruction(Opcode::MemoryWrite, {}, earlierOperands);
+            builder.addInstruction(Opcode::MemoryWriteCondMask, {}, earlierOperands);
 
         const StringId outputName = builder.addString("read_data");
         ProgramInterface interface;
@@ -1843,13 +1843,13 @@ namespace
         const InstructionId reader =
             builder.addInstruction(Opcode::MemoryRead, readerResults, readerOperands);
         // The latch write is eventless: its commit Block gates on a
-        // ChangedAny watch over the merged nextValue.
+        // ChangedAny watch over the data operand.
         const std::array<VariableId, 2> registerOperands = {data, registerState};
         const InstructionId registerWrite =
             builder.addInstruction(Opcode::LatchWrite, {}, registerOperands);
         const std::array<VariableId, 6> memoryOperands = {enable, address, mask, data, memory, writeEvent};
         const InstructionId memoryWrite =
-            builder.addInstruction(Opcode::MemoryWrite, {}, memoryOperands);
+            builder.addInstruction(Opcode::MemoryWriteCondMask, {}, memoryOperands);
 
         const StringId outputName = builder.addString("read_data");
         ProgramInterface interface;
@@ -2647,102 +2647,6 @@ namespace
         return 0;
     }
 
-    // Unit-cost vs width-weighted segment DP (docs/10): 100 compute atoms in
-    // a fixed chain, no coarsening, capacity 60 forces exactly two segments.
-    // v_wide (weight 8) is defined at atom 46 and used at 47..99; v_n1/v_n2
-    // (weight 1) are defined at atom 30 and used at 45..54. The unit-cost DP
-    // crosses v_wide (cost 1) with the cut at 55; the width-weighted DP
-    // prefers crossing v_n1+v_n2 (cost 2) with the cut at 40 over paying 8.
-    int testWidthWeightedCopyCostChangesSegmentation()
-    {
-        constexpr uint32_t kAtoms = 100;
-        std::array<uint32_t, kAtoms + 1> atomOffsets{};
-        std::array<uint32_t, kAtoms - 1> atomTargets{};
-        for (uint32_t atom = 0; atom < kAtoms; ++atom) {
-            atomOffsets[atom] = atom;
-            if (atom + 1 < kAtoms) {
-                atomTargets[atom] = atom + 1;
-            }
-        }
-        atomOffsets[kAtoms] = kAtoms - 1;
-        const std::vector<uint32_t> atomInstructions(kAtoms, 1);
-        const std::vector<uint32_t> atomStateWrites(kAtoms, 0);
-        const std::vector<uint8_t> atomIsCommit(kAtoms, 0);
-        std::vector<uint32_t> atomMinInstruction(kAtoms);
-        std::iota(atomMinInstruction.begin(), atomMinInstruction.end(), uint32_t{0});
-        const std::vector<uint32_t> commitRanks(kAtoms, 0);
-        const std::vector<uint32_t> definitions = {46, 30, 30};
-        std::vector<uint32_t> uses;
-        for (uint32_t use = 47; use < kAtoms; ++use) {
-            uses.push_back(use); // v_wide
-        }
-        for (uint32_t rep = 0; rep < 2; ++rep) {
-            for (uint32_t use = 45; use <= 54; ++use) {
-                uses.push_back(use); // v_n1, v_n2
-            }
-        }
-        const std::array<uint32_t, 4> useOffsets = {0, 53, 63, 73};
-        std::vector<uint32_t> instructionAtom(kAtoms);
-        std::iota(instructionAtom.begin(), instructionAtom.end(), uint32_t{0});
-        const std::array<uint32_t, 3> copyWeights = {8, 1, 1};
-
-        AmGraphPartitionInput input{
-            .atomCount = kAtoms,
-            .atomOffsets = atomOffsets,
-            .atomTargets = atomTargets,
-            .atomInstructions = atomInstructions,
-            .atomStateWrites = atomStateWrites,
-            .atomIsCommit = atomIsCommit,
-            .atomMinInstruction = atomMinInstruction,
-            .commitEventRank = commitRanks,
-            .variableCount = 3,
-            .definitions = definitions,
-            .useOffsets = useOffsets,
-            .uses = uses,
-            .instructionAtom = instructionAtom,
-            .maxInstructionsPerBlock = 60,
-            .enableCoarsening = false,
-            .segmentPenalty = 1.0,
-        };
-        std::string error;
-        auto split = splitAmGraph(input, error);
-        if (!split) {
-            return fail("graph split failed: " + error);
-        }
-        optAmComputeGraph(split->computeGraph, input);
-        // Every atom is compute, so compute-local ids coincide with the
-        // global atom ids used by the assertions below.
-        const auto unitResult = partitionAmComputeGraph(input, *split, error);
-        if (!unitResult) {
-            return fail("unit-cost block formation failed: " + error);
-        }
-        if (unitResult->dpSegments != 2) {
-            return fail("unit-cost DP should cut into 2 segments");
-        }
-        if (unitResult->atomBlock[54] == unitResult->atomBlock[55]) {
-            return fail("unit-cost DP should cut between atoms 54 and 55");
-        }
-        if (unitResult->atomBlock[39] != unitResult->atomBlock[40]) {
-            return fail("unit-cost DP should not cut between atoms 39 and 40");
-        }
-
-        input.variableCopyWeights = copyWeights;
-        const auto weightedResult = partitionAmComputeGraph(input, *split, error);
-        if (!weightedResult) {
-            return fail("width-weighted block formation failed: " + error);
-        }
-        if (weightedResult->dpSegments != 2) {
-            return fail("width-weighted DP should cut into 2 segments");
-        }
-        if (weightedResult->atomBlock[39] == weightedResult->atomBlock[40]) {
-            return fail("width-weighted DP should cut between atoms 39 and 40");
-        }
-        if (weightedResult->atomBlock[54] != weightedResult->atomBlock[55]) {
-            return fail("width-weighted DP should not cut between atoms 54 and 55");
-        }
-        return 0;
-    }
-
     // split-am-graph must isolate the two induced subgraphs (no cross-class
     // edges inside either subgraph), and the two partition passes bucket the
     // atoms as expected: direct assertions on the split and on both
@@ -2840,6 +2744,119 @@ namespace
         }
         return 0;
     }
+
+    // Post-DP local-move refinement: on a crafted graph the segment DP's
+    // contiguous segmentation is uniquely suboptimal and the refinement must
+    // make exactly one improving move, then converge -- without introducing
+    // any backward (def-after-use across blocks) edge.
+    //
+    // Graph (instruction = atom, sizes {2,1,1,1,1,1}, cap 3, penalty 1.0):
+    //   edges: 0->2, 0->3, 1->3, 1->4, 2->5, 3->5, 4->5
+    //   vars:  v1..v7 defined by {0,0,1,1,2,3,4};
+    //          v1->use{2}, v2->{3}, v3->{3}, v4->{4}, v5->{5}, v6->{5}, v7->{5}
+    // The DP optimum is uniquely [0],[1,2],[3,4,5] (pairs 5, cost 5+3=8; next
+    // best costs 9). Refinement moves instruction 2 from block 2 to block 1
+    // (delta -1: v1 stops crossing; v5's consumer is in block 3 either way),
+    // then converges: pairs 4, blocks [0,2],[1],[3,4,5].
+    int testRefinementMovesClusterIntoNeighborBlock()
+    {
+        // The Kernighan DP segments a fixed topological sequence by edge
+        // cuts, so it is blind to external variables (no defining
+        // instruction, hence no DAG edge): the DP puts atom 1 with atom 2 in
+        // block 2 although atom 1's only data input v0 is defined in block 1.
+        // Refinement must move atom 1 into block 1, removing one
+        // (variable, block) incoming pair; atom 2 stays behind because
+        // joining block 1 as well would exceed the block cap.
+        constexpr uint32_t kAtoms = 3;
+        const std::vector<std::pair<uint32_t, uint32_t>> edges = {
+            {0, 1}, {1, 2},
+        };
+        std::vector<uint32_t> atomOffsets(kAtoms + 1, 0);
+        for (const auto &[source, target] : edges) {
+            ++atomOffsets[source + 1];
+        }
+        std::partial_sum(atomOffsets.begin(), atomOffsets.end(), atomOffsets.begin());
+        std::vector<uint32_t> atomTargets(atomOffsets.back());
+        {
+            std::vector<uint32_t> cursor(atomOffsets.begin(), atomOffsets.end() - 1);
+            for (const auto &[source, target] : edges) {
+                atomTargets[cursor[source]++] = target;
+            }
+        }
+        const std::vector<uint32_t> atomInstructions(kAtoms, 1);
+        const std::vector<uint32_t> atomStateWrites(kAtoms, 0);
+        const std::vector<uint8_t> atomIsCommit(kAtoms, 0);
+        std::vector<uint32_t> atomMinInstruction(kAtoms);
+        std::iota(atomMinInstruction.begin(), atomMinInstruction.end(), uint32_t{0});
+        const std::vector<uint32_t> commitRanks(kAtoms, 0);
+        const uint32_t none = std::numeric_limits<uint32_t>::max();
+        // v0: defined by instruction 0, used by instruction 1 -- the only
+        // variable refinement can re-home. v1: external (no definition),
+        // used by instruction 2.
+        const std::vector<uint32_t> definitions = {0, none};
+        const std::vector<uint32_t> useOffsets = {0, 1, 2};
+        const std::vector<uint32_t> uses = {1, 2};
+        std::vector<uint32_t> instructionAtom(kAtoms);
+        std::iota(instructionAtom.begin(), instructionAtom.end(), uint32_t{0});
+
+        const auto runCase = [&](std::size_t refinementRounds) {
+            AmGraphPartitionInput input{
+                .atomCount = kAtoms,
+                .atomOffsets = atomOffsets,
+                .atomTargets = atomTargets,
+                .atomInstructions = atomInstructions,
+                .atomStateWrites = atomStateWrites,
+                .atomIsCommit = atomIsCommit,
+                .atomMinInstruction = atomMinInstruction,
+                .commitEventRank = commitRanks,
+                .variableCount = 2,
+                .definitions = definitions,
+                .useOffsets = useOffsets,
+                .uses = uses,
+                .instructionAtom = instructionAtom,
+                .maxInstructionsPerBlock = 2,
+                .enableCoarsening = false,
+                .segmentPenalty = 1.0,
+                .refinementRounds = refinementRounds,
+            };
+            std::string error;
+            auto split = splitAmGraph(input, error);
+            if (!split) {
+                return std::optional<AmComputeActivityGraph>{};
+            }
+            optAmComputeGraph(split->computeGraph, input);
+            return partitionAmComputeGraph(input, *split, error);
+        };
+
+        const auto baseline = runCase(0);
+        if (!baseline) {
+            return fail("baseline partition failed");
+        }
+        const std::vector<uint32_t> expectedBaseline = {1, 2, 2};
+        if (baseline->atomBlock != expectedBaseline || baseline->refinementMoves != 0) {
+            return fail("baseline DP assignment mismatch");
+        }
+
+        const auto refined = runCase(10);
+        if (!refined) {
+            return fail("refined partition failed");
+        }
+        if (refined->refinementMoves != 1) {
+            return fail("expected exactly one refinement move, got " +
+                        std::to_string(refined->refinementMoves));
+        }
+        if (refined->refinementCostBefore != 2.0 || refined->refinementCostAfter != 1.0) {
+            return fail("refinement cost should drop 2 -> 1");
+        }
+        const std::vector<uint32_t> expectedRefined = {1, 1, 2};
+        if (refined->atomBlock != expectedRefined) {
+            return fail("refinement should move atom 1 into block 1");
+        }
+        if (refined->refinementRounds != 2) {
+            return fail("refinement should converge after one idle round");
+        }
+        return 0;
+    }
 } // namespace
 
 int main()
@@ -2931,10 +2948,10 @@ int main()
     if (const int result = testBlockAssignmentExportWritesJsonl(); result != 0) {
         return result;
     }
-    if (const int result = testWidthWeightedCopyCostChangesSegmentation(); result != 0) {
+    if (const int result = testComputeCommitGraphSplitAndPartitions(); result != 0) {
         return result;
     }
-    if (const int result = testComputeCommitGraphSplitAndPartitions(); result != 0) {
+    if (const int result = testRefinementMovesClusterIntoNeighborBlock(); result != 0) {
         return result;
     }
     return 0;
