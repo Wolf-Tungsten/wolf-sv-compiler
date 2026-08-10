@@ -1119,7 +1119,16 @@ namespace wolvrix::lib::grhsim::am
                     {
                         continue;
                     }
-                    const StringId label = internString(op.symbolText());
+                    std::string nodeNameStorage;
+                    std::string_view labelText = op.symbolText();
+                    if (const auto nodeName = optionalAttr<std::string>(op, "gsim.node_name"))
+                    {
+                        // gsim exports carry meaningless gsim.reg.N op symbols;
+                        // the real RTL provenance lives in gsim.node_name.
+                        nodeNameStorage = *nodeName;
+                        labelText = nodeNameStorage;
+                    }
+                    const StringId label = internString(labelText);
                     VariableRole role = VariableRole::State;
                     if (declaredStateIndices_.contains(operation.index))
                     {
@@ -1671,6 +1680,13 @@ namespace wolvrix::lib::grhsim::am
                     return resultType;
                 case OperationKind::kAdd:
                 case OperationKind::kSub:
+                    // The declared output width is authoritative: FIRRTL-derived
+                    // graphs extend add/sub by one carry bit (operands narrower
+                    // than the declared result), SV-derived graphs may truncate.
+                    // Operand-width arithmetic loses the carry and cannot be
+                    // recovered by the downstream widening assign.
+                    return Type::bitVector(resultType.bitWidth,
+                                           commonSign(operands[0], operands[1]));
                 case OperationKind::kAnd:
                 case OperationKind::kOr:
                 case OperationKind::kXor:
@@ -2034,6 +2050,30 @@ namespace wolvrix::lib::grhsim::am
                         error("shift operand cannot be coerced to its native type",
                               opContext(op));
                         return;
+                    }
+                }
+                if (opcode == Opcode::Add || opcode == Opcode::Sub)
+                {
+                    // FIRRTL-derived graphs declare add/sub results one carry
+                    // bit wider than their operands; extend the operands
+                    // explicitly so the AM instruction keeps its operand-width
+                    // Type signature while the carry is preserved.
+                    for (std::size_t index = 0; index < loweredOperands.size();
+                         ++index)
+                    {
+                        const Type *sourceType = variableTypeOf(loweredOperands[index]);
+                        if (!sourceType)
+                        {
+                            return;
+                        }
+                        loweredOperands[index] = coerceToType(
+                            loweredOperands[index], *sourceType, *nativeType);
+                        if (!loweredOperands[index].valid())
+                        {
+                            error("add/sub operand cannot be coerced to its declared width",
+                                  opContext(op));
+                            return;
+                        }
                     }
                 }
                 const VariableId destination = mappedValue(results.front(), op);

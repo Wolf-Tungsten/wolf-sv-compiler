@@ -59,6 +59,32 @@ namespace wolvrix::lib::grhsim::am
             return !keywords.contains(text);
         }
 
+        // Port names arriving through imported graphs (e.g. gsim executable
+        // GRH) may contain non-identifier characters ("difftest$$perfCtrl$$clean").
+        // Sanitize them exactly like the legacy GrhSIM emitter does, so the
+        // difftest port ABI keeps matching its double-underscore alternatives.
+        std::string sanitizeCppIdentifier(std::string_view text)
+        {
+            std::string out;
+            out.reserve(text.size() + 8);
+            if (text.empty() || (!std::isalpha(static_cast<unsigned char>(text.front())) && text.front() != '_'))
+            {
+                out.push_back('_');
+            }
+            for (unsigned char ch : text)
+            {
+                if (std::isalnum(ch) || ch == '_')
+                {
+                    out.push_back(static_cast<char>(ch));
+                }
+                else
+                {
+                    out.push_back('_');
+                }
+            }
+            return out;
+        }
+
         std::string cppScalarType(uint32_t width)
         {
             if (width == 1)
@@ -172,6 +198,18 @@ namespace wolvrix::lib::grhsim::am
             // carries no profile counters or hot-path profile branches, and the
             // host-facing profile API degrades to no-op stubs.
             bool runtimeProfile = false;
+            // Compile-time full-evaluation switch (attribute "fullEvaluation",
+            // default off). When true every scan/commit byte chunk executes its
+            // blocks unconditionally, bypassing activity filtering. Block
+            // bodies still perform their activation bookkeeping, so the mode
+            // measures exactly the value of activity filtering itself.
+            bool fullEvaluation = false;
+            // Compile-time changed-trace switch (attribute "changedTrace",
+            // default off). When true the model can stream per-(eval, round)
+            // changed-variable records to the file named by
+            // EMU_AM_CHANGED_TRACE (windowed by EMU_AM_TRACE_BEGIN_EVAL /
+            // EMU_AM_TRACE_END_EVAL) for offline ideal-dynamic-work replay.
+            bool changedTrace = false;
             std::unordered_map<uint32_t, uint32_t> onceSlotByInstruction;
             uint32_t onceSlotCount = 0;
             std::unordered_map<uint32_t, uint32_t> pendingEventSlotByInstruction;
@@ -333,29 +371,28 @@ namespace wolvrix::lib::grhsim::am
             // Mutable emission context (same pattern as arrayWriteAccum): the
             // current RegisterWrite position's raise flag, -1 when none.
             mutable int32_t scalarWriteRaise = -1;
-            // Atom-driven same-select mux fusion (NO0006 pass, NO0007 P2):
-            // a MuxMerge atom emits its non-arm members (the cone) normally
-            // in atom member order, then one fused if/else over the arm
-            // members (the same-select muxes, also in member order, so
-            // chained arms read the earlier branch assignment). The atom is
-            // the single source of truth -- no block-level run pattern
-            // matching remains. instructionMuxAtom maps an instruction to
-            // its MuxMerge atom plan id (-1 when not a member); the head
-            // member (first in atom member order) emits the atom's whole
-            // code, the other members emit nothing.
-            struct MuxAtomPlan
+            // Block-level same-select mux fusion (NO0008): mux-rooted atoms
+            // (Singleton/Tree carrying a select signature) that sit adjacent
+            // in a Block form a fusion run; the head instruction of the run
+            // emits every run atom's cone members (in atom order) followed by
+            // one fused if/else over the root muxes, and the other covered
+            // instructions emit nothing. Runs are broken whenever a cone
+            // member would read an earlier run root's result (the fused
+            // if/else would otherwise be a use-before-def). instructionMuxRun
+            // maps an instruction to its run plan id (-1 when not covered).
+            struct MuxRunPlan
             {
-                uint32_t head = 0; // first member instruction value
+                uint32_t head = 0; // first covered instruction value
                 VariableId select;
-                std::vector<InstructionId> preamble; // non-arm members, atom order
-                std::vector<InstructionId> arms;     // same-select muxes, atom order
+                std::vector<InstructionId> preamble; // cone members, atom order
+                std::vector<InstructionId> arms;     // root muxes, atom order
             };
-            std::vector<int32_t> instructionMuxAtom;
-            std::vector<MuxAtomPlan> muxAtomPlans;
+            std::vector<int32_t> instructionMuxRun;
+            std::vector<MuxRunPlan> muxRunPlans;
             uint64_t muxAtomFusedCount = 0;
-            // Re-entrancy guard: emitMuxAtom emits its members through
-            // emitInstruction, which must not re-enter the atom hook.
-            mutable bool muxAtomEmissionActive = false;
+            // Re-entrancy guard: emitMuxFusionRun emits the preamble through
+            // emitInstruction, which must not re-enter the run hook.
+            mutable bool muxRunEmissionActive = false;
         };
 
         constexpr uint8_t kEscapeGlobal = 1U << 0U;
@@ -904,7 +941,7 @@ namespace wolvrix::lib::grhsim::am
             const std::size_t argumentEnd = operands.size() - attributes->eventCount;
             const std::size_t argumentCount = argumentEnd - 1U;
             const std::string name(state.program.string(attributes->name));
-            if (name != "fwrite" && name != "finish")
+            if (name != "fwrite" && name != "finish" && name != "fatal")
             {
                 error = "unsupported system.task binding in the AM C++ emitter: " + name;
                 return std::nullopt;
@@ -945,6 +982,14 @@ namespace wolvrix::lib::grhsim::am
             }
 
             std::string code = preamble + "if (" + fire + ") {\n";
+            if (name == "fatal")
+            {
+                // The first eval is a baseline-sync pass: compute blocks read
+                // registers before the commit scan applies their reset values,
+                // so assertion conditions can be transiently violated. Skip
+                // fatal firing during it (checks resume from eval 2 onward).
+                code = preamble + "if (!firstEval_ && (" + fire + ")) {\n";
+            }
             if (name == "fwrite")
             {
                 if (argumentCount < 2)
@@ -986,21 +1031,54 @@ namespace wolvrix::lib::grhsim::am
             }
             else
             {
+                // "fatal" mirrors the legacy GrhSIM emitter semantics: an
+                // optional leading scalar logic argument is the exit code
+                // (default 1), remaining String arguments are printed to
+                // std::cerr with a "[fatal] " prefix; both fatal and finish
+                // request termination via the host-facing flags.
+                const bool fatalTask = name == "fatal";
+                if (fatalTask)
+                {
+                    code += "fatalRequested_ = true;\n";
+                }
                 code += "finishRequested_ = true;\n";
+                std::size_t messageBegin = 1U;
                 if (argumentCount != 0)
                 {
                     const Type &exitType = variableType(state, operands[1]);
-                    if (exitType.kind != TypeKind::BitVector || exitType.bitWidth > 64)
+                    if (exitType.kind == TypeKind::BitVector && exitType.bitWidth <= 64)
+                    {
+                        code += "systemExitCode_ = static_cast<int>(" + valueExpr(state, operands[1]) +
+                                " & " + maskExpr(exitType.bitWidth) + ");\n";
+                        messageBegin = 2U;
+                    }
+                    else if (!fatalTask)
                     {
                         error = "finish system.task exit code must be scalar logic";
                         return std::nullopt;
                     }
-                    code += "systemExitCode_ = static_cast<int>(" + valueExpr(state, operands[1]) +
-                            " & " + maskExpr(exitType.bitWidth) + ");\n";
+                    else
+                    {
+                        code += "systemExitCode_ = 1;\n";
+                    }
                 }
                 else
                 {
-                    code += "systemExitCode_ = 0;\n";
+                    code += std::string("systemExitCode_ = ") + (fatalTask ? "1" : "0") + ";\n";
+                }
+                if (fatalTask)
+                {
+                    for (std::size_t index = messageBegin; index < argumentEnd; ++index)
+                    {
+                        const Type &messageType = variableType(state, operands[index]);
+                        if (messageType.kind != TypeKind::String)
+                        {
+                            continue;
+                        }
+                        code += "std::cerr << \"[fatal] \" << stringValues_[" +
+                                std::to_string(variableStorage(state, operands[index]).offset) +
+                                "] << \"\\n\";\n";
+                    }
                 }
             }
             if (attributes->schedule == CallSchedule::Once)
@@ -1577,16 +1655,15 @@ namespace wolvrix::lib::grhsim::am
                                                    InstructionId instruction,
                                                    std::string &error);
 
-        // MuxMerge atom two-phase emission (NO0007 P2): the non-arm members
-        // (the absorbed cone) emit normally in atom member order, then one
-        // fused if/else covers the arm members. The pass guarantees arms
-        // only depend on the cone, state reads, or earlier arms, so this
-        // order is def-before-use by construction.
-        std::optional<std::string> emitMuxAtom(const EmitState &state,
-                                               const EmitState::MuxAtomPlan &plan,
-                                               std::string &error)
+        // Mux-run two-phase emission (NO0008): the run atoms' cone members
+        // emit normally in atom order, then one fused if/else covers the
+        // root muxes. The run planner guarantees cones never read an
+        // earlier run root's result, so this order is def-before-use.
+        std::optional<std::string> emitMuxFusionRun(const EmitState &state,
+                                                    const EmitState::MuxRunPlan &plan,
+                                                    std::string &error)
         {
-            state.muxAtomEmissionActive = true;
+            state.muxRunEmissionActive = true;
             std::string code;
             for (const InstructionId member : plan.preamble)
             {
@@ -1594,35 +1671,19 @@ namespace wolvrix::lib::grhsim::am
                     emitInstruction(state, member, error);
                 if (!emitted)
                 {
-                    state.muxAtomEmissionActive = false;
+                    state.muxRunEmissionActive = false;
                     return std::nullopt;
                 }
                 code += *emitted;
             }
-            if (plan.arms.size() >= 2)
+            std::optional<std::string> fused = emitMuxRun(state, plan.arms, error);
+            if (!fused)
             {
-                std::optional<std::string> fused = emitMuxRun(state, plan.arms, error);
-                if (!fused)
-                {
-                    state.muxAtomEmissionActive = false;
-                    return std::nullopt;
-                }
-                code += *fused;
+                state.muxRunEmissionActive = false;
+                return std::nullopt;
             }
-            else if (!plan.arms.empty())
-            {
-                // Degenerate single-arm atom (validate forbids it in
-                // production): keep the plain emission.
-                std::optional<std::string> emitted =
-                    emitInstruction(state, plan.arms.front(), error);
-                if (!emitted)
-                {
-                    state.muxAtomEmissionActive = false;
-                    return std::nullopt;
-                }
-                code += *emitted;
-            }
-            state.muxAtomEmissionActive = false;
+            code += *fused;
+            state.muxRunEmissionActive = false;
             return code;
         }
 
@@ -1646,19 +1707,19 @@ namespace wolvrix::lib::grhsim::am
                 return std::array<std::string, 2>{lhs, rhs};
             };
 
-            if (!state.muxAtomEmissionActive &&
-                instruction.value < state.instructionMuxAtom.size())
+            if (!state.muxRunEmissionActive &&
+                instruction.value < state.instructionMuxRun.size())
             {
-                const int32_t muxAtom = state.instructionMuxAtom[instruction.value];
-                if (muxAtom >= 0)
+                const int32_t muxRun = state.instructionMuxRun[instruction.value];
+                if (muxRun >= 0)
                 {
-                    const EmitState::MuxAtomPlan &plan = state.muxAtomPlans[muxAtom];
+                    const EmitState::MuxRunPlan &plan = state.muxRunPlans[muxRun];
                     if (plan.head != instruction.value)
                     {
-                        // The atom head emitted the whole two-phase code.
+                        // The run head emitted the whole two-phase code.
                         return std::string();
                     }
-                    return emitMuxAtom(state, plan, error);
+                    return emitMuxFusionRun(state, plan, error);
                 }
             }
 
@@ -1676,7 +1737,7 @@ namespace wolvrix::lib::grhsim::am
                 }
                 if (resultType.bitWidth <= 64)
                 {
-                    return resultAssign(wideDataExpr(state, operands.front()) + "[0]");
+                    return resultAssign("(" + wideDataExpr(state, operands.front()) + ")[0]");
                 }
                 const std::string sign =
                     sourceType.signedness == Signedness::Signed ? "true" : "false";
@@ -2904,8 +2965,17 @@ namespace wolvrix::lib::grhsim::am
         // consume the snapshot with straight-line ascending bit tests (the
         // legacy/GSIM batch idiom). Same-byte forward activations relay into
         // the local byteFlags, so they are picked up later in the same pass.
-        std::string scanByteChunkPrologue(std::size_t byteIndex, uint8_t ownedMask)
+        // In full-evaluation mode the snapshot is forced to the owned mask, so
+        // every owned block test passes unconditionally.
+        std::string scanByteChunkPrologue(std::size_t byteIndex, uint8_t ownedMask,
+                                          bool fullEvaluation)
         {
+            if (fullEvaluation)
+            {
+                return "    {\n        std::uint8_t byteFlags = " +
+                       byteMaskLiteral(ownedMask) +
+                       ";\n        if (byteFlags != 0) {\n";
+            }
             std::string text = "    {\n        std::uint8_t byteFlags = active_byte_ref(" +
                                std::to_string(byteIndex) + ")";
             if (ownedMask == 0xffU)
@@ -3266,7 +3336,9 @@ namespace wolvrix::lib::grhsim::am
                     return addByteCount(
                         pendingBytes,
                         static_cast<uint64_t>(
-                            scanByteChunkPrologue(scanByte, ownedMask).size()) +
+                            scanByteChunkPrologue(scanByte, ownedMask,
+                                                  state.fullEvaluation)
+                                .size()) +
                             static_cast<uint64_t>(kScanByteChunkEpilogue.size()));
                 };
 
@@ -4057,70 +4129,126 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
-        // NO0006/NO0007 P2 atom-driven mux fusion: MuxMerge atoms carry the
-        // pass-recorded same-select mux group. The head member (first in
-        // atom member order) emits the two-phase code for the whole atom;
-        // the other members emit nothing. Atoms of any other kind fall
-        // through to the plain per-instruction emission, so no block-level
-        // run pattern matching remains.
-        void planMuxMergeAtoms(const ExecutableModel &model, EmitState &state)
+        // NO0008 block-level same-select mux fusion: mux-rooted atoms
+        // (Singleton/Tree whose last member is a Mux) adjacent in a Block
+        // form fusion runs; the select derives from the root instruction
+        // itself, so the planner does not depend on atom signatures. The
+        // first covered instruction emits the run's whole two-phase code
+        // (cones in atom order, then one fused if/else over the root
+        // muxes); the other covered instructions emit nothing. A run closes
+        // on a non-eligible atom, on a select change, or when a cone member
+        // would read an earlier run root's result (the fused if/else would
+        // otherwise become a use-before-def); the atom then starts a fresh
+        // run. Runs with a single arm emit plainly.
+        void planMuxFusionRuns(const ExecutableModel &model, EmitState &state)
         {
-            state.instructionMuxAtom.assign(state.program.instructionCount(), -1);
-            state.muxAtomPlans.clear();
+            state.instructionMuxRun.assign(state.program.instructionCount(), -1);
+            state.muxRunPlans.clear();
             state.muxAtomFusedCount = 0;
             for (uint32_t blockIndex = 0; blockIndex < state.blockCount; ++blockIndex)
             {
                 const BlockId block{blockIndex};
+                std::vector<InstructionId> runPreamble;
+                std::vector<InstructionId> runArms;
+                std::unordered_set<uint32_t> runRootResults;
+                uint32_t runSelect = kInvalidAtomSignature;
+                const auto flushRun = [&]() {
+                    if (runArms.size() >= 2)
+                    {
+                        EmitState::MuxRunPlan plan;
+                        plan.head = (runPreamble.empty() ? runArms.front()
+                                                         : runPreamble.front())
+                                        .value;
+                        plan.select = VariableId{runSelect};
+                        plan.preamble = runPreamble;
+                        plan.arms = runArms;
+                        const int32_t planId =
+                            static_cast<int32_t>(state.muxRunPlans.size());
+                        for (const InstructionId member : plan.preamble)
+                        {
+                            state.instructionMuxRun[member.value] = planId;
+                        }
+                        for (const InstructionId member : plan.arms)
+                        {
+                            state.instructionMuxRun[member.value] = planId;
+                        }
+                        state.muxAtomFusedCount += plan.arms.size();
+                        state.muxRunPlans.push_back(std::move(plan));
+                    }
+                    runPreamble.clear();
+                    runArms.clear();
+                    runRootResults.clear();
+                    runSelect = kInvalidAtomSignature;
+                };
                 for (std::size_t atomIndex = 0;
                      atomIndex < model.program.blockAtomCount(block); ++atomIndex)
                 {
                     const AtomId atom = model.program.blockAtom(block, atomIndex);
-                    if (model.program.atomKind(atom) != AmAtomKind::MuxMerge)
-                    {
-                        continue;
-                    }
+                    const AmAtomKind kind = model.program.atomKind(atom);
                     const std::size_t memberCount = model.program.atomInstructionCount(atom);
-                    if (memberCount == 0)
+                    bool eligible = (kind == AmAtomKind::Singleton ||
+                                     kind == AmAtomKind::Tree) &&
+                                    memberCount > 0;
+                    InstructionId root;
+                    uint32_t select = kInvalidAtomSignature;
+                    if (eligible)
                     {
+                        root = model.program.atomInstruction(atom, memberCount - 1);
+                        const auto operands = state.program.operands(root);
+                        eligible = state.program.opcode(root) == Opcode::Mux &&
+                                   operands.size() == 3 && operands[0].valid();
+                        if (eligible)
+                        {
+                            select = operands[0].value;
+                        }
+                    }
+                    if (!eligible)
+                    {
+                        flushRun();
                         continue;
                     }
-                    EmitState::MuxAtomPlan plan;
-                    plan.head = model.program.atomInstruction(atom, 0).value;
-                    plan.select = VariableId{model.program.atomSignature(atom)};
-                    for (std::size_t member = 0; member < memberCount; ++member)
+                    if (select != runSelect)
                     {
-                        const InstructionId instruction =
+                        flushRun();
+                        runSelect = select;
+                    }
+                    // Cone safety: a cone member reading an earlier run
+                    // root's result would move its def after this use.
+                    bool coneUnsafe = false;
+                    for (std::size_t member = 0; member + 1 < memberCount && !coneUnsafe;
+                         ++member)
+                    {
+                        const InstructionId coneInstruction =
                             model.program.atomInstruction(atom, member);
-                        const auto operands = state.program.operands(instruction);
-                        if (state.program.opcode(instruction) == Opcode::Mux &&
-                            operands.size() == 3 && operands[0] == plan.select)
+                        for (const VariableId operand :
+                             state.program.operands(coneInstruction))
                         {
-                            plan.arms.push_back(instruction);
+                            if (operand.valid() &&
+                                runRootResults.count(operand.value) != 0)
+                            {
+                                coneUnsafe = true;
+                                break;
+                            }
                         }
-                        else
-                        {
-                            plan.preamble.push_back(instruction);
-                        }
                     }
-                    if (plan.arms.size() < 2)
+                    if (coneUnsafe)
                     {
-                        // Degenerate atom (validate forbids it in
-                        // production): emit members plainly.
-                        continue;
+                        flushRun();
+                        runSelect = select;
                     }
-                    const int32_t planId =
-                        static_cast<int32_t>(state.muxAtomPlans.size());
-                    for (const InstructionId member : plan.preamble)
+                    for (std::size_t member = 0; member + 1 < memberCount; ++member)
                     {
-                        state.instructionMuxAtom[member.value] = planId;
+                        runPreamble.push_back(
+                            model.program.atomInstruction(atom, member));
                     }
-                    for (const InstructionId member : plan.arms)
+                    runArms.push_back(root);
+                    const auto rootResults = state.program.results(root);
+                    if (!rootResults.empty() && rootResults.front().valid())
                     {
-                        state.instructionMuxAtom[member.value] = planId;
+                        runRootResults.insert(rootResults.front().value);
                     }
-                    state.muxAtomFusedCount += plan.arms.size();
-                    state.muxAtomPlans.push_back(std::move(plan));
                 }
+                flushRun();
             }
         }
     } // namespace
@@ -4164,6 +4292,12 @@ namespace wolvrix::lib::grhsim::am
         const auto runtimeProfileAttribute = options.attributes.find("runtimeProfile");
         state.runtimeProfile = runtimeProfileAttribute != options.attributes.end() &&
                                runtimeProfileAttribute->second == "true";
+        const auto fullEvaluationAttribute = options.attributes.find("fullEvaluation");
+        state.fullEvaluation = fullEvaluationAttribute != options.attributes.end() &&
+                               fullEvaluationAttribute->second == "true";
+        const auto changedTraceAttribute = options.attributes.find("changedTrace");
+        state.changedTrace = changedTraceAttribute != options.attributes.end() &&
+                             changedTraceAttribute->second == "true";
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
         for (uint32_t index = 0; index < program.variableCount(); ++index)
@@ -4421,7 +4555,7 @@ namespace wolvrix::lib::grhsim::am
         std::unordered_set<std::string> portNames;
         for (const PortBinding &port : model.interface.ports)
         {
-            const std::string name(program.string(port.name));
+            const std::string name = sanitizeCppIdentifier(program.string(port.name));
             if (!isCppIdentifier(name) || !portNames.insert(name).second)
             {
                 diagnostics.error(
@@ -4662,9 +4796,9 @@ namespace wolvrix::lib::grhsim::am
         // RegisterWrite sites. Planned after ST00010 (emission consults its
         // group assignments).
         planScalarWatchGroups(model, state);
-        // NO0006/NO0007 P2 same-select mux fusion: MuxMerge atoms emit one
-        // fused if/else over their arm members.
-        planMuxMergeAtoms(model, state);
+        // NO0008 block-level same-select mux fusion: adjacent mux-rooted
+        // atoms sharing one select emit one fused if/else per run.
+        planMuxFusionRuns(model, state);
 
         if (statsAttribute != options.attributes.end() && statsAttribute->second == "true")
         {
@@ -4726,8 +4860,12 @@ namespace wolvrix::lib::grhsim::am
         }
         std::ostringstream header;
         header << "#pragma once\n"
-               << "#include <array>\n#include <chrono>\n#include <cstddef>\n#include <cstdint>\n#include <cstring>\n#include <string>\n#include <vector>\n\n"
-               << "#define WOLVRIX_GRHSIM_PERF 0\n\n"
+               << "#include <array>\n#include <chrono>\n#include <cstddef>\n#include <cstdint>\n#include <cstring>\n#include <string>\n#include <vector>\n\n";
+        if (state.runtimeProfile || state.changedTrace)
+        {
+            header << "#include <cstdio>\n#include <cstdlib>\n\n";
+        }
+        header << "#define WOLVRIX_GRHSIM_PERF 0\n\n"
                << "class " << className << " {\npublic:\n"
                << "    " << className << "();\n"
                << "    ~" << className << "();\n"
@@ -4755,7 +4893,7 @@ namespace wolvrix::lib::grhsim::am
             const VariableId variable =
                 port.direction == PortDirection::Input ? port.input : port.output;
             const Type &type = variableType(state, variable);
-            header << "    " << cppPortType(type) << " " << program.string(port.name)
+            header << "    " << cppPortType(type) << " " << sanitizeCppIdentifier(program.string(port.name))
                    << "{};\n";
         }
         header << "\nprivate:\n";
@@ -4805,8 +4943,12 @@ namespace wolvrix::lib::grhsim::am
                << "        if (event) mark_changed_result(variable);\n"
                << "    }\n"
                << "    void mark_changed_result(std::size_t variable);\n"
-               << "    void clear_changed_results();\n"
-               << "    static constexpr std::uint64_t bit_mask(std::uint32_t width) {\n"
+               << "    void clear_changed_results();\n";
+        if (state.changedTrace)
+        {
+            header << "    void trace_changed_init();\n";
+        }
+        header << "    static constexpr std::uint64_t bit_mask(std::uint32_t width) {\n"
                << "        return width >= 64 ? UINT64_MAX : ((UINT64_C(1) << width) - 1);\n"
                << "    }\n"
                << "    static std::size_t word_count(std::uint32_t width);\n"
@@ -4947,6 +5089,14 @@ namespace wolvrix::lib::grhsim::am
                    << "    std::uint64_t profileCommitNs_ = 0;\n"
                    << "    std::uint64_t profileEvalNs_ = 0;\n"
                    << "    std::array<std::uint64_t, kBlockCount> profilePerBlockExecs_{};\n";
+        }
+        if (state.changedTrace)
+        {
+            header << "    std::FILE *traceChangedFile_ = nullptr;\n"
+                   << "    bool traceChangedInit_ = false;\n"
+                   << "    std::uint64_t traceChangedEval_ = 0;\n"
+                   << "    std::uint64_t traceChangedBegin_ = 0;\n"
+                   << "    std::uint64_t traceChangedEnd_ = UINT64_MAX;\n";
         }
         header << "    bool finalized_ = false;\n"
                << "    bool finishRequested_ = false;\n"
@@ -6130,14 +6280,40 @@ namespace
                 << (state.runtimeProfile
                         ? "    if (runtimeProfileEnabled_) profileChangedClears_ += dirtyChangedResults_.size();\n"
                         : "")
+                << (state.changedTrace
+                        ? "    if (traceChangedFile_ != nullptr && !dirtyChangedResults_.empty() &&\n"
+                          "        traceChangedEval_ >= traceChangedBegin_ && traceChangedEval_ <= traceChangedEnd_) {\n"
+                          "        const std::uint64_t traceHeader[3] = { traceChangedEval_, roundCounter_,\n"
+                          "                                               static_cast<std::uint64_t>(dirtyChangedResults_.size()) };\n"
+                          "        std::fwrite(traceHeader, sizeof(traceHeader), 1, traceChangedFile_);\n"
+                          "        std::fwrite(dirtyChangedResults_.data(), sizeof(std::uint32_t),\n"
+                          "                    dirtyChangedResults_.size(), traceChangedFile_);\n"
+                          "    }\n"
+                        : "")
                 << "    for (const std::uint32_t variable : dirtyChangedResults_) {\n"
                 << "        changedResults_[variable] = 0;\n"
                 << "        dirtyChangedBits_[variable / 64U] &= ~(UINT64_C(1) << (variable % 64U));\n"
                 << "    }\n"
                 << "    dirtyChangedResults_.clear();\n"
-                << "}\n\nvoid " << className << "::finalize() {\n"
+                << "}\n";
+        if (state.changedTrace)
+        {
+            runtime << "\nvoid " << className
+                    << "::trace_changed_init() {\n"
+                    << "    traceChangedInit_ = true;\n"
+                    << "    const char *path = std::getenv(\"EMU_AM_CHANGED_TRACE\");\n"
+                    << "    if (path == nullptr || path[0] == '\\0') return;\n"
+                    << "    if (const char *begin = std::getenv(\"EMU_AM_TRACE_BEGIN_EVAL\")) traceChangedBegin_ = std::strtoull(begin, nullptr, 10);\n"
+                    << "    if (const char *end = std::getenv(\"EMU_AM_TRACE_END_EVAL\")) traceChangedEnd_ = std::strtoull(end, nullptr, 10);\n"
+                    << "    traceChangedFile_ = std::fopen(path, \"wb\");\n"
+                    << "}\n";
+        }
+        runtime << "\nvoid " << className << "::finalize() {\n"
                 << "    if (finalized_) return;\n"
-                << "    finalized_ = true;\n";
+                << "    finalized_ = true;\n"
+                << (state.changedTrace
+                        ? "    if (traceChangedFile_ != nullptr) { std::fclose(traceChangedFile_); traceChangedFile_ = nullptr; }\n"
+                        : "");
         for (InstructionId instruction : state.finalSystemTasks)
         {
             std::string error;
@@ -6160,6 +6336,10 @@ namespace
                 << (state.runtimeProfile
                         ? "    if (runtimeProfileEnabled_) ++profileEvalCalls_;\n"
                           "    const auto profileEvalStart = std::chrono::steady_clock::now();\n"
+                        : "")
+                << (state.changedTrace
+                        ? "    if (!traceChangedInit_) trace_changed_init();\n"
+                          "    ++traceChangedEval_;\n"
                         : "");
         for (const PortBinding &port : model.interface.ports)
         {
@@ -6171,7 +6351,7 @@ namespace
             if (type.bitWidth <= 64)
             {
                 runtime << "    " << valueExpr(state, port.input)
-                        << " = static_cast<std::uint64_t>(" << program.string(port.name)
+                        << " = static_cast<std::uint64_t>(" << sanitizeCppIdentifier(program.string(port.name))
                         << ") & " << maskExpr(type.bitWidth) << ";\n";
             }
             else
@@ -6183,7 +6363,7 @@ namespace
                                               ? type.bitWidth - word * 64U
                                               : 64U;
                     runtime << "    wideValues_[" << storage.offset + word << "] = "
-                            << program.string(port.name) << "[" << word << "] & "
+                            << sanitizeCppIdentifier(program.string(port.name)) << "[" << word << "] & "
                             << maskExpr(bits) << ";\n";
                 }
             }
@@ -6325,7 +6505,7 @@ namespace
             const Type &type = variableType(state, port.output);
             if (type.bitWidth <= 64)
             {
-                runtime << "    " << program.string(port.name) << " = static_cast<"
+                runtime << "    " << sanitizeCppIdentifier(program.string(port.name)) << " = static_cast<"
                         << cppScalarType(type.bitWidth) << ">("
                         << valueExpr(state, port.output) << ");\n";
             }
@@ -6334,7 +6514,7 @@ namespace
                 const EmitState::Storage &storage = variableStorage(state, port.output);
                 for (uint32_t word = 0; word < storage.wordCount; ++word)
                 {
-                    runtime << "    " << program.string(port.name) << "[" << word
+                    runtime << "    " << sanitizeCppIdentifier(program.string(port.name)) << "[" << word
                             << "] = wideValues_[" << storage.offset + word << "];\n";
                 }
             }
@@ -6374,6 +6554,20 @@ namespace
                     << "        if (profilePerBlockExecs_[block] == 0) break;\n"
                     << "        std::cerr << \"  block \" << block << (is_commit_block(block) ? \" (commit)\" : \"\") << \": \" << profilePerBlockExecs_[block]\n"
                     << "                  << \" (\" << (totalBlockExecs != 0 ? 100.0 * static_cast<double>(profilePerBlockExecs_[block]) / static_cast<double>(totalBlockExecs) : 0.0) << \"%)\\n\";\n"
+                    << "    }\n"
+                    // NO0017 B-layer: optionally stream the full per-block exec
+                    // counts (one "block kind execs" line per block) to the file
+                    // named by EMU_AM_BLOCK_EXECS, for offline dynamic
+                    // instruction-count derivation.
+                    << "    if (const char *blockExecsPath = std::getenv(\"EMU_AM_BLOCK_EXECS\")) {\n"
+                    << "        if (std::FILE *blockExecsFile = std::fopen(blockExecsPath, \"w\")) {\n"
+                    << "            for (std::size_t block = 0; block < kBlockCount; ++block) {\n"
+                    << "                std::fprintf(blockExecsFile, \"%zu %c %llu\\n\", block,\n"
+                    << "                             is_commit_block(block) ? 'c' : 'w',\n"
+                    << "                             static_cast<unsigned long long>(profilePerBlockExecs_[block]));\n"
+                    << "            }\n"
+                    << "            std::fclose(blockExecsFile);\n"
+                    << "        }\n"
                     << "    }\n"
                     << "}\n";
         }
@@ -6630,7 +6824,8 @@ namespace
                          scanByteChunks(scanLo, scanHi))
                     {
                         blockSource << scanByteChunkPrologue(chunk.byteIndex,
-                                                             chunk.ownedMask);
+                                                             chunk.ownedMask,
+                                                             state.fullEvaluation);
                         state.scanRelayByte =
                             static_cast<int32_t>(chunk.byteIndex);
                         state.scanRelayMask = chunk.ownedMask;
@@ -6684,7 +6879,8 @@ namespace
                          scanByteChunks(commitLo, commitHi))
                     {
                         blockSource << scanByteChunkPrologue(chunk.byteIndex,
-                                                             chunk.ownedMask);
+                                                             chunk.ownedMask,
+                                                             state.fullEvaluation);
                         state.scanRelayByte =
                             static_cast<int32_t>(chunk.byteIndex);
                         state.scanRelayMask = chunk.ownedMask;

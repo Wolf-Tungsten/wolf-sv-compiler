@@ -538,16 +538,27 @@ target_link_libraries(grhsim-am-lowering
 
 register_test_exe(grhsim-am-lowering)
 
-add_executable(grhsim-am-mux-atom
-    tests/grhsim/am/test_mux_atom.cpp
+add_executable(grhsim-am-tree-atom
+    tests/grhsim/am/test_tree_atom.cpp
 )
 
-target_link_libraries(grhsim-am-mux-atom
+target_link_libraries(grhsim-am-tree-atom
     PRIVATE
         wolvrix-lib
 )
 
-register_test_exe(grhsim-am-mux-atom)
+register_test_exe(grhsim-am-tree-atom)
+
+add_executable(grhsim-am-fanout-absorb
+    tests/grhsim/am/test_fanout_absorb.cpp
+)
+
+target_link_libraries(grhsim-am-fanout-absorb
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(grhsim-am-fanout-absorb)
 
 add_executable(grhsim-am-program-atoms
     tests/grhsim/am/test_program_atoms.cpp
@@ -606,6 +617,26 @@ target_link_libraries(grhsim-am-lower-json
     PRIVATE
         wolvrix-lib
 )
+
+add_executable(grhsim-am-import-debug
+    tests/grhsim/am/import_debug_driver.cpp
+)
+
+target_link_libraries(grhsim-am-import-debug
+    PRIVATE
+        wolvrix-lib
+)
+
+add_executable(grhsim-am-concat-slice-semantics
+    tests/grhsim/am/test_concat_slice_semantics.cpp
+)
+
+target_link_libraries(grhsim-am-concat-slice-semantics
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(grhsim-am-concat-slice-semantics)
 
 add_executable(emit-sv-top-reachable
     tests/emit/test_emit_sv_top_reachable.cpp

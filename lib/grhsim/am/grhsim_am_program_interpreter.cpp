@@ -1193,12 +1193,23 @@ namespace wolvrix::lib::grhsim::am {
                 attributes.eventMode == HostEventMode::Pending;
             if (retainEvent && attributes.eventCount != 0 && eventHit) {
                 pendingHostEvents[instruction.value] = true;
+                if (std::getenv("WOLVRIX_AM_INTERP_DPI_TRACE") != nullptr) {
+                    std::fprintf(stderr,
+                                 "[dpi-trace] pend-set instr=%u truth0=%d\n",
+                                 instruction.value,
+                                 static_cast<int>(truth(operands[0])));
+                }
             }
             if (!truth(operands[0]) ||
                 (attributes.eventCount != 0 &&
                  !(retainEvent ? pendingHostEvents[instruction.value]
                                 : eventHit))) {
                 return {};
+            }
+            if (std::getenv("WOLVRIX_AM_INTERP_DPI_TRACE") != nullptr) {
+                std::fprintf(stderr, "[dpi-trace] fire instr=%u sym=%s\n",
+                             instruction.value,
+                             std::string(program.string(attributes.importSymbol)).c_str());
             }
             const std::span<const InterpreterValue> arguments(
                 operands.data() + 1U, eventBegin - 1U);

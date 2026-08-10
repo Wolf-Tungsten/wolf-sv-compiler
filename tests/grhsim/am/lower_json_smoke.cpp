@@ -111,9 +111,9 @@ int main(int argc, char **argv)
                      "[--emit <output-directory>] [--blocks-per-source <count>] "
                      "[--max-source-bytes <count>] [--max-commit-source-bytes <count>] "
                      "[--max-atoms-per-block <count>] "
-                     "[--dp-segment-penalty <value>] [--mux-atom-max <count>] "
+                     "[--dp-segment-penalty <value>] [--merge-when-min-group <count>] "
                      "[--dp-coarsen-atom-budget <count>] [--disable-coarsening] "
-                     "[--runtime-profile] "
+                     "[--runtime-profile] [--full-evaluation] [--changed-trace] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -124,12 +124,19 @@ int main(int argc, char **argv)
     std::optional<std::string> blocksPerSource;
     std::optional<std::string> maxSourceBytes;
     std::optional<std::string> maxCommitSourceBytes;
-    std::size_t maxAtomsPerBlock = 128;
+    std::size_t maxAtomsPerBlock = 48;
+    std::size_t maxCommitAtomsPerBlock = 4096;
     double dpSegmentPenalty = 1.0;
     std::size_t dpCoarsenAtomBudget = 0;
-    std::size_t muxAtomMax = 512;
+    std::size_t mergeWhenMinGroup = 5;
+    std::size_t dpRefinementRounds = 10;
+    std::size_t fanoutAbsorbMaxInstructions = 0;
+    double fanoutAbsorbBudgetMult = 1.0;
+    std::size_t fanoutAbsorbMaxConsumers = 256;
     bool enableCoarsening = true;
     bool runtimeProfile = false;
+    bool fullEvaluation = false;
+    bool changedTrace = false;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
     {
@@ -195,6 +202,19 @@ int main(int argc, char **argv)
             }
             maxAtomsPerBlock = value;
         }
+        else if (argument == "--max-commit-atoms-per-block" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            std::size_t value = 0;
+            const auto [end, error] =
+                std::from_chars(text.data(), text.data() + text.size(), value);
+            if (error != std::errc{} || end != text.data() + text.size() || value == 0)
+            {
+                std::cerr << "invalid --max-commit-atoms-per-block value: " << text << '\n';
+                return 2;
+            }
+            maxCommitAtomsPerBlock = value;
+        }
         else if (argument == "--dp-segment-penalty" && index + 1 < argc)
         {
             const std::string_view text(argv[++index]);
@@ -221,7 +241,7 @@ int main(int argc, char **argv)
             }
             dpCoarsenAtomBudget = value;
         }
-        else if (argument == "--mux-atom-max" && index + 1 < argc)
+        else if (argument == "--merge-when-min-group" && index + 1 < argc)
         {
             const std::string_view text(argv[++index]);
             std::size_t value = 0;
@@ -229,10 +249,62 @@ int main(int argc, char **argv)
                 std::from_chars(text.data(), text.data() + text.size(), value);
             if (error != std::errc{} || end != text.data() + text.size())
             {
-                std::cerr << "invalid --mux-atom-max value: " << text << '\n';
+                std::cerr << "invalid --merge-when-min-group value: " << text << '\n';
                 return 2;
             }
-            muxAtomMax = value;
+            mergeWhenMinGroup = value;
+        }
+        else if (argument == "--dp-refinement-rounds" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            std::size_t value = 0;
+            const auto [end, error] =
+                std::from_chars(text.data(), text.data() + text.size(), value);
+            if (error != std::errc{} || end != text.data() + text.size())
+            {
+                std::cerr << "invalid --dp-refinement-rounds value: " << text << '\n';
+                return 2;
+            }
+            dpRefinementRounds = value;
+        }
+        else if (argument == "--fanout-absorb-max-instructions" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            std::size_t value = 0;
+            const auto [end, error] =
+                std::from_chars(text.data(), text.data() + text.size(), value);
+            if (error != std::errc{} || end != text.data() + text.size())
+            {
+                std::cerr << "invalid --fanout-absorb-max-instructions value: " << text << '\n';
+                return 2;
+            }
+            fanoutAbsorbMaxInstructions = value;
+        }
+        else if (argument == "--fanout-absorb-budget-mult" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            try
+            {
+                fanoutAbsorbBudgetMult = std::stod(std::string(text));
+            }
+            catch (const std::exception &)
+            {
+                std::cerr << "invalid --fanout-absorb-budget-mult value: " << text << '\n';
+                return 2;
+            }
+        }
+        else if (argument == "--fanout-absorb-max-consumers" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            std::size_t value = 0;
+            const auto [end, error] =
+                std::from_chars(text.data(), text.data() + text.size(), value);
+            if (error != std::errc{} || end != text.data() + text.size())
+            {
+                std::cerr << "invalid --fanout-absorb-max-consumers value: " << text << '\n';
+                return 2;
+            }
+            fanoutAbsorbMaxConsumers = value;
         }
         else if (argument == "--disable-coarsening")
         {
@@ -241,6 +313,14 @@ int main(int argc, char **argv)
         else if (argument == "--runtime-profile")
         {
             runtimeProfile = true;
+        }
+        else if (argument == "--full-evaluation")
+        {
+            fullEvaluation = true;
+        }
+        else if (argument == "--changed-trace")
+        {
+            changedTrace = true;
         }
         else if (argument == "--no-am-optimize")
         {
@@ -462,11 +542,16 @@ int main(int argc, char **argv)
                 std::move(*amGraph),
                 ActivityScheduleOptions{
                     .maxAtomsPerBlock = maxAtomsPerBlock,
+                    .maxCommitAtomsPerBlock = maxCommitAtomsPerBlock,
                     .enableCoarsening = enableCoarsening,
                     .collectStats = true,
                     .dpSegmentPenalty = dpSegmentPenalty,
                     .dpCoarsenAtomBudget = dpCoarsenAtomBudget,
-                    .muxAtomMax = muxAtomMax,
+                    .dpRefinementRounds = dpRefinementRounds,
+                    .mergeWhenMinGroup = mergeWhenMinGroup,
+                    .fanoutAbsorbMaxInstructions = fanoutAbsorbMaxInstructions,
+                    .fanoutAbsorbBudgetMult = fanoutAbsorbBudgetMult,
+                    .fanoutAbsorbMaxConsumers = fanoutAbsorbMaxConsumers,
                 },
                 diagnostics);
             scheduleMs = elapsedMilliseconds(phaseStart);
@@ -512,6 +597,14 @@ int main(int argc, char **argv)
                 if (runtimeProfile)
                 {
                     emitOptions.attributes.emplace("runtimeProfile", "true");
+                }
+                if (fullEvaluation)
+                {
+                    emitOptions.attributes.emplace("fullEvaluation", "true");
+                }
+                if (changedTrace)
+                {
+                    emitOptions.attributes.emplace("changedTrace", "true");
                 }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,
