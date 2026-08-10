@@ -60,15 +60,22 @@ namespace wolvrix::lib::grhsim::am
 
     // ScheduledProgram atom 层次：Block 内指令的不可再分结构/元数据分组
     // （纯结构层，不承载语义；解释器按指令流执行时无视它）。signature 的
-    // 含义按 kind 解释：MuxMerge 为组内共享的 select 变量 id，CommitEvent
-    // 为 commit 事件签名 rank，Singleton/CombLoopScc 不用（置 0）。
+    // 含义按 kind 解释：compute 侧 atom（Singleton/Tree）若根指令为 Mux
+    // 则为其 select 变量 id，否则为 kInvalidAtomSignature（0xFFFFFFFF）；
+    // CommitEvent 为 commit 事件签名 rank；CombLoopScc 不用（置
+    // kInvalidAtomSignature）。
     enum class AmAtomKind : uint8_t
     {
         Singleton = 0,
-        MuxMerge = 1,
+        Tree = 1,
         CombLoopScc = 2,
         CommitEvent = 3,
     };
+
+    // atom signature 的“无 select”标记（变量 id 从 0 起排，该值不可能是
+    // 合法 select）。
+    inline constexpr uint32_t kInvalidAtomSignature =
+        std::numeric_limits<uint32_t>::max();
 
     struct Range32
     {

@@ -5,8 +5,8 @@
 #include "grhsim_am_common.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <limits>
-#include <map>
 #include <queue>
 #include <string>
 #include <unordered_map>
@@ -16,22 +16,14 @@
 namespace wolvrix::lib::grhsim::am
 {
 
-
     namespace
     {
-        constexpr char kDiagnosticContext[] = "grhsim-am-mux-merge-atom";
+        constexpr char kDiagnosticContext[] = "grhsim-am-tree-atom";
         constexpr uint32_t kInvalidIndex = std::numeric_limits<uint32_t>::max();
-
-        struct MuxMergeGroup
-        {
-            uint32_t select = 0;
-            std::vector<uint32_t> muxes; // ascending instruction ids
-            std::vector<uint32_t> cone;  // absorbed producer instructions
-        };
 
         // Deterministic topological order of `members` restricted to def-use
         // edges internal to the set; ties break by ascending instruction id,
-        // so the member order of a merged atom is fully determined by the
+        // so the member order of a folded atom is fully determined by the
         // program, not by traversal order.
         std::vector<uint32_t> topoOrderSubset(ProgramView program,
                                               const DefUseIndex &defUse,
@@ -89,8 +81,8 @@ namespace wolvrix::lib::grhsim::am
                     }
                 }
             }
-            // The member set is a DAG by construction (atom-level cycles were
-            // excluded); fall back to ascending ids defensively.
+            // The member set is a DAG by construction (the fold contracts
+            // def-use edges of a DAG); fall back to ascending ids defensively.
             if (order.size() != members.size())
             {
                 order = members;
@@ -100,74 +92,17 @@ namespace wolvrix::lib::grhsim::am
         }
     } // namespace
 
-    void optAmComputeGraph(AmComputeGraph &computeGraph,
-                           const AmGraphPartitionInput &input)
+    bool absorbFanoutAtoms(AmGraph &graph, AmGraphSplitContext &context,
+                           std::size_t maxAtomInstructions, double budgetMultiplier,
+                           std::size_t maxConsumers,
+                           wolvrix::lib::diag::Diagnostics &diagnostics)
     {
-        // Reserved stage boundary (framework: opt-am-compute-graph). Graph-level
-        // compute optimizations land here; intentionally a no-op today.
-        (void)computeGraph;
-        (void)input;
-    }
-
-    bool mergeMuxSelectAtoms(AmGraph &graph, AmGraphSplitContext &context,
-                             std::size_t muxAtomMax,
-                             wolvrix::lib::diag::Diagnostics &diagnostics)
-    {
-        if (muxAtomMax == 0)
-        {
-            return true;
-        }
-        const ProgramView program = graph.program();
-        const uint32_t instructionCount = context.instructionCount;
+        ProgramView program = graph.program();
+        const uint32_t atomCount = context.atomCount;
         const DefUseIndex &defUse = context.defUse;
-        const uint32_t originalAtomCount = context.atomCount;
 
-        // ---- grouping: same-select compute muxes in single-instruction
-        // atoms; only groups of at least two are atomization candidates.
-        std::map<uint32_t, std::vector<uint32_t>> groupsBySelect;
-        for (uint32_t index = 0; index < instructionCount; ++index)
-        {
-            const InstructionId instruction{index};
-            if (program.opcode(instruction) != Opcode::Mux)
-            {
-                continue;
-            }
-            const uint32_t atom = context.instructionAtom[index];
-            if (atom == kInvalidIndex || context.atomIsCommit[atom] != 0 ||
-                context.atomInstructions[atom] != 1)
-            {
-                continue;
-            }
-            const auto operands = program.operands(instruction);
-            if (operands.size() != 3 || !operands[0].valid())
-            {
-                continue;
-            }
-            groupsBySelect[operands[0].value].push_back(index);
-        }
-        std::vector<MuxMergeGroup> groups;
-        for (auto &[select, muxes] : groupsBySelect)
-        {
-            if (muxes.size() >= 2)
-            {
-                groups.push_back(MuxMergeGroup{select, std::move(muxes), {}});
-            }
-        }
-        if (groups.empty())
-        {
-            return true;
-        }
-        // Greedy priority: larger groups claim first (doc §8.2); the select
-        // variable id tiebreak keeps the order total and deterministic.
-        std::sort(groups.begin(), groups.end(),
-                  [](const MuxMergeGroup &lhs, const MuxMergeGroup &rhs) {
-                      return lhs.muxes.size() != rhs.muxes.size()
-                                 ? lhs.muxes.size() > rhs.muxes.size()
-                                 : lhs.select < rhs.select;
-                  });
-
-        // Host-visible / interface-referenced variables never join an
-        // absorbed cone: their value must stay observable outside the atom.
+        // Host-visible / interface-referenced variables keep an orphan atom
+        // (same pin rule as the tree-atom fold).
         std::vector<uint8_t> pinnedVariable(context.variableCount, 0);
         for (const PortBinding &port : graph.interface().ports)
         {
@@ -197,467 +132,593 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
-        std::vector<uint8_t> claimed(instructionCount, 0);
-        std::vector<uint8_t> memberMark(instructionCount, 0);
-        std::vector<uint8_t> tainted(instructionCount, 0);
-        std::vector<uint8_t> inClosure(instructionCount, 0);
-        std::vector<uint8_t> inCone(instructionCount, 0);
-        std::vector<uint32_t> worklist;
-
-        std::vector<MuxMergeGroup> accepted;
-        std::size_t capSkippedGroups = 0;
-        std::size_t capSkippedMuxes = 0;
-
-        for (MuxMergeGroup &group : groups)
+        // Instructions referenced by ordered-effect edges can never be
+        // absorbed (pure members make this defensive, but keep it exact).
+        std::vector<uint8_t> orderedInstruction(context.instructionCount, 0);
+        for (const OrderEdge &edge : context.orderedEdges)
         {
-            std::vector<uint32_t> members;
-            for (uint32_t instruction : group.muxes)
+            orderedInstruction[edge.source] = 1;
+            orderedInstruction[edge.target] = 1;
+        }
+
+        const uint8_t kCombLoop = static_cast<uint8_t>(AmAtomKind::CombLoopScc);
+
+        // Atom roots by the fold/split invariant (members store root-last).
+        // Member lists grow as the sweep absorbs upstream trees into
+        // downstream atoms, so members.back() is NOT stable -- always
+        // consult this table for an atom's root.
+        std::vector<uint32_t> rootOfAtom(atomCount, kInvalidIndex);
+        for (uint32_t atom = 0; atom < atomCount; ++atom)
+        {
+            if (context.atomMemberOffsets[atom + 1] >
+                context.atomMemberOffsets[atom])
             {
-                if (!claimed[instruction])
-                {
-                    members.push_back(instruction);
-                }
+                rootOfAtom[atom] =
+                    context.atomMembers[context.atomMemberOffsets[atom + 1] - 1];
             }
-            if (members.size() < 2)
+        }
+
+        // Live tables (extended by copies / rewired by moves as the sweep
+        // proceeds).
+        std::vector<std::vector<uint32_t>> membersOf(atomCount);
+        for (uint32_t atom = 0; atom < atomCount; ++atom)
+        {
+            membersOf[atom].assign(context.atomMembers.begin() +
+                                       context.atomMemberOffsets[atom],
+                                   context.atomMembers.begin() +
+                                       context.atomMemberOffsets[atom + 1]);
+        }
+        std::vector<uint32_t> atomOfInstr = context.instructionAtom;
+        std::vector<uint32_t> definitionOf = defUse.definitions;
+
+        std::vector<std::vector<uint32_t>> consumersOf(atomCount);
+        for (uint32_t variable = 0; variable < defUse.definitions.size(); ++variable)
+        {
+            const uint32_t definition = defUse.definitions[variable];
+            if (definition == kInvalidIndex)
             {
                 continue;
             }
-            for (uint32_t instruction : members)
+            const uint32_t producerAtom = atomOfInstr[definition];
+            if (producerAtom == kInvalidIndex)
             {
-                claimed[instruction] = 1;
-                memberMark[instruction] = 1;
+                continue;
             }
+            for (uint32_t offset = defUse.useOffsets[variable];
+                 offset < defUse.useOffsets[variable + 1]; ++offset)
+            {
+                const uint32_t consumerAtom = atomOfInstr[defUse.uses[offset]];
+                if (consumerAtom != kInvalidIndex && consumerAtom != producerAtom)
+                {
+                    consumersOf[producerAtom].push_back(consumerAtom);
+                }
+            }
+        }
+        for (std::vector<uint32_t> &consumers : consumersOf)
+        {
+            std::sort(consumers.begin(), consumers.end());
+            consumers.erase(std::unique(consumers.begin(), consumers.end()),
+                            consumers.end());
+        }
 
-            // Forward taint: everything downstream of the group muxes. A
-            // cone node depending on a group mux would break the
-            // cone-preamble / contiguous-mux member order, so downstream
-            // instructions stay outside as interface producers.
-            std::vector<uint32_t> taintList;
-            const auto taint = [&](uint32_t instruction) {
-                if (!tainted[instruction])
-                {
-                    tainted[instruction] = 1;
-                    taintList.push_back(instruction);
-                }
-            };
-            for (uint32_t instruction : members)
+        // Atom-DAG topological order (Kahn, ascending-id tie-break).
+        std::vector<uint32_t> topo;
+        topo.reserve(atomCount);
+        {
+            std::vector<uint32_t> indegree(atomCount, 0);
+            for (uint32_t atom = 0; atom < atomCount; ++atom)
             {
-                taint(instruction);
-                for (VariableId result : program.results(InstructionId{instruction}))
+                for (uint32_t offset = context.atomGraph.offsets[atom];
+                     offset < context.atomGraph.offsets[atom + 1]; ++offset)
                 {
-                    if (!result.valid())
+                    ++indegree[context.atomGraph.targets[offset]];
+                }
+            }
+            std::priority_queue<uint32_t, std::vector<uint32_t>,
+                                std::greater<uint32_t>>
+                ready;
+            for (uint32_t atom = 0; atom < atomCount; ++atom)
+            {
+                if (indegree[atom] == 0)
+                {
+                    ready.push(atom);
+                }
+            }
+            while (!ready.empty())
+            {
+                const uint32_t top = ready.top();
+                ready.pop();
+                topo.push_back(top);
+                for (uint32_t offset = context.atomGraph.offsets[top];
+                     offset < context.atomGraph.offsets[top + 1]; ++offset)
+                {
+                    if (--indegree[context.atomGraph.targets[offset]] == 0)
                     {
-                        continue;
-                    }
-                    for (uint32_t offset = defUse.useOffsets[result.value];
-                         offset < defUse.useOffsets[result.value + 1]; ++offset)
-                    {
-                        worklist.push_back(defUse.uses[offset]);
+                        ready.push(context.atomGraph.targets[offset]);
                     }
                 }
             }
-            while (!worklist.empty())
+            if (topo.size() != atomCount)
             {
-                const uint32_t instruction = worklist.back();
-                worklist.pop_back();
-                if (tainted[instruction])
-                {
-                    continue;
-                }
-                taint(instruction);
-                for (VariableId result : program.results(InstructionId{instruction}))
-                {
-                    if (!result.valid())
-                    {
-                        continue;
-                    }
-                    for (uint32_t offset = defUse.useOffsets[result.value];
-                         offset < defUse.useOffsets[result.value + 1]; ++offset)
-                    {
-                        worklist.push_back(defUse.uses[offset]);
-                    }
-                }
-            }
-
-            // Backward closure from the arm producers. Candidates are
-            // complete single-instruction compute atoms (comb-loop atoms are
-            // indivisible and never join a cone: doc §10.3); the select
-            // variable's own cone is a barrier (select stays the atom's
-            // interface).
-            std::vector<uint32_t> closureList;
-            const auto eligible = [&](uint32_t instruction) {
-                if (claimed[instruction] || tainted[instruction])
-                {
-                    return false;
-                }
-                const uint32_t atom = context.instructionAtom[instruction];
-                if (atom == kInvalidIndex || context.atomIsCommit[atom] != 0 ||
-                    context.atomInstructions[atom] != 1)
-                {
-                    return false;
-                }
-                if (opcodeTraits(program.opcode(InstructionId{instruction})).effect !=
-                    OpcodeEffect::Pure)
-                {
-                    return false;
-                }
-                const auto results = program.results(InstructionId{instruction});
-                return results.size() == 1 && results.front().valid() &&
-                       !pinnedVariable[results.front().value];
-            };
-            const auto pushProducer = [&](VariableId variable) {
-                if (!variable.valid() || variable.value == group.select)
-                {
-                    return;
-                }
-                const uint32_t producer = defUse.definitions[variable.value];
-                if (producer == kInvalidIndex || inClosure[producer] ||
-                    !eligible(producer))
-                {
-                    return;
-                }
-                inClosure[producer] = 1;
-                closureList.push_back(producer);
-                worklist.push_back(producer);
-            };
-            for (uint32_t instruction : members)
-            {
-                const auto operands = program.operands(InstructionId{instruction});
-                pushProducer(operands[1]);
-                pushProducer(operands[2]);
-            }
-            while (!worklist.empty())
-            {
-                const uint32_t instruction = worklist.back();
-                worklist.pop_back();
-                for (VariableId operand : program.operands(InstructionId{instruction}))
-                {
-                    pushProducer(operand);
-                }
-            }
-
-            // Exclusive use, greatest fixpoint: a cone node survives only
-            // while every consumer of its result is a group mux or a
-            // surviving cone node; shared values stay interface inputs.
-            const auto violates = [&](uint32_t instruction) {
-                const VariableId result =
-                    program.results(InstructionId{instruction}).front();
-                for (uint32_t offset = defUse.useOffsets[result.value];
-                     offset < defUse.useOffsets[result.value + 1]; ++offset)
-                {
-                    const uint32_t consumer = defUse.uses[offset];
-                    if (!memberMark[consumer] && !inCone[consumer])
-                    {
-                        return true;
-                    }
-                }
+                diagnostics.error("AM fanout absorption saw a cyclic atom graph",
+                                  std::string(kDiagnosticContext));
                 return false;
-            };
-            for (uint32_t instruction : closureList)
+            }
+        }
+
+        std::size_t totalComputeInstructions = 0;
+        for (uint32_t atom = 0; atom < atomCount; ++atom)
+        {
+            if (context.atomIsCommit[atom] == 0)
             {
-                inCone[instruction] = 1;
-                if (violates(instruction))
+                totalComputeInstructions += context.atomInstructions[atom];
+            }
+        }
+        const std::size_t instructionBudget = static_cast<std::size_t>(
+            budgetMultiplier * static_cast<double>(totalComputeInstructions));
+
+        const auto absorbableSource = [&](uint32_t atom) {
+            if (context.atomIsCommit[atom] != 0 ||
+                context.atomKinds[atom] == kCombLoop)
+            {
+                return false;
+            }
+            const std::vector<uint32_t> &members = membersOf[atom];
+            if (members.empty())
+            {
+                return false;
+            }
+            const InstructionId root{rootOfAtom[atom]};
+            if (program.results(root).size() != 1)
+            {
+                return false;
+            }
+            for (const uint32_t member : members)
+            {
+                if (orderedInstruction[member] ||
+                    opcodeTraits(program.opcode(InstructionId{member})).effect !=
+                        OpcodeEffect::Pure)
                 {
-                    worklist.push_back(instruction);
+                    return false;
                 }
             }
-            while (!worklist.empty())
+            return true;
+        };
+        // A consumer atom is an absorbable target iff it is compute-side,
+        // not a comb-loop packing, and its root is not part of the
+        // activation/host machinery (StateRead roots are fine: the cone is
+        // absorbed into the read port's operand tree, the port itself is
+        // never duplicated).
+        const auto absorbableTarget = [&](uint32_t atom) {
+            if (context.atomIsCommit[atom] != 0 ||
+                context.atomKinds[atom] == kCombLoop)
             {
-                const uint32_t instruction = worklist.back();
-                worklist.pop_back();
-                if (!inCone[instruction])
+                return false;
+            }
+            if (membersOf[atom].empty())
+            {
+                return false;
+            }
+            const OpcodeEffect effect = opcodeTraits(
+                program.opcode(InstructionId{rootOfAtom[atom]})).effect;
+            return effect == OpcodeEffect::Pure || effect == OpcodeEffect::StateRead;
+        };
+
+        std::size_t absorbedAtoms = 0;
+        std::size_t orphanAtoms = 0;
+        std::size_t duplicatedInstructions = 0;
+        std::vector<uint8_t> dirtyAtom(atomCount, 0);
+        // Deferred rewire rules per target atom: (absorbed root variable ->
+        // per-target copy variable), replayed against the FINAL member lists
+        // at rebuild time -- later absorptions can move/copy new users of the
+        // variable into the target after it absorbed the source. Targets of
+        // an absorption are always downstream atoms whose own sweep turn has
+        // already passed, so a recorded target is never absorbed afterwards
+        // and stays alive.
+        std::vector<std::vector<std::pair<uint32_t, uint32_t>>> rewireRules(
+            atomCount);
+
+        for (auto it = topo.rbegin(); it != topo.rend(); ++it)
+        {
+            const uint32_t atom = *it;
+            if (membersOf[atom].empty() || !absorbableSource(atom))
+            {
+                continue;
+            }
+            const uint32_t rootInstruction = rootOfAtom[atom];
+            const uint32_t rootVariable =
+                program.results(InstructionId{rootInstruction}).front().value;
+
+            std::vector<uint32_t> targets;
+            bool external = pinnedVariable[rootVariable] != 0;
+            for (const uint32_t consumer : consumersOf[atom])
+            {
+                if (absorbableTarget(consumer))
                 {
-                    continue;
+                    targets.push_back(consumer);
                 }
-                inCone[instruction] = 0;
-                for (VariableId operand : program.operands(InstructionId{instruction}))
+                else
+                {
+                    external = true;
+                }
+            }
+            const std::size_t fanout = targets.size();
+            if (fanout < 2 || fanout > maxConsumers)
+            {
+                continue;
+            }
+            const std::size_t cost = membersOf[atom].size();
+            if (cost > maxAtomInstructions)
+            {
+                continue;
+            }
+            const std::size_t dup =
+                (external ? fanout : fanout - 1) * cost;
+            if (duplicatedInstructions + dup > instructionBudget)
+            {
+                break;
+            }
+
+            // The tree's external input producers, computed from the source
+            // atom's ORIGINAL members before any mutation (scanning a
+            // target's mixed member list after a move would spuriously add
+            // producers that only the target's own members use).
+            std::vector<uint32_t> inputProducers;
+            for (const uint32_t member : membersOf[atom])
+            {
+                for (const VariableId operand :
+                     program.operands(InstructionId{member}))
                 {
                     if (!operand.valid())
                     {
                         continue;
                     }
-                    const uint32_t producer = defUse.definitions[operand.value];
-                    if (producer != kInvalidIndex && inCone[producer] &&
-                        violates(producer))
+                    const uint32_t definition = definitionOf[operand.value];
+                    if (definition == kInvalidIndex)
                     {
-                        worklist.push_back(producer);
+                        continue;
                     }
+                    const uint32_t producer = atomOfInstr[definition];
+                    if (producer == kInvalidIndex || producer == atom)
+                    {
+                        continue;
+                    }
+                    inputProducers.push_back(producer);
                 }
             }
-            std::vector<uint32_t> cone;
-            for (uint32_t instruction : closureList)
-            {
-                if (inCone[instruction])
-                {
-                    cone.push_back(instruction);
-                }
-            }
+            std::sort(inputProducers.begin(), inputProducers.end());
+            inputProducers.erase(
+                std::unique(inputProducers.begin(), inputProducers.end()),
+                inputProducers.end());
 
-            const uint64_t total =
-                static_cast<uint64_t>(members.size()) + cone.size();
-            if (total > muxAtomMax)
+            // The first target inherits the original members when no orphan
+            // is needed; every other target gets a fresh copy of the tree.
+            const std::size_t copyBegin = external ? 0 : 1;
+            for (std::size_t index = copyBegin; index < fanout; ++index)
             {
-                // Activation-granularity guard: the whole group stays as-is;
-                // the emitter's block-level same-select fusion still applies.
-                ++capSkippedGroups;
-                capSkippedMuxes += members.size();
-                for (uint32_t instruction : members)
+                const uint32_t target = targets[index];
+                std::unordered_map<uint32_t, uint32_t> varMap;
+                uint32_t copyRootVariable = kInvalidIndex;
+                for (const uint32_t member : membersOf[atom])
                 {
-                    claimed[instruction] = 0;
+                    const InstructionId source{member};
+                    const auto results = program.results(source);
+                    const auto operands = program.operands(source);
+                    std::vector<VariableId> newResults;
+                    newResults.reserve(results.size());
+                    for (const VariableId result : results)
+                    {
+                        const VariableRecord &record = program.variable(result);
+                        AmValueFacts facts = graph.valueFacts(result);
+                        facts.roles = VariableRole::None;
+                        const VariableId fresh =
+                            graph.addVariable(record.type, record.init,
+                                              std::nullopt, facts);
+                        varMap.emplace(result.value, fresh.value);
+                        definitionOf.push_back(kInvalidIndex);
+                        newResults.push_back(fresh);
+                    }
+                    std::vector<VariableId> newOperands;
+                    newOperands.reserve(operands.size());
+                    for (const VariableId operand : operands)
+                    {
+                        if (!operand.valid())
+                        {
+                            newOperands.push_back(operand);
+                            continue;
+                        }
+                        const auto found = varMap.find(operand.value);
+                        newOperands.push_back(
+                            found != varMap.end()
+                                ? VariableId{found->second}
+                                : operand);
+                    }
+                    const InstructionId copy = graph.addInstruction(
+                        program.opcode(source), newResults, newOperands);
+                    if (const auto slice =
+                            program.sliceStaticAttributes(source))
+                    {
+                        graph.setSliceStaticAttributes(copy, slice->lsb);
+                    }
+                    atomOfInstr.push_back(target);
+                    if (!newResults.empty())
+                    {
+                        definitionOf[newResults.front().value] = copy.value;
+                        if (member == rootInstruction)
+                        {
+                            copyRootVariable = newResults.front().value;
+                        }
+                    }
+                    membersOf[target].push_back(copy.value);
                 }
+                dirtyAtom[target] = 1;
+                // Rewiring is deferred to the rebuild: later absorptions can
+                // still move/copy new users of the absorbed root variable
+                // into this target, so the rule is applied to the FINAL
+                // member list.
+                rewireRules[target].emplace_back(rootVariable,
+                                                 copyRootVariable);
+            }
+            if (!external)
+            {
+                // Move: the first target inherits the original members; the
+                // source atom dies (no orphan needed).
+                const uint32_t target = targets.front();
+                auto &inherited = membersOf[atom];
+                auto &destination = membersOf[target];
+                destination.insert(destination.end(), inherited.begin(),
+                                   inherited.end());
+                for (const uint32_t member : inherited)
+                {
+                    atomOfInstr[member] = target;
+                }
+                inherited.clear();
+                dirtyAtom[target] = 1;
             }
             else
             {
-                for (uint32_t instruction : cone)
+                ++orphanAtoms;
+                // Targets no longer consume the orphan's root variable.
+                for (const uint32_t target : targets)
                 {
-                    claimed[instruction] = 1;
+                    auto &consumers = consumersOf[atom];
+                    consumers.erase(
+                        std::remove(consumers.begin(), consumers.end(), target),
+                        consumers.end());
                 }
-                accepted.push_back(MuxMergeGroup{group.select, std::move(members),
-                                                 std::move(cone)});
             }
 
-            for (uint32_t instruction : group.muxes)
+            // Fanout bookkeeping for upstream producers of the absorbed
+            // atom's external inputs: the source atom leaves their consumer
+            // sets (move case), every target joins them.
+            for (const uint32_t producer : inputProducers)
             {
-                memberMark[instruction] = 0;
+                auto &consumers = consumersOf[producer];
+                if (!external)
+                {
+                    consumers.erase(
+                        std::remove(consumers.begin(), consumers.end(), atom),
+                        consumers.end());
+                }
+                for (const uint32_t target : targets)
+                {
+                    if (std::find(consumers.begin(), consumers.end(), target) ==
+                        consumers.end())
+                    {
+                        consumers.push_back(target);
+                    }
+                }
+                std::sort(consumers.begin(), consumers.end());
+                consumers.erase(
+                    std::unique(consumers.begin(), consumers.end()),
+                    consumers.end());
             }
-            for (uint32_t instruction : taintList)
-            {
-                tainted[instruction] = 0;
-            }
-            for (uint32_t instruction : closureList)
-            {
-                inClosure[instruction] = 0;
-                inCone[instruction] = 0;
-            }
+
+            duplicatedInstructions += dup;
+            ++absorbedAtoms;
         }
 
-        if (accepted.empty())
+        if (absorbedAtoms == 0)
         {
-            if (capSkippedGroups != 0)
-            {
-                diagnostics.info("AM mux-merge atom: no group fit the cap: skipped_groups=" +
-                                     std::to_string(capSkippedGroups) +
-                                     " skipped_muxes=" + std::to_string(capSkippedMuxes),
-                                 std::string(kDiagnosticContext));
-            }
             return true;
         }
 
-        // ---- atom table rebuild (with DAG-safety repair) ------------------
-        const CsrGraph instructionGraph =
-            detail::buildInstructionGraph(instructionCount, defUse,
-                                          context.orderedEdges);
-        // Original (pre-merge) tables: the unmerged-atom carry-over and the
-        // merged-group sort keys must keep addressing them even when a DAG
-        // repair round restarts the rebuild after context was rewritten.
-        const std::vector<uint32_t> originalInstructionAtom = context.instructionAtom;
-        const std::vector<uint32_t> originalAtomMemberOffsets = context.atomMemberOffsets;
-        const std::vector<uint32_t> originalAtomMembers = context.atomMembers;
-        const std::vector<uint32_t> originalAtomInstructions = context.atomInstructions;
-        const std::vector<uint32_t> originalAtomStateWrites = context.atomStateWrites;
-        const std::vector<uint8_t> originalAtomIsCommit = context.atomIsCommit;
-        const std::vector<uint32_t> originalAtomMinInstruction = context.atomMinInstruction;
-        const std::vector<uint32_t> originalCommitEventRank = context.commitEventRank;
-        const std::vector<uint8_t> originalAtomKinds = context.atomKinds;
-        const std::vector<uint32_t> originalAtomSignatures = context.atomSignatures;
-
-        std::vector<uint32_t> groupOfAtom;
-        std::size_t repairRounds = 0;
-        std::size_t unmergedGroups = 0;
-        for (;;)
+        // ---- rebuild atom tables on the mutated program ------------------
+        // Replay the deferred rewire rules against the final member lists.
+        for (uint32_t atom = 0; atom < atomCount; ++atom)
         {
-            // New atom order: unmerged atoms keep their relative order;
-            // merged groups slot in at their earliest member's original atom
-            // id, so the relative atom order is stable.
-            std::vector<uint8_t> coveredAtom(originalAtomCount, 0);
-            std::vector<uint32_t> groupMinAtom(accepted.size(), kInvalidIndex);
-            for (uint32_t groupIndex = 0; groupIndex < accepted.size(); ++groupIndex)
+            if (rewireRules[atom].empty() || membersOf[atom].empty())
             {
-                const auto track = [&](uint32_t instruction) {
-                    const uint32_t atom = originalInstructionAtom[instruction];
-                    coveredAtom[atom] = 1;
-                    groupMinAtom[groupIndex] =
-                        std::min(groupMinAtom[groupIndex], atom);
-                };
-                for (uint32_t instruction : accepted[groupIndex].muxes)
-                {
-                    track(instruction);
-                }
-                for (uint32_t instruction : accepted[groupIndex].cone)
-                {
-                    track(instruction);
-                }
+                continue;
             }
-            struct AtomSlot
+            for (const uint32_t member : membersOf[atom])
             {
-                uint32_t sortKey;
-                uint32_t oldAtom;
-                uint32_t groupIndex;
-            };
-            std::vector<AtomSlot> slots;
-            slots.reserve(originalAtomCount);
-            for (uint32_t atom = 0; atom < originalAtomCount; ++atom)
-            {
-                if (!coveredAtom[atom])
+                const InstructionId user{member};
+                const auto operands = program.operands(user);
+                for (std::size_t position = 0; position < operands.size();
+                     ++position)
                 {
-                    slots.push_back(AtomSlot{atom, atom, kInvalidIndex});
-                }
-            }
-            for (uint32_t groupIndex = 0; groupIndex < accepted.size(); ++groupIndex)
-            {
-                slots.push_back(AtomSlot{groupMinAtom[groupIndex], kInvalidIndex,
-                                         groupIndex});
-            }
-            std::sort(slots.begin(), slots.end(),
-                      [](const AtomSlot &lhs, const AtomSlot &rhs) {
-                          return std::tie(lhs.sortKey, lhs.oldAtom, lhs.groupIndex) <
-                                 std::tie(rhs.sortKey, rhs.oldAtom, rhs.groupIndex);
-                      });
-
-            const uint32_t newAtomCount = static_cast<uint32_t>(slots.size());
-            std::vector<uint32_t> newInstructionAtom(instructionCount, kInvalidIndex);
-            std::vector<uint32_t> newAtomMemberOffsets(newAtomCount + 1, 0);
-            std::vector<uint32_t> newAtomMembers;
-            newAtomMembers.reserve(instructionCount);
-            std::vector<uint32_t> newAtomInstructions(newAtomCount, 0);
-            std::vector<uint32_t> newAtomStateWrites(newAtomCount, 0);
-            std::vector<uint8_t> newAtomIsCommit(newAtomCount, 0);
-            std::vector<uint32_t> newAtomMinInstruction(newAtomCount, kInvalidIndex);
-            std::vector<uint32_t> newCommitEventRank(newAtomCount, 0);
-            std::vector<uint8_t> newAtomKinds(newAtomCount, 0);
-            std::vector<uint32_t> newAtomSignatures(newAtomCount, 0);
-            groupOfAtom.assign(newAtomCount, kInvalidIndex);
-
-            for (uint32_t slotIndex = 0; slotIndex < newAtomCount; ++slotIndex)
-            {
-                const AtomSlot &slot = slots[slotIndex];
-                newAtomMemberOffsets[slotIndex] =
-                    static_cast<uint32_t>(newAtomMembers.size());
-                if (slot.groupIndex == kInvalidIndex)
-                {
-                    // Unmerged atom: carry the original member list and all
-                    // per-atom properties verbatim.
-                    const uint32_t oldAtom = slot.oldAtom;
-                    for (uint32_t offset = originalAtomMemberOffsets[oldAtom];
-                         offset < originalAtomMemberOffsets[oldAtom + 1]; ++offset)
+                    if (!operands[position].valid())
                     {
-                        const uint32_t instruction = originalAtomMembers[offset];
-                        newInstructionAtom[instruction] = slotIndex;
-                        newAtomMembers.push_back(instruction);
+                        continue;
                     }
-                    newAtomInstructions[slotIndex] =
-                        originalAtomInstructions[oldAtom];
-                    newAtomStateWrites[slotIndex] =
-                        originalAtomStateWrites[oldAtom];
-                    newAtomIsCommit[slotIndex] = originalAtomIsCommit[oldAtom];
-                    newAtomMinInstruction[slotIndex] =
-                        originalAtomMinInstruction[oldAtom];
-                    newCommitEventRank[slotIndex] =
-                        originalCommitEventRank[oldAtom];
-                    newAtomKinds[slotIndex] = originalAtomKinds[oldAtom];
-                    newAtomSignatures[slotIndex] = originalAtomSignatures[oldAtom];
-                    continue;
-                }
-                const MuxMergeGroup &group = accepted[slot.groupIndex];
-                groupOfAtom[slotIndex] = slot.groupIndex;
-                // Absorbed cone first (topological preamble), then the group
-                // muxes as one contiguous run (the emitter's if-else fusion
-                // consumes that run).
-                const std::vector<uint32_t> orderedCone =
-                    topoOrderSubset(program, defUse, group.cone);
-                const std::vector<uint32_t> orderedMuxes =
-                    topoOrderSubset(program, defUse, group.muxes);
-                uint32_t minInstruction = kInvalidIndex;
-                for (uint32_t instruction : orderedCone)
-                {
-                    newInstructionAtom[instruction] = slotIndex;
-                    newAtomMembers.push_back(instruction);
-                    minInstruction = std::min(minInstruction, instruction);
-                }
-                for (uint32_t instruction : orderedMuxes)
-                {
-                    newInstructionAtom[instruction] = slotIndex;
-                    newAtomMembers.push_back(instruction);
-                    minInstruction = std::min(minInstruction, instruction);
-                }
-                newAtomInstructions[slotIndex] =
-                    static_cast<uint32_t>(group.cone.size() + group.muxes.size());
-                newAtomStateWrites[slotIndex] = 0;
-                newAtomIsCommit[slotIndex] = 0;
-                newAtomMinInstruction[slotIndex] = minInstruction;
-                newCommitEventRank[slotIndex] = 0;
-                newAtomKinds[slotIndex] = static_cast<uint8_t>(AmAtomKind::MuxMerge);
-                newAtomSignatures[slotIndex] = group.select;
-            }
-            newAtomMemberOffsets[newAtomCount] =
-                static_cast<uint32_t>(newAtomMembers.size());
-
-            context.atomCount = newAtomCount;
-            context.instructionAtom = std::move(newInstructionAtom);
-            context.atomMemberOffsets = std::move(newAtomMemberOffsets);
-            context.atomMembers = std::move(newAtomMembers);
-            context.atomInstructions = std::move(newAtomInstructions);
-            context.atomStateWrites = std::move(newAtomStateWrites);
-            context.atomIsCommit = std::move(newAtomIsCommit);
-            context.atomMinInstruction = std::move(newAtomMinInstruction);
-            context.commitEventRank = std::move(newCommitEventRank);
-            context.atomKinds = std::move(newAtomKinds);
-            context.atomSignatures = std::move(newAtomSignatures);
-            context.atomGraph =
-                detail::buildCondensationGraph(instructionGraph,
-                                               context.instructionAtom,
-                                               newAtomCount);
-
-            // DAG safety: a merge must not turn the atom DAG cyclic (a member
-            // pair connected externally in both directions). Exclusive use
-            // plus the downstream taint makes this impossible in practice;
-            // treat any multi-atom SCC involving a merged atom as a hard
-            // failure of that group and rebuild once without it.
-            const detail::SccResult scc =
-                detail::findStronglyConnectedComponents(context.atomGraph);
-            if (static_cast<uint32_t>(scc.count) == newAtomCount)
-            {
-                break;
-            }
-            std::vector<uint32_t> sccSize(scc.count, 0);
-            for (uint32_t atom = 0; atom < newAtomCount; ++atom)
-            {
-                ++sccSize[scc.component[atom]];
-            }
-            std::vector<uint8_t> unmerge(accepted.size(), 0);
-            bool any = false;
-            for (uint32_t atom = 0; atom < newAtomCount; ++atom)
-            {
-                if (sccSize[scc.component[atom]] > 1 &&
-                    groupOfAtom[atom] != kInvalidIndex)
-                {
-                    unmerge[groupOfAtom[atom]] = 1;
-                    any = true;
+                    for (const auto &[from, to] : rewireRules[atom])
+                    {
+                        if (operands[position].value == from)
+                        {
+                            graph.setInstructionOperand(user, position,
+                                                        VariableId{to});
+                            break;
+                        }
+                    }
                 }
             }
-            if (!any)
-            {
-                break;
-            }
-            ++repairRounds;
-            std::vector<MuxMergeGroup> surviving;
-            for (uint32_t groupIndex = 0; groupIndex < accepted.size(); ++groupIndex)
-            {
-                if (!unmerge[groupIndex])
-                {
-                    surviving.push_back(std::move(accepted[groupIndex]));
-                }
-                else
-                {
-                    ++unmergedGroups;
-                }
-            }
-            accepted = std::move(surviving);
         }
 
-        // Oversized statistics follow the same per-class limits as the split
-        // stage (merged atoms exceeding them intentionally occupy one
-        // oversized block each, the gsim oversized-super-node analogue).
+        context.instructionCount =
+            static_cast<uint32_t>(graph.instructionCount());
+        context.variableCount = static_cast<uint32_t>(graph.variableCount());
+        DefUseIndex newDefUse = detail::buildDefUseIndex(program);
+
+        std::vector<uint32_t> oldToNew(atomCount, kInvalidIndex);
+        uint32_t newAtomCount = 0;
+        for (uint32_t atom = 0; atom < atomCount; ++atom)
+        {
+            if (!membersOf[atom].empty())
+            {
+                oldToNew[atom] = newAtomCount++;
+            }
+        }
+
+        std::vector<uint32_t> newInstructionAtom(context.instructionCount,
+                                                 kInvalidIndex);
+        std::vector<uint32_t> newAtomMemberOffsets(newAtomCount + 1, 0);
+        std::vector<uint32_t> newAtomMembers;
+        newAtomMembers.reserve(context.atomMembers.size() +
+                               duplicatedInstructions);
+        std::vector<uint32_t> newAtomInstructions(newAtomCount, 0);
+        std::vector<uint32_t> newAtomStateWrites(newAtomCount, 0);
+        std::vector<uint8_t> newAtomIsCommit(newAtomCount, 0);
+        std::vector<uint32_t> newAtomMinInstruction(newAtomCount,
+                                                    kInvalidIndex);
+        std::vector<uint32_t> newCommitEventRank(newAtomCount, 0);
+        std::vector<uint8_t> newAtomKinds(newAtomCount, 0);
+        std::vector<uint32_t> newAtomSignatures(newAtomCount,
+                                                kInvalidAtomSignature);
+
+        for (uint32_t atom = 0; atom < atomCount; ++atom)
+        {
+            if (oldToNew[atom] == kInvalidIndex)
+            {
+                continue;
+            }
+            const uint32_t slot = oldToNew[atom];
+            newAtomMemberOffsets[slot] =
+                static_cast<uint32_t>(newAtomMembers.size());
+            std::vector<uint32_t> members = membersOf[atom];
+            if (dirtyAtom[atom] != 0)
+            {
+                members = topoOrderSubset(program, newDefUse, members);
+                // The atom's own root must remain the unique sink of the
+                // enlarged tree.
+                if (members.back() != rootOfAtom[atom])
+                {
+                    std::string dump;
+                    for (const uint32_t member : members)
+                    {
+                        const InstructionId mi{member};
+                        uint32_t internalUses = 0;
+                        for (const VariableId result : program.results(mi))
+                        {
+                            for (uint32_t uo = newDefUse.useOffsets[result.value];
+                                 uo < newDefUse.useOffsets[result.value + 1]; ++uo)
+                            {
+                                if (std::find(members.begin(), members.end(),
+                                              newDefUse.uses[uo]) != members.end())
+                                {
+                                    ++internalUses;
+                                }
+                            }
+                        }
+                        dump += " [" + std::to_string(member) + " op=" +
+                                std::to_string(static_cast<int>(program.opcode(mi))) +
+                                " iuses=" + std::to_string(internalUses) + "]";
+                    }
+                    diagnostics.error(
+                        "AM fanout absorption changed an atom's sink: atom=" +
+                            std::to_string(atom) +
+                            " root=" + std::to_string(rootOfAtom[atom]) +
+                            " back=" + std::to_string(members.back()) +
+                            " members=" + std::to_string(members.size()) + dump,
+                        std::string(kDiagnosticContext));
+                    return false;
+                }
+            }
+            uint32_t minInstruction = kInvalidIndex;
+            for (const uint32_t member : members)
+            {
+                newInstructionAtom[member] = slot;
+                newAtomMembers.push_back(member);
+                minInstruction = std::min(minInstruction, member);
+            }
+            newAtomInstructions[slot] =
+                static_cast<uint32_t>(members.size());
+            newAtomStateWrites[slot] = context.atomStateWrites[atom];
+            newAtomIsCommit[slot] = context.atomIsCommit[atom];
+            newAtomMinInstruction[slot] = minInstruction;
+            newCommitEventRank[slot] = context.commitEventRank[atom];
+            if (context.atomIsCommit[atom] != 0)
+            {
+                newAtomKinds[slot] = context.atomKinds[atom];
+                newAtomSignatures[slot] = context.atomSignatures[atom];
+            }
+            else if (context.atomKinds[atom] == kCombLoop)
+            {
+                newAtomKinds[slot] = kCombLoop;
+            }
+            else
+            {
+                newAtomKinds[slot] =
+                    members.size() > 1
+                        ? static_cast<uint8_t>(AmAtomKind::Tree)
+                        : static_cast<uint8_t>(AmAtomKind::Singleton);
+                const InstructionId root{members.back()};
+                const auto rootOperands = program.operands(root);
+                if (program.opcode(root) == Opcode::Mux &&
+                    rootOperands.size() == 3 && rootOperands[0].valid())
+                {
+                    newAtomSignatures[slot] = rootOperands[0].value;
+                }
+            }
+        }
+        newAtomMemberOffsets[newAtomCount] =
+            static_cast<uint32_t>(newAtomMembers.size());
+
+        for (uint32_t instruction = 0; instruction < context.instructionCount;
+             ++instruction)
+        {
+            if (newInstructionAtom[instruction] == kInvalidIndex)
+            {
+                diagnostics.error(
+                    "AM fanout absorption left an instruction atomless: " +
+                        std::to_string(instruction),
+                    std::string(kDiagnosticContext));
+                return false;
+            }
+        }
+
+        context.atomCount = newAtomCount;
+        context.instructionAtom = std::move(newInstructionAtom);
+        context.atomMemberOffsets = std::move(newAtomMemberOffsets);
+        context.atomMembers = std::move(newAtomMembers);
+        context.atomInstructions = std::move(newAtomInstructions);
+        context.atomStateWrites = std::move(newAtomStateWrites);
+        context.atomIsCommit = std::move(newAtomIsCommit);
+        context.atomMinInstruction = std::move(newAtomMinInstruction);
+        context.commitEventRank = std::move(newCommitEventRank);
+        context.atomKinds = std::move(newAtomKinds);
+        context.atomSignatures = std::move(newAtomSignatures);
+        context.defUse = std::move(newDefUse);
+
+        const CsrGraph instructionGraph =
+            detail::buildInstructionGraph(context.instructionCount,
+                                          context.defUse,
+                                          context.orderedEdges);
+        context.atomGraph = detail::buildCondensationGraph(
+            instructionGraph, context.instructionAtom, newAtomCount);
+
+        // Absorption contracts consumer-side memberships only; a multi-atom
+        // SCC here means the rewire rule was broken.
+        const detail::SccResult scc =
+            detail::findStronglyConnectedComponents(context.atomGraph);
+        if (static_cast<uint32_t>(scc.count) != newAtomCount)
+        {
+            diagnostics.error(
+                "AM fanout absorption produced a cyclic atom graph",
+                std::string(kDiagnosticContext));
+            return false;
+        }
+
         context.oversizedAtomCount = 0;
         context.maxAtomInstructions = 0;
         context.maxAtomStateWrites = 0;
@@ -679,33 +740,366 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
-        // Rebuild the compute/commit induced subgraphs on the merged atom DAG.
         std::string blockError;
         std::optional<AmGraphSplit> split =
             splitAmGraph(context.partitionInput(), blockError);
         if (!split)
         {
-            diagnostics.error("AM mux-merge atom produced an unsplittable graph: " +
+            diagnostics.error("AM fanout absorption produced an unsplittable "
+                              "graph: " +
                                   blockError,
                               std::string(kDiagnosticContext));
             return false;
         }
         context.split = std::move(*split);
 
-        std::size_t mergedMuxes = 0;
-        std::size_t absorbedCone = 0;
-        for (const MuxMergeGroup &group : accepted)
+        diagnostics.info(
+            "AM fanout absorption: absorbed_atoms=" +
+                std::to_string(absorbedAtoms) +
+                " orphan_atoms=" + std::to_string(orphanAtoms) +
+                " duplicated_instructions=" +
+                std::to_string(duplicatedInstructions) +
+                " atoms=" + std::to_string(newAtomCount),
+            std::string(kDiagnosticContext));
+        return true;
+    }
+
+    void optAmComputeGraph(AmComputeGraph &computeGraph,
+                           const AmGraphPartitionInput &input)
+    {
+        // Reserved stage boundary (framework: opt-am-compute-graph). Graph-level
+        // compute optimizations land here; intentionally a no-op today.
+        (void)computeGraph;
+        (void)input;
+    }
+
+    bool foldSingleOutputTreeAtoms(AmGraph &graph, AmGraphSplitContext &context,
+                                   wolvrix::lib::diag::Diagnostics &diagnostics)
+    {
+        const ProgramView program = graph.program();
+        const uint32_t instructionCount = context.instructionCount;
+        const DefUseIndex &defUse = context.defUse;
+        const uint32_t originalAtomCount = context.atomCount;
+
+        // ---- fold decision (NO0008): a compute instruction whose single
+        // result feeds exactly one consumer folds into that consumer's atom,
+        // so every atom becomes a single-output expression tree (the gsim
+        // "node = signal + assignTree" analogue). Fold barriers: commit-side
+        // atoms, comb-loop SCC atoms (multi-instruction), non-pure effects,
+        // and pinned (interface / observable / external) results. The fold
+        // relation is a static forest over the instruction DAG, so it is
+        // confluent and cannot create atom-level cycles (edge contraction in
+        // a DAG).
+
+        // Host-visible / interface-referenced variables never fold away:
+        // their value must stay observable outside the atom.
+        std::vector<uint8_t> pinnedVariable(context.variableCount, 0);
+        for (const PortBinding &port : graph.interface().ports)
         {
-            mergedMuxes += group.muxes.size();
-            absorbedCone += group.cone.size();
+            if (port.input.valid())
+            {
+                pinnedVariable[port.input.value] = 1;
+            }
+            if (port.output.valid())
+            {
+                pinnedVariable[port.output.value] = 1;
+            }
         }
-        diagnostics.info("AM mux-merge atom: groups=" + std::to_string(accepted.size()) +
-                             " merged_muxes=" + std::to_string(mergedMuxes) +
-                             " absorbed_cone=" + std::to_string(absorbedCone) +
-                             " cap_skipped_groups=" + std::to_string(capSkippedGroups) +
-                             " cap_skipped_muxes=" + std::to_string(capSkippedMuxes) +
-                             " cycle_unmerged_groups=" + std::to_string(unmergedGroups) +
-                             " repair_rounds=" + std::to_string(repairRounds),
+        for (const VariableLabel &label : graph.interface().declaredVariables)
+        {
+            if (label.variable.valid())
+            {
+                pinnedVariable[label.variable.value] = 1;
+            }
+        }
+        for (uint32_t variable = 0; variable < context.variableCount; ++variable)
+        {
+            const VariableRole role = graph.valueFacts(VariableId{variable}).roles;
+            if (hasRole(role, VariableRole::ExternalOutput) ||
+                hasRole(role, VariableRole::Observable))
+            {
+                pinnedVariable[variable] = 1;
+            }
+        }
+
+        const auto singletonComputeAtom = [&](uint32_t instruction) {
+            const uint32_t atom = context.instructionAtom[instruction];
+            return context.atomIsCommit[atom] == 0 &&
+                   context.atomInstructions[atom] == 1;
+        };
+
+        std::vector<uint32_t> foldInto(instructionCount, kInvalidIndex);
+        for (uint32_t index = 0; index < instructionCount; ++index)
+        {
+            if (!singletonComputeAtom(index))
+            {
+                continue;
+            }
+            const InstructionId instruction{index};
+            if (opcodeTraits(program.opcode(instruction)).effect != OpcodeEffect::Pure)
+            {
+                continue;
+            }
+            const auto results = program.results(instruction);
+            if (results.size() != 1 || !results.front().valid())
+            {
+                continue;
+            }
+            const uint32_t variable = results.front().value;
+            if (pinnedVariable[variable] ||
+                defUse.useOffsets[variable + 1] - defUse.useOffsets[variable] != 1)
+            {
+                continue;
+            }
+            const uint32_t consumer = defUse.uses[defUse.useOffsets[variable]];
+            if (consumer == index || !singletonComputeAtom(consumer))
+            {
+                continue;
+            }
+            foldInto[index] = consumer;
+        }
+
+        // Root of each fold chain (memoized walk; chains are def-use paths).
+        std::vector<uint32_t> rootOf(instructionCount, kInvalidIndex);
+        std::vector<uint32_t> chain;
+        for (uint32_t index = 0; index < instructionCount; ++index)
+        {
+            if (rootOf[index] != kInvalidIndex)
+            {
+                continue;
+            }
+            uint32_t cursor = index;
+            chain.clear();
+            while (rootOf[cursor] == kInvalidIndex &&
+                   foldInto[cursor] != kInvalidIndex)
+            {
+                chain.push_back(cursor);
+                cursor = foldInto[cursor];
+            }
+            const uint32_t root =
+                rootOf[cursor] != kInvalidIndex ? rootOf[cursor] : cursor;
+            rootOf[cursor] = root;
+            for (const uint32_t member : chain)
+            {
+                rootOf[member] = root;
+            }
+        }
+
+        // Fold sets keyed by their root instruction. Only singleton compute
+        // atoms take part; commit and comb-loop atoms carry over unchanged.
+        std::unordered_map<uint32_t, std::vector<uint32_t>> setMembers;
+        for (uint32_t index = 0; index < instructionCount; ++index)
+        {
+            if (!singletonComputeAtom(index))
+            {
+                continue;
+            }
+            setMembers[rootOf[index]].push_back(index);
+        }
+
+        // New atom order: carry-over atoms keep their relative order; fold
+        // sets slot in at their earliest member's original atom id (stable,
+        // deterministic; mirrors the retired mux-merge slot rule).
+        struct AtomSlot
+        {
+            uint32_t sortKey;
+            uint32_t oldAtom;
+            uint32_t root;
+        };
+        std::vector<AtomSlot> slots;
+        slots.reserve(originalAtomCount);
+        for (uint32_t atom = 0; atom < originalAtomCount; ++atom)
+        {
+            if (context.atomIsCommit[atom] != 0 || context.atomInstructions[atom] != 1)
+            {
+                slots.push_back(AtomSlot{atom, atom, kInvalidIndex});
+            }
+        }
+        for (auto &[root, members] : setMembers)
+        {
+            uint32_t sortKey = kInvalidIndex;
+            for (const uint32_t member : members)
+            {
+                sortKey = std::min(sortKey, context.instructionAtom[member]);
+            }
+            slots.push_back(AtomSlot{sortKey, kInvalidIndex, root});
+        }
+        std::sort(slots.begin(), slots.end(),
+                  [](const AtomSlot &lhs, const AtomSlot &rhs) {
+                      return std::tie(lhs.sortKey, lhs.oldAtom, lhs.root) <
+                             std::tie(rhs.sortKey, rhs.oldAtom, rhs.root);
+                  });
+
+        const CsrGraph instructionGraph =
+            detail::buildInstructionGraph(instructionCount, defUse,
+                                          context.orderedEdges);
+
+        const uint32_t newAtomCount = static_cast<uint32_t>(slots.size());
+        std::vector<uint32_t> newInstructionAtom(instructionCount, kInvalidIndex);
+        std::vector<uint32_t> newAtomMemberOffsets(newAtomCount + 1, 0);
+        std::vector<uint32_t> newAtomMembers;
+        newAtomMembers.reserve(instructionCount);
+        std::vector<uint32_t> newAtomInstructions(newAtomCount, 0);
+        std::vector<uint32_t> newAtomStateWrites(newAtomCount, 0);
+        std::vector<uint8_t> newAtomIsCommit(newAtomCount, 0);
+        std::vector<uint32_t> newAtomMinInstruction(newAtomCount, kInvalidIndex);
+        std::vector<uint32_t> newCommitEventRank(newAtomCount, 0);
+        std::vector<uint8_t> newAtomKinds(newAtomCount, 0);
+        std::vector<uint32_t> newAtomSignatures(newAtomCount, kInvalidAtomSignature);
+
+        std::size_t treeAtomCount = 0;
+        std::size_t muxRootedAtomCount = 0;
+        std::size_t foldedInstructions = 0;
+        std::size_t maxTreeInstructions = 0;
+
+        for (uint32_t slotIndex = 0; slotIndex < newAtomCount; ++slotIndex)
+        {
+            const AtomSlot &slot = slots[slotIndex];
+            newAtomMemberOffsets[slotIndex] =
+                static_cast<uint32_t>(newAtomMembers.size());
+            if (slot.oldAtom != kInvalidIndex)
+            {
+                // Carry-over atom (commit or comb-loop SCC): keep the original
+                // member list and all per-atom properties verbatim, except the
+                // signature bookkeeping (no-select marker for comb loops).
+                const uint32_t oldAtom = slot.oldAtom;
+                for (uint32_t offset = context.atomMemberOffsets[oldAtom];
+                     offset < context.atomMemberOffsets[oldAtom + 1]; ++offset)
+                {
+                    const uint32_t instruction = context.atomMembers[offset];
+                    newInstructionAtom[instruction] = slotIndex;
+                    newAtomMembers.push_back(instruction);
+                }
+                newAtomInstructions[slotIndex] = context.atomInstructions[oldAtom];
+                newAtomStateWrites[slotIndex] = context.atomStateWrites[oldAtom];
+                newAtomIsCommit[slotIndex] = context.atomIsCommit[oldAtom];
+                newAtomMinInstruction[slotIndex] = context.atomMinInstruction[oldAtom];
+                newCommitEventRank[slotIndex] = context.commitEventRank[oldAtom];
+                newAtomKinds[slotIndex] = context.atomKinds[oldAtom];
+                newAtomSignatures[slotIndex] =
+                    context.atomIsCommit[oldAtom] != 0
+                        ? context.atomSignatures[oldAtom]
+                        : kInvalidAtomSignature;
+                continue;
+            }
+
+            // Fold set: members in internal def-use order; the root (the one
+            // member that did not fold) is the unique sink and orders last.
+            const std::vector<uint32_t> &members = setMembers[slot.root];
+            const std::vector<uint32_t> ordered = topoOrderSubset(program, defUse, members);
+            uint32_t minInstruction = kInvalidIndex;
+            for (const uint32_t instruction : ordered)
+            {
+                newInstructionAtom[instruction] = slotIndex;
+                newAtomMembers.push_back(instruction);
+                minInstruction = std::min(minInstruction, instruction);
+            }
+            if (ordered.back() != slot.root)
+            {
+                diagnostics.error(
+                    "AM tree-atom fold produced a set whose sink is not the fold root: "
+                    "root=" +
+                        std::to_string(slot.root),
+                    std::string(kDiagnosticContext));
+                return false;
+            }
+            newAtomInstructions[slotIndex] = static_cast<uint32_t>(ordered.size());
+            newAtomIsCommit[slotIndex] = 0;
+            newAtomMinInstruction[slotIndex] = minInstruction;
+            const InstructionId rootInstruction{slot.root};
+            const auto rootOperands = program.operands(rootInstruction);
+            if (program.opcode(rootInstruction) == Opcode::Mux &&
+                rootOperands.size() == 3 && rootOperands[0].valid())
+            {
+                newAtomSignatures[slotIndex] = rootOperands[0].value;
+                ++muxRootedAtomCount;
+            }
+            if (ordered.size() > 1)
+            {
+                newAtomKinds[slotIndex] = static_cast<uint8_t>(AmAtomKind::Tree);
+                ++treeAtomCount;
+                foldedInstructions += ordered.size() - 1;
+                maxTreeInstructions = std::max(maxTreeInstructions, ordered.size());
+            }
+            else
+            {
+                newAtomKinds[slotIndex] = static_cast<uint8_t>(AmAtomKind::Singleton);
+            }
+        }
+        newAtomMemberOffsets[newAtomCount] =
+            static_cast<uint32_t>(newAtomMembers.size());
+
+        context.atomCount = newAtomCount;
+        context.instructionAtom = std::move(newInstructionAtom);
+        context.atomMemberOffsets = std::move(newAtomMemberOffsets);
+        context.atomMembers = std::move(newAtomMembers);
+        context.atomInstructions = std::move(newAtomInstructions);
+        context.atomStateWrites = std::move(newAtomStateWrites);
+        context.atomIsCommit = std::move(newAtomIsCommit);
+        context.atomMinInstruction = std::move(newAtomMinInstruction);
+        context.commitEventRank = std::move(newCommitEventRank);
+        context.atomKinds = std::move(newAtomKinds);
+        context.atomSignatures = std::move(newAtomSignatures);
+        context.atomGraph =
+            detail::buildCondensationGraph(instructionGraph,
+                                           context.instructionAtom, newAtomCount);
+
+        // DAG safety net: contracting def-use edges of a DAG cannot create a
+        // cycle, so a multi-atom SCC here means the fold rule was broken.
+        const detail::SccResult scc =
+            detail::findStronglyConnectedComponents(context.atomGraph);
+        if (static_cast<uint32_t>(scc.count) != newAtomCount)
+        {
+            diagnostics.error("AM tree-atom fold produced a cyclic atom graph",
+                              std::string(kDiagnosticContext));
+            return false;
+        }
+
+        // Oversized statistics follow the same per-class limits as the split
+        // stage (oversized atoms intentionally occupy one oversized block
+        // each, the gsim oversized-super-node analogue).
+        context.oversizedAtomCount = 0;
+        context.maxAtomInstructions = 0;
+        context.maxAtomStateWrites = 0;
+        for (uint32_t atom = 0; atom < context.atomCount; ++atom)
+        {
+            context.maxAtomInstructions =
+                std::max<std::size_t>(context.maxAtomInstructions,
+                                      context.atomInstructions[atom]);
+            context.maxAtomStateWrites =
+                std::max<std::size_t>(context.maxAtomStateWrites,
+                                      context.atomStateWrites[atom]);
+            const std::size_t instructionLimit =
+                context.atomIsCommit[atom] != 0
+                    ? context.maxCommitAtomsPerBlock
+                    : context.maxAtomsPerBlock;
+            if (context.atomInstructions[atom] > instructionLimit)
+            {
+                ++context.oversizedAtomCount;
+            }
+        }
+
+        // Rebuild the compute/commit induced subgraphs on the folded atom DAG.
+        std::string blockError;
+        std::optional<AmGraphSplit> split =
+            splitAmGraph(context.partitionInput(), blockError);
+        if (!split)
+        {
+            diagnostics.error("AM tree-atom fold produced an unsplittable graph: " +
+                                  blockError,
+                              std::string(kDiagnosticContext));
+            return false;
+        }
+        context.split = std::move(*split);
+
+        diagnostics.info("AM tree-atom fold: atoms=" + std::to_string(newAtomCount) +
+                             " tree_atoms=" + std::to_string(treeAtomCount) +
+                             " mux_rooted_atoms=" +
+                             std::to_string(muxRootedAtomCount) +
+                             " folded_instructions=" +
+                             std::to_string(foldedInstructions) +
+                             " max_tree_instructions=" +
+                             std::to_string(maxTreeInstructions),
                          std::string(kDiagnosticContext));
         return true;
     }

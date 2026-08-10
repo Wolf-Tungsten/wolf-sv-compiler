@@ -62,7 +62,7 @@ namespace
             const InstructionId expected = index == 0 ? first : second;
             if (atom.value != index ||
                 program.atomKind(atom) != AmAtomKind::Singleton ||
-                program.atomSignature(atom) != 0 ||
+                program.atomSignature(atom) != kInvalidAtomSignature ||
                 program.atomInstructionCount(atom) != 1 ||
                 program.atomInstruction(atom, 0) != expected ||
                 program.atomInstruction(atom, 0) !=
@@ -100,7 +100,7 @@ namespace
 
         ScheduledProgramBuilder builder(linear.finish());
         builder.beginBlock();
-        builder.beginAtom(AmAtomKind::MuxMerge, sel.value);
+        builder.beginAtom(AmAtomKind::Tree, sel.value);
         builder.appendBlockInstruction(mux1);
         builder.appendBlockInstruction(mux2);
         builder.endAtom();
@@ -114,13 +114,13 @@ namespace
         }
         const AtomId merged = program.blockAtom(BlockId{0}, 0);
         const AtomId singleton = program.blockAtom(BlockId{0}, 1);
-        if (program.atomKind(merged) != AmAtomKind::MuxMerge ||
+        if (program.atomKind(merged) != AmAtomKind::Tree ||
             program.atomSignature(merged) != sel.value ||
             program.atomInstructionCount(merged) != 2 ||
             program.atomInstruction(merged, 0) != mux1 ||
             program.atomInstruction(merged, 1) != mux2)
         {
-            return fail("explicit MuxMerge atom metadata did not round-trip");
+            return fail("explicit Tree atom metadata did not round-trip");
         }
         if (program.atomKind(singleton) != AmAtomKind::Singleton ||
             program.atomInstructionCount(singleton) != 1 ||
@@ -229,18 +229,19 @@ namespace
         const VariableId a = linear.addVariable(u8Type, linear.zeroInit());
         const VariableId b = linear.addVariable(u8Type, linear.zeroInit());
         const VariableId r1 = linear.addVariable(u8Type, linear.zeroInit());
-        // A MuxMerge atom needs >= 2 member instructions and >= 2 muxes whose
-        // select matches the signature; a lone assign fails both.
+        (void)sel;
+        // A Tree atom needs >= 2 member instructions (a single-output tree);
+        // a lone instruction fails the shape rule.
         const InstructionId assign =
             linear.addInstruction(Opcode::Assign, std::array{r1}, std::array{a});
         const InstructionId assign2 =
             linear.addInstruction(Opcode::Assign, std::array{b}, std::array{r1});
         ScheduledProgramBuilder builder(linear.finish());
         builder.beginBlock();
-        builder.beginAtom(AmAtomKind::MuxMerge, sel.value);
+        builder.beginAtom(AmAtomKind::Tree, kInvalidAtomSignature);
         builder.appendBlockInstruction(assign);
-        builder.appendBlockInstruction(assign2);
         builder.endAtom();
+        builder.appendBlockInstruction(assign2);
         builder.endBlock();
         ScheduledProgram program = builder.finish();
         const ValidationResult result =
@@ -256,14 +257,15 @@ namespace
         }
         if (result.success() || !found)
         {
-            return fail("validator did not reject the malformed MuxMerge atom");
+            return fail("validator did not reject the single-member Tree atom");
         }
         return 0;
     }
 
-    // End to end: a register write plus a same-select mux pair through
-    // graphToProgram must surface the atom layer (Singleton / MuxMerge /
-    // CommitEvent) with the pass-recorded select as the MuxMerge signature.
+    // End to end: a register write plus mux/cone logic through graphToProgram
+    // must surface the atom layer (Singleton / Tree / CommitEvent): single-use
+    // chains fold into their root's Tree atom, a multi-use mux stays a
+    // select-signed Singleton, and the commit Block carries CommitEvent atoms.
     int testMaterializeCarriesAtomLayer()
     {
         LinearProgramBuilder builder;
@@ -280,15 +282,22 @@ namespace
         const VariableId r1 = builder.addVariable(u8Type, builder.undefInit());
         const VariableId r2 = builder.addVariable(u8Type, builder.undefInit());
         const VariableId next = builder.addVariable(u8Type, builder.undefInit());
+        const VariableId out = builder.addVariable(u8Type, builder.undefInit());
         const VariableId state = builder.addVariable(u8Type, builder.zeroInit());
 
         builder.addInstruction(Opcode::ChangedPos, std::array{posedge},
                                std::array{clock, clockOld});
-        builder.addInstruction(Opcode::Mux, std::array{r1}, std::array{sel, a, b});
-        builder.addInstruction(Opcode::Mux, std::array{r2}, std::array{sel, c, d});
-        builder.addInstruction(Opcode::Or, std::array{next}, std::array{r1, r2});
+        const InstructionId mux1 =
+            builder.addInstruction(Opcode::Mux, std::array{r1}, std::array{sel, a, b});
+        const InstructionId mux2 =
+            builder.addInstruction(Opcode::Mux, std::array{r2}, std::array{sel, c, d});
+        const InstructionId or1 =
+            builder.addInstruction(Opcode::Or, std::array{next}, std::array{r1, r2});
         const InstructionId write = builder.addInstruction(
             Opcode::RegisterWrite, {}, std::array{next, state, posedge});
+        // A second consumer for r1 (through the pinned output) keeps mux1
+        // mux-rooted instead of folding into or1's tree.
+        builder.addInstruction(Opcode::Assign, std::array{out}, std::array{r1});
 
         SchedulingFacts facts;
         facts.variableRoles = {
@@ -296,21 +305,31 @@ namespace
             VariableRole::None, VariableRole::None,
             VariableRole::None, VariableRole::None,
             VariableRole::None, VariableRole::None, VariableRole::None,
-            VariableRole::None, VariableRole::State,
+            VariableRole::None, VariableRole::ExternalOutput,
+            VariableRole::State,
         };
         facts.orderedEffects = {
             OrderedEffect{.instruction = write, .group = 0, .ordinal = 0},
         };
+        ProgramInterface interface;
+        interface.ports.push_back(PortBinding{
+            .name = builder.addString("out"),
+            .direction = PortDirection::Output,
+            .output = out,
+        });
 
         AmGraph graph = AmGraph::fromLinearProgram(LinearProgramArtifact{
             .program = builder.finish(),
-            .interface = {},
+            .interface = std::move(interface),
             .schedulingFacts = std::move(facts),
         });
         diag::Diagnostics diagnostics;
         std::optional<ExecutableModel> model =
             GrhIRToGrhSimAMProgram::graphToProgram(std::move(graph),
-                                                   ActivityScheduleOptions{}, diagnostics);
+                                                   ActivityScheduleOptions{
+                                                       .fanoutAbsorbMaxInstructions = 2,
+                                                   },
+                                                   diagnostics);
         if (!model || diagnostics.hasError())
         {
             for (const auto &message : diagnostics.messages())
@@ -329,7 +348,8 @@ namespace
         {
             return fail("materialized program carries no atoms");
         }
-        std::size_t muxMergeAtoms = 0;
+        std::size_t treeAtoms = 0;
+        std::size_t muxRootedSingletons = 0;
         std::size_t commitEventAtoms = 0;
         std::size_t coveredInstructions = 0;
         for (uint32_t blockIndex = 0; blockIndex < program.blockCount(); ++blockIndex)
@@ -339,30 +359,17 @@ namespace
             {
                 const AtomId atom = program.blockAtom(block, index);
                 coveredInstructions += program.atomInstructionCount(atom);
-                if (program.atomKind(atom) == AmAtomKind::MuxMerge)
+                const AmAtomKind kind = program.atomKind(atom);
+                if (kind == AmAtomKind::Tree)
                 {
-                    ++muxMergeAtoms;
-                    if (program.atomSignature(atom) != sel.value)
-                    {
-                        return fail("MuxMerge atom lost its select signature");
-                    }
-                    uint32_t muxMembers = 0;
-                    for (std::size_t member = 0;
-                         member < program.atomInstructionCount(atom); ++member)
-                    {
-                        const InstructionId instruction =
-                            program.atomInstruction(atom, member);
-                        if (program.view().opcode(instruction) == Opcode::Mux)
-                        {
-                            ++muxMembers;
-                        }
-                    }
-                    if (muxMembers < 2)
-                    {
-                        return fail("MuxMerge atom does not hold the same-select muxes");
-                    }
+                    ++treeAtoms;
                 }
-                if (program.atomKind(atom) == AmAtomKind::CommitEvent)
+                if (kind == AmAtomKind::Singleton &&
+                    program.atomSignature(atom) == sel.value)
+                {
+                    ++muxRootedSingletons;
+                }
+                if (kind == AmAtomKind::CommitEvent)
                 {
                     ++commitEventAtoms;
                 }
@@ -372,14 +379,25 @@ namespace
         {
             return fail("atoms do not tile the materialized program");
         }
-        if (muxMergeAtoms != 1)
+        // mux2 folds into or1's tree (single-use chain); mux1 is then
+        // absorbed by fanout absorption (NO0015): it joins or1's tree and a
+        // copy lands in the assign's atom, so no select-signed singleton mux
+        // survives and both consumer atoms become Trees.
+        if (treeAtoms != 2)
         {
-            return fail("expected exactly one MuxMerge atom after scheduling");
+            return fail("expected two Tree atoms after scheduling (or1 tree + assign copy)");
+        }
+        if (muxRootedSingletons != 0)
+        {
+            return fail("expected no select-signed singleton mux atom after absorption");
         }
         if (commitEventAtoms == 0)
         {
             return fail("expected CommitEvent atoms in the commit Block");
         }
+        (void)mux1;
+        (void)mux2;
+        (void)or1;
         return 0;
     }
 

@@ -463,6 +463,11 @@ namespace wolvrix::lib::grhsim::am
                                  " coarsen_ms=" + std::to_string(computeActivity.coarsenMs) +
                                  " dp_ms=" + std::to_string(computeActivity.dpMs) +
                                  " rounds=" + std::to_string(computeActivity.coarsenRounds) +
+                                 " when_groups=" +
+                                 std::to_string(computeActivity.coarsenWhenGroups) +
+                                 " when_merges=" +
+                                 std::to_string(computeActivity.coarsenWhenMerges) +
+                                 " " + computeActivity.mergeWhenDiag +
                                  " out1_merges=" +
                                  std::to_string(computeActivity.coarsenOut1Merges) +
                                  " in1_merges=" +

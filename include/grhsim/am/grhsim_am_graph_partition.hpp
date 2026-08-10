@@ -23,20 +23,28 @@ namespace wolvrix::lib::grhsim::am
         std::span<const uint8_t> atomIsCommit;
         std::span<const uint32_t> atomMinInstruction;
         std::span<const uint32_t> commitEventRank;
+        // Per-atom select variable id for mux-rooted compute atoms
+        // (kInvalidAtomSignature otherwise; commit atoms hold their event
+        // rank here and are excluded by atomIsCommit).
+        std::span<const uint32_t> atomSignatures;
         uint32_t variableCount = 0;
         std::span<const uint32_t> definitions; // variable -> defining instruction (kInvalid if none)
         std::span<const uint32_t> useOffsets;  // variable -> using instructions CSR
         std::span<const uint32_t> uses;
         std::span<const uint32_t> instructionAtom; // instruction -> atom
-        std::size_t maxAtomsPerBlock = 128;      // compute 块 atom 数上限
+        std::size_t maxAtomsPerBlock = 48;       // compute 块 atom 数上限
         std::size_t maxCommitAtomsPerBlock = 4096; // commit 块 atom 数上限
-        bool enableCoarsening = true;   // out1/in1/sibling merge sweeps
+        bool enableCoarsening = true;   // mergeWhen/out1/in1/sibling merge sweeps
         std::size_t coarsenAtomBudget = 256; // merge host member atom limit
         double segmentPenalty = 1.0;    // DP fixed cost per segment boundary
         // Post-DP local-move refinement rounds (0 = off). Each round scans
         // clusters in topo order and moves a cluster to a neighbor block when
         // the move strictly reduces the exact block-level incoming-copy cost.
         std::size_t refinementRounds = 10;
+        // mergeWhen sweep (gsim mergeWhenNodes): same-select mux-rooted
+        // atoms ready at one select wavefront merge into a coarsen cluster
+        // when the group out-sizes this threshold; < 2 disables the sweep.
+        std::size_t mergeWhenMinGroup = 5;
     };
 
     // ------------------------------------------------------------------
@@ -89,12 +97,22 @@ namespace wolvrix::lib::grhsim::am
     {
         std::vector<uint32_t> atomBlock; // per compute-local atom, 1..blockCount
         std::vector<uint32_t> atomTopo;  // compute-local atoms, block-grouped topological
+        // mergeWhen 融合锚点（compute 局部索引）：同组 atom 共享的排序键
+        // （组内最小 atomMinInstruction），materialize 的块内 Kahn 用它把
+        // 同组 mux 根 atom 排相邻，供 emitter 块级融合；非组成员为
+        // kInvalidAtomSignature 同值的哨兵（0xFFFFFFFF）。
+        std::vector<uint32_t> atomFusionAnchor;
         uint32_t blockCount = 0;
         std::size_t clustersAfterCoarsen = 0;
         std::size_t dpSegments = 0;
         uint64_t coarsenMs = 0;
         uint64_t dpMs = 0;
         std::size_t coarsenRounds = 0;
+        std::size_t coarsenWhenGroups = 0;
+        std::size_t coarsenWhenMerges = 0;
+        // mergeWhen 归组诊断（按 select 来源的机会/门槛统计），空串表示
+        // sweep 未运行（coarsening 关闭或 minGroup<2）。
+        std::string mergeWhenDiag;
         std::size_t coarsenOut1Merges = 0;
         std::size_t coarsenIn1Merges = 0;
         std::size_t coarsenSiblingMerges = 0;

@@ -194,6 +194,7 @@ namespace
         const TypeId type = builder.addType(Type::bitVector(8));
         const StringId inputName = builder.addString("input");
         const StringId outputName = builder.addString("output");
+        const StringId tapName = builder.addString("tap");
         const VariableId input = builder.addVariable(type, builder.zeroInit());
         const VariableId temporary = builder.addVariable(type, builder.undefInit());
         const VariableId output = builder.addVariable(type, builder.undefInit());
@@ -219,11 +220,19 @@ namespace
                 .direction = PortDirection::Output,
                 .output = output,
             },
+            // The tap pins `temporary` (tree-atom fold barrier, NO0008), so
+            // produce/consume stay two atoms and the two-block topology
+            // check keeps its meaning.
+            PortBinding{
+                .name = tapName,
+                .direction = PortDirection::Output,
+                .output = temporary,
+            },
         };
         SchedulingFacts facts;
         facts.variableRoles = {
             VariableRole::ExternalInput,
-            VariableRole::None,
+            VariableRole::ExternalOutput,
             VariableRole::ExternalOutput,
         };
         facts.instructionEffects = {
@@ -2093,6 +2102,12 @@ namespace
         }
         SchedulingFacts facts;
         facts.variableRoles.assign(values.size(), VariableRole::None);
+        // Observable roles pin the chain values (a tree-atom fold barrier,
+        // NO0008): the segment-DP packing scenario below needs every chain
+        // instruction to stay a singleton atom.
+        for (std::size_t index = 1; index < values.size(); ++index) {
+            facts.variableRoles[index] = VariableRole::Observable;
+        }
         facts.instructionEffects.assign(instructionCount, InstructionEffect::Pure);
         return LinearProgramArtifact{
             .program = builder.finish(),
@@ -2211,7 +2226,9 @@ namespace
         SchedulingFacts facts;
         facts.variableRoles = {
             VariableRole::None, VariableRole::State, VariableRole::None,
-            VariableRole::None, VariableRole::None, VariableRole::None,
+            // Observable pins `temporary` (tree-atom fold barrier, NO0008)
+            // so producer/consumer stay two singleton atoms.
+            VariableRole::None, VariableRole::Observable, VariableRole::None,
         };
         facts.instructionEffects = {
             InstructionEffect::Pure,
@@ -2457,7 +2474,7 @@ namespace
         }
         const std::string expectedHeader =
             "{\"record\":\"header\",\"format\":\"wolvrix.am-instruction-graph.v1\","
-            "\"instructions\":7,\"variables\":10,\"atoms\":6,\"comb_loop_atoms\":1,"
+            "\"instructions\":7,\"variables\":10,\"atoms\":5,\"comb_loop_atoms\":1,"
             "\"def_use_edges\":3,\"external_reads\":3,\"order_edges\":1}";
         if (lines.front() != expectedHeader) {
             return fail("instruction graph export header mismatch: " + lines.front());
@@ -2630,10 +2647,11 @@ namespace
         if (lines.front() != expectedHeader) {
             return fail("block assignment export header mismatch: " + lines.front());
         }
-        // Block records carry the post-merge atom count: block 1 packs the
-        // comb-loop assign pair as one CombLoopScc atom plus two singleton
-        // producers (3 atoms); block 2 is the single CommitEvent write atom.
-        if (lines[1] != "{\"record\":\"block\",\"id\":1,\"kind\":\"compute\",\"size\":4,\"atoms\":3}" ||
+        // Block records carry the post-fold atom count: block 1 packs the
+        // single-use value chain as one Tree atom (NO0008) plus the
+        // comb-loop assign pair as one CombLoopScc atom (2 atoms); block 2
+        // is the single CommitEvent write atom.
+        if (lines[1] != "{\"record\":\"block\",\"id\":1,\"kind\":\"compute\",\"size\":4,\"atoms\":2}" ||
             lines[2] != "{\"record\":\"block\",\"id\":2,\"kind\":\"commit\",\"size\":1,\"atoms\":1}") {
             return fail("block assignment export block records mismatch");
         }
@@ -2658,12 +2676,12 @@ namespace
             }
             recordAtoms[instruction] = atom;
         }
-        // The comb-loop pair shares one atom; the two chain producers are
-        // distinct singletons; the write is its own commit atom.
-        if (recordAtoms[2] != recordAtoms[3] || recordAtoms[0] == recordAtoms[2] ||
-            recordAtoms[1] == recordAtoms[2] || recordAtoms[0] == recordAtoms[1] ||
+        // The single-use chain folds into one Tree atom (NO0008); the
+        // comb-loop pair shares one atom; the write is its own commit atom.
+        if (recordAtoms[0] != recordAtoms[1] || recordAtoms[2] != recordAtoms[3] ||
+            recordAtoms[0] == recordAtoms[2] || recordAtoms[4] == recordAtoms[0] ||
             recordAtoms[4] == recordAtoms[2]) {
-            return fail("block assignment export atom fields do not reflect the SCC packing");
+            return fail("block assignment export atom fields do not reflect the tree/SCC packing");
         }
         return 0;
     }
@@ -2698,6 +2716,7 @@ namespace
         std::vector<uint32_t> atomMinInstruction(kAtoms);
         std::iota(atomMinInstruction.begin(), atomMinInstruction.end(), uint32_t{0});
         const std::vector<uint32_t> commitRanks = {0, 0, 0, 0, 0, 0, 0, 0, 1};
+        const std::vector<uint32_t> atomSignatures(kAtoms, kInvalidAtomSignature);
         const uint32_t none = std::numeric_limits<uint32_t>::max();
         const std::vector<uint32_t> definitions = {0, none};
         const std::vector<uint32_t> useOffsets = {0, 4, 5};
@@ -2714,6 +2733,7 @@ namespace
             .atomIsCommit = atomIsCommit,
             .atomMinInstruction = atomMinInstruction,
             .commitEventRank = commitRanks,
+            .atomSignatures = atomSignatures,
             .variableCount = 2,
             .definitions = definitions,
             .useOffsets = useOffsets,
@@ -2810,6 +2830,7 @@ namespace
         std::vector<uint32_t> atomMinInstruction(kAtoms);
         std::iota(atomMinInstruction.begin(), atomMinInstruction.end(), uint32_t{0});
         const std::vector<uint32_t> commitRanks(kAtoms, 0);
+        const std::vector<uint32_t> atomSignatures(kAtoms, kInvalidAtomSignature);
         const uint32_t none = std::numeric_limits<uint32_t>::max();
         // v0: defined by instruction 0, used by instruction 1 -- the only
         // variable refinement can re-home. v1: external (no definition),
@@ -2830,6 +2851,7 @@ namespace
                 .atomIsCommit = atomIsCommit,
                 .atomMinInstruction = atomMinInstruction,
                 .commitEventRank = commitRanks,
+                .atomSignatures = atomSignatures,
                 .variableCount = 2,
                 .definitions = definitions,
                 .useOffsets = useOffsets,
@@ -2875,6 +2897,318 @@ namespace
         }
         if (refined->refinementRounds != 2) {
             return fail("refinement should converge after one idle round");
+        }
+        return 0;
+    }
+
+    // mergeWhen sweep (NO0008): hand-built atom DAGs with one select
+    // producer anchor and mux-rooted member atoms (signature = select var).
+    struct MergeWhenInput
+    {
+        std::vector<uint32_t> atomOffsets;
+        std::vector<uint32_t> atomTargets;
+        std::vector<uint32_t> atomInstructions;
+        std::vector<uint32_t> atomStateWrites;
+        std::vector<uint8_t> atomIsCommit;
+        std::vector<uint32_t> atomMinInstruction;
+        std::vector<uint32_t> commitRanks;
+        std::vector<uint32_t> atomSignatures;
+        std::vector<uint32_t> definitions;
+        std::vector<uint32_t> useOffsets;
+        std::vector<uint32_t> uses;
+        std::vector<uint32_t> instructionAtom;
+    };
+
+    // Atom 0 produces select var 0; memberCount mux-rooted atoms (1..N)
+    // consume it. extraEdges/additionalUses model chained members.
+    MergeWhenInput makeMergeWhenInput(uint32_t memberCount,
+                                      std::span<const std::pair<uint32_t, uint32_t>> extraEdges)
+    {
+        MergeWhenInput data;
+        const uint32_t atomCount = memberCount + 1;
+        std::vector<std::pair<uint32_t, uint32_t>> edges;
+        edges.reserve(memberCount + extraEdges.size());
+        for (uint32_t member = 1; member <= memberCount; ++member) {
+            edges.emplace_back(0, member);
+        }
+        for (const auto &edge : extraEdges) {
+            edges.push_back(edge);
+        }
+        data.atomOffsets.assign(atomCount + 1, 0);
+        for (const auto &[source, target] : edges) {
+            ++data.atomOffsets[source + 1];
+        }
+        std::partial_sum(data.atomOffsets.begin(), data.atomOffsets.end(),
+                         data.atomOffsets.begin());
+        data.atomTargets.resize(data.atomOffsets.back());
+        {
+            std::vector<uint32_t> cursor(data.atomOffsets.begin(),
+                                         data.atomOffsets.end() - 1);
+            for (const auto &[source, target] : edges) {
+                data.atomTargets[cursor[source]++] = target;
+            }
+        }
+        data.atomInstructions.assign(atomCount, 1);
+        data.atomStateWrites.assign(atomCount, 0);
+        data.atomIsCommit.assign(atomCount, 0);
+        data.atomMinInstruction.resize(atomCount);
+        std::iota(data.atomMinInstruction.begin(), data.atomMinInstruction.end(),
+                  uint32_t{0});
+        data.commitRanks.assign(atomCount, 0);
+        data.atomSignatures.assign(atomCount, kInvalidAtomSignature);
+        for (uint32_t member = 1; member <= memberCount; ++member) {
+            data.atomSignatures[member] = 0; // select variable 0
+        }
+        data.definitions = {0}; // var 0 <- instruction 0
+        data.useOffsets = {0, memberCount};
+        data.uses.resize(memberCount);
+        std::iota(data.uses.begin(), data.uses.end(), uint32_t{1});
+        data.instructionAtom.resize(atomCount);
+        std::iota(data.instructionAtom.begin(), data.instructionAtom.end(), uint32_t{0});
+        return data;
+    }
+
+    std::optional<AmComputeActivityGraph>
+    runMergeWhenCase(MergeWhenInput &data, uint32_t atomCount, std::size_t minGroup)
+    {
+        AmGraphPartitionInput input{
+            .atomCount = atomCount,
+            .atomOffsets = data.atomOffsets,
+            .atomTargets = data.atomTargets,
+            .atomInstructions = data.atomInstructions,
+            .atomStateWrites = data.atomStateWrites,
+            .atomIsCommit = data.atomIsCommit,
+            .atomMinInstruction = data.atomMinInstruction,
+            .commitEventRank = data.commitRanks,
+            .atomSignatures = data.atomSignatures,
+            .variableCount = 1,
+            .definitions = data.definitions,
+            .useOffsets = data.useOffsets,
+            .uses = data.uses,
+            .instructionAtom = data.instructionAtom,
+            .maxAtomsPerBlock = 60,
+            .enableCoarsening = true,
+            .segmentPenalty = 1.0,
+            .refinementRounds = 0,
+            .mergeWhenMinGroup = minGroup,
+        };
+        std::string error;
+        auto split = splitAmGraph(input, error);
+        if (!split) {
+            return std::nullopt;
+        }
+        return partitionAmComputeGraph(input, *split, error);
+    }
+
+    int testMergeWhenClustersSameSelectAtoms()
+    {
+        MergeWhenInput data = makeMergeWhenInput(6, {});
+        const auto compute = runMergeWhenCase(data, 7, 5);
+        if (!compute) {
+            return fail("mergeWhen cluster case did not partition");
+        }
+        // Six member atoms collapse into one cluster (five moved members).
+        if (compute->coarsenWhenGroups != 1 || compute->coarsenWhenMerges != 5) {
+            return fail("mergeWhen did not cluster the six same-select atoms: groups=" +
+                        std::to_string(compute->coarsenWhenGroups) +
+                        " merges=" + std::to_string(compute->coarsenWhenMerges) +
+                        " clusters=" + std::to_string(compute->clustersAfterCoarsen));
+        }
+        const uint32_t anchor = compute->atomFusionAnchor[1];
+        if (anchor == kInvalidAtomSignature) {
+            return fail("mergeWhen members lost their fusion anchor");
+        }
+        for (uint32_t atom = 2; atom <= 6; ++atom) {
+            if (compute->atomFusionAnchor[atom] != anchor) {
+                return fail("mergeWhen members do not share one fusion anchor");
+            }
+        }
+        if (compute->atomFusionAnchor[0] != kInvalidAtomSignature) {
+            return fail("the select producer anchor gained a fusion anchor");
+        }
+        uint32_t block = compute->atomBlock[1];
+        for (uint32_t atom = 2; atom <= 6; ++atom) {
+            if (compute->atomBlock[atom] != block) {
+                return fail("mergeWhen cluster members scattered across blocks");
+            }
+        }
+        return 0;
+    }
+
+    int testMergeWhenRespectsMinGroup()
+    {
+        MergeWhenInput data = makeMergeWhenInput(3, {});
+        const auto compute = runMergeWhenCase(data, 4, 5);
+        if (!compute) {
+            return fail("mergeWhen min-group case did not partition");
+        }
+        if (compute->coarsenWhenGroups != 0 || compute->coarsenWhenMerges != 0) {
+            return fail("mergeWhen clustered a group below the minimum size");
+        }
+        for (uint32_t atom = 1; atom <= 3; ++atom) {
+            if (compute->atomFusionAnchor[atom] != kInvalidAtomSignature) {
+                return fail("below-threshold group gained a fusion anchor");
+            }
+        }
+        return 0;
+    }
+
+    int testMergeWhenWavefrontExcludesChainedMember()
+    {
+        // Atom 7 consumes both the select and member 1's output, so it is
+        // not ready at the select wavefront and must stay out of the cluster.
+        const std::pair<uint32_t, uint32_t> extra{1, 7};
+        MergeWhenInput data = makeMergeWhenInput(7, std::span<const std::pair<uint32_t, uint32_t>>(&extra, 1));
+        const auto compute = runMergeWhenCase(data, 8, 5);
+        if (!compute) {
+            return fail("mergeWhen wavefront case did not partition");
+        }
+        // Six wavefront-ready members merge; the chained atom 7 stays out.
+        if (compute->coarsenWhenGroups != 1 || compute->coarsenWhenMerges != 5) {
+            return fail("mergeWhen wavefront gate merged the wrong member set: groups=" +
+                        std::to_string(compute->coarsenWhenGroups) +
+                        " merges=" + std::to_string(compute->coarsenWhenMerges));
+        }
+        if (compute->atomFusionAnchor[7] != kInvalidAtomSignature) {
+            return fail("chained member joined the mergeWhen cluster");
+        }
+        return 0;
+    }
+
+    // A hand-rolled state-select fixture: variable `select` has no defining
+    // instruction (state/interface value), so members anchor on a virtual
+    // source cond. Atoms 0..atomCount-1 are all mux-rooted on it.
+    MergeWhenInput makeStateSelectInput(uint32_t atomCount,
+                                        std::span<const std::pair<uint32_t, uint32_t>> edges,
+                                        uint32_t secondSelectFrom)
+    {
+        MergeWhenInput data;
+        data.atomOffsets.assign(atomCount + 1, 0);
+        for (const auto &[source, target] : edges) {
+            ++data.atomOffsets[source + 1];
+        }
+        std::partial_sum(data.atomOffsets.begin(), data.atomOffsets.end(),
+                         data.atomOffsets.begin());
+        data.atomTargets.resize(data.atomOffsets.back());
+        {
+            std::vector<uint32_t> cursor(data.atomOffsets.begin(),
+                                         data.atomOffsets.end() - 1);
+            for (const auto &[source, target] : edges) {
+                data.atomTargets[cursor[source]++] = target;
+            }
+        }
+        data.atomInstructions.assign(atomCount, 1);
+        data.atomStateWrites.assign(atomCount, 0);
+        data.atomIsCommit.assign(atomCount, 0);
+        data.atomMinInstruction.resize(atomCount);
+        std::iota(data.atomMinInstruction.begin(), data.atomMinInstruction.end(),
+                  uint32_t{0});
+        data.commitRanks.assign(atomCount, 0);
+        data.atomSignatures.assign(atomCount, kInvalidAtomSignature);
+        for (uint32_t atom = 0; atom < atomCount; ++atom) {
+            data.atomSignatures[atom] = atom < secondSelectFrom ? 0 : 1;
+        }
+        const uint32_t none = kInvalidAtomSignature;
+        data.definitions = {none, none}; // both selects are state values
+        data.useOffsets = {0, secondSelectFrom, atomCount};
+        data.uses.resize(atomCount);
+        std::iota(data.uses.begin(), data.uses.end(), uint32_t{0});
+        data.instructionAtom.resize(atomCount);
+        std::iota(data.instructionAtom.begin(), data.instructionAtom.end(), uint32_t{0});
+        return data;
+    }
+
+    int testMergeWhenStateSelectVirtualAnchor()
+    {
+        MergeWhenInput data = makeStateSelectInput(6, {}, 6);
+        AmGraphPartitionInput input{
+            .atomCount = 6,
+            .atomOffsets = data.atomOffsets,
+            .atomTargets = data.atomTargets,
+            .atomInstructions = data.atomInstructions,
+            .atomStateWrites = data.atomStateWrites,
+            .atomIsCommit = data.atomIsCommit,
+            .atomMinInstruction = data.atomMinInstruction,
+            .commitEventRank = data.commitRanks,
+            .atomSignatures = data.atomSignatures,
+            .variableCount = 2,
+            .definitions = data.definitions,
+            .useOffsets = data.useOffsets,
+            .uses = data.uses,
+            .instructionAtom = data.instructionAtom,
+            .maxAtomsPerBlock = 60,
+            .enableCoarsening = true,
+            .segmentPenalty = 1.0,
+            .refinementRounds = 0,
+            .mergeWhenMinGroup = 5,
+        };
+        std::string error;
+        auto split = splitAmGraph(input, error);
+        if (!split) {
+            return fail("state-select fixture did not split: " + error);
+        }
+        const auto compute = partitionAmComputeGraph(input, *split, error);
+        if (!compute) {
+            return fail("state-select case did not partition: " + error);
+        }
+        // No producer atom: a virtual source cond anchors the group and all
+        // six mux-rooted atoms merge at the drain point (five moved members).
+        if (compute->coarsenWhenGroups != 1 || compute->coarsenWhenMerges != 5) {
+            return fail("state-select group did not merge via the virtual anchor: groups=" +
+                        std::to_string(compute->coarsenWhenGroups) +
+                        " merges=" + std::to_string(compute->coarsenWhenMerges));
+        }
+        const uint32_t anchor = compute->atomFusionAnchor[0];
+        for (uint32_t atom = 1; atom < 6; ++atom) {
+            if (compute->atomFusionAnchor[atom] != anchor ||
+                anchor == kInvalidAtomSignature) {
+                return fail("state-select members do not share one fusion anchor");
+            }
+        }
+        return 0;
+    }
+
+    int testMergeWhenVirtualCrossCycleDissolves()
+    {
+        // Two state selects chained across groups: 0 -> 6 -> 1. Merging both
+        // groups would make a 2-cycle between the clusters; the repair must
+        // dissolve every virtual group and keep the graph partitionable.
+        const std::pair<uint32_t, uint32_t> edges[] = {{0, 6}, {6, 1}};
+        MergeWhenInput data = makeStateSelectInput(12, edges, 6);
+        AmGraphPartitionInput input{
+            .atomCount = 12,
+            .atomOffsets = data.atomOffsets,
+            .atomTargets = data.atomTargets,
+            .atomInstructions = data.atomInstructions,
+            .atomStateWrites = data.atomStateWrites,
+            .atomIsCommit = data.atomIsCommit,
+            .atomMinInstruction = data.atomMinInstruction,
+            .commitEventRank = data.commitRanks,
+            .atomSignatures = data.atomSignatures,
+            .variableCount = 2,
+            .definitions = data.definitions,
+            .useOffsets = data.useOffsets,
+            .uses = data.uses,
+            .instructionAtom = data.instructionAtom,
+            .maxAtomsPerBlock = 60,
+            .enableCoarsening = true,
+            .segmentPenalty = 1.0,
+            .refinementRounds = 0,
+            .mergeWhenMinGroup = 5,
+        };
+        std::string error;
+        auto split = splitAmGraph(input, error);
+        if (!split) {
+            return fail("virtual-cycle fixture did not split: " + error);
+        }
+        const auto compute = partitionAmComputeGraph(input, *split, error);
+        if (!compute) {
+            return fail("virtual-cycle case did not partition: " + error);
+        }
+        if (compute->coarsenWhenGroups != 0 || compute->coarsenWhenMerges != 0) {
+            return fail("cyclic virtual groups were not dissolved: groups=" +
+                        std::to_string(compute->coarsenWhenGroups) +
+                        " merges=" + std::to_string(compute->coarsenWhenMerges));
         }
         return 0;
     }
@@ -2973,6 +3307,21 @@ int main()
         return result;
     }
     if (const int result = testRefinementMovesClusterIntoNeighborBlock(); result != 0) {
+        return result;
+    }
+    if (const int result = testMergeWhenClustersSameSelectAtoms(); result != 0) {
+        return result;
+    }
+    if (const int result = testMergeWhenRespectsMinGroup(); result != 0) {
+        return result;
+    }
+    if (const int result = testMergeWhenWavefrontExcludesChainedMember(); result != 0) {
+        return result;
+    }
+    if (const int result = testMergeWhenStateSelectVirtualAnchor(); result != 0) {
+        return result;
+    }
+    if (const int result = testMergeWhenVirtualCrossCycleDissolves(); result != 0) {
         return result;
     }
     return 0;

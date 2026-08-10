@@ -3101,10 +3101,10 @@ int main()
         return 0;
     }
 
-    // NO0006/NO0007 P2 same-select mux fusion: one compute Block holds two
-    // explicit MuxMerge atoms (a narrow one with a cone member and a chained
-    // mux, a wide one), separated by a singleton assign; a lone
-    // different-select singleton mux keeps the standalone ternary form.
+    // NO0008 block-level same-select mux fusion: one compute Block holds a
+    // Tree atom (cone member + mux root) followed by two singleton muxes on
+    // the same select (one chained), a singleton assign separator, two wide
+    // singleton muxes on the same select, and a lone different-select mux.
     ExecutableModel makeMuxRunEmitterModel()
     {
         LinearProgramBuilder linear;
@@ -3183,20 +3183,21 @@ int main()
             entry.push_back(activate);
         }
         scheduled.addBlock(std::span<const InstructionId>(entry.data(), entry.size()));
-        // Two MuxMerge atoms with singleton instructions in between and a
-        // singleton different-select mux at the tail.
+        // One Tree atom (cone first, mux root last) followed by two
+        // singleton muxes on the same select, a singleton assign separator,
+        // two wide singleton muxes, and a singleton different-select mux at
+        // the tail. Run fusion derives the select from each root
+        // instruction, so implicit singleton atoms are eligible.
         scheduled.beginBlock();
-        scheduled.beginAtom(AmAtomKind::MuxMerge, sel.value);
+        scheduled.beginAtom(AmAtomKind::Tree, sel.value);
         scheduled.appendBlockInstruction(coneAnd);
         scheduled.appendBlockInstruction(mux1);
+        scheduled.endAtom();
         scheduled.appendBlockInstruction(mux2);
         scheduled.appendBlockInstruction(mux3);
-        scheduled.endAtom();
         scheduled.appendBlockInstruction(separator);
-        scheduled.beginAtom(AmAtomKind::MuxMerge, sel.value);
         scheduled.appendBlockInstruction(wide1);
         scheduled.appendBlockInstruction(wide2);
-        scheduled.endAtom();
         scheduled.appendBlockInstruction(other);
         scheduled.endBlock();
 
@@ -3256,11 +3257,11 @@ int main()
             return fail("mux-run model lost its interface bindings");
         }
         // Two fused if/else structures share one select evaluation each: one
-        // for the narrow atom, one for the wide atom. The trailing space
+        // for the narrow run, one for the wide run. The trailing space
         // after '{' keeps activation-merge ifs out of the count. The cone
         // member (a & d) must be emitted before the fused gate it feeds, and
         // the singleton different-select mux keeps the plain ternary form
-        // (no block-level fallback fusion any more).
+        // (a single-arm run never fuses).
         const std::string fusedGate = "if ((v" + std::to_string(sel.value) + " != 0)) { ";
         const std::string singletonGate = "if ((v" + std::to_string(sel2.value) + " != 0)) { ";
         const std::string chainTrue = "v" + std::to_string(r2.value) +
@@ -3284,7 +3285,7 @@ int main()
             countOccurrences(*blocksText, "assign_words(") < 4 ||
             blocksText->find(loneTernary) == std::string::npos)
         {
-            return fail("AM C++ emitter did not fuse the MuxMerge atoms");
+            return fail("AM C++ emitter did not fuse the mux-rooted atom runs");
         }
 
         const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
@@ -3348,11 +3349,12 @@ int main()
         return 0;
     }
 
-    // NO0006 production-form fusion: same-select muxes lowered into an
-    // AmGraph, scheduled through graphToProgram (split -> mux-merge atom ->
-    // partition -> materialize), then emitted. The merged atom must surface
-    // as one fused if/else segment in the generated compute Block.
-    int testMuxMergeAtomPipelineFusion(const std::filesystem::path &outputDirectory)
+    // NO0008 production-form fusion: same-select muxes lowered into an
+    // AmGraph, scheduled through graphToProgram (split -> tree-atom fold ->
+    // partition -> materialize), then emitted. The pinned outputs keep each
+    // mux a select-carrying singleton atom; adjacent in one Block they form
+    // a single fusion run emitted as one fused if/else segment.
+    int testMuxRunPipelineFusion(const std::filesystem::path &outputDirectory)
     {
         std::filesystem::remove_all(outputDirectory);
         LinearProgramBuilder builder;
@@ -3445,7 +3447,7 @@ int main()
         }
         if (emitResult.muxAtomFused != 3)
         {
-            return fail("mux-merge atom did not surface as one fused run of three");
+            return fail("mux-rooted run did not surface as one fused run of three");
         }
         const std::optional<std::string> blocksText =
             readTextFile(outputDirectory / "grhsim_MuxPipeTop_blocks_0.cpp");
@@ -3517,10 +3519,11 @@ int main()
         return 0;
     }
 
-    // NO0007 P2 behavior change, pinned: a cap-skipped same-select group
-    // stays singleton atoms, and the emitter no longer fuses it through the
-    // block-level run fallback -- plain ternaries only.
-    int testCapSkippedMuxGroupStaysUnfused(const std::filesystem::path &outputDirectory)
+    // NO0008 run-break behavior, pinned: same-select mux atoms interrupted
+    // by a different-select mux never form a multi-atom run -- plain
+    // ternaries only. (mergeWhenMinGroup stays at the default 5, so the
+    // two-member same-select set is not clustered either.)
+    int testSelectChangeBreaksMuxRun(const std::filesystem::path &outputDirectory)
     {
         std::filesystem::remove_all(outputDirectory);
         LinearProgramBuilder builder;
@@ -3545,12 +3548,17 @@ int main()
             });
             return variable;
         };
-        const VariableId sel = builder.addVariable(u1Type, builder.zeroInit());
-        interface.ports.push_back(PortBinding{
-            .name = builder.addString("sel"),
-            .direction = PortDirection::Input,
-            .input = sel,
-        });
+        const auto addSelect = [&](std::string_view name) {
+            const VariableId variable = builder.addVariable(u1Type, builder.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = builder.addString(name),
+                .direction = PortDirection::Input,
+                .input = variable,
+            });
+            return variable;
+        };
+        const VariableId sel = addSelect("sel");
+        const VariableId sel2 = addSelect("sel2");
         const VariableId a = addInput("a");
         const VariableId b = addInput("b");
         const VariableId c = addInput("c");
@@ -3559,20 +3567,16 @@ int main()
         const VariableId r1 = addOutput("r1");
         const VariableId r2 = addOutput("r2");
         const VariableId r3 = addOutput("r3");
-        const auto mux = [&](VariableId result, VariableId whenTrue,
-                             VariableId whenFalse) {
-            builder.addInstruction(Opcode::Mux, std::array{result},
-                                   std::array{sel, whenTrue, whenFalse});
-        };
-        mux(r1, a, b);
-        mux(r2, c, d);
-        mux(r3, a, e);
+        builder.addInstruction(Opcode::Mux, std::array{r1}, std::array{sel, a, b});
+        builder.addInstruction(Opcode::Mux, std::array{r2}, std::array{sel2, c, d});
+        builder.addInstruction(Opcode::Mux, std::array{r3}, std::array{sel, a, e});
 
         SchedulingFacts facts;
         facts.variableRoles = {
             VariableRole::ExternalInput, VariableRole::ExternalInput,
             VariableRole::ExternalInput, VariableRole::ExternalInput,
             VariableRole::ExternalInput, VariableRole::ExternalInput,
+            VariableRole::ExternalInput,
             VariableRole::ExternalOutput, VariableRole::ExternalOutput,
             VariableRole::ExternalOutput,
         };
@@ -3584,29 +3588,29 @@ int main()
         });
         wolvrix::lib::diag::Diagnostics diagnostics;
         std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
-            std::move(graph), ActivityScheduleOptions{.muxAtomMax = 2}, diagnostics);
+            std::move(graph), ActivityScheduleOptions{}, diagnostics);
         if (!model || diagnostics.hasError())
         {
-            return fail("cap-skipped mux graph did not schedule");
+            return fail("select-change mux graph did not schedule");
         }
         GrhSimAmCppEmitter emitter;
         const GrhSimAmCppResult emitResult = emitter.emit(
             *model,
             GrhSimAmCppOptions{
                 .outputDirectory = outputDirectory,
-                .modelName = "MuxCapTop",
+                .modelName = "MuxBreakTop",
                 .maxOutputFileBytes = 1024 * 1024,
             },
             diagnostics);
         if (!emitResult.success || diagnostics.hasError())
         {
-            return fail("AM C++ emitter failed to generate the cap-skipped model");
+            return fail("AM C++ emitter failed to generate the select-change model");
         }
         const std::optional<std::string> blocksText =
-            readTextFile(outputDirectory / "grhsim_MuxCapTop_blocks_0.cpp");
+            readTextFile(outputDirectory / "grhsim_MuxBreakTop_blocks_0.cpp");
         if (!blocksText)
         {
-            return fail("AM C++ emitter produced no cap-skipped blocks source");
+            return fail("AM C++ emitter produced no select-change blocks source");
         }
         const std::string fusedGate =
             "if ((v" + std::to_string(sel.value) + " != 0)) { ";
@@ -3614,9 +3618,9 @@ int main()
             " = ((v" + std::to_string(sel.value) + " != 0) ? ";
         if (emitResult.muxAtomFused != 0 ||
             countOccurrences(*blocksText, fusedGate) != 0 ||
-            countOccurrences(*blocksText, ternaryHead) != 3)
+            countOccurrences(*blocksText, ternaryHead) != 2)
         {
-            return fail("cap-skipped mux group was still fused by the emitter fallback");
+            return fail("select-interrupted mux atoms were still fused");
         }
         return 0;
     }
@@ -3928,16 +3932,16 @@ int main()
     {
         return result;
     }
-    if (const int result = testMuxMergeAtomPipelineFusion(
+    if (const int result = testMuxRunPipelineFusion(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-mux-pipeline");
         result != 0)
     {
         return result;
     }
-    if (const int result = testCapSkippedMuxGroupStaysUnfused(
+    if (const int result = testSelectChangeBreaksMuxRun(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
-            "cpp-emitter-mux-cap-skip");
+            "cpp-emitter-mux-run-break");
         result != 0)
     {
         return result;

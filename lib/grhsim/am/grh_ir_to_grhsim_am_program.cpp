@@ -857,7 +857,7 @@ namespace wolvrix::lib::grhsim::am
             }
 
             // Atom-kind placement: CommitEvent atoms only inside the commit
-            // Block range; MuxMerge/CombLoopScc only outside it.
+            // Block range; Tree/CombLoopScc only outside it.
             for (uint32_t block = 0; block < blockCount; ++block)
             {
                 const BlockId blockId{block};
@@ -874,7 +874,7 @@ namespace wolvrix::lib::grhsim::am
                                      std::to_string(atom.value) +
                                      " block=" + std::to_string(block));
                     }
-                    if ((kind == AmAtomKind::MuxMerge || kind == AmAtomKind::CombLoopScc) &&
+                    if ((kind == AmAtomKind::Tree || kind == AmAtomKind::CombLoopScc) &&
                         isCommitBlock)
                     {
                         addError(result, options,
@@ -1042,18 +1042,36 @@ namespace wolvrix::lib::grhsim::am
         }
 
         // ---- stage: opt-am-compute-graph --------------------------------
-        // mux-merge atom pass: same-select compute mux groups merge into
-        // indivisible scheduling atoms (0 disables); rewrites the split
-        // context's atom tables and rebuilds the induced subgraphs on the
-        // merged atom DAG. Runs before partitionInput() assembly because the
-        // partition input spans address the context storage.
-        if (options.muxAtomMax != 0 &&
-            !mergeMuxSelectAtoms(graph, *context, options.muxAtomMax, diagnostics)) {
+        // tree-atom formation (NO0008): single-use pure producers fold into
+        // their unique consumer's atom, so every compute atom is a
+        // single-output expression tree (mux-rooted trees are the when-tree
+        // analogue). Rewrites the split context's atom tables and rebuilds
+        // the induced subgraphs on the folded atom DAG. Runs before
+        // partitionInput() assembly because the partition input spans
+        // address the context storage.
+        // Debug escape hatch (NO0017): WOLVRIX_GRHSIM_AM_DISABLE_TREE_ATOM_FOLD
+        // skips the fold entirely for import-compat bisection.
+        const bool disableTreeAtomFold = std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_TREE_ATOM_FOLD") != nullptr;
+        if (!disableTreeAtomFold &&
+            !foldSingleOutputTreeAtoms(graph, *context, diagnostics)) {
             return std::nullopt;
         }
 
-        // Research export of the instruction graph: after the mux-merge pass
-        // so the atom fields are the post-merge split-context values.
+        // Fanout absorption (NO0015): replicate small fanout>=2 compute
+        // atoms into every consumer atom up to the read-port boundary, so
+        // the partition graph sheds the shared-fanout structure gsim never
+        // had. Runs after the tree-atom fold (consumers are atoms by then)
+        // and rebuilds the same tables.
+        if (options.fanoutAbsorbMaxInstructions > 0 &&
+            !absorbFanoutAtoms(graph, *context,
+                               options.fanoutAbsorbMaxInstructions,
+                               options.fanoutAbsorbBudgetMult,
+                               options.fanoutAbsorbMaxConsumers, diagnostics)) {
+            return std::nullopt;
+        }
+
+        // Research export of the instruction graph: after the tree-atom fold
+        // so the atom fields are the post-fold split-context values.
         if (const char *exportPath = std::getenv("WOLVRIX_GRHSIM_AM_INSTRUCTION_GRAPH_JSONL")) {
             if (exportPath[0] == '\0' ||
                 !exportInstructionGraphJsonl(graph.program(), *context,

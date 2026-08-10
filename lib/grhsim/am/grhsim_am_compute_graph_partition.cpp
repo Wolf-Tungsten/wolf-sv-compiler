@@ -8,8 +8,10 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <queue>
+#include <set>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -479,10 +481,361 @@ namespace wolvrix::lib::grhsim::am
         std::vector<uint8_t> alive(n, 1);
         std::vector<uint32_t> parent(n, 0);
         std::iota(parent.begin(), parent.end(), uint32_t{0});
+        const auto findRoot = [&parent](uint32_t value) {
+            uint32_t root = value;
+            while (parent[root] != root) {
+                root = parent[root];
+            }
+            while (parent[value] != root) {
+                const uint32_t next = parent[value];
+                parent[value] = root;
+                value = next;
+            }
+            return root;
+        };
+        std::size_t whenGroups = 0;
+        std::size_t whenMerges = 0;
+        std::string mergeWhenDiag;
+        // mergeWhen 融合锚点（compute 局部 atom 索引）：同组成员共享组内最
+        // 小 atomMinInstruction 作为块内排序键，使同组 mux 根 atom 在块内
+        // 相邻，供 emitter 块级同 select 融合。
+        std::vector<uint32_t> fusionAnchor(n, kInvalidIndex);
         std::size_t out1Merges = 0;
         std::size_t in1Merges = 0;
         std::size_t siblingMerges = 0;
         if (input.enableCoarsening) {
+            // mergeWhen (gsim mergeNodes.cpp mergeWhenNodes, NO0008): atoms
+            // whose root mux shares one select merge into a single coarsen
+            // cluster when the group becomes ready at the same select
+            // wavefront and out-sizes mergeWhenMinGroup. The cond-queue
+            // readiness gate mirrors the reference: a member only joins when
+            // the select producer is its last unsatisfied predecessor, so
+            // chained members never merge together and no cycle can form.
+            // Membership moves only (DSU); the rid adjacency is rebuilt
+            // right after the sweep so the out1/in1 passes see clusters.
+            if (input.mergeWhenMinGroup >= 2) {
+                std::map<uint32_t, std::vector<uint32_t>> allCond;
+                std::vector<uint32_t> node2Cond(n, kInvalidIndex);
+                // NO0010 增量(三) 诊断：按 select 来源统计同 select mux 根
+                // atom 的归组机会——state/interface select（无生产者 atom）
+                // 经虚拟锚点归组（gsim 的 reg-src cond 语义：select 是图外
+                // 源点，成员在全部图依赖就绪时归组）。
+                std::size_t muxRootedAtoms = 0;
+                std::size_t stateSelectAtoms = 0;
+                std::map<uint32_t, uint32_t> stateGroupSizes;
+                // state select -> 虚拟锚点 key（>= n，不与 rid 冲突；
+                // std::map 保证初始化顺序确定）。
+                std::map<uint32_t, uint32_t> virtualAnchorOf;
+                for (uint32_t rid = 0; rid < n; ++rid) {
+                    const uint32_t global = computeGraph.globalOfAtom[atomOfRid[rid]];
+                    const uint32_t select = input.atomSignatures[global];
+                    if (select == kInvalidIndex) {
+                        continue;
+                    }
+                    ++muxRootedAtoms;
+                    const uint32_t producer = input.definitions[select];
+                    if (producer == kInvalidIndex) {
+                        ++stateSelectAtoms;
+                        ++stateGroupSizes[select];
+                        const auto [it, inserted] = virtualAnchorOf.try_emplace(
+                            select, n + static_cast<uint32_t>(virtualAnchorOf.size()));
+                        (void)inserted;
+                        allCond[it->second].push_back(rid);
+                        node2Cond[rid] = it->second;
+                        continue;
+                    }
+                    const uint32_t producerAtom = input.instructionAtom[producer];
+                    if (input.atomIsCommit[producerAtom] != 0) {
+                        continue;
+                    }
+                    const uint32_t anchorLocal = computeGraph.localOfAtom[producerAtom];
+                    if (anchorLocal == kInvalidIndex) {
+                        continue;
+                    }
+                    const uint32_t anchorRid = ridOfAtom[anchorLocal];
+                    if (anchorRid == rid) {
+                        continue;
+                    }
+                    allCond[anchorRid].push_back(rid);
+                    node2Cond[rid] = anchorRid;
+                }
+                // 诊断串无条件组装（几个 map 遍历，量级千级，代价可忽略）；
+                // anchored_* 只统计真实锚点（key < n），虚拟组走 state_*。
+                {
+                    std::size_t stateGroupsGe2 = 0;
+                    std::size_t stateGroupsGe6 = 0;
+                    std::size_t anchoredGroups = 0;
+                    std::size_t anchoredMembers = 0;
+                    std::size_t anchoredGroupsGe6 = 0;
+                    for (const auto &[select, size] : stateGroupSizes) {
+                        (void)select;
+                        stateGroupsGe2 += size >= 2 ? 1 : 0;
+                        stateGroupsGe6 += size >= 6 ? 1 : 0;
+                    }
+                    for (const auto &[anchor, members] : allCond) {
+                        if (anchor >= n) {
+                            continue;
+                        }
+                        ++anchoredGroups;
+                        anchoredMembers += members.size();
+                        anchoredGroupsGe6 += members.size() >= 6 ? 1 : 0;
+                    }
+                    mergeWhenDiag =
+                        "mux_rooted=" + std::to_string(muxRootedAtoms) +
+                        " anchored_groups=" + std::to_string(anchoredGroups) +
+                        " anchored_members=" + std::to_string(anchoredMembers) +
+                        " anchored_ge6=" + std::to_string(anchoredGroupsGe6) +
+                        " state_atoms=" + std::to_string(stateSelectAtoms) +
+                        " state_groups=" + std::to_string(stateGroupSizes.size()) +
+                        " state_ge2=" + std::to_string(stateGroupsGe2) +
+                        " state_ge6=" + std::to_string(stateGroupsGe6);
+                }
+                if (!allCond.empty()) {
+                    std::vector<uint32_t> times(n, 0);
+                    std::queue<uint32_t> pending;
+                    std::queue<uint32_t> conds;
+                    std::set<uint32_t> condWait;
+                    const auto addCond = [&](uint32_t anchor) {
+                        uint32_t readyMembers = 0;
+                        for (const uint32_t member : allCond[anchor]) {
+                            if (times[member] + 1 == prevs[member].size()) {
+                                ++readyMembers;
+                            }
+                        }
+                        if (readyMembers >= 2) {
+                            conds.push(anchor);
+                        } else {
+                            condWait.insert(anchor);
+                        }
+                    };
+                    const auto cond2Queue = [&](uint32_t anchor) {
+                        const auto found = condWait.find(anchor);
+                        if (found != condWait.end()) {
+                            condWait.erase(found);
+                            conds.push(anchor);
+                        }
+                    };
+                    for (uint32_t rid = 0; rid < n; ++rid) {
+                        if (!prevs[rid].empty()) {
+                            continue;
+                        }
+                        if (allCond.find(rid) != allCond.end()) {
+                            addCond(rid);
+                        } else {
+                            pending.push(rid);
+                        }
+                    }
+                    // 虚拟锚点（state/interface select）：不参与即时门控，
+                    // 直接进 condWait；key >= n 使其排在所有真实锚点之后，
+                    // 在 drain 点处理——彼时遍历基本完成，成员的真实依赖
+                    // 均已就绪，组按完整尺寸收集（gsim 源点 cond 的等价
+                    // 效果）。std::map 迭代顺序确定。
+                    for (const auto &[select, anchorKey] : virtualAnchorOf) {
+                        (void)select;
+                        condWait.insert(anchorKey);
+                    }
+                    std::vector<std::vector<uint32_t>> groups;
+                    std::vector<std::vector<uint32_t>> virtualGroups;
+                    while (!pending.empty() || !conds.empty() || !condWait.empty()) {
+                        if (pending.empty()) {
+                            if (conds.empty()) {
+                                cond2Queue(*condWait.begin());
+                            }
+                            const uint32_t mergeCond = conds.front();
+                            conds.pop();
+                            std::vector<uint32_t> members;
+                            const std::vector<uint32_t> &group = allCond[mergeCond];
+                            if (mergeCond >= n) {
+                                // 虚拟锚点：drain 点处成员的真实依赖均已
+                                // 就绪（未就绪者按 gsim 同型损失放弃）；
+                                // 不做计数与调度推进——成员早已正常调度。
+                                for (const uint32_t member : group) {
+                                    if (times[member] == prevs[member].size()) {
+                                        members.push_back(member);
+                                    }
+                                }
+                                if (members.size() > input.mergeWhenMinGroup) {
+                                    virtualGroups.push_back(std::move(members));
+                                }
+                            } else {
+                                for (const uint32_t next : nexts[mergeCond]) {
+                                    ++times[next];
+                                    if (times[next] == prevs[next].size()) {
+                                        if (std::binary_search(group.begin(), group.end(),
+                                                               next)) {
+                                            members.push_back(next);
+                                        }
+                                        pending.push(next);
+                                    }
+                                }
+                                if (members.size() > input.mergeWhenMinGroup) {
+                                    groups.push_back(std::move(members));
+                                }
+                            }
+                            continue;
+                        }
+                        const uint32_t top = pending.front();
+                        pending.pop();
+                        for (const uint32_t next : nexts[top]) {
+                            ++times[next];
+                            // 即时促进只对真实锚点：虚拟锚点静候 drain。
+                            if (times[next] + 1 == prevs[next].size() &&
+                                node2Cond[next] != kInvalidIndex && node2Cond[next] < n) {
+                                cond2Queue(node2Cond[next]);
+                            }
+                            if (times[next] == prevs[next].size()) {
+                                if (allCond.find(next) != allCond.end()) {
+                                    addCond(next);
+                                } else {
+                                    pending.push(next);
+                                }
+                            }
+                        }
+                    }
+                    std::size_t virtualMerges = 0;
+                    const auto applyGroup = [&](const std::vector<uint32_t> &group,
+                                                std::size_t &mergeCounter) {
+                        const uint32_t host = group.front();
+                        uint32_t anchorKey = kInvalidIndex;
+                        for (const uint32_t rid : group) {
+                            anchorKey = std::min(
+                                anchorKey,
+                                input.atomMinInstruction[computeGraph.globalOfAtom[atomOfRid[rid]]]);
+                        }
+                        for (const uint32_t rid : group) {
+                            fusionAnchor[atomOfRid[rid]] = anchorKey;
+                            if (rid == host) {
+                                continue;
+                            }
+                            member[host] += member[rid];
+                            member[rid] = 0;
+                            alive[rid] = 0;
+                            parent[rid] = host;
+                            ++mergeCounter;
+                        }
+                        ++whenGroups;
+                    };
+                    for (const std::vector<uint32_t> &group : groups) {
+                        applyGroup(group, whenMerges);
+                    }
+                    for (const std::vector<uint32_t> &group : virtualGroups) {
+                        applyGroup(group, virtualMerges);
+                    }
+                    whenMerges += virtualMerges;
+                    std::size_t virtualDissolvedGroups = 0;
+                    if (whenMerges != 0) {
+                        // Rebuild the rid adjacency through the DSU so the
+                        // out1/in1/sibling sweeps observe merged clusters.
+                        const auto rebuildAdjacency = [&]() {
+                            for (uint32_t rid = 0; rid < n; ++rid) {
+                                nexts[rid].clear();
+                                prevs[rid].clear();
+                            }
+                            for (std::size_t index = 0; index < edgeSrc.size(); ++index) {
+                                const uint32_t source = findRoot(edgeSrc[index]);
+                                const uint32_t target = findRoot(edgeDst[index]);
+                                if (source != target && alive[source] != 0 &&
+                                    alive[target] != 0) {
+                                    nexts[source].push_back(target);
+                                    prevs[target].push_back(source);
+                                }
+                            }
+                            for (uint32_t rid = 0; rid < n; ++rid) {
+                                std::sort(nexts[rid].begin(), nexts[rid].end());
+                                nexts[rid].erase(
+                                    std::unique(nexts[rid].begin(), nexts[rid].end()),
+                                    nexts[rid].end());
+                                std::sort(prevs[rid].begin(), prevs[rid].end());
+                                prevs[rid].erase(
+                                    std::unique(prevs[rid].begin(), prevs[rid].end()),
+                                    prevs[rid].end());
+                            }
+                        };
+                        rebuildAdjacency();
+                        // 跨组成环兜底：虚拟组没有波前门，跨组链可成环
+                        // （真实组由波前门天然免疫）。SCC 精确解散：只解
+                        // 散成员落在非平凡 SCC 里的虚拟组，其余保留；
+                        // 修复轮次确定（组序即收集序）。残余不涉及虚拟组
+                        // 的环交给下游 "cluster graph is cyclic" 硬错误。
+                        std::size_t repairRounds = 0;
+                        for (;;) {
+                            CsrGraph ridGraph;
+                            ridGraph.offsets.assign(n + 1, 0);
+                            for (uint32_t rid = 0; rid < n; ++rid) {
+                                if (alive[rid] != 0) {
+                                    ridGraph.offsets[rid + 1] =
+                                        static_cast<uint32_t>(nexts[rid].size());
+                                }
+                            }
+                            std::partial_sum(ridGraph.offsets.begin(),
+                                             ridGraph.offsets.end(),
+                                             ridGraph.offsets.begin());
+                            ridGraph.targets.resize(ridGraph.offsets.back());
+                            {
+                                std::vector<uint32_t> cursor(
+                                    ridGraph.offsets.begin(),
+                                    ridGraph.offsets.end() - 1);
+                                for (uint32_t rid = 0; rid < n; ++rid) {
+                                    if (alive[rid] == 0) {
+                                        continue;
+                                    }
+                                    for (const uint32_t target : nexts[rid]) {
+                                        ridGraph.targets[cursor[rid]++] = target;
+                                    }
+                                }
+                            }
+                            const detail::SccResult scc =
+                                detail::findStronglyConnectedComponents(ridGraph);
+                            if (static_cast<uint32_t>(scc.count) == n) {
+                                break;
+                            }
+                            std::vector<uint32_t> sccSize(scc.count, 0);
+                            for (uint32_t rid = 0; rid < n; ++rid) {
+                                ++sccSize[scc.component[rid]];
+                            }
+                            std::vector<std::vector<uint32_t>> surviving;
+                            bool any = false;
+                            for (const std::vector<uint32_t> &group : virtualGroups) {
+                                bool cyclic = false;
+                                for (const uint32_t rid : group) {
+                                    if (sccSize[scc.component[rid]] > 1) {
+                                        cyclic = true;
+                                        break;
+                                    }
+                                }
+                                if (!cyclic) {
+                                    surviving.push_back(group);
+                                    continue;
+                                }
+                                for (const uint32_t rid : group) {
+                                    alive[rid] = 1;
+                                    parent[rid] = rid;
+                                    member[rid] = 1;
+                                    fusionAnchor[atomOfRid[rid]] = kInvalidIndex;
+                                }
+                                --whenGroups;
+                                whenMerges -= static_cast<std::size_t>(group.size()) - 1;
+                                virtualMerges -= static_cast<std::size_t>(group.size()) - 1;
+                                ++virtualDissolvedGroups;
+                                any = true;
+                            }
+                            virtualGroups = std::move(surviving);
+                            if (!any) {
+                                break;
+                            }
+                            ++repairRounds;
+                            rebuildAdjacency();
+                        }
+                        (void)repairRounds;
+                    }
+                    mergeWhenDiag +=
+                        " virtual_collected=" + std::to_string(virtualGroups.size()) +
+                        " virtual_merges=" + std::to_string(virtualMerges) +
+                        " virtual_dissolved=" +
+                        std::to_string(virtualDissolvedGroups);
+                }
+            }
+
             // mergeOut1: reverse sweep (downstream first). A node whose
             // out-degree is exactly one merges into its unique successor t
             // when t's pre-merge member count is within the merge limit.
@@ -588,18 +941,6 @@ namespace wolvrix::lib::grhsim::am
 
         // Rebuild the cluster adjacency (reconnectSuper equivalent): original
         // edges remapped through the merge DSU, self-loops dropped, deduped.
-        const auto findRoot = [&parent](uint32_t value) {
-            uint32_t root = value;
-            while (parent[root] != root) {
-                root = parent[root];
-            }
-            while (parent[value] != root) {
-                const uint32_t next = parent[value];
-                parent[value] = root;
-                value = next;
-            }
-            return root;
-        };
         std::vector<std::vector<uint32_t>>().swap(nexts);
         std::vector<std::vector<uint32_t>>().swap(prevs);
         std::vector<uint64_t> mappedEdges;
@@ -830,10 +1171,14 @@ namespace wolvrix::lib::grhsim::am
         }
 
         // A block-grouped Kahn keeps the compute topo topological both across
-        // and inside blocks.
+        // and inside blocks. mergeWhen group members share their group's
+        // minimum atomMinInstruction as the primary sort key, so same-select
+        // mux-rooted atoms emit adjacently inside a block (the emitter's
+        // block-level fusion consumes those runs; readiness gating keeps the
+        // order topological regardless).
         result.atomTopo.reserve(computeAtomCount);
         {
-            using Candidate = std::tuple<uint32_t, uint32_t, uint32_t>;
+            using Candidate = std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>;
             std::priority_queue<Candidate, std::vector<Candidate>, std::greater<>> ready;
             std::vector<uint32_t> indegree(computeAtomCount, 0);
             for (uint32_t atom = 0; atom < computeAtomCount; ++atom) {
@@ -842,23 +1187,29 @@ namespace wolvrix::lib::grhsim::am
                     ++indegree[computeGraph.targets[offset]];
                 }
             }
+            const auto minInstruction = [&](uint32_t atom) {
+                return input.atomMinInstruction[computeGraph.globalOfAtom[atom]];
+            };
+            const auto sortKey = [&](uint32_t atom) {
+                return fusionAnchor[atom] != kInvalidIndex ? fusionAnchor[atom]
+                                                           : minInstruction(atom);
+            };
             for (uint32_t atom = 0; atom < computeAtomCount; ++atom) {
                 if (indegree[atom] == 0) {
-                    ready.emplace(result.atomBlock[atom],
-                                  input.atomMinInstruction[computeGraph.globalOfAtom[atom]], atom);
+                    ready.emplace(result.atomBlock[atom], sortKey(atom),
+                                  minInstruction(atom), atom);
                 }
             }
             while (!ready.empty()) {
-                const uint32_t atom = std::get<2>(ready.top());
+                const uint32_t atom = std::get<3>(ready.top());
                 ready.pop();
                 result.atomTopo.push_back(atom);
                 for (uint32_t offset = computeGraph.offsets[atom];
                      offset < computeGraph.offsets[atom + 1]; ++offset) {
                     const uint32_t target = computeGraph.targets[offset];
                     if (--indegree[target] == 0) {
-                        ready.emplace(result.atomBlock[target],
-                                      input.atomMinInstruction[computeGraph.globalOfAtom[target]],
-                                      target);
+                        ready.emplace(result.atomBlock[target], sortKey(target),
+                                      minInstruction(target), target);
                     }
                 }
             }
@@ -867,11 +1218,16 @@ namespace wolvrix::lib::grhsim::am
             return fail("internal error: AM compute atom graph is cyclic");
         }
 
+        result.atomFusionAnchor = std::move(fusionAnchor);
         result.clustersAfterCoarsen = graph.count;
         result.dpSegments = computeBlockCount;
         result.coarsenMs = coarsenMs;
         result.dpMs = dpMs;
-        result.coarsenRounds = input.enableCoarsening ? 3 : 0;
+        result.coarsenRounds =
+            input.enableCoarsening ? (input.mergeWhenMinGroup >= 2 ? 4 : 3) : 0;
+        result.coarsenWhenGroups = whenGroups;
+        result.coarsenWhenMerges = whenMerges;
+        result.mergeWhenDiag = std::move(mergeWhenDiag);
         result.coarsenOut1Merges = out1Merges;
         result.coarsenIn1Merges = in1Merges;
         result.coarsenSiblingMerges = siblingMerges;

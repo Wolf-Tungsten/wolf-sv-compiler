@@ -45,6 +45,42 @@ normalized GRH
 > B0 activation target 到实际 reader 的完整性、边沿分支的联合完备性和
 > ordered-effect 完整性证明。
 
+> 实现进展（2026-08-08，NO0015）：`absorbFanoutAtoms` 落入 opt-am-compute-graph
+> （tree-atom fold 之后、导出与分区之前）——消费方 atom ≥2 且成员指令数 ≤
+> `fanoutAbsorbMaxInstructions`（**默认 0=禁用**：指标收益与指令复制量近似
+> 线性地转化为 host 成本，cap48/×1.0 实测 +164%，待孤本开销治理后再评估
+> 默认）的 compute atom 吸收进全部消费方 atom（等价于 atom 建立前按消费方
+> 复制指令锥 + fold 吸收；消费方变胖，不产生新分区单元）。屏障：非纯成员、
+> 多结果根、ordered-effect 触及、comb-loop/commit/Activation/Host 消费方；
+> pinned 或带 commit 消费方的根保留孤本 atom。预算 `fanoutAbsorbBudgetMult`
+> （×compute 指令总数）耗尽即停，单 atom 消费方上限
+> `fanoutAbsorbMaxConsumers`（默认 256）。rewire 采用延迟回放（规则记录→
+> 重建期对最终成员表统一回放）。香山生产锚点档：cross_values_compute_network
+> 396,008→192,054（2.22x→**1.078x**，过 1.10x 达标线）@ cap2/预算×2.0。
+> CLI/Makefile：`--fanout-absorb-max-instructions` /
+> `--fanout-absorb-budget-mult` / `--fanout-absorb-max-consumers` 与
+> `XS_WOLF_GRHSIM_AM_FANOUT_ABSORB_*`。
+>
+> 实现进展（2026-08-08，NO0008）：atom 单输出树化 + mergeWhen 降为 coarsen，
+> 取代 NO0006 的 mux-merge atom 路线（该路线经 supernode-align NO0014 诊断为
+> 层级错误：多输出 atom 破坏链合并并制造跨块扇出）。**P1**：
+> `foldSingleOutputTreeAtoms` 取代 `mergeMuxSelectAtoms`——compute 侧单用纯
+> 生产者折叠进唯一消费者的 atom，每个 atom 成为单输出表达式树（mux 根树即
+> when 树，对齐 gsim node=信号+assignTree）；屏障为 commit 侧、comb-loop SCC、
+> 非纯副作用与 pinned 结果；`AmAtomKind::MuxMerge` 退役，新增 `Tree`；mux 根
+> compute atom（含 Singleton）的 signature 记 select 变量 id，其余记
+> `kInvalidAtomSignature`。`muxAtomMax` 参数链整体移除。**P2**：mergeWhen 作为
+> coarsen 首个 sweep 落入 partition-am-compute-graph（gsim mergeWhenNodes 移
+> 植：按 select 生产者锚点归组、拓扑波前就绪门控、组尺寸 >
+> `mergeWhenMinGroup`（默认 5，<2 关闭）才合并；只动 DSU 归属，不改 atom）；
+> 组内成员共享融合锚点，materialize 的块内 Kahn 以锚点为序键使同组 mux 根
+> atom 相邻。**P3**：emitter 改块级 mux-run 融合（`planMuxFusionRuns`）：相邻
+> 同 select 的 mux 根 atom 成 run，锥成员按序前置、根 mux 合并为单 if/else；
+> run 在 select 变化、非合格 atom 或锥引用前序 run 根结果（防 use-before-def）
+> 处断开；select 从根指令推导，不依赖 signature。CLI/Makefile 旋钮：
+> `grhsim-am-lower-json --merge-when-min-group` /
+> `XS_WOLF_GRHSIM_AM_MERGE_WHEN_MIN_GROUP` / wolvrix_xs_grhsim_am.py 同名透传。
+
 > 实现进展（2026-08-07，NO0007 P3）：分区经济模型换 atom 计权——compute 分区
 > `member[rid]=1`（atom 即尺寸单位，mergeLimit/DP maxNodes/refinement 块尺寸随之
 > 全部按 atom 计），commit 桶合并主限改 `maxCommitAtomsPerBlock`（atom 计）并保留
@@ -235,8 +271,25 @@ make run_xs_wolf_grhsim_am_emu
 AM 路径由 `scripts/wolvrix_xs_grhsim_am.py` 编排。前处理子进程只生成 normalized
 post-stats JSON 并退出，释放 GRH 内存后再启动 `grhsim-am-lower-json`。两条路径使用独立的
 normalize、emit、model build 和运行日志名称；difftest 侧继续复用相同的 `GRHSIM=1`
-模型 ABI。当前 AM emitter 不支持 waveform/runtime-profile，AM target 会显式拒绝对应选项，
+模型 ABI。当前 AM emitter 不支持 waveform，AM target 会显式拒绝该选项，
 而不是回退到 legacy emitter。
+
+AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/脚本/Makefile 已接线）：
+
+- `runtimeProfile`（`--runtime-profile` / `XS_WOLF_GRHSIM_AM_RUNTIME_PROFILE=1`）：
+  编译进逐块 exec 计数、compute/commit 相计时与激活/变更计数器；运行期
+  `EMU_RUNTIME_PROFILE=1` 启用，`dump_runtime_profile()` 在仿真结束时输出汇总与
+  top-32 块；设置 `EMU_AM_BLOCK_EXECS=<path>` 时额外导出全量逐块 exec 文件
+  （"block kind execs" 行，block 0 为 entry 块，其 execs 即 eval() 调用次数）。
+- `fullEvaluation`（`--full-evaluation` / `XS_WOLF_GRHSIM_AM_FULL_EVALUATION=1`）：
+  扫描/commit 的 byte chunk 以 ownedMask 代替活动位快照，所有块无条件执行；
+  块体的激活簿记保留，用于测量活动过滤本身的价值（NO0017 oracle）。
+- `changedTrace`（`--changed-trace` / `XS_WOLF_GRHSIM_AM_CHANGED_TRACE=1`）：
+  运行期设置 `EMU_AM_CHANGED_TRACE=<path>` 后，按 (eval, round) 流式写出
+  二进制 changed 变量记录（3×uint64 头 + count×uint32 id），窗口由
+  `EMU_AM_TRACE_BEGIN_EVAL`/`EMU_AM_TRACE_END_EVAL` 限定。注意其数据源是
+  跨块 changed-results 的 mark 列表，不含已被 detector-group folding 合并的
+  检测器，不能作为全量变更源。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成

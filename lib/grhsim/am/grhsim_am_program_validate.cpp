@@ -1651,29 +1651,9 @@ namespace wolvrix::lib::grhsim::am
                     case AmAtomKind::CommitEvent:
                         shapeValid = true;
                         break;
-                    case AmAtomKind::MuxMerge:
-                    {
-                        uint32_t selectMuxes = 0;
-                        for (std::size_t member = 0; member < count; ++member)
-                        {
-                            const InstructionId instruction =
-                                program.atomInstruction(atom, member);
-                            if (!instruction.valid() ||
-                                instruction.value >= view.instructionCount())
-                            {
-                                continue;
-                            }
-                            const auto operands = view.operands(instruction);
-                            if (view.opcode(instruction) == Opcode::Mux &&
-                                operands.size() == 3 && operands[0].valid() &&
-                                operands[0].value == program.atomSignature(atom))
-                            {
-                                ++selectMuxes;
-                            }
-                        }
-                        shapeValid = count >= 2 && selectMuxes >= 2;
+                    case AmAtomKind::Tree:
+                        shapeValid = count > 1;
                         break;
-                    }
                     }
                     if (!shapeValid)
                     {

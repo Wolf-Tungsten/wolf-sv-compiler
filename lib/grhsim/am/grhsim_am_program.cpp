@@ -1681,11 +1681,12 @@ namespace wolvrix::lib::grhsim::am
         requireRoom(layoutInstructionCount_, 1, "block instruction arena");
 
         // Implicit Singleton atom: instruction appended outside any explicit
-        // beginAtom/endAtom pair.
+        // beginAtom/endAtom pair. The no-select signature keeps the atom out
+        // of mux-run fusion planning.
         const bool implicitAtom = !atomOpen_;
         if (implicitAtom)
         {
-            beginAtom(AmAtomKind::Singleton, 0);
+            beginAtom(AmAtomKind::Singleton, kInvalidAtomSignature);
         }
         if (blockLayoutIdentity_ && instruction.value != layoutInstructionCount_)
         {

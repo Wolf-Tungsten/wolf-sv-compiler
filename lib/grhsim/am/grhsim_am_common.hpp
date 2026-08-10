@@ -592,6 +592,7 @@ namespace wolvrix::lib::grhsim::am::detail
             input.atomIsCommit.size() != atomCount ||
             input.atomMinInstruction.size() != atomCount ||
             input.commitEventRank.size() != atomCount ||
+            input.atomSignatures.size() != atomCount ||
             input.definitions.size() != input.variableCount ||
             input.useOffsets.size() != static_cast<std::size_t>(input.variableCount) + 1) {
             error = "internal error: malformed coarsen-dp block formation input";

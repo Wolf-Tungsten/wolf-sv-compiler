@@ -55,22 +55,24 @@ namespace wolvrix::lib::grhsim::am
         std::vector<uint8_t> atomIsCommit;
         std::vector<uint32_t> atomMinInstruction;
         std::vector<uint32_t> commitEventRank;
-        // Atom 分类学（NO0007 P1）：Singleton/CombLoopScc/CommitEvent 由
-        // split 阶段标注（CommitEvent 的 signature 为 commitEventRank），
-        // MuxMerge 由 mux-merge atom pass 在重建时标注（signature 为组内
-        // 共享的 select 变量 id）。
+        // Atom 分类学（NO0007/NO0008）：Singleton/Tree/CombLoopScc/
+        // CommitEvent；CommitEvent 的 signature 为 commitEventRank，mux 根
+        // compute atom（Singleton/Tree）的 signature 为 select 变量 id，
+        // 其余为 kInvalidAtomSignature。Tree 由 tree-atom fold pass 在重建
+        // 时标注。
         std::vector<uint8_t> atomKinds;
         std::vector<uint32_t> atomSignatures;
         std::size_t oversizedAtomCount = 0;
         std::size_t maxAtomInstructions = 0;
         std::size_t maxAtomStateWrites = 0;
         // Scheduling limits folded into the assembled partition input.
-        std::size_t maxAtomsPerBlock = 128;
+        std::size_t maxAtomsPerBlock = 48;
         std::size_t maxCommitAtomsPerBlock = 4096;
         bool enableCoarsening = true;
         std::size_t coarsenAtomBudget = 256;
         double segmentPenalty = 1.0;
         std::size_t refinementRounds = 10;
+        std::size_t mergeWhenMinGroup = 5;
         AmGraphSplit split;
 
         // Assembles the span POD consumed by the partition passes; the spans

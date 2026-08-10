@@ -33,9 +33,11 @@ namespace wolvrix::lib::grhsim::am
     struct ActivityScheduleOptions
     {
         // Compute 块容量上限，按 atom 计（NO0007 P3：atom 是分区大小的
-        // 单位；单超 cap 的 atom 自成一块）。对齐 legacy
-        // maxOpInComputeSupernode 的数值默认值。
-        std::size_t maxAtomsPerBlock = 128;
+        // 单位；单超 cap 的 atom 自成一块）。NO0008 树化后 atom=单输出
+        // 表达式树（均值 ~2.7 指令），默认 48 是香山实测的性能中性点
+        // （host 306.6s ≈ NO0007 基线 309.7s；cap128 形态最优但 +5.2%
+        // host，见 am-graph NO0008 §11）。
+        std::size_t maxAtomsPerBlock = 48;
         // Commit Blocks may carry a longer ordered state-write chain than a
         // compute block, but never split an indivisible effect atom.
         // 按 commit atom 计数；另有指令数护栏 kMaxGuardEventMergeOps
@@ -58,14 +60,27 @@ namespace wolvrix::lib::grhsim::am
         // (0 = off). Deterministic, monotone cost decrease; see
         // grhsim_am_compute_graph_partition.cpp.
         std::size_t dpRefinementRounds = 10;
-        // mux-merge atom cap (opt-am-compute-graph): same-select compute mux
-        // groups plus their exclusively-used producer cones merge into
-        // indivisible scheduling atoms when the total instruction count does
-        // not exceed this threshold. Larger groups are left as-is (emitter
-        // 端无兜底，atom 是融合的唯一事实源). 0 disables the pass.
-        // Activation-granularity guard, not a partition feasibility limit
-        // (see am-graph NO0006 §10).
-        std::size_t muxAtomMax = 512;
+        // mergeWhen coarsen sweep (partition-am-compute-graph, gsim
+        // mergeWhenNodes analogue): same-select mux-rooted compute atoms
+        // merge into one coarsen cluster when the ready-at-one-wavefront
+        // group out-sizes this threshold (gsim MergeWhenSize). Values < 2
+        // disable the sweep.
+        std::size_t mergeWhenMinGroup = 5;
+        // Fanout absorption (NO0015): absorb compute atoms with >= 2
+        // consumer atoms and at most fanoutAbsorbMaxInstructions member
+        // instructions into every consumer atom (pre-partition replication,
+        // gsim replication analogue pushed to the read-port boundary).
+        // Lab evidence on the corrected anchor graph: cross 394,306 ->
+        // 180,213 (1.011x gsim) at cost cap 2 / budget x1.0; production
+        // anchor reaches 1.078x at budget x2.0. DEFAULT OFF: the metric win
+        // costs host time roughly linear in the duplicated instructions
+        // (cap48 x1.0: +164% host) until the orphan overhead is fixed.
+        std::size_t fanoutAbsorbMaxInstructions = 0;
+        // Global duplication budget: fanoutAbsorbBudgetMult x total compute
+        // instructions. Absorption stops when the budget is exhausted.
+        double fanoutAbsorbBudgetMult = 1.0;
+        // Per-atom consumer-count cap (hubs above it stay shared).
+        std::size_t fanoutAbsorbMaxConsumers = 256;
     };
 
     struct AmOptimizeOptions
@@ -127,9 +142,9 @@ namespace wolvrix::lib::grhsim::am
     {
         bool success = true;
         std::vector<std::string> artifacts;
-        // Same-select mux fusion (NO0006/NO0007 P2, atom-driven): number of
-        // mux assignments covered by fused if/else segments (MuxMerge atoms)
-        // in the emitted sources.
+        // Same-select mux fusion (NO0008, block-level mux-run fusion over
+        // mux-rooted atoms): number of mux assignments covered by fused
+        // if/else segments in the emitted sources.
         uint64_t muxAtomFused = 0;
     };
 

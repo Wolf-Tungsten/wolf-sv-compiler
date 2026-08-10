@@ -60,8 +60,8 @@ namespace wolvrix::lib::grhsim::am
 
     // Research export of the pre-scheduling instruction graph (def-use +
     // ordered-effect edges plus the atom packing). Atom fields come from
-    // the split context, so the export reflects the mux-merge atom pass
-    // when it ran (the orchestrator invokes it after that pass).
+    // the split context, so the export reflects the tree-atom fold pass
+    // (the orchestrator invokes it after that pass).
     bool exportInstructionGraphJsonl(ProgramView program,
                                      const AmGraphSplitContext &context,
                                      const std::filesystem::path &path,
@@ -453,6 +453,7 @@ namespace wolvrix::lib::grhsim::am
             .atomIsCommit = atomIsCommit,
             .atomMinInstruction = atomMinInstruction,
             .commitEventRank = commitEventRank,
+            .atomSignatures = atomSignatures,
             .variableCount = variableCount,
             .definitions = defUse.definitions,
             .useOffsets = defUse.useOffsets,
@@ -464,6 +465,7 @@ namespace wolvrix::lib::grhsim::am
             .coarsenAtomBudget = coarsenAtomBudget,
             .segmentPenalty = segmentPenalty,
             .refinementRounds = refinementRounds,
+            .mergeWhenMinGroup = mergeWhenMinGroup,
         };
     }
 
@@ -711,12 +713,14 @@ namespace wolvrix::lib::grhsim::am
             atomIsCommit[atom] = atomCosts[atom].blockClass == BlockClass::Commit ? 1 : 0;
         }
 
-        // Atom taxonomy (NO0007): commit atoms carry their event-signature
-        // rank, multi-instruction SCC packings are comb-loop atoms, and
-        // everything else is a singleton; the mux-merge atom pass may later
-        // re-tag compute atoms as MuxMerge with the select variable id.
+        // Atom taxonomy (NO0007/NO0008): commit atoms carry their
+        // event-signature rank, multi-instruction SCC packings are comb-loop
+        // atoms, and everything else is a singleton. A mux-rooted compute
+        // atom records its select variable id as the signature; the
+        // tree-atom fold pass keeps the same convention when it rebuilds the
+        // tables. Other compute atoms use kInvalidAtomSignature.
         std::vector<uint8_t> atomKinds(atomCount, 0);
-        std::vector<uint32_t> atomSignatures(atomCount, 0);
+        std::vector<uint32_t> atomSignatures(atomCount, kInvalidAtomSignature);
         for (uint32_t atom = 0; atom < atomCount; ++atom) {
             if (atomIsCommit[atom] != 0) {
                 atomKinds[atom] = static_cast<uint8_t>(AmAtomKind::CommitEvent);
@@ -725,6 +729,12 @@ namespace wolvrix::lib::grhsim::am
                 atomKinds[atom] = static_cast<uint8_t>(AmAtomKind::CombLoopScc);
             } else {
                 atomKinds[atom] = static_cast<uint8_t>(AmAtomKind::Singleton);
+                const InstructionId root{atomMembers[atomMemberOffsets[atom]]};
+                const auto operands = program.operands(root);
+                if (program.opcode(root) == Opcode::Mux && operands.size() == 3 &&
+                    operands[0].valid()) {
+                    atomSignatures[atom] = operands[0].value;
+                }
             }
         }
 
@@ -757,6 +767,7 @@ namespace wolvrix::lib::grhsim::am
             options.dpCoarsenAtomBudget != 0 ? options.dpCoarsenAtomBudget : 256;
         context.segmentPenalty = options.dpSegmentPenalty;
         context.refinementRounds = options.dpRefinementRounds;
+        context.mergeWhenMinGroup = options.mergeWhenMinGroup;
 
         // ---- stage: split-am-graph --------------------------------------
         // The atom DAG is decomposed into the GRHSIM AM Compute Graph and
