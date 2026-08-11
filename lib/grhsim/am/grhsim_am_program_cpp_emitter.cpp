@@ -210,6 +210,12 @@ namespace wolvrix::lib::grhsim::am
             // EMU_AM_CHANGED_TRACE (windowed by EMU_AM_TRACE_BEGIN_EVAL /
             // EMU_AM_TRACE_END_EVAL) for offline ideal-dynamic-work replay.
             bool changedTrace = false;
+            // Compile-time branchy-mux switch (attribute "branchyMux", default
+            // off). When true scalar Mux instructions emit if/else arm
+            // assignments instead of a ternary expression, chopping block
+            // bodies into many small basic blocks so the C++ backend never
+            // faces one giant straight-line region (emit-cost NO0001 B2).
+            bool branchyMux = false;
             std::unordered_map<uint32_t, uint32_t> onceSlotByInstruction;
             uint32_t onceSlotCount = 0;
             std::unordered_map<uint32_t, uint32_t> pendingEventSlotByInstruction;
@@ -1508,6 +1514,20 @@ namespace wolvrix::lib::grhsim::am
                            wordDataExpr(state, operands[1]) + ", " +
                            std::to_string(indexType.bitWidth) + ");\n";
                 }
+                case Opcode::Insert:
+                {
+                    const Type &resultType = variableType(state, results.front());
+                    const Type &rowType = variableType(state, operands[0]);
+                    const Type &dataType = variableType(state, operands[1]);
+                    const auto attributes = state.program.sliceStaticAttributes(instruction);
+                    return "insert_replace_words(" + wordDataExpr(state, results.front()) +
+                           ", " + std::to_string(resultType.bitWidth) + ", " +
+                           wordDataExpr(state, operands[0]) + ", " +
+                           std::to_string(rowType.bitWidth) + ", UINT64_C(" +
+                           std::to_string(attributes->lsb) + "), " +
+                           wordDataExpr(state, operands[1]) + ", " +
+                           std::to_string(dataType.bitWidth) + ");\n";
+                }
                 case Opcode::Div:
                 case Opcode::Mod:
                     error = "wide div/mod is not yet supported by the AM C++ emitter";
@@ -2066,6 +2086,22 @@ namespace wolvrix::lib::grhsim::am
                 case Opcode::Mux:
                 {
                     const Type &resultType = variableType(state, results.front());
+                    if (state.branchyMux)
+                    {
+                        // B2 branchy form: one if/else per mux so block bodies
+                        // split into small basic blocks (ternary chains kept
+                        // giant single-block bodies that clang could not
+                        // optimize in acceptable time).
+                        return "if (" + boolExpr(state, operands[0]) + ") { " +
+                               valueExpr(state, results.front()) + " = (" +
+                               resizedExpr(state, operands[1], resultType.bitWidth,
+                                           resultType.signedness) +
+                               ") & " + maskExpr(resultType.bitWidth) + "; } else { " +
+                               valueExpr(state, results.front()) + " = (" +
+                               resizedExpr(state, operands[2], resultType.bitWidth,
+                                           resultType.signedness) +
+                               ") & " + maskExpr(resultType.bitWidth) + "; }\n";
+                    }
                     return resultAssign(boolExpr(state, operands[0]) + " ? " +
                                         resizedExpr(state, operands[1], resultType.bitWidth,
                                                     resultType.signedness) +
@@ -2114,6 +2150,17 @@ namespace wolvrix::lib::grhsim::am
                     return resultAssign("slice_value(" + valueExpr(state, operands.front()) + ", " +
                                         std::to_string(attributes->lsb) + ", " +
                                         std::to_string(variableType(state, results.front()).bitWidth) + ")");
+                }
+                case Opcode::Insert:
+                {
+                    const auto attributes = state.program.sliceStaticAttributes(instruction);
+                    const uint32_t dataWidth = variableType(state, operands[1]).bitWidth;
+                    const std::string lsb = std::to_string(attributes->lsb);
+                    const std::string window =
+                        "(" + maskExpr(dataWidth) + " << " + lsb + ")";
+                    return resultAssign("((" + valueExpr(state, operands[0]) + " & ~" +
+                                        window + ") | ((" + valueExpr(state, operands[1]) +
+                                        " & " + maskExpr(dataWidth) + ") << " + lsb + "))");
                 }
                 case Opcode::SliceDynamic:
                     return resultAssign("slice_value(" + valueExpr(state, operands[0]) + ", " +
@@ -4298,6 +4345,9 @@ namespace wolvrix::lib::grhsim::am
         const auto changedTraceAttribute = options.attributes.find("changedTrace");
         state.changedTrace = changedTraceAttribute != options.attributes.end() &&
                              changedTraceAttribute->second == "true";
+        const auto branchyMuxAttribute = options.attributes.find("branchyMux");
+        state.branchyMux = branchyMuxAttribute != options.attributes.end() &&
+                           branchyMuxAttribute->second == "true";
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
         for (uint32_t index = 0; index < program.variableCount(); ++index)
@@ -4970,6 +5020,7 @@ namespace wolvrix::lib::grhsim::am
                << "    static std::size_t index_words(const std::uint64_t *source, std::uint32_t width, std::size_t limit);\n"
                << "    static std::uint64_t extract_word(const std::uint64_t *source, std::uint32_t width, std::uint64_t start);\n"
                << "    static void insert_words(std::uint64_t *target, std::uint32_t targetWidth, std::uint64_t targetLsb, const std::uint64_t *source, std::uint32_t sourceWidth);\n"
+               << "    static void insert_replace_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *row, std::uint32_t rowWidth, std::uint64_t targetLsb, const std::uint64_t *source, std::uint32_t sourceWidth);\n"
                << "    static void slice_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, std::uint64_t start);\n"
                << "    static void slice_dynamic_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, const std::uint64_t *index, std::uint32_t indexWidth);\n"
                << "    static void slice_array_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, const std::uint64_t *index, std::uint32_t indexWidth);\n"
@@ -5827,6 +5878,30 @@ namespace
                << "        if (shift != 0 && targetIndex + 1U < targetWords) target[targetIndex + 1U] |= value >> (64U - shift);\n"
                << "    }\n"
                << "    target[targetWords - 1U] &= bit_mask(targetWidth - static_cast<std::uint32_t>((targetWords - 1U) * 64U));\n"
+               << "}\n"
+               << "void " << className
+               << "::insert_replace_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *row, std::uint32_t rowWidth, std::uint64_t targetLsb, const std::uint64_t *source, std::uint32_t sourceWidth) {\n"
+               << "    assign_words(target, targetWidth, row, rowWidth, false);\n"
+               << "    if (targetLsb >= targetWidth) return;\n"
+               << "    const std::size_t targetWords = word_count(targetWidth);\n"
+               << "    const std::size_t sourceWords = word_count(sourceWidth);\n"
+               << "    const std::size_t firstTargetWord = static_cast<std::size_t>(targetLsb / 64U);\n"
+               << "    const std::uint32_t shift = static_cast<std::uint32_t>(targetLsb % 64U);\n"
+               << "    for (std::size_t index = 0; index < sourceWords; ++index) {\n"
+               << "        const std::uint32_t bits = index + 1U == sourceWords ? sourceWidth - static_cast<std::uint32_t>(index * 64U) : 64U;\n"
+               << "        const std::uint64_t value = source[index] & bit_mask(bits);\n"
+               << "        const std::size_t targetIndex = firstTargetWord + index;\n"
+               << "        const std::uint32_t covered = bits < 64U - shift ? bits : 64U - shift;\n"
+               << "        if (targetIndex < targetWords) {\n"
+               << "            const std::uint64_t window = covered >= 64U ? UINT64_MAX : (bit_mask(covered) << shift);\n"
+               << "            target[targetIndex] = (target[targetIndex] & ~window) | ((value << shift) & window);\n"
+               << "        }\n"
+               << "        if (shift != 0 && bits > covered && targetIndex + 1U < targetWords) {\n"
+               << "            const std::uint32_t spill = bits - covered;\n"
+               << "            const std::uint64_t window = bit_mask(spill);\n"
+               << "            target[targetIndex + 1U] = (target[targetIndex + 1U] & ~window) | ((value >> (64U - shift)) & window);\n"
+               << "        }\n"
+               << "    }\n"
                << "}\n"
                << "void " << className
                << "::slice_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, std::uint64_t start) {\n"

@@ -26,7 +26,8 @@ namespace wolvrix::lib::grhsim::am
     // 变量 id，其余 compute atom 记 kInvalidAtomSignature。返回 false 表示
     // 内部错误（diagnostics 已填）。
     bool foldSingleOutputTreeAtoms(AmGraph &graph, AmGraphSplitContext &context,
-                                   wolvrix::lib::diag::Diagnostics &diagnostics);
+                                   wolvrix::lib::diag::Diagnostics &diagnostics,
+                                   std::size_t foldMaxInstructions = 0);
 
     // opt-am-compute-graph 的 fanout 吸收 pass（NO0015，tree-atom fold 之后
     // 运行）：把消费方 atom 数 ≥2 的小指令数 compute atom 吸收进全部消费方

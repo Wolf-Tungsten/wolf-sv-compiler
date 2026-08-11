@@ -112,7 +112,7 @@ namespace wolvrix::lib::grhsim::am
 
     std::string_view toString(Opcode opcode) noexcept
     {
-        static constexpr std::array<std::string_view, 68> names = {
+        static constexpr std::array<std::string_view, 69> names = {
             "assign",
             "add",
             "sub",
@@ -181,6 +181,7 @@ namespace wolvrix::lib::grhsim::am
             "mem.write.c",
             "mem.write.m",
             "mem.write.cm",
+            "insert",
         };
         const std::size_t index = static_cast<std::size_t>(opcode);
         return index < names.size() ? names[index] : std::string_view("unknown");
@@ -956,7 +957,13 @@ namespace wolvrix::lib::grhsim::am
                                          InstructionId instruction,
                                          uint32_t lsb)
         {
-            requireInstructionOpcode(storage, instruction, Opcode::SliceStatic);
+            // Insert carries its window lsb in the same attribute slot.
+            if (storage.opcodes[instruction.value] != Opcode::SliceStatic &&
+                storage.opcodes[instruction.value] != Opcode::Insert)
+            {
+                throw std::invalid_argument("AM slice_static attributes require a "
+                                            "SliceStatic/Insert instruction");
+            }
             appendAttributeRecord(storage.sliceStaticAttributes,
                                   detail::SliceStaticAttributeRecord{
                                       .instruction = instruction,
@@ -1048,6 +1055,7 @@ namespace wolvrix::lib::grhsim::am
                 switch (storage.opcodes[index])
                 {
                 case Opcode::SliceStatic:
+                case Opcode::Insert:
                     present = consumeRecord(storage.sliceStaticAttributes,
                                             sliceStaticIndex,
                                             instruction);

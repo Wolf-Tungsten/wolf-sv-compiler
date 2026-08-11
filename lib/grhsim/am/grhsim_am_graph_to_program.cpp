@@ -956,6 +956,40 @@ namespace wolvrix::lib::grhsim::am
             }
             if (options.collectStats) {
                 const ProgramStorageStats stats = model.program.view().storageStats();
+                // NO0002 three-level alignment: per-atom instruction-count
+                // distribution, same shape as gsim's Final_Stats
+                // dumpVectorStats (nodes_enodes).
+                std::vector<uint32_t> atomInstrSorted(atomInstructions.begin(),
+                                                      atomInstructions.end());
+                std::sort(atomInstrSorted.begin(), atomInstrSorted.end());
+                const auto percentile = [&](std::size_t num, std::size_t den) {
+                    if (atomInstrSorted.empty()) {
+                        return uint32_t{0};
+                    }
+                    return atomInstrSorted[(atomInstrSorted.size() - 1) * num / den];
+                };
+                uint64_t atomInstrSum = 0;
+                for (const uint32_t count : atomInstrSorted) {
+                    atomInstrSum += count;
+                }
+                const double atomInstrMean =
+                    atomInstrSorted.empty()
+                        ? 0.0
+                        : static_cast<double>(atomInstrSum) /
+                              static_cast<double>(atomInstrSorted.size());
+                // NO0002 L1: scheduled-instruction opcode mix (bookkeeping
+                // materialization vs compute payload), aligned against the
+                // gsim enode op-type census.
+                std::map<std::string, uint64_t> opcodeCounts;
+                const ProgramView scheduledProgram = model.program.view();
+                for (uint32_t instr = 0; instr < stats.instructions; ++instr) {
+                    opcodeCounts[std::string(toString(
+                        scheduledProgram.opcode(InstructionId{instr})))] += 1;
+                }
+                std::string opcodeMix;
+                for (const auto &[name, count] : opcodeCounts) {
+                    opcodeMix += " " + name + "=" + std::to_string(count);
+                }
                 diagnostics.info(
                     "production schedule stats: linear_instructions=" +
                         std::to_string(instructionCount) + " def_use_edges=" +
@@ -972,7 +1006,13 @@ namespace wolvrix::lib::grhsim::am
                         " activation_edges=" + std::to_string(materialization.targets) +
                         " scheduled_instructions=" + std::to_string(stats.instructions) +
                         " storage_bytes=" + std::to_string(stats.estimatedBytes) +
-                        " reserved_bytes=" + std::to_string(stats.reservedBytes),
+                        " reserved_bytes=" + std::to_string(stats.reservedBytes) +
+                        " atom_instr[mean=" + std::to_string(atomInstrMean) +
+                        " p50=" + std::to_string(percentile(50, 100)) +
+                        " p90=" + std::to_string(percentile(90, 100)) +
+                        " p99=" + std::to_string(percentile(99, 100)) +
+                        " max=" + std::to_string(percentile(1, 1)) + "]" +
+                        " opcode_mix[" + opcodeMix + " ]",
                     std::string(kDiagnosticContext));
             }
             return std::optional<ExecutableModel>(std::move(model));

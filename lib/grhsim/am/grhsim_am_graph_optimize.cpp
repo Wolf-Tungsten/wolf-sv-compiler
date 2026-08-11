@@ -564,6 +564,21 @@ namespace wolvrix::lib::grhsim::am {
                 }
                 return true;
             }
+            case Opcode::Insert: {
+                if (operands.size() != 2) {
+                    return false;
+                }
+                resultWords = resizedWords(operands[0].words, operands[0].type.bitWidth,
+                                           resultType.bitWidth, resultType.signedness);
+                const uint64_t dataWidth = operands[1].type.bitWidth;
+                if (static_cast<uint64_t>(staticLsb) + dataWidth > resultType.bitWidth) {
+                    return false;
+                }
+                for (uint64_t bit = 0; bit < dataWidth; ++bit) {
+                    setBit(resultWords, staticLsb + bit, getBit(operands[1].words, bit));
+                }
+                return true;
+            }
             default:
                 return false;
             }
@@ -662,7 +677,7 @@ namespace wolvrix::lib::grhsim::am {
                 if (options_.constFold || options_.cse || options_.assignAlias ||
                     options_.constMemFold || options_.logicUnify ||
                     options_.muxNotAbsorb || options_.notUnify ||
-                    options_.sliceFuse) {
+                    options_.sliceFuse || options_.insertFuse) {
                     bool changed = true;
                     while (changed) {
                         changed = false;
@@ -680,6 +695,9 @@ namespace wolvrix::lib::grhsim::am {
                         }
                         if (options_.sliceFuse) {
                             changed |= sliceFusePass();
+                        }
+                        if (options_.insertFuse) {
+                            changed |= insertFusePass();
                         }
                         if (options_.assignAlias) {
                             changed |= assignAliasPass();
@@ -1117,7 +1135,7 @@ namespace wolvrix::lib::grhsim::am {
                     CseKey key;
                     key.opcode = opcode;
                     key.resultType = view_.type(record.type);
-                    if (opcode == Opcode::SliceStatic) {
+                    if (opcode == Opcode::SliceStatic || opcode == Opcode::Insert) {
                         const std::optional<uint32_t> lsb =
                             effectiveStaticLsb(index);
                         if (!lsb) {
@@ -1503,6 +1521,143 @@ namespace wolvrix::lib::grhsim::am {
                 return changed;
             }
 
+            // Fuse packed-vector element-write insert patterns into a single
+            // Insert instruction (NO0004):
+            //   concat(hi=slice(row, off+w .. rowW-1), data(w), lo=slice(row, 0 .. off-1))
+            //   concat(data(w), lo=slice(row, 0 .. off-1))          with w+off == rowW
+            //   concat(hi=slice(row, w .. rowW-1), data(w))         with off == 0
+            // become Insert(row, data, lsb=off). The exporter's element-write
+            // insert lowering emits these networks; fusing removes two
+            // instructions per write and lets CSE deduplicate repeated writes
+            // to the same window. Slices left without consumers die in the
+            // liveness sweep.
+            bool insertFusePass() {
+                bool changed = false;
+                std::vector<VariableId> operands;
+                std::vector<VariableId> sliceOperands;
+                // If variable is produced by a live SliceStatic, report its
+                // row and lsb; the window width is the variable's own width.
+                const auto staticSliceOf = [&](VariableId variable, VariableId &row,
+                                               uint32_t &lsb) -> bool {
+                    if (variable.value >= producerOf_.size()) {
+                        return false;
+                    }
+                    const uint32_t producer = producerOf_[variable.value];
+                    if (producer == kInvalidIndex || transformDead_[producer] != 0 ||
+                        effectiveOpcode(producer) != Opcode::SliceStatic) {
+                        return false;
+                    }
+                    const auto producerResults =
+                        view_.results(InstructionId{producer});
+                    if (producerResults.size() != 1 ||
+                        producerResults.front() != variable) {
+                        return false;
+                    }
+                    const std::optional<uint32_t> sliceLsb =
+                        effectiveStaticLsb(producer);
+                    if (!sliceLsb) {
+                        return false;
+                    }
+                    effectiveOperands(producer, sliceOperands);
+                    if (sliceOperands.size() != 1 || !sliceOperands[0].valid()) {
+                        return false;
+                    }
+                    row = sliceOperands[0];
+                    lsb = *sliceLsb;
+                    return true;
+                };
+                for (uint32_t index = 0; index < oldInstructionCount_; ++index) {
+                    if (transformDead_[index] != 0 ||
+                        effectiveOpcode(index) != Opcode::Concat) {
+                        continue;
+                    }
+                    const auto results = view_.results(InstructionId{index});
+                    if (results.size() != 1) {
+                        continue;
+                    }
+                    effectiveOperands(index, operands);
+                    if (operands.size() < 2 || operands.size() > 3 ||
+                        std::any_of(operands.begin(), operands.end(),
+                                    [](VariableId v) { return !v.valid(); })) {
+                        continue;
+                    }
+                    const uint32_t resultWidth = bitWidthOf(results.front());
+                    if (resultWidth == 0) {
+                        continue;
+                    }
+                    // Operands are MSB-first: [hi?, data, lo?].
+                    VariableId row = VariableId::invalid();
+                    VariableId data = VariableId::invalid();
+                    uint32_t off = 0;
+                    bool matched = false;
+                    if (operands.size() == 3) {
+                        VariableId hiRow = VariableId::invalid();
+                        VariableId loRow = VariableId::invalid();
+                        uint32_t hiLsb = 0;
+                        uint32_t loLsb = 0;
+                        data = operands[1];
+                        const uint32_t loWidth = bitWidthOf(operands[2]);
+                        const uint32_t dataWidth = bitWidthOf(data);
+                        if (staticSliceOf(operands[0], hiRow, hiLsb) &&
+                            staticSliceOf(operands[2], loRow, loLsb) &&
+                            hiRow == loRow && loLsb == 0 &&
+                            hiLsb == loWidth + dataWidth &&
+                            static_cast<uint64_t>(loWidth) + dataWidth +
+                                    bitWidthOf(operands[0]) ==
+                                resultWidth) {
+                            row = hiRow;
+                            off = loWidth;
+                            matched = true;
+                        }
+                    } else {
+                        VariableId loRow = VariableId::invalid();
+                        uint32_t loLsb = 0;
+                        // concat(data, lo): window ends at the row's top.
+                        const uint32_t dataWidth = bitWidthOf(operands[0]);
+                        const uint32_t loWidth = bitWidthOf(operands[1]);
+                        if (staticSliceOf(operands[1], loRow, loLsb) && loLsb == 0 &&
+                            static_cast<uint64_t>(dataWidth) + loWidth == resultWidth) {
+                            row = loRow;
+                            data = operands[0];
+                            off = loWidth;
+                            matched = true;
+                        } else {
+                            // concat(hi, data): window starts at bit zero.
+                            VariableId hiRow = VariableId::invalid();
+                            uint32_t hiLsb = 0;
+                            if (staticSliceOf(operands[0], hiRow, hiLsb) &&
+                                hiLsb == bitWidthOf(operands[1]) &&
+                                static_cast<uint64_t>(bitWidthOf(operands[0])) +
+                                        bitWidthOf(operands[1]) ==
+                                    resultWidth) {
+                                row = hiRow;
+                                data = operands[1];
+                                off = 0;
+                                matched = true;
+                            }
+                        }
+                    }
+                    if (!matched) {
+                        continue;
+                    }
+                    // The Insert result carries the full row: widths and
+                    // signedness must match the row operand exactly.
+                    if (bitWidthOf(row) != resultWidth ||
+                        view_.variable(row).type !=
+                            view_.variable(results.front()).type) {
+                        continue;
+                    }
+                    rewrites_[index] = InstructionRewrite{
+                        .opcode = Opcode::Insert,
+                        .operands = {row, data},
+                        .staticLsb = off,
+                    };
+                    ++insertFuseCount_;
+                    changed = true;
+                }
+                return changed;
+            }
+
 
             // Fold MemoryRead instructions with a constant address on memories
             // that are never written. Storage is zero-initialized (emitted
@@ -1861,7 +2016,7 @@ namespace wolvrix::lib::grhsim::am {
                                            std::string(kDiagnosticContext));
                         return false;
                     }
-                    if (opcode == Opcode::SliceStatic) {
+                    if (opcode == Opcode::SliceStatic || opcode == Opcode::Insert) {
                         if (const std::optional<uint32_t> lsb =
                                 effectiveStaticLsb(index)) {
                             next.setSliceStaticAttributes(rebuilt, *lsb);
@@ -1877,7 +2032,9 @@ namespace wolvrix::lib::grhsim::am {
                         next.setDpiCallAttributes(rebuilt, *attributes);
                     }
                     next.setInstructionEffect(rebuilt, expectedEffect(instruction));
+                    next.setGsimNodeId(rebuilt, graph_.gsimNodeId(instruction));
                 }
+                next.setGsimNodeProvenance(graph_.hasGsimNodeProvenance());
 
                 // Interface entries keep referring to the eliminated
                 // duplicates unless re-pointed to their alias representatives
@@ -1934,6 +2091,7 @@ namespace wolvrix::lib::grhsim::am {
                         " muxabsorb=" + std::to_string(muxAbsorbCount_) +
                         " notunify=" + std::to_string(notUnifyCount_) +
                         " slicefuse=" + std::to_string(sliceFuseCount_) +
+                        " insertfuse=" + std::to_string(insertFuseCount_) +
                         " dce=" + std::to_string(removed > accounted
                                                     ? removed - accounted
                                                     : std::size_t{0}) +
@@ -1969,6 +2127,7 @@ namespace wolvrix::lib::grhsim::am {
             std::size_t muxAbsorbCount_ = 0;
             std::size_t notUnifyCount_ = 0;
             std::size_t sliceFuseCount_ = 0;
+            std::size_t insertFuseCount_ = 0;
         };
 
     } // namespace
@@ -1978,7 +2137,7 @@ namespace wolvrix::lib::grhsim::am {
                          wolvrix::lib::diag::Diagnostics &diagnostics) {
         if (!options.dce && !options.constFold && !options.cse && !options.assignAlias &&
             !options.constMemFold && !options.logicUnify && !options.muxNotAbsorb &&
-            !options.notUnify && !options.sliceFuse) {
+            !options.notUnify && !options.sliceFuse && !options.insertFuse) {
             return true;
         }
         try {

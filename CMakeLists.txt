@@ -549,6 +549,17 @@ target_link_libraries(grhsim-am-tree-atom
 
 register_test_exe(grhsim-am-tree-atom)
 
+add_executable(grhsim-am-node-aligned
+    tests/grhsim/am/test_node_aligned.cpp
+)
+
+target_link_libraries(grhsim-am-node-aligned
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(grhsim-am-node-aligned)
+
 add_executable(grhsim-am-fanout-absorb
     tests/grhsim/am/test_fanout_absorb.cpp
 )

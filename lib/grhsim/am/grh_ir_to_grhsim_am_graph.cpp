@@ -39,6 +39,26 @@ namespace wolvrix::lib::grhsim::am
             "gsim.external_instance_group";
         constexpr std::string_view kExternalCallOrdinalAttr =
             "gsim.external_call_ordinal";
+        // NO0006: gsim node provenance stamped by the executable-GRH
+        // exporter; every node-owned op carries its owner node id.
+        constexpr std::string_view kGsimNodeIdAttr = "gsim.node_id";
+
+        // RAII guard for the lowering-time gsim node context: every
+        // instruction created while the guard is live inherits the node id
+        // (trigger-owner rule), and the previous context is restored on
+        // scope exit.
+        struct ScopedGsimNodeId
+        {
+            ScopedGsimNodeId(int64_t &slot, int64_t value)
+                : slot_(slot), previous_(slot)
+            {
+                slot_ = value;
+            }
+            ~ScopedGsimNodeId() { slot_ = previous_; }
+
+            int64_t &slot_;
+            int64_t previous_;
+        };
 
         std::string lowerAscii(std::string_view text)
         {
@@ -135,6 +155,9 @@ namespace wolvrix::lib::grhsim::am
             std::vector<VariableId> events; // empty for latch.write
             std::optional<ExplicitOrder> explicitOrder;
             std::string context;
+            // gsim node id of the source write op (NO0006); the commit
+            // instructions materialized from this record inherit it.
+            int64_t gsimNodeId = -1;
         };
 
         struct PendingOrderedGroup
@@ -209,6 +232,14 @@ namespace wolvrix::lib::grhsim::am
                                 std::to_string(flattenedUnknownLiterals_),
                             "grhsim-am-lowering");
                     }
+                    diagnostics_.info(
+                        "am.import assign sites: from_grh=" +
+                            std::to_string(assignFromGrhCount_) +
+                            " pre_commit=" + std::to_string(assignPreCommitCount_) +
+                            " coerce=" + std::to_string(assignCoerceCount_) +
+                            " result_bridge=" + std::to_string(assignResultBridgeCount_) +
+                            " dpi_bridge=" + std::to_string(assignDpiBridgeCount_),
+                        "grhsim-am-lowering");
                     return std::optional<AmGraph>(std::move(amGraph_));
                 }
                 catch (const std::exception &ex)
@@ -697,6 +728,10 @@ namespace wolvrix::lib::grhsim::am
                                          std::optional<InstructionEffect> effect = std::nullopt)
             {
                 const InstructionId id = amGraph_.addInstruction(opcode, results, operands);
+                // NO0006: single stamping choke point — every instruction
+                // created while a node-owned GRH op lowers inherits that
+                // op's gsim node id (-1 when unowned).
+                amGraph_.setGsimNodeId(id, currentGsimNodeId_);
                 if (effect)
                 {
                     amGraph_.setInstructionEffect(id, *effect);
@@ -1473,7 +1508,11 @@ namespace wolvrix::lib::grhsim::am
                 preCommitSnapshots_.emplace(source.value, snapshot);
                 const std::array<VariableId, 1> results{snapshot};
                 const std::array<VariableId, 1> operands{source};
+                // AM clock-domain helper with no gsim node counterpart:
+                // stays unowned even while a node-owned write op lowers.
+                const ScopedGsimNodeId unowned(currentGsimNodeId_, -1);
                 addInstruction(Opcode::Assign, results, operands);
+                ++assignPreCommitCount_;
                 return snapshot;
             }
 
@@ -1608,6 +1647,7 @@ namespace wolvrix::lib::grhsim::am
                 const std::array<VariableId, 1> results{converted};
                 const std::array<VariableId, 1> operands{source};
                 addInstruction(Opcode::Assign, results, operands);
+                ++assignCoerceCount_;
                 ++freshTemporaryCount_;
                 return converted;
             }
@@ -1839,6 +1879,10 @@ namespace wolvrix::lib::grhsim::am
 
             void lowerCombinational(const Operation &op, Opcode opcode)
             {
+                if (opcode == Opcode::Assign)
+                {
+                    ++assignFromGrhCount_;
+                }
                 const auto operands = op.operands();
                 const auto results = op.results();
                 std::size_t expectedOperands = 0;
@@ -2099,6 +2143,7 @@ namespace wolvrix::lib::grhsim::am
                     const std::array<VariableId, 1> finalResults{destination};
                     const std::array<VariableId, 1> finalOperands{nativeDestination};
                     addInstruction(Opcode::Assign, finalResults, finalOperands);
+                    ++assignResultBridgeCount_;
                 }
             }
 
@@ -2158,6 +2203,9 @@ namespace wolvrix::lib::grhsim::am
                     const VariableId event = addVariable(eventType, amGraph_.zeroInit());
                     const std::array<VariableId, 1> results{event};
                     const std::array<VariableId, 2> eventOperands{rawVariable, old};
+                    // AM clock-domain detector with no gsim node
+                    // counterpart: stays unowned (-1).
+                    const ScopedGsimNodeId unowned(currentGsimNodeId_, -1);
                     addInstruction(opcode, results, eventOperands);
                     eventDetectorMemo_.emplace(memoKey, event);
                     events.push_back(event);
@@ -2411,6 +2459,10 @@ namespace wolvrix::lib::grhsim::am
                     amGraph_.program().type(amGraph_.program().variable(head.target).type);
                 for (const PendingStateWrite &write : signatureGroup)
                 {
+                    // Commit instructions inherit the source write op's gsim
+                    // node id (NO0006).
+                    const ScopedGsimNodeId writeNode(currentGsimNodeId_,
+                                                     write.gsimNodeId);
                     if (isConstantZero(write.cond))
                     {
                         // A write that never fires has no effect, ever.
@@ -2524,6 +2576,8 @@ namespace wolvrix::lib::grhsim::am
                 {
                     for (const PendingStateWrite &write : signatureGroup)
                     {
+                        const ScopedGsimNodeId writeNode(currentGsimNodeId_,
+                                                         write.gsimNodeId);
                         std::vector<VariableId> operands{write.cond, write.data,
                                                          write.target};
                         operands.insert(operands.end(), write.events.begin(),
@@ -2541,6 +2595,8 @@ namespace wolvrix::lib::grhsim::am
                     Type::bitVector(targetType.bitWidth, targetType.signedness);
                 for (const PendingStateWrite &write : signatureGroup)
                 {
+                    const ScopedGsimNodeId writeNode(currentGsimNodeId_,
+                                                     write.gsimNodeId);
                     if (write.opcode == Opcode::MemoryWrite)
                     {
                         if (isConstantZero(write.cond) ||
@@ -2674,6 +2730,7 @@ namespace wolvrix::lib::grhsim::am
                                          ? explicitOrderByOperation_[op.id().index]
                                          : std::nullopt,
                     .context = opContext(op),
+                    .gsimNodeId = currentGsimNodeId_,
                 };
                 if (!write.cond.valid() || !write.mask.valid() || !write.data.valid())
                 {
@@ -2732,6 +2789,7 @@ namespace wolvrix::lib::grhsim::am
                                          ? explicitOrderByOperation_[op.id().index]
                                          : std::nullopt,
                     .context = opContext(op),
+                    .gsimNodeId = currentGsimNodeId_,
                 };
                 if (!write.cond.valid() || !write.mask.valid() || !write.data.valid())
                 {
@@ -2836,6 +2894,7 @@ namespace wolvrix::lib::grhsim::am
                                          ? explicitOrderByOperation_[op.id().index]
                                          : std::nullopt,
                     .context = opContext(op),
+                    .gsimNodeId = currentGsimNodeId_,
                 };
                 if (!write.cond.valid() || !write.mask.valid() || !write.data.valid() ||
                     !write.addr.valid())
@@ -2929,6 +2988,7 @@ namespace wolvrix::lib::grhsim::am
                                          ? explicitOrderByOperation_[op.id().index]
                                          : std::nullopt,
                     .context = opContext(op),
+                    .gsimNodeId = currentGsimNodeId_,
                 };
                 if (!write.cond.valid() || !write.data.valid())
                 {
@@ -2986,6 +3046,7 @@ namespace wolvrix::lib::grhsim::am
                                          ? explicitOrderByOperation_[op.id().index]
                                          : std::nullopt,
                     .context = opContext(op),
+                    .gsimNodeId = currentGsimNodeId_,
                 };
                 if (!write.cond.valid() || !write.data.valid())
                 {
@@ -3360,6 +3421,7 @@ namespace wolvrix::lib::grhsim::am
                     const std::array<VariableId, 1> bridgeResults{bridge.target};
                     const std::array<VariableId, 1> bridgeOperands{bridge.temporary};
                     addInstruction(Opcode::Assign, bridgeResults, bridgeOperands);
+                    ++assignDpiBridgeCount_;
                 }
             }
 
@@ -3368,6 +3430,17 @@ namespace wolvrix::lib::grhsim::am
                 for (OperationId operation : graph_.operations())
                 {
                     const Operation op = graph_.getOperation(operation);
+                    // NO0006: every instruction created while lowering this
+                    // op inherits the op's gsim node id (trigger-owner
+                    // rule); ops without provenance lower unowned (-1).
+                    const std::optional<int64_t> gsimNodeId =
+                        optionalAttr<int64_t>(op, kGsimNodeIdAttr);
+                    if (gsimNodeId)
+                    {
+                        amGraph_.setGsimNodeProvenance(true);
+                    }
+                    const ScopedGsimNodeId gsimNodeScope(currentGsimNodeId_,
+                                                         gsimNodeId.value_or(-1));
                     if (const auto opcode = combinationalOpcode(op.kind()))
                     {
                         lowerCombinational(op, *opcode);
@@ -3461,12 +3534,23 @@ namespace wolvrix::lib::grhsim::am
             std::unordered_set<uint32_t> declaredValueIndices_;
             std::unordered_set<uint32_t> declaredStateIndices_;
             std::vector<PendingStateWrite> pendingStateWrites_;
+            // gsim node id of the GRH op currently being lowered (NO0006);
+            // -1 outside op lowering or for unowned ops.
+            int64_t currentGsimNodeId_ = -1;
             uint32_t nextOrderedGroup_ = 0;
             std::unordered_map<uint32_t, uint32_t> stateOrderGroups_;
             std::map<std::pair<Opcode, uint32_t>, VariableId> eventDetectorMemo_;
             std::unordered_map<uint32_t, VariableId> preCommitSnapshots_;
             uint64_t freshTemporaryCount_ = 0;
             std::size_t flattenedUnknownLiterals_ = 0;
+            // NO0004 import QC: per-site attribution of Assign instructions so
+            // the pre-optimize opcode census can be reconciled exactly against
+            // the source GRH op census.
+            uint64_t assignFromGrhCount_ = 0;
+            uint64_t assignPreCommitCount_ = 0;
+            uint64_t assignCoerceCount_ = 0;
+            uint64_t assignResultBridgeCount_ = 0;
+            uint64_t assignDpiBridgeCount_ = 0;
         };
     } // namespace
 

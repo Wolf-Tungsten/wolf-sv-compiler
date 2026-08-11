@@ -911,6 +911,42 @@ split 后 compute 图出度≥2 节点 599,947 → 574,724（compute-partition N
 接口重指向与角色转移、状态快照保留与纯计算状态读旁路、逻辑统一、mux 取反吸收、
 slice 融合、ROM 折叠与根集合安全性。
 
+### 3.2.6 gsim node 对齐 atom 化（NO0006，2026-08-11）
+
+当输入 GRH JSON 携带 gsim node 溯源（`gsim.node_id` int attr，由 gsim 侧
+`--export-executable-grh` 在 flatten 图上对每条 node 所属 op 戳记；`kConstant`
+豁免、保持全局常量），AM 流水线默认切换到 **node 对齐模式**，把"atom 是启发式
+产物"改为"atom 由 gsim node 结构直接构造"：
+
+- **lowering**：逐指令侧表 `AmGraph::gsimNodeId`（-1 = 无归属）在
+  `addInstruction` 单点戳记； lowering 合成胶（coerce/result-bridge/dpi-bridge
+  Assign）按"触发者归属"继承当前 op 的 node id；preCommit 快照与 changed
+  检测器显式无归属（AM 时钟域附加层，gsim 无对应 node）；commit 指令经
+  `PendingStateWrite` 继承写 op 的 node id。任一 op 带溯源即置
+  `hasGsimNodeProvenance`。
+- **模式门控**：`ActivityScheduleOptions::gsimNodeAligned`
+  （Auto/On/Off，默认 Auto=有溯源即启用），env 覆盖
+  `WOLVRIX_GRHSIM_AM_NODE_ALIGNED=0|1`。
+- **optimize/fold 策略**：该模式下默认**跳过** `optimizeAmGraph`（assignAlias
+  会抹掉 anchor、CSE 会跨 node 合并——都破坏 1:1 映射；gsim flatten 图本身已经
+  gsim 优化过），escape hatch `WOLVRIX_GRHSIM_AM_NODE_ALIGNED_OPTIMIZE=1`
+  供 A/B；split 后的 tree-atom fold 与 fanout absorb 同样跳过（atom 已定型）。
+- **split 的 atom 构造**：commit 指令保持 singleton-per-instruction；compute
+  指令按 node_id 分组（一个 node 一个 atom）；无归属 compute 指令 singleton；
+  SCC 仍跑用于环安全——跨组多指令 SCC union 兜底并标 CombLoopScc（香山实测
+  0 次）；组内 anchor（唯一外定义汇）旋正末位，多汇组（EXT 多输出）合法并计
+  multi_sink。类型：commit→CommitEvent（签名=event rank）、多指令组→Tree、
+  单指令→Singleton（mux 根签名约定不变）。
+- **审计**：`WOLVRIX_GRHSIM_AM_NODE_ATOM_AUDIT_JSONL=<path>` 逐 atom JSONL
+  （node_id/kind/instructions/multi_sink）+ stderr 汇总（atom 计数、node 双射
+  校验、无归属 opcode 直方图、SCC union 计数）。
+
+香山 flatten 图实测：3,071,711 个 node 映射 compute atom 与 gsim node 一一对应
+（零重复），严格 compute 口径 L2 = 0.9995x，atom-DAG 边 recall 99.2%；逐类型
+残差与边残差全部列账（见 pdocs/grh-notepad/emit-cost NO0006 §11）。单测
+`tests/grhsim/am/test_node_aligned.cpp` 覆盖戳记、Tree atom 成形与 anchor 序、
+commit singleton、无归属检测器、Off 模式回退旧路径。
+
 ### 3.3 临时 scheduling facts
 
 以下内容只属于 scheduler workspace，不进入 ScheduledProgram 或 session 的长期公共契约：

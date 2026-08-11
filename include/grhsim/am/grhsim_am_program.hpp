@@ -275,6 +275,12 @@ namespace wolvrix::lib::grhsim::am
         MemoryWriteCond,
         MemoryWriteMask,
         MemoryWriteCondMask,
+        // Packed-vector element overwrite: result = operands[0] (row) with
+        // bits [lsb + width(operands[1]) - 1 : lsb] replaced by operands[1]
+        // (data); lsb rides the SliceStatic attribute slot. Result type must
+        // equal the row type. Fused by the AM optimizer from the
+        // slice/slice/concat element-write insert pattern (NO0004).
+        Insert,
     };
 
     static_assert(sizeof(Opcode) == sizeof(uint8_t));

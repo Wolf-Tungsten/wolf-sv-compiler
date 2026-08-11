@@ -411,12 +411,19 @@ namespace wolvrix::lib::grhsim::am
         // unit -- one per atom -- so the coarsen budget, the DP per-block
         // node cap, and the refinement block sizes all count atoms.
         std::vector<uint32_t> member(n, 0);
+        // Member instruction counts alongside the atom counts: the coarsen
+        // merge limit can apply in emitted-instruction terms
+        // (coarsenInstructionBudget) because tree-atom fatness makes the
+        // atom count a poor proxy for what the host compiler sees.
+        std::vector<uint32_t> memberInstructions(n, 0);
         std::vector<uint32_t> edgeSrc;
         std::vector<uint32_t> edgeDst;
         edgeSrc.reserve(computeGraph.offsets.back());
         edgeDst.reserve(computeGraph.offsets.back());
         for (uint32_t rid = 0; rid < n; ++rid) {
             member[rid] = 1;
+            memberInstructions[rid] =
+                input.atomInstructions[computeGraph.globalOfAtom[atomOfRid[rid]]];
         }
         std::vector<std::vector<uint32_t>> nexts(n);
         std::vector<std::vector<uint32_t>> prevs(n);
@@ -478,6 +485,12 @@ namespace wolvrix::lib::grhsim::am
         // Merge sweeps (gsim mergeNodes.cpp): one pass per rule, no fixpoint;
         // the live rewiring below collapses whole chains within the pass.
         const std::size_t mergeLimit = input.coarsenAtomBudget;
+        // Emitted-instruction merge limit (gsim MAX_NODES_PER_SUPER corrected
+        // for tree-atom fatness). Applies to every merge sweep, mergeWhen
+        // included: gsim leaves when-groups uncapped because its nodes are
+        // thin, but on this graph a state-select group alone can reach
+        // 178k instructions — past what the host C++ backend can optimize.
+        const std::size_t mergeInstrLimit = input.coarsenInstructionBudget;
         std::vector<uint8_t> alive(n, 1);
         std::vector<uint32_t> parent(n, 0);
         std::iota(parent.begin(), parent.end(), uint32_t{0});
@@ -703,12 +716,21 @@ namespace wolvrix::lib::grhsim::am
                                 input.atomMinInstruction[computeGraph.globalOfAtom[atomOfRid[rid]]]);
                         }
                         for (const uint32_t rid : group) {
+                            if (rid != host && mergeInstrLimit != 0 &&
+                                memberInstructions[host] > mergeInstrLimit) {
+                                // Over the instruction budget: rid keeps its
+                                // own cluster and stays eligible for the
+                                // out1/in1 sweeps below.
+                                continue;
+                            }
                             fusionAnchor[atomOfRid[rid]] = anchorKey;
                             if (rid == host) {
                                 continue;
                             }
                             member[host] += member[rid];
                             member[rid] = 0;
+                            memberInstructions[host] += memberInstructions[rid];
+                            memberInstructions[rid] = 0;
                             alive[rid] = 0;
                             parent[rid] = host;
                             ++mergeCounter;
@@ -811,6 +833,8 @@ namespace wolvrix::lib::grhsim::am
                                     alive[rid] = 1;
                                     parent[rid] = rid;
                                     member[rid] = 1;
+                                    memberInstructions[rid] =
+                                        input.atomInstructions[computeGraph.globalOfAtom[atomOfRid[rid]]];
                                     fusionAnchor[atomOfRid[rid]] = kInvalidIndex;
                                 }
                                 --whenGroups;
@@ -838,14 +862,21 @@ namespace wolvrix::lib::grhsim::am
 
             // mergeOut1: reverse sweep (downstream first). A node whose
             // out-degree is exactly one merges into its unique successor t
-            // when t's pre-merge member count is within the merge limit.
+            // when t's pre-merge member count is within the merge limit
+            // (member instructions when coarsenInstructionBudget is set,
+            // member atoms otherwise).
+            const auto overMergeLimit = [&](uint32_t host) {
+                return mergeInstrLimit != 0
+                           ? memberInstructions[host] > mergeInstrLimit
+                           : member[host] > mergeLimit;
+            };
             for (uint32_t s = n; s-- > 0;) {
                 std::vector<uint32_t> &ns = nexts[s];
                 if (ns.size() != 1) {
                     continue;
                 }
                 const uint32_t t = ns.front();
-                if (member[t] > mergeLimit) {
+                if (overMergeLimit(t)) {
                     continue;
                 }
                 // t inherits s's in-neighborhood; s's only out-neighbor is t
@@ -859,6 +890,8 @@ namespace wolvrix::lib::grhsim::am
                 sortedUnionInto(pt, prevs[s]);
                 member[t] += member[s];
                 member[s] = 0;
+                memberInstructions[t] += memberInstructions[s];
+                memberInstructions[s] = 0;
                 alive[s] = 0;
                 parent[s] = t;
                 ns.clear();
@@ -877,7 +910,7 @@ namespace wolvrix::lib::grhsim::am
                     continue;
                 }
                 const uint32_t p = sp.front();
-                if (member[p] > mergeLimit) {
+                if (overMergeLimit(p)) {
                     continue;
                 }
                 std::vector<uint32_t> &np = nexts[p];
@@ -889,6 +922,8 @@ namespace wolvrix::lib::grhsim::am
                 sortedUnionInto(np, nexts[s]);
                 member[p] += member[s];
                 member[s] = 0;
+                memberInstructions[p] += memberInstructions[s];
+                memberInstructions[s] = 0;
                 alive[s] = 0;
                 parent[s] = p;
                 sp.clear();
@@ -924,6 +959,8 @@ namespace wolvrix::lib::grhsim::am
                         if (member[host] < kMaxSiblingClusterMembers) {
                             member[host] += member[s];
                             member[s] = 0;
+                            memberInstructions[host] += memberInstructions[s];
+                            memberInstructions[s] = 0;
                             alive[s] = 0;
                             parent[s] = host;
                             ++siblingMerges;

@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -82,6 +83,29 @@ namespace
         }
     }
 
+    // Incremental variant for the success path: prints messages appended since
+    // the cursor position and advances it, so phase stats (lowering, optimize)
+    // surface at the point they are produced without duplicate output.
+    void printNewDiagnostics(const diag::Diagnostics &diagnostics,
+                             std::size_t &cursor)
+    {
+        const auto &messages = diagnostics.messages();
+        while (cursor < messages.size())
+        {
+            const diag::Diagnostic &message = messages[cursor++];
+            if (message.kind == diag::DiagnosticKind::Debug)
+            {
+                continue;
+            }
+            std::cerr << message.message;
+            if (!message.context.empty())
+            {
+                std::cerr << " [" << message.context << ']';
+            }
+            std::cerr << '\n';
+        }
+    }
+
     bool readFile(const std::string &path, std::string &contents)
     {
         std::ifstream input(path, std::ios::binary);
@@ -112,8 +136,10 @@ int main(int argc, char **argv)
                      "[--max-source-bytes <count>] [--max-commit-source-bytes <count>] "
                      "[--max-atoms-per-block <count>] "
                      "[--dp-segment-penalty <value>] [--merge-when-min-group <count>] "
-                     "[--dp-coarsen-atom-budget <count>] [--disable-coarsening] "
+                     "[--dp-coarsen-atom-budget <count>] [--dp-coarsen-instr-budget <count>] [--disable-coarsening] "
+                     "[--tree-atom-fold-max-instr <count>] "
                      "[--runtime-profile] [--full-evaluation] [--changed-trace] "
+                     "[--branchy-mux] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -124,12 +150,18 @@ int main(int argc, char **argv)
     std::optional<std::string> blocksPerSource;
     std::optional<std::string> maxSourceBytes;
     std::optional<std::string> maxCommitSourceBytes;
-    std::size_t maxAtomsPerBlock = 48;
+    // Default partition configuration = the gsim-aligned point locked by
+    // emit-cost NO0002 (2026-08-10): fold cap 2 + 9 atoms/block + 32768
+    // instruction coarsen budget + 0 penalty + 0 refinement rounds lands
+    // L2 0.95x / L3 0.98x structural parity with gsim on the same exec-GRH.
+    std::size_t maxAtomsPerBlock = 9;
     std::size_t maxCommitAtomsPerBlock = 4096;
-    double dpSegmentPenalty = 1.0;
+    double dpSegmentPenalty = 0.0;
     std::size_t dpCoarsenAtomBudget = 0;
+    std::size_t dpCoarsenInstrBudget = 32768;
+    std::size_t treeAtomFoldMaxInstr = 2;
     std::size_t mergeWhenMinGroup = 5;
-    std::size_t dpRefinementRounds = 10;
+    std::size_t dpRefinementRounds = 0;
     std::size_t fanoutAbsorbMaxInstructions = 0;
     double fanoutAbsorbBudgetMult = 1.0;
     std::size_t fanoutAbsorbMaxConsumers = 256;
@@ -137,6 +169,7 @@ int main(int argc, char **argv)
     bool runtimeProfile = false;
     bool fullEvaluation = false;
     bool changedTrace = false;
+    bool branchyMux = false;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
     {
@@ -241,6 +274,32 @@ int main(int argc, char **argv)
             }
             dpCoarsenAtomBudget = value;
         }
+        else if (argument == "--dp-coarsen-instr-budget" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            std::size_t value = 0;
+            const auto [end, error] =
+                std::from_chars(text.data(), text.data() + text.size(), value);
+            if (error != std::errc{} || end != text.data() + text.size())
+            {
+                std::cerr << "invalid --dp-coarsen-instr-budget value: " << text << '\n';
+                return 2;
+            }
+            dpCoarsenInstrBudget = value;
+        }
+        else if (argument == "--tree-atom-fold-max-instr" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            std::size_t value = 0;
+            const auto [end, error] =
+                std::from_chars(text.data(), text.data() + text.size(), value);
+            if (error != std::errc{} || end != text.data() + text.size())
+            {
+                std::cerr << "invalid --tree-atom-fold-max-instr value: " << text << '\n';
+                return 2;
+            }
+            treeAtomFoldMaxInstr = value;
+        }
         else if (argument == "--merge-when-min-group" && index + 1 < argc)
         {
             const std::string_view text(argv[++index]);
@@ -322,6 +381,10 @@ int main(int argc, char **argv)
         {
             changedTrace = true;
         }
+        else if (argument == "--branchy-mux")
+        {
+            branchyMux = true;
+        }
         else if (argument == "--no-am-optimize")
         {
             amOptimize = AmOptimizeOptions{};
@@ -334,6 +397,7 @@ int main(int argc, char **argv)
             amOptimize.muxNotAbsorb = false;
             amOptimize.notUnify = false;
             amOptimize.sliceFuse = false;
+            amOptimize.insertFuse = false;
             amOptimize.constMemFold = false;
             amOptimize.interfaceAlias = false;
         }
@@ -351,6 +415,7 @@ int main(int argc, char **argv)
             parsed.muxNotAbsorb = false;
             parsed.notUnify = false;
             parsed.sliceFuse = false;
+            parsed.insertFuse = false;
             parsed.constMemFold = false;
             parsed.interfaceAlias = false;
             bool valid = true;
@@ -397,6 +462,10 @@ int main(int argc, char **argv)
                 else if (token == "slicefuse")
                 {
                     parsed.sliceFuse = true;
+                }
+                else if (token == "insertfuse")
+                {
+                    parsed.insertFuse = true;
                 }
                 else if (token == "memfold")
                 {
@@ -483,6 +552,7 @@ int main(int argc, char **argv)
 
         phaseStart = std::chrono::steady_clock::now();
         diag::Diagnostics diagnostics;
+        std::size_t diagnosticsCursor = 0;
         GrhIRToGrhSimAMGraphLowering lowering(GrhIRToGrhSimAMGraphLoweringOptions{
             .unknownLogic = UnknownLogicPolicy::FlattenToZero,
         });
@@ -497,11 +567,58 @@ int main(int argc, char **argv)
                       << " peak_rss_kib=" << peakRssKiB() << '\n';
             return 1;
         }
-        if (amOptimize.dce || amOptimize.constFold || amOptimize.cse ||
-            amOptimize.assignAlias || amOptimize.stateReadAlias ||
-            amOptimize.logicUnify || amOptimize.muxNotAbsorb ||
-            amOptimize.notUnify || amOptimize.sliceFuse ||
-            amOptimize.constMemFold)
+        printNewDiagnostics(diagnostics, diagnosticsCursor);
+        // NO0004 import QC point: pre-optimize instruction opcode census,
+        // same shape as the schedule-time opcode_mix so the three stages
+        // (import -> optimize -> schedule) can be compared directly.
+        {
+            const ProgramView importView = amGraph->program();
+            const std::size_t importInstructions = importView.instructionCount();
+            std::map<std::string, uint64_t> importOpcodeCounts;
+            for (uint32_t instr = 0; instr < importInstructions; ++instr)
+            {
+                importOpcodeCounts[std::string(toString(
+                    importView.opcode(InstructionId{instr})))] += 1;
+            }
+            std::string importMix;
+            for (const auto &[name, count] : importOpcodeCounts)
+            {
+                importMix += " " + name + "=" + std::to_string(count);
+            }
+            std::cerr << "am.import: instructions=" << importInstructions
+                      << " opcode_mix[" << importMix << " ] [grhsim.am.import]\n";
+        }
+        // NO0006: gsim node-aligned scheduling skips the AM optimize stage
+        // (the gsim flatten graph is pre-optimized; the passes would erase
+        // the node anchors). WOLVRIX_GRHSIM_AM_NODE_ALIGNED_OPTIMIZE=1
+        // force-runs it for A/B.
+        const ActivityScheduleOptions scheduleOptions{
+            .maxAtomsPerBlock = maxAtomsPerBlock,
+            .maxCommitAtomsPerBlock = maxCommitAtomsPerBlock,
+            .enableCoarsening = enableCoarsening,
+            .collectStats = true,
+            .dpSegmentPenalty = dpSegmentPenalty,
+            .dpCoarsenAtomBudget = dpCoarsenAtomBudget,
+            .dpCoarsenInstrBudget = dpCoarsenInstrBudget,
+            .dpRefinementRounds = dpRefinementRounds,
+            .mergeWhenMinGroup = mergeWhenMinGroup,
+            .fanoutAbsorbMaxInstructions = fanoutAbsorbMaxInstructions,
+            .fanoutAbsorbBudgetMult = fanoutAbsorbBudgetMult,
+            .fanoutAbsorbMaxConsumers = fanoutAbsorbMaxConsumers,
+            .treeAtomFoldMaxInstr = treeAtomFoldMaxInstr,
+        };
+        const bool nodeAligned = gsimNodeAlignedScheduling(*amGraph, scheduleOptions);
+        const bool skipAmOptimize = nodeAligned && !gsimNodeAlignedOptimizeForced();
+        if (skipAmOptimize)
+        {
+            std::cerr << "[grhsim-am-lower-json] optimize skipped (gsim node-aligned)\n";
+        }
+        if (!skipAmOptimize &&
+            (amOptimize.dce || amOptimize.constFold || amOptimize.cse ||
+             amOptimize.assignAlias || amOptimize.stateReadAlias ||
+             amOptimize.logicUnify || amOptimize.muxNotAbsorb ||
+             amOptimize.notUnify || amOptimize.sliceFuse ||
+             amOptimize.insertFuse || amOptimize.constMemFold))
         {
             phaseStart = std::chrono::steady_clock::now();
             const bool optimized =
@@ -516,6 +633,7 @@ int main(int argc, char **argv)
                           << " peak_rss_kib=" << peakRssKiB() << '\n';
                 return 1;
             }
+            printNewDiagnostics(diagnostics, diagnosticsCursor);
         }
         const ProgramStorageStats stats = amGraph->program().storageStats();
         const std::size_t interfacePorts = amGraph->interface().ports.size();
@@ -539,21 +657,7 @@ int main(int argc, char **argv)
         {
             phaseStart = std::chrono::steady_clock::now();
             model = GrhIRToGrhSimAMProgram::graphToProgram(
-                std::move(*amGraph),
-                ActivityScheduleOptions{
-                    .maxAtomsPerBlock = maxAtomsPerBlock,
-                    .maxCommitAtomsPerBlock = maxCommitAtomsPerBlock,
-                    .enableCoarsening = enableCoarsening,
-                    .collectStats = true,
-                    .dpSegmentPenalty = dpSegmentPenalty,
-                    .dpCoarsenAtomBudget = dpCoarsenAtomBudget,
-                    .dpRefinementRounds = dpRefinementRounds,
-                    .mergeWhenMinGroup = mergeWhenMinGroup,
-                    .fanoutAbsorbMaxInstructions = fanoutAbsorbMaxInstructions,
-                    .fanoutAbsorbBudgetMult = fanoutAbsorbBudgetMult,
-                    .fanoutAbsorbMaxConsumers = fanoutAbsorbMaxConsumers,
-                },
-                diagnostics);
+                std::move(*amGraph), scheduleOptions, diagnostics);
             scheduleMs = elapsedMilliseconds(phaseStart);
             std::cerr << "[grhsim-am-lower-json] schedule complete ms="
                       << scheduleMs << " peak_rss_kib=" << peakRssKiB()
@@ -563,7 +667,7 @@ int main(int argc, char **argv)
                 printDiagnostics(diagnostics);
                 return 1;
             }
-            printDiagnostics(diagnostics);
+            printNewDiagnostics(diagnostics, diagnosticsCursor);
             scheduledStats = model->program.view().storageStats();
             blockCount = model->program.blockCount();
             activationTargets = scheduledStats
@@ -605,6 +709,10 @@ int main(int argc, char **argv)
                 if (changedTrace)
                 {
                     emitOptions.attributes.emplace("changedTrace", "true");
+                }
+                if (branchyMux)
+                {
+                    emitOptions.attributes.emplace("branchyMux", "true");
                 }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,

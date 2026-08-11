@@ -47,6 +47,7 @@ namespace wolvrix::lib::grhsim::am
         bool isPureCombinational(Opcode opcode) noexcept
         {
             return (opcode >= Opcode::Assign && opcode <= Opcode::SliceArray) ||
+                   opcode == Opcode::Insert ||
                    (opcode >= Opcode::ArrayMux && opcode <= Opcode::ArrayReduceLanesXor);
         }
 
@@ -63,7 +64,7 @@ namespace wolvrix::lib::grhsim::am
 
         bool validOpcode(Opcode opcode) noexcept
         {
-            return opcode <= Opcode::MemoryWriteCondMask;
+            return opcode <= Opcode::Insert;
         }
 
         bool validString(ProgramView view, StringId id)
@@ -466,7 +467,8 @@ namespace wolvrix::lib::grhsim::am
             else if ((opcode >= Opcode::Add && opcode <= Opcode::Xnor) ||
                 (opcode >= Opcode::Eq && opcode <= Opcode::LogicOr) ||
                 (opcode >= Opcode::Shl && opcode <= Opcode::ArithmeticShr) ||
-                opcode == Opcode::SliceDynamic || opcode == Opcode::SliceArray)
+                opcode == Opcode::SliceDynamic || opcode == Opcode::SliceArray ||
+                opcode == Opcode::Insert)
             {
                 shapeValid = resultCount == 1 && operandCount == 2;
             }
@@ -591,6 +593,7 @@ namespace wolvrix::lib::grhsim::am
             switch (opcode)
             {
             case Opcode::SliceStatic:
+            case Opcode::Insert:
                 attributesPresent = view.sliceStaticAttributes(instruction).has_value();
                 break;
             case Opcode::SystemFunction:
@@ -806,6 +809,25 @@ namespace wolvrix::lib::grhsim::am
                 const Type *base = variableType(view, operands.front());
                 const uint64_t end = static_cast<uint64_t>(attributes->lsb) + result->bitWidth;
                 valid = result->signedness == Signedness::Unsigned && end <= base->bitWidth;
+            }
+            else if (opcode == Opcode::Insert)
+            {
+                if (operands.size() != 2)
+                {
+                    return;
+                }
+                const auto attributes = view.sliceStaticAttributes(instruction);
+                if (!attributes)
+                {
+                    return;
+                }
+                const Type *base = variableType(view, operands[0]);
+                const Type *data = variableType(view, operands[1]);
+                const uint64_t end = static_cast<uint64_t>(attributes->lsb) + data->bitWidth;
+                // Result carries the full row: width and signedness match the
+                // base operand, and the data window must fit inside it.
+                valid = result->bitWidth == base->bitWidth &&
+                        result->signedness == base->signedness && end <= base->bitWidth;
             }
             else if (opcode == Opcode::SliceDynamic)
             {

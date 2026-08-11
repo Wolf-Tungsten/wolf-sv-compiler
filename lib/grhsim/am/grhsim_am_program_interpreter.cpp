@@ -1084,6 +1084,17 @@ namespace wolvrix::lib::grhsim::am {
                 }
                 break;
             }
+            case Opcode::Insert: {
+                const uint64_t lsb = program.sliceStaticAttributes(instruction)->lsb;
+                resultWords = resizedWords(operands[0], resultType.bitWidth,
+                                           resultType.signedness);
+                const uint64_t dataWidth = operands[1].type().bitWidth;
+                for (uint64_t bit = 0; bit < dataWidth; ++bit) {
+                    setBit(resultWords, lsb + bit,
+                           getBit(operands[1].words(), bit));
+                }
+                break;
+            }
             default:
                 return fail(InterpreterErrorCode::UnsupportedOpcode,
                             "AM interpreter does not implement opcode " +
@@ -1251,7 +1262,7 @@ namespace wolvrix::lib::grhsim::am {
             const auto results = program.results(instruction);
             const std::vector<InterpreterValue> operands = snapshot(operandIds);
 
-            if (opcode <= Opcode::SliceArray ||
+            if (opcode <= Opcode::SliceArray || opcode == Opcode::Insert ||
                 (opcode >= Opcode::ArrayMux && opcode <= Opcode::ArrayReduceLanesXor)) {
                 return executePure(block, instruction, opcode, results,
                                    operands);

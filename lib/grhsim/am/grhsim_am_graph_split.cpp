@@ -15,6 +15,8 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -440,6 +442,81 @@ namespace wolvrix::lib::grhsim::am
                 std::string(kDiagnosticContext));
             return true;
         }
+
+        // NO0006 bijection audit: per-atom JSONL dump of the node-aligned
+        // atomization. One line per atom carrying its gsim node id (-1 for
+        // unowned clock-domain helpers), kind, member count and multi-sink
+        // flag. Written at the end of splitAmGraphStage, where the atom
+        // tables are final on the node-aligned path (no atom-rewriting pass
+        // runs afterwards: tree-atom fold and fanout absorb are skipped).
+        constexpr char kNodeAtomAuditEnv[] = "WOLVRIX_GRHSIM_AM_NODE_ATOM_AUDIT_JSONL";
+
+        std::string_view atomKindName(uint8_t kind)
+        {
+            switch (static_cast<AmAtomKind>(kind))
+            {
+            case AmAtomKind::Singleton:
+                return "Singleton";
+            case AmAtomKind::Tree:
+                return "Tree";
+            case AmAtomKind::CombLoopScc:
+                return "CombLoopScc";
+            case AmAtomKind::CommitEvent:
+                return "CommitEvent";
+            }
+            return "Unknown";
+        }
+
+        bool exportNodeAtomAuditJsonl(const AmGraphSplitContext &context,
+                                      const std::vector<int64_t> &atomGsimNodeId,
+                                      const std::vector<uint8_t> &atomMultiSink,
+                                      const std::filesystem::path &path,
+                                      wolvrix::lib::diag::Diagnostics &diagnostics)
+        {
+            if (path.has_parent_path()) {
+                std::error_code error;
+                std::filesystem::create_directories(path.parent_path(), error);
+                if (error) {
+                    diagnostics.error("failed to create AM node-atom audit directory: " +
+                                          path.parent_path().string(),
+                                      std::string(kDiagnosticContext));
+                    return false;
+                }
+            }
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            if (!output) {
+                diagnostics.error("failed to open AM node-atom audit path: " + path.string(),
+                                  std::string(kDiagnosticContext));
+                return false;
+            }
+
+            JsonlGraphWriter writer(output);
+            for (uint32_t atom = 0; atom < context.atomCount; ++atom) {
+                writer.raw("{\"atom\":").number(atom).raw(",\"node_id\":");
+                const int64_t nodeId = atomGsimNodeId[atom];
+                if (nodeId < 0) {
+                    writer.raw("-1");
+                } else {
+                    writer.number(static_cast<uint64_t>(nodeId));
+                }
+                writer.raw(",\"kind\":\"").raw(atomKindName(context.atomKinds[atom]))
+                    .raw("\",\"instructions\":")
+                    .number(context.atomInstructions[atom])
+                    .raw(",\"multi_sink\":")
+                    .number(atomMultiSink[atom] != 0 ? 1 : 0)
+                    .raw("}");
+                writer.endLine();
+            }
+            if (!writer.flush()) {
+                diagnostics.error("failed while writing AM node-atom audit: " + path.string(),
+                                  std::string(kDiagnosticContext));
+                return false;
+            }
+            diagnostics.info("exported AM node-atom audit: path=" + path.string() +
+                                 " atoms=" + std::to_string(context.atomCount),
+                             std::string(kDiagnosticContext));
+            return true;
+        }
     } // namespace
 
     AmGraphPartitionInput AmGraphSplitContext::partitionInput() const
@@ -463,6 +540,7 @@ namespace wolvrix::lib::grhsim::am
             .maxCommitAtomsPerBlock = maxCommitAtomsPerBlock,
             .enableCoarsening = enableCoarsening,
             .coarsenAtomBudget = coarsenAtomBudget,
+            .coarsenInstructionBudget = coarsenInstructionBudget,
             .segmentPenalty = segmentPenalty,
             .refinementRounds = refinementRounds,
             .mergeWhenMinGroup = mergeWhenMinGroup,
@@ -577,10 +655,114 @@ namespace wolvrix::lib::grhsim::am
         const CsrGraph instructionGraph =
             buildInstructionGraph(instructionCount, defUse, orderedEdges);
         const SccResult scc = findStronglyConnectedComponents(instructionGraph);
-        const uint32_t atomCount = scc.count;
+
+        // NO0006 gsim node-aligned atomization: when the graph carries gsim
+        // node provenance (mode On/Auto), atoms are the gsim node groups
+        // instead of SCC packings. Commit instructions stay
+        // singleton-per-instruction (today's commit behavior), compute
+        // instructions with a node id group per node, and unowned compute
+        // instructions (AM clock-domain helpers: changed detectors,
+        // pre-commit snapshots) stay singleton. The SCC decomposition still
+        // runs for cycle safety: a multi-instruction SCC spanning several
+        // groups unions them into one CombLoopScc atom.
+        const bool nodeAligned = gsimNodeAlignedScheduling(graph, options);
+        uint32_t atomCount = 0;
         std::vector<uint32_t> instructionAtom(instructionCount, kInvalidIndex);
-        for (uint32_t index = 0; index < instructionCount; ++index) {
-            instructionAtom[index] = scc.component[index];
+        // Node-aligned per-atom extras: audit node id, multi-sink flag and
+        // the comb-loop marker (atom contains a multi-instruction SCC).
+        std::vector<int64_t> atomGsimNodeId;
+        std::vector<uint8_t> atomMultiSink;
+        std::vector<uint8_t> atomCombLoop;
+        std::size_t sccUnionFallbackCount = 0;
+        if (!nodeAligned) {
+            atomCount = scc.count;
+            for (uint32_t index = 0; index < instructionCount; ++index) {
+                instructionAtom[index] = scc.component[index];
+            }
+        } else {
+            std::vector<uint32_t> groupOf(instructionCount, kInvalidIndex);
+            std::vector<int64_t> groupNodeId;
+            groupNodeId.reserve(instructionCount);
+            std::unordered_map<int64_t, uint32_t> nodeGroup;
+            for (uint32_t index = 0; index < instructionCount; ++index) {
+                const InstructionId instruction{index};
+                const int64_t nodeId = graph.gsimNodeId(instruction);
+                if (nodeId < 0 || stateWriteTarget(program, instruction).has_value()) {
+                    groupOf[index] = static_cast<uint32_t>(groupNodeId.size());
+                    groupNodeId.push_back(nodeId);
+                    continue;
+                }
+                const auto [it, inserted] = nodeGroup.try_emplace(
+                    nodeId, static_cast<uint32_t>(groupNodeId.size()));
+                if (inserted) {
+                    groupNodeId.push_back(nodeId);
+                }
+                groupOf[index] = it->second;
+            }
+
+            // Cycle safety: union the groups touched by one
+            // multi-instruction SCC. gsim-flatten input is acyclic per
+            // node, so this is expected to fire ~never.
+            const uint32_t groupCount = static_cast<uint32_t>(groupNodeId.size());
+            std::vector<uint32_t> groupParent(groupCount);
+            std::iota(groupParent.begin(), groupParent.end(), uint32_t{0});
+            const auto findGroup = [&](uint32_t group) {
+                uint32_t root = group;
+                while (groupParent[root] != root) {
+                    root = groupParent[root];
+                }
+                while (groupParent[group] != root) {
+                    const uint32_t next = groupParent[group];
+                    groupParent[group] = root;
+                    group = next;
+                }
+                return root;
+            };
+            std::vector<uint32_t> sccSize(scc.count, 0);
+            for (uint32_t index = 0; index < instructionCount; ++index) {
+                ++sccSize[scc.component[index]];
+            }
+            std::vector<uint32_t> sccFirstGroup(scc.count, kInvalidIndex);
+            std::vector<uint8_t> sccSpanning(scc.count, 0);
+            for (uint32_t index = 0; index < instructionCount; ++index) {
+                const uint32_t component = scc.component[index];
+                if (sccSize[component] == 1) {
+                    continue;
+                }
+                const uint32_t root = findGroup(groupOf[index]);
+                if (sccFirstGroup[component] == kInvalidIndex) {
+                    sccFirstGroup[component] = root;
+                } else if (sccFirstGroup[component] != root) {
+                    groupParent[findGroup(sccFirstGroup[component])] = root;
+                    sccSpanning[component] = 1;
+                }
+            }
+            for (uint32_t component = 0; component < scc.count; ++component) {
+                sccUnionFallbackCount += sccSpanning[component] != 0 ? 1 : 0;
+            }
+
+            // Atom per surviving group root, in first-appearance order; the
+            // audit node id is the first merged group's id.
+            std::vector<uint32_t> atomOfGroup(groupCount, kInvalidIndex);
+            atomGsimNodeId.reserve(groupCount);
+            for (uint32_t group = 0; group < groupCount; ++group) {
+                const uint32_t root = findGroup(group);
+                if (atomOfGroup[root] == kInvalidIndex) {
+                    atomOfGroup[root] = atomCount;
+                    atomGsimNodeId.push_back(groupNodeId[group]);
+                    ++atomCount;
+                }
+            }
+            for (uint32_t index = 0; index < instructionCount; ++index) {
+                instructionAtom[index] = atomOfGroup[findGroup(groupOf[index])];
+            }
+            atomCombLoop.assign(atomCount, 0);
+            atomMultiSink.assign(atomCount, 0);
+            for (uint32_t index = 0; index < instructionCount; ++index) {
+                if (sccSize[scc.component[index]] > 1) {
+                    atomCombLoop[instructionAtom[index]] = 1;
+                }
+            }
         }
 
         std::vector<uint32_t> atomMemberOffsets(atomCount + 1, 0);        for (uint32_t atom : instructionAtom) {
@@ -604,8 +786,117 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
-        CsrGraph atomGraph =
-            buildCondensationGraph(instructionGraph, scc.component, atomCount);
+        // NO0006 node-aligned anchor ordering: the node anchor (the member
+        // whose result leaves the atom — the node's output variable)
+        // orders last when it is the unique external-defining member and
+        // has no intra-atom successors. Groups with several
+        // external-defining members (EXT multi-output nodes) keep their
+        // order and are counted as multi-sink in the audit.
+        if (nodeAligned) {
+            std::vector<uint8_t> pinnedVariable(variableCount, 0);
+            for (const PortBinding &port : graph.interface().ports) {
+                if (port.input.valid()) {
+                    pinnedVariable[port.input.value] = 1;
+                }
+                if (port.output.valid()) {
+                    pinnedVariable[port.output.value] = 1;
+                }
+                if (port.outputEnable.valid()) {
+                    pinnedVariable[port.outputEnable.value] = 1;
+                }
+            }
+            for (const VariableLabel &label : graph.interface().declaredVariables) {
+                if (label.variable.valid()) {
+                    pinnedVariable[label.variable.value] = 1;
+                }
+            }
+            for (uint32_t variable = 0; variable < variableCount; ++variable) {
+                const VariableRole role = graph.valueFacts(VariableId{variable}).roles;
+                if (hasRole(role, VariableRole::ExternalOutput) ||
+                    hasRole(role, VariableRole::Observable)) {
+                    pinnedVariable[variable] = 1;
+                }
+            }
+            // An anchor that sources an intra-atom ordered-effect edge must
+            // not move past its target.
+            std::vector<uint8_t> orderConstrained(instructionCount, 0);
+            for (const OrderEdge &edge : orderedEdges) {
+                if (edge.source != edge.target &&
+                    instructionAtom[edge.source] == instructionAtom[edge.target]) {
+                    orderConstrained[edge.source] = 1;
+                }
+            }
+            const auto usedOutsideAtom = [&](uint32_t instruction, uint32_t atom) {
+                for (const VariableId result : program.results(InstructionId{instruction})) {
+                    if (!result.valid()) {
+                        continue;
+                    }
+                    if (pinnedVariable[result.value]) {
+                        return true;
+                    }
+                    for (uint32_t use = defUse.useOffsets[result.value];
+                         use < defUse.useOffsets[result.value + 1]; ++use) {
+                        if (instructionAtom[defUse.uses[use]] != atom) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            };
+            const auto usedInsideAtom = [&](uint32_t instruction, uint32_t atom) {
+                for (const VariableId result : program.results(InstructionId{instruction})) {
+                    if (!result.valid()) {
+                        continue;
+                    }
+                    for (uint32_t use = defUse.useOffsets[result.value];
+                         use < defUse.useOffsets[result.value + 1]; ++use) {
+                        if (instructionAtom[defUse.uses[use]] == atom) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            };
+            for (uint32_t atom = 0; atom < atomCount; ++atom) {
+                const uint32_t begin = atomMemberOffsets[atom];
+                const uint32_t end = atomMemberOffsets[atom + 1];
+                if (end - begin <= 1 || atomCombLoop[atom] != 0) {
+                    continue;
+                }
+                uint32_t anchor = kInvalidIndex;
+                uint32_t externalDefs = 0;
+                for (uint32_t offset = begin; offset < end; ++offset) {
+                    if (usedOutsideAtom(atomMembers[offset], atom)) {
+                        anchor = atomMembers[offset];
+                        ++externalDefs;
+                    }
+                }
+                if (externalDefs > 1) {
+                    atomMultiSink[atom] = 1;
+                    continue;
+                }
+                if (externalDefs == 0 || anchor == atomMembers[end - 1] ||
+                    orderConstrained[anchor] != 0 || usedInsideAtom(anchor, atom)) {
+                    continue;
+                }
+                // Nothing inside the atom depends on the anchor, so moving
+                // it to the end keeps the topological order valid.
+                for (uint32_t offset = begin; offset < end; ++offset) {
+                    if (atomMembers[offset] == anchor) {
+                        std::rotate(atomMembers.begin() + offset,
+                                    atomMembers.begin() + offset + 1,
+                                    atomMembers.begin() + end);
+                        break;
+                    }
+                }
+            }
+        }
+
+        CsrGraph atomGraph = buildCondensationGraph(
+            instructionGraph,
+            nodeAligned ? std::span<const uint32_t>(instructionAtom)
+                        : std::span<const uint32_t>(scc.component),
+            atomCount);
         enum class BlockClass : uint8_t
         {
             Compute = 0,
@@ -719,17 +1010,36 @@ namespace wolvrix::lib::grhsim::am
         // atom records its select variable id as the signature; the
         // tree-atom fold pass keeps the same convention when it rebuilds the
         // tables. Other compute atoms use kInvalidAtomSignature.
+        // NO0006 node-aligned path: comb-loop atoms are exactly the
+        // cycle-unioned groups, multi-instruction node groups are trees
+        // (anchor root orders last) and singleton node groups stay
+        // singletons; the mux signature reads the root (last member), same
+        // as the fold-pass convention.
         std::vector<uint8_t> atomKinds(atomCount, 0);
         std::vector<uint32_t> atomSignatures(atomCount, kInvalidAtomSignature);
         for (uint32_t atom = 0; atom < atomCount; ++atom) {
             if (atomIsCommit[atom] != 0) {
                 atomKinds[atom] = static_cast<uint8_t>(AmAtomKind::CommitEvent);
                 atomSignatures[atom] = commitEventRank[atom];
-            } else if (atomInstructions[atom] > 1) {
+            } else if (!nodeAligned) {
+                if (atomInstructions[atom] > 1) {
+                    atomKinds[atom] = static_cast<uint8_t>(AmAtomKind::CombLoopScc);
+                } else {
+                    atomKinds[atom] = static_cast<uint8_t>(AmAtomKind::Singleton);
+                    const InstructionId root{atomMembers[atomMemberOffsets[atom]]};
+                    const auto operands = program.operands(root);
+                    if (program.opcode(root) == Opcode::Mux && operands.size() == 3 &&
+                        operands[0].valid()) {
+                        atomSignatures[atom] = operands[0].value;
+                    }
+                }
+            } else if (atomCombLoop[atom] != 0) {
                 atomKinds[atom] = static_cast<uint8_t>(AmAtomKind::CombLoopScc);
             } else {
-                atomKinds[atom] = static_cast<uint8_t>(AmAtomKind::Singleton);
-                const InstructionId root{atomMembers[atomMemberOffsets[atom]]};
+                atomKinds[atom] = atomInstructions[atom] > 1
+                                      ? static_cast<uint8_t>(AmAtomKind::Tree)
+                                      : static_cast<uint8_t>(AmAtomKind::Singleton);
+                const InstructionId root{atomMembers[atomMemberOffsets[atom + 1] - 1]};
                 const auto operands = program.operands(root);
                 if (program.opcode(root) == Opcode::Mux && operands.size() == 3 &&
                     operands[0].valid()) {
@@ -765,6 +1075,7 @@ namespace wolvrix::lib::grhsim::am
         // sweeps (gsim MAX_NODES_PER_SUPER); 0 selects the 256 default.
         context.coarsenAtomBudget =
             options.dpCoarsenAtomBudget != 0 ? options.dpCoarsenAtomBudget : 256;
+        context.coarsenInstructionBudget = options.dpCoarsenInstrBudget;
         context.segmentPenalty = options.dpSegmentPenalty;
         context.refinementRounds = options.dpRefinementRounds;
         context.mergeWhenMinGroup = options.mergeWhenMinGroup;
@@ -791,6 +1102,62 @@ namespace wolvrix::lib::grhsim::am
                 diagnostics.error("AM split graph export failed",
                                   std::string(kDiagnosticContext));
                 return std::nullopt;
+            }
+        }
+
+        // NO0006 node-aligned audit: a one-line summary (atom counts, the
+        // node bijection check, unowned-helper opcode mix, SCC-union
+        // fallbacks) plus the optional per-atom JSONL dump. On this path no
+        // atom-rewriting pass runs after split, so the tables are final.
+        if (nodeAligned) {
+            std::size_t commitAtoms = 0;
+            std::size_t nodeMappedAtoms = 0;
+            std::size_t multiSinkAtoms = 0;
+            std::unordered_set<int64_t> distinctNodes;
+            std::map<std::string, uint64_t> unownedOpcodes;
+            for (uint32_t atom = 0; atom < atomCount; ++atom) {
+                if (context.atomIsCommit[atom] != 0) {
+                    ++commitAtoms;
+                    continue;
+                }
+                multiSinkAtoms += atomMultiSink[atom] != 0 ? 1 : 0;
+                if (atomGsimNodeId[atom] >= 0) {
+                    ++nodeMappedAtoms;
+                    distinctNodes.insert(atomGsimNodeId[atom]);
+                    continue;
+                }
+                for (uint32_t offset = context.atomMemberOffsets[atom];
+                     offset < context.atomMemberOffsets[atom + 1]; ++offset) {
+                    ++unownedOpcodes[std::string(
+                        toString(program.opcode(
+                            InstructionId{context.atomMembers[offset]})))];
+                }
+            }
+            std::string unownedMix;
+            for (const auto &[name, count] : unownedOpcodes) {
+                unownedMix += " " + name + "=" + std::to_string(count);
+            }
+            diagnostics.info(
+                "am.node-atoms: atoms=" + std::to_string(atomCount) +
+                    " compute=" + std::to_string(atomCount - commitAtoms) +
+                    " commit=" + std::to_string(commitAtoms) +
+                    " node_mapped=" + std::to_string(nodeMappedAtoms) +
+                    " distinct_nodes=" + std::to_string(distinctNodes.size()) +
+                    " unowned_compute=" +
+                    std::to_string(atomCount - commitAtoms - nodeMappedAtoms) +
+                    " unowned_opcode_mix[" + unownedMix + " ]" +
+                    " scc_union_fallback=" + std::to_string(sccUnionFallbackCount) +
+                    " multi_sink_atoms=" + std::to_string(multiSinkAtoms),
+                std::string(kDiagnosticContext));
+            if (const char *auditPath = std::getenv(kNodeAtomAuditEnv)) {
+                if (auditPath[0] == '\0' ||
+                    !exportNodeAtomAuditJsonl(context, atomGsimNodeId, atomMultiSink,
+                                              std::filesystem::path(auditPath),
+                                              diagnostics)) {
+                    diagnostics.error("AM node-atom audit export failed",
+                                      std::string(kDiagnosticContext));
+                    return std::nullopt;
+                }
             }
         }
         return context;

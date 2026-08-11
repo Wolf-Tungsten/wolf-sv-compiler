@@ -137,6 +137,18 @@ namespace wolvrix::lib::grhsim::am
         void setInstructionEffect(InstructionId instruction, InstructionEffect effect);
         const std::vector<InstructionEffect> &instructionEffects() const noexcept;
 
+        // gsim node provenance (NO0006): one gsim node id per instruction,
+        // -1 when unowned (constants, AM clock-domain helpers). Lowering
+        // stamps every instruction created while lowering a node-owned GRH
+        // op; the split stage packs scheduling atoms by node id when the
+        // provenance flag is set. The table lives only on the graph (the
+        // linear program never carries it): fromLinearProgram leaves it
+        // empty and toLinearProgram drops it.
+        int64_t gsimNodeId(InstructionId instruction) const noexcept;
+        void setGsimNodeId(InstructionId instruction, int64_t nodeId);
+        bool hasGsimNodeProvenance() const noexcept;
+        void setGsimNodeProvenance(bool present) noexcept;
+
         // Bulk role view matching SchedulingFacts.variableRoles order.
         std::vector<VariableRole> variableRoles() const;
 

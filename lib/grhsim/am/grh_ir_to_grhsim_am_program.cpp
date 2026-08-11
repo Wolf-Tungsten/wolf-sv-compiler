@@ -12,11 +12,14 @@
 #include "grhsim_am_common.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdlib>
 #include <filesystem>
 #include <iterator>
 #include <span>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -393,6 +396,39 @@ namespace wolvrix::lib::grhsim::am
             return watchedInputs;
         }
     } // namespace
+
+    bool gsimNodeAlignedScheduling(const AmGraph &graph,
+                                   const ActivityScheduleOptions &options)
+    {
+        if (const char *env = std::getenv("WOLVRIX_GRHSIM_AM_NODE_ALIGNED"))
+        {
+            const std::string_view value(env);
+            if (value == "0")
+            {
+                return false;
+            }
+            if (value == "1")
+            {
+                return true;
+            }
+        }
+        switch (options.gsimNodeAligned)
+        {
+        case GsimNodeAlignedMode::On:
+            return true;
+        case GsimNodeAlignedMode::Off:
+            return false;
+        case GsimNodeAlignedMode::Auto:
+            break;
+        }
+        return graph.hasGsimNodeProvenance();
+    }
+
+    bool gsimNodeAlignedOptimizeForced()
+    {
+        const char *env = std::getenv("WOLVRIX_GRHSIM_AM_NODE_ALIGNED_OPTIMIZE");
+        return env != nullptr && std::string_view(env) == "1";
+    }
 
     void SchedulingFacts::clearAndRelease()
     {
@@ -1051,9 +1087,36 @@ namespace wolvrix::lib::grhsim::am
         // address the context storage.
         // Debug escape hatch (NO0017): WOLVRIX_GRHSIM_AM_DISABLE_TREE_ATOM_FOLD
         // skips the fold entirely for import-compat bisection.
-        const bool disableTreeAtomFold = std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_TREE_ATOM_FOLD") != nullptr;
+        // NO0006: node-aligned scheduling builds final atoms directly from
+        // the gsim node grouping in split-am-graph, so the fold (and the
+        // fanout absorb below) are skipped.
+        const bool nodeAligned = gsimNodeAlignedScheduling(graph, options);
+        const bool disableTreeAtomFold =
+            nodeAligned || std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_TREE_ATOM_FOLD") != nullptr;
+        // NO0002 L2 alignment knob: options.treeAtomFoldMaxInstr caps the
+        // fold-set size (connected sub-tree split); the
+        // WOLVRIX_GRHSIM_AM_TREE_ATOM_FOLD_MAX_INSTR env var applies when the
+        // option is 0.
+        std::size_t treeAtomFoldMaxInstr = options.treeAtomFoldMaxInstr;
+        if (treeAtomFoldMaxInstr == 0) {
+            if (const char *text = std::getenv("WOLVRIX_GRHSIM_AM_TREE_ATOM_FOLD_MAX_INSTR"))
+            {
+                const std::string_view view(text);
+                const auto [end, convError] =
+                    std::from_chars(view.data(), view.data() + view.size(),
+                                    treeAtomFoldMaxInstr);
+                if (convError != std::errc{} || end != view.data() + view.size())
+                {
+                    diagnostics.error("WOLVRIX_GRHSIM_AM_TREE_ATOM_FOLD_MAX_INSTR must be a "
+                                      "non-negative integer",
+                                      std::string(detail::kDiagnosticContext));
+                    return std::nullopt;
+                }
+            }
+        }
         if (!disableTreeAtomFold &&
-            !foldSingleOutputTreeAtoms(graph, *context, diagnostics)) {
+            !foldSingleOutputTreeAtoms(graph, *context, diagnostics,
+                                       treeAtomFoldMaxInstr)) {
             return std::nullopt;
         }
 
@@ -1061,8 +1124,9 @@ namespace wolvrix::lib::grhsim::am
         // atoms into every consumer atom up to the read-port boundary, so
         // the partition graph sheds the shared-fanout structure gsim never
         // had. Runs after the tree-atom fold (consumers are atoms by then)
-        // and rebuilds the same tables.
-        if (options.fanoutAbsorbMaxInstructions > 0 &&
+        // and rebuilds the same tables. Off under node-aligned scheduling
+        // (NO0006): the node-grouped atoms are already final.
+        if (!nodeAligned && options.fanoutAbsorbMaxInstructions > 0 &&
             !absorbFanoutAtoms(graph, *context,
                                options.fanoutAbsorbMaxInstructions,
                                options.fanoutAbsorbBudgetMult,
@@ -1131,8 +1195,19 @@ namespace wolvrix::lib::grhsim::am
             return result;
         }
 
-        if (!optimizeAmGraph(graph, optimizeOptions_, diagnostics) ||
-            diagnostics.hasError())
+        // NO0006: with gsim node-aligned scheduling the gsim flatten graph
+        // is already optimized, and the AM opt passes (assignAlias/cse/fold)
+        // would erase node anchors and break the 1:1 node mapping — skip
+        // them unless the escape hatch forces a run for A/B.
+        const bool nodeAligned = gsimNodeAlignedScheduling(graph, scheduleOptions);
+        if (nodeAligned && !gsimNodeAlignedOptimizeForced())
+        {
+            diagnostics.info("am.optimize skipped: gsim node-aligned scheduling is active "
+                             "(set WOLVRIX_GRHSIM_AM_NODE_ALIGNED_OPTIMIZE=1 to force)",
+                             "grhsim-am-lower");
+        }
+        else if (!optimizeAmGraph(graph, optimizeOptions_, diagnostics) ||
+                 diagnostics.hasError())
         {
             return result;
         }

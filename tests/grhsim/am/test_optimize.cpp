@@ -879,6 +879,93 @@ namespace {
         return 0;
     }
 
+    int testInsertFuse() {
+        Fixture fixture;
+        const TypeId bv16 = fixture.builder.addType(Type::bitVector(16));
+        const TypeId bv12 = fixture.builder.addType(Type::bitVector(12));
+        const TypeId bv8 = fixture.builder.addType(Type::bitVector(8));
+        const TypeId bv4 = fixture.builder.addType(Type::bitVector(4));
+        const VariableId row = fixture.variable(bv16, VariableRole::ExternalInput);
+        const VariableId row2 = fixture.variable(bv16, VariableRole::ExternalInput);
+        const VariableId data = fixture.variable(bv4, VariableRole::ExternalInput);
+        const VariableId hi = fixture.variable(bv8);
+        const VariableId lo = fixture.variable(bv4);
+        const VariableId cat = fixture.variable(bv16);
+        const VariableId lo2 = fixture.variable(bv12);
+        const VariableId cat2 = fixture.variable(bv16);
+        const VariableId hi3 = fixture.variable(bv8);
+        const VariableId lo3 = fixture.variable(bv4);
+        const VariableId cat3 = fixture.variable(bv16);
+        const VariableId out0 = fixture.variable(bv16, VariableRole::ExternalOutput);
+        const VariableId out1 = fixture.variable(bv16, VariableRole::ExternalOutput);
+        const VariableId out2 = fixture.variable(bv16, VariableRole::ExternalOutput);
+        fixture.addInputPort("row", row);
+        fixture.addInputPort("row2", row2);
+        fixture.addInputPort("data", data);
+        fixture.addOutputPort("o0", out0);
+        fixture.addOutputPort("o1", out1);
+        fixture.addOutputPort("o2", out2);
+        // concat(row[15:8], data, row[3:0]) -> Insert(row, data, lsb=4).
+        const InstructionId hiSlice = fixture.emit(Opcode::SliceStatic, {hi}, {row});
+        fixture.builder.setSliceStaticAttributes(hiSlice, 8);
+        const InstructionId loSlice = fixture.emit(Opcode::SliceStatic, {lo}, {row});
+        fixture.builder.setSliceStaticAttributes(loSlice, 0);
+        fixture.emit(Opcode::Concat, {cat}, {hi, data, lo});
+        fixture.emit(Opcode::Assign, {out0}, {cat});
+        // concat(data, row[11:0]) -> Insert(row, data, lsb=12).
+        const InstructionId lo2Slice = fixture.emit(Opcode::SliceStatic, {lo2}, {row});
+        fixture.builder.setSliceStaticAttributes(lo2Slice, 0);
+        fixture.emit(Opcode::Concat, {cat2}, {data, lo2});
+        fixture.emit(Opcode::Assign, {out1}, {cat2});
+        // Mixed rows must not fuse.
+        const InstructionId hi3Slice = fixture.emit(Opcode::SliceStatic, {hi3}, {row});
+        fixture.builder.setSliceStaticAttributes(hi3Slice, 8);
+        const InstructionId lo3Slice = fixture.emit(Opcode::SliceStatic, {lo3}, {row2});
+        fixture.builder.setSliceStaticAttributes(lo3Slice, 0);
+        fixture.emit(Opcode::Concat, {cat3}, {hi3, data, lo3});
+        fixture.emit(Opcode::Assign, {out2}, {cat3});
+        AmGraph graph = AmGraph::fromLinearProgram(fixture.finish());
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
+            return failValidation("insert-fuse fixture is invalid", result);
+        }
+
+        diag::Diagnostics diagnostics;
+        if (!optimizeAmGraph(graph, AmOptimizeOptions{}, diagnostics)) {
+            return fail("insert-fuse optimize reported failure");
+        }
+        const ProgramView program = graph.program();
+        if (countOpcode(program, Opcode::Insert) != 2) {
+            return fail("insert-fuse did not produce exactly two Insert instructions");
+        }
+        if (countOpcode(program, Opcode::Concat) != 1 ||
+            countOpcode(program, Opcode::SliceStatic) != 2) {
+            return fail("insert-fuse rewrote the mixed-row concat");
+        }
+        bool sawLsb4 = false;
+        bool sawLsb12 = false;
+        for (uint32_t index = 0; index < program.instructionCount(); ++index) {
+            const InstructionId instruction{index};
+            if (program.opcode(instruction) != Opcode::Insert) {
+                continue;
+            }
+            const auto operands = program.operands(instruction);
+            const auto attributes = program.sliceStaticAttributes(instruction);
+            if (operands.size() != 2 || operands[0] != row || operands[1] != data ||
+                !attributes) {
+                return fail("insert-fuse produced a malformed Insert");
+            }
+            sawLsb4 = sawLsb4 || attributes->lsb == 4;
+            sawLsb12 = sawLsb12 || attributes->lsb == 12;
+        }
+        if (!sawLsb4 || !sawLsb12) {
+            return fail("insert-fuse produced wrong window offsets");
+        }
+        if (const ValidationResult result = validateSemantic(graph); !result.success()) {
+            return failValidation("insert-fuse optimized artifact is invalid", result);
+        }
+        return 0;
+    }
+
     int testConstMemFold() {
         Fixture fixture;
         const TypeId bv32 = fixture.builder.addType(Type::bitVector(32));
@@ -991,6 +1078,9 @@ int main() {
         return result;
     }
     if (const int result = testSliceFuse(); result != 0) {
+        return result;
+    }
+    if (const int result = testInsertFuse(); result != 0) {
         return result;
     }
     return testConstMemFold();

@@ -412,6 +412,12 @@ namespace
                 {unsigned130Base, dynamicIndex});
         addPure(Opcode::SliceArray, addOutput(u65Type, "slice_array_65"),
                 {unsigned130Base, arrayIndex});
+        // NO0004: wide Insert must overwrite the window (not OR into it) —
+        // unsigned65A overlaps bits already set in unsigned130Base.
+        const InstructionId insertWide =
+            addPure(Opcode::Insert, addOutput(u130Type, "insert_130"),
+                    {unsigned130Base, unsigned65A});
+        builder.setSliceStaticAttributes(insertWide, 17);
 
         LinearProgram program = builder.finish();
         SchedulingFacts facts;
@@ -3349,6 +3355,123 @@ int main()
         return 0;
     }
 
+    // B2 branchy-mux emission (emit-cost NO0001): with the "branchyMux"
+    // attribute on, every scalar Mux emits an if/else arm assignment instead
+    // of a ternary, so block bodies split into small basic blocks. Same model
+    // and semantics as testMuxRunFusion; the fused runs keep their if/else
+    // form, the different-select singleton mux joins them, and no narrow
+    // ternary may remain in the file.
+    int testBranchyMux(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        ExecutableModel model = makeMuxRunEmitterModel();
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "BranchyTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"branchyMux", "true"}},
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the branchy-mux model");
+        }
+        const std::optional<std::string> blocksText =
+            readTextFile(outputDirectory / "grhsim_BranchyTop_blocks_0.cpp");
+        if (!blocksText)
+        {
+            return fail("AM C++ emitter produced no branchy-mux blocks source");
+        }
+        const ProgramView program = model.program.view();
+        const auto findPort = [&](std::string_view name) {
+            for (const PortBinding &port : model.interface.ports)
+            {
+                if (program.string(port.name) == name)
+                {
+                    return port.direction == PortDirection::Input ? port.input : port.output;
+                }
+            }
+            return VariableId::invalid();
+        };
+        const VariableId sel2 = findPort("sel2");
+        if (!sel2.valid())
+        {
+            return fail("branchy-mux model lost its interface bindings");
+        }
+        // The fused runs contribute two if/else gates on sel; the
+        // different-select singleton mux must add one more gate on sel2, and
+        // no narrow ternary may remain anywhere in the file.
+        const std::string singletonGate = "if ((v" + std::to_string(sel2.value) + " != 0)) { ";
+        if (countOccurrences(*blocksText, singletonGate) != 1 ||
+            countOccurrences(*blocksText, " != 0) ? ") != 0)
+        {
+            return fail("AM C++ emitter did not branch the scalar mux form");
+        }
+
+        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << R"CPP(#include "grhsim_BranchyTop.hpp"
+int main()
+{
+    GrhSIM_BranchyTop model;
+    model.init();
+    model.sel = 0;
+    model.sel2 = 0;
+    model.a = 0x11;
+    model.b = 0x22;
+    model.c = 0x33;
+    model.d = 0x44;
+    model.wide_a = {UINT64_C(0xaaaabbbbccccdddd), UINT64_C(0x12)};
+    model.wide_b = {UINT64_C(0x1111222233334444), UINT64_C(0x56)};
+    model.eval();
+    if (model.r1 != 0x22 || model.r2 != 0x22 || model.r3 != 0x44 || model.mo != 0x22)
+        return 1;
+    if (model.w2[0] != UINT64_C(0xaaaabbbbccccdddd) || model.w2[1] != UINT64_C(0x12))
+        return 2;
+    model.sel = 1;
+    model.sel2 = 1;
+    model.eval();
+    if (model.r1 != 0x00 || model.r2 != 0x33 || model.r3 != 0x11 || model.mo != 0x11)
+        return 3;
+    if (model.w2[0] != UINT64_C(0x1111222233334444) || model.w2[1] != UINT64_C(0x56))
+        return 4;
+    return 0;
+}
+)CPP";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the branchy-mux model harness");
+        }
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated branchy-mux model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (outputDirectory / "libgrhsim_BranchyTop.a").string() + "' -o '" +
+            harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated branchy-mux model harness failed to compile");
+        }
+        const std::string runCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(runCommand.c_str()) != 0)
+        {
+            return fail("generated branchy-mux model violated the scalar mux semantics");
+        }
+        return 0;
+    }
+
     // NO0008 production-form fusion: same-select muxes lowered into an
     // AmGraph, scheduled through graphToProgram (split -> tree-atom fold ->
     // partition -> materialize), then emitted. The pinned outputs keep each
@@ -3928,6 +4051,13 @@ int main()
     if (const int result = testMuxRunFusion(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-mux-run");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testBranchyMux(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-branchy-mux");
         result != 0)
     {
         return result;

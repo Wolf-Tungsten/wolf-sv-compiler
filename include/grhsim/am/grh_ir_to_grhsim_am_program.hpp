@@ -30,6 +30,20 @@ namespace wolvrix::lib::grhsim::am
     ValidationResult validate(const ExecutableModel &model,
                               const ValidationOptions &options = {});
 
+    // gsim node-aligned atomization mode (NO0006). When active, the split
+    // stage packs scheduling atoms by the gsim.node_id provenance stamped
+    // during lowering (one compute atom per gsim node) instead of the
+    // heuristic SCC + tree-atom-fold atomization, and the AM graph
+    // optimize/fold passes are skipped (the gsim flatten graph is already
+    // optimized; the AM passes would erase node anchors and break the 1:1
+    // mapping). Auto activates iff the graph carries gsim node provenance.
+    enum class GsimNodeAlignedMode : uint8_t
+    {
+        Auto = 0,
+        On,
+        Off,
+    };
+
     struct ActivityScheduleOptions
     {
         // Compute 块容量上限，按 atom 计（NO0007 P3：atom 是分区大小的
@@ -56,6 +70,14 @@ namespace wolvrix::lib::grhsim::am
         // (XiangShan: 7000 -> +6% host time, 256 -> -3% host time vs the
         // legacy partitioner; see compute-partition NO0004).
         std::size_t dpCoarsenAtomBudget = 0;
+        // Merge host member limit in member instructions for the out1/in1
+        // sweeps (gsim MAX_NODES_PER_SUPER corrected to emitted-instruction
+        // terms: tree-atom fold makes an atom ~25 instructions on XiangShan
+        // vs ~6.5 emitted lines per gsim node, so the atom budget lets
+        // single blocks grow past what the host C++ backend can optimize).
+        // 0 = off (atom budget applies); nonzero replaces the atom budget in
+        // every merge sweep (out1/in1 and mergeWhen group formation).
+        std::size_t dpCoarsenInstrBudget = 0;
         // Post-DP local-move refinement rounds for the compute partition
         // (0 = off). Deterministic, monotone cost decrease; see
         // grhsim_am_compute_graph_partition.cpp.
@@ -81,7 +103,29 @@ namespace wolvrix::lib::grhsim::am
         double fanoutAbsorbBudgetMult = 1.0;
         // Per-atom consumer-count cap (hubs above it stay shared).
         std::size_t fanoutAbsorbMaxConsumers = 256;
+        // Tree-atom fold set size cap (NO0002 L2 alignment): fold trees are
+        // partitioned into connected sub-trees of at most this many member
+        // instructions. 0 = uncapped (legacy behavior). The
+        // WOLVRIX_GRHSIM_AM_TREE_ATOM_FOLD_MAX_INSTR env var overrides when
+        // this is 0. Value 2 aligns the AM atom count with the gsim node
+        // count on the XiangShan exec-GRH (0.95x).
+        std::size_t treeAtomFoldMaxInstr = 0;
+        // NO0006 gsim node-aligned atomization (see GsimNodeAlignedMode).
+        // The WOLVRIX_GRHSIM_AM_NODE_ALIGNED env var (0|1) overrides this
+        // option when set.
+        GsimNodeAlignedMode gsimNodeAligned = GsimNodeAlignedMode::Auto;
     };
+
+    // Resolves the effective node-aligned mode (NO0006): the
+    // WOLVRIX_GRHSIM_AM_NODE_ALIGNED env var (0|1) wins over the option;
+    // Auto activates iff the graph carries gsim node provenance.
+    bool gsimNodeAlignedScheduling(const AmGraph &graph,
+                                   const ActivityScheduleOptions &options);
+
+    // Escape hatch (NO0006): WOLVRIX_GRHSIM_AM_NODE_ALIGNED_OPTIMIZE=1
+    // force-runs the AM graph optimize passes even when node-aligned
+    // scheduling is active (A/B bisection; erases the 1:1 node mapping).
+    bool gsimNodeAlignedOptimizeForced();
 
     struct AmOptimizeOptions
     {
@@ -112,6 +156,10 @@ namespace wolvrix::lib::grhsim::am
         // Fuse SliceStatic chains (slice(slice(x, l1), l2) -> slice(x,
         // l1+l2)) and bypass identity slices (lsb 0, identical type).
         bool sliceFuse = true;
+        // Fuse packed-vector element-write insert patterns
+        // (concat(slice(row, hi), data, slice(row, lo)) and its two-operand
+        // boundary forms) into a single Insert instruction (NO0004).
+        bool insertFuse = true;
         // Canonicalize 1-bit Not to Eq(x, 0): matches the reference flow's
         // negation form and lets CSE merge it with an explicit x == 0.
         // Measured on XiangShan (compute-partition NO0005): pure bucket

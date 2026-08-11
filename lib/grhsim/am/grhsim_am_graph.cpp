@@ -102,6 +102,8 @@ namespace wolvrix::lib::grhsim::am
         std::vector<uint8_t> removed;
         std::vector<OrderedEffect> orderedEffects;
         std::unordered_map<uint64_t, AmStateAccess> stateAccesses;
+        std::vector<int64_t> gsimNodeIds;
+        bool gsimNodeProvenance = false;
     };
 
     AmGraph::AmGraph() : impl_(std::make_unique<Impl>()) {}
@@ -195,6 +197,7 @@ namespace wolvrix::lib::grhsim::am
             }
         }
         impl.removed.assign(program.instructionCount(), uint8_t{0});
+        impl.gsimNodeIds.assign(program.instructionCount(), -1);
         impl.orderedEffects = artifact.schedulingFacts.orderedEffects;
         return graph;
     }
@@ -408,6 +411,7 @@ namespace wolvrix::lib::grhsim::am
         storage.results.insert(storage.results.end(), results.begin(), results.end());
         storage.resultOffsets.push_back(static_cast<uint32_t>(storage.results.size()));
         impl_->removed.push_back(uint8_t{0});
+        impl_->gsimNodeIds.push_back(-1);
         switch (opcodeTraits(opcode).effect)
         {
         case OpcodeEffect::Pure:
@@ -550,6 +554,7 @@ namespace wolvrix::lib::grhsim::am
         impl_->valueFacts.reserve(reserve.variables);
         impl_->effects.reserve(reserve.instructions);
         impl_->removed.reserve(reserve.instructions);
+        impl_->gsimNodeIds.reserve(reserve.instructions);
     }
 
     LiteralId AmGraph::addStringLiteral(TypeId type, std::string_view bytes)
@@ -653,6 +658,33 @@ namespace wolvrix::lib::grhsim::am
     const std::vector<InstructionEffect> &AmGraph::instructionEffects() const noexcept
     {
         return impl_->effects;
+    }
+
+    int64_t AmGraph::gsimNodeId(InstructionId instruction) const noexcept
+    {
+        if (!instruction.valid() || instruction.value >= impl_->gsimNodeIds.size())
+        {
+            return -1;
+        }
+        return impl_->gsimNodeIds[instruction.value];
+    }
+
+    void AmGraph::setGsimNodeId(InstructionId instruction, int64_t nodeId)
+    {
+        if (instruction.valid() && instruction.value < impl_->gsimNodeIds.size())
+        {
+            impl_->gsimNodeIds[instruction.value] = nodeId;
+        }
+    }
+
+    bool AmGraph::hasGsimNodeProvenance() const noexcept
+    {
+        return impl_->gsimNodeProvenance;
+    }
+
+    void AmGraph::setGsimNodeProvenance(bool present) noexcept
+    {
+        impl_->gsimNodeProvenance = present;
     }
 
     std::vector<VariableRole> AmGraph::variableRoles() const

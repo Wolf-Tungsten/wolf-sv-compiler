@@ -774,7 +774,8 @@ namespace wolvrix::lib::grhsim::am
     }
 
     bool foldSingleOutputTreeAtoms(AmGraph &graph, AmGraphSplitContext &context,
-                                   wolvrix::lib::diag::Diagnostics &diagnostics)
+                                   wolvrix::lib::diag::Diagnostics &diagnostics,
+                                   std::size_t foldMaxInstructions)
     {
         const ProgramView program = graph.program();
         const uint32_t instructionCount = context.instructionCount;
@@ -857,6 +858,87 @@ namespace wolvrix::lib::grhsim::am
                 continue;
             }
             foldInto[index] = consumer;
+        }
+
+        // NO0002 L2 alignment: optional fold-set size cap. The fold relation
+        // forms in-trees keyed by their sink; with a cap, each tree is
+        // partitioned into connected sub-trees of at most foldMaxInstructions
+        // members by detaching the fold link of the first node that would
+        // overflow a set (deterministic DFS from each root, children in
+        // ascending instruction order). 0 = uncapped (default).
+        if (foldMaxInstructions != 0)
+        {
+            std::vector<uint32_t> childOffsets(instructionCount + 1, 0);
+            for (uint32_t index = 0; index < instructionCount; ++index)
+            {
+                if (foldInto[index] != kInvalidIndex)
+                {
+                    ++childOffsets[foldInto[index] + 1];
+                }
+            }
+            for (uint32_t index = 0; index < instructionCount; ++index)
+            {
+                childOffsets[index + 1] += childOffsets[index];
+            }
+            std::vector<uint32_t> children(childOffsets[instructionCount]);
+            {
+                std::vector<uint32_t> cursor(childOffsets.begin(),
+                                             childOffsets.end() - 1);
+                for (uint32_t index = 0; index < instructionCount; ++index)
+                {
+                    if (foldInto[index] != kInvalidIndex)
+                    {
+                        children[cursor[foldInto[index]]++] = index;
+                    }
+                }
+            }
+            std::vector<uint8_t> visited(instructionCount, 0);
+            std::vector<uint32_t> roots;
+            std::vector<uint32_t> stack;
+            for (uint32_t index = 0; index < instructionCount; ++index)
+            {
+                if (foldInto[index] == kInvalidIndex &&
+                    childOffsets[index + 1] != childOffsets[index])
+                {
+                    roots.push_back(index);
+                }
+            }
+            std::size_t rootCursor = 0;
+            while (rootCursor < roots.size())
+            {
+                const uint32_t root = roots[rootCursor++];
+                if (visited[root] != 0)
+                {
+                    continue;
+                }
+                std::size_t size = 0;
+                stack.push_back(root);
+                while (!stack.empty())
+                {
+                    const uint32_t node = stack.back();
+                    stack.pop_back();
+                    if (visited[node] != 0)
+                    {
+                        continue;
+                    }
+                    if (size == foldMaxInstructions)
+                    {
+                        // Overflow: node starts a fresh sub-tree (its fold
+                        // link to the full parent is cut); its children are
+                        // traversed when the new root is processed.
+                        foldInto[node] = kInvalidIndex;
+                        roots.push_back(node);
+                        continue;
+                    }
+                    visited[node] = 1;
+                    ++size;
+                    for (uint32_t offset = childOffsets[node + 1];
+                         offset-- > childOffsets[node];)
+                    {
+                        stack.push_back(children[offset]);
+                    }
+                }
+            }
         }
 
         // Root of each fold chain (memoized walk; chains are def-use paths).

@@ -59,7 +59,9 @@ namespace wolvrix::lib::grhsim::am
         // CommitEvent；CommitEvent 的 signature 为 commitEventRank，mux 根
         // compute atom（Singleton/Tree）的 signature 为 select 变量 id，
         // 其余为 kInvalidAtomSignature。Tree 由 tree-atom fold pass 在重建
-        // 时标注。
+        // 时标注；NO0006 node-aligned 路径（gsim.node_id  provenance）按
+        // gsim node 分组直接标注 Tree/Singleton，CombLoopScc 仅用于跨组
+        // 成环时的 union 回退。
         std::vector<uint8_t> atomKinds;
         std::vector<uint32_t> atomSignatures;
         std::size_t oversizedAtomCount = 0;
@@ -70,6 +72,7 @@ namespace wolvrix::lib::grhsim::am
         std::size_t maxCommitAtomsPerBlock = 4096;
         bool enableCoarsening = true;
         std::size_t coarsenAtomBudget = 256;
+        std::size_t coarsenInstructionBudget = 0;
         double segmentPenalty = 1.0;
         std::size_t refinementRounds = 10;
         std::size_t mergeWhenMinGroup = 5;

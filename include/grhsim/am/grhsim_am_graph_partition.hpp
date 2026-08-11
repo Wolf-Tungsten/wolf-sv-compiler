@@ -36,6 +36,12 @@ namespace wolvrix::lib::grhsim::am
         std::size_t maxCommitAtomsPerBlock = 4096; // commit 块 atom 数上限
         bool enableCoarsening = true;   // mergeWhen/out1/in1/sibling merge sweeps
         std::size_t coarsenAtomBudget = 256; // merge host member atom limit
+        // Merge host member limit in member instructions (emitted-size unit,
+        // gsim MAX_NODES_PER_SUPER corrected for tree-atom fatness). When
+        // nonzero it replaces coarsenAtomBudget in every merge sweep,
+        // mergeWhen included (gsim leaves when-groups uncapped; on this
+        // graph a state-select group alone reaches 178k instructions).
+        std::size_t coarsenInstructionBudget = 0;
         double segmentPenalty = 1.0;    // DP fixed cost per segment boundary
         // Post-DP local-move refinement rounds (0 = off). Each round scans
         // clusters in topo order and moves a cluster to a neighbor block when
