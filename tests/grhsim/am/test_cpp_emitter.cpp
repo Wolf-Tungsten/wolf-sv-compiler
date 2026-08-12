@@ -3195,7 +3195,7 @@ int main()
         // the tail. Run fusion derives the select from each root
         // instruction, so implicit singleton atoms are eligible.
         scheduled.beginBlock();
-        scheduled.beginAtom(AmAtomKind::Tree, sel.value);
+        scheduled.beginAtom(AmAtomKind::Tree, sel.value, 42);
         scheduled.appendBlockInstruction(coneAnd);
         scheduled.appendBlockInstruction(mux1);
         scheduled.endAtom();
@@ -3351,6 +3351,71 @@ int main()
         if (std::system(runCommand.c_str()) != 0)
         {
             return fail("generated mux-run model violated the fused select semantics");
+        }
+        return 0;
+    }
+
+    // NO0006 trace comments: the emitter annotates block sources with
+    // per-block banners and per-atom provenance comments by default;
+    // GrhSimAmCppOptions::traceComments = false turns them off.
+    int testTraceComments(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        ExecutableModel model = makeMuxRunEmitterModel();
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "TraceTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the trace-comment model");
+        }
+        const std::optional<std::string> blocksText =
+            readTextFile(outputDirectory / "grhsim_TraceTop_blocks_0.cpp");
+        if (!blocksText)
+        {
+            return fail("AM C++ emitter produced no trace-comment blocks source");
+        }
+        if (blocksText->find("// ===== block 0 role=entry atoms=") == std::string::npos ||
+            blocksText->find("// ===== block 1 role=compute atoms=") == std::string::npos ||
+            blocksText->find("// --- atom ") == std::string::npos ||
+            blocksText->find("kind=Tree gsim_node=42 ---") == std::string::npos ||
+            blocksText->find("kind=Singleton gsim_node=-1 ---") == std::string::npos)
+        {
+            return fail("AM C++ emitter did not emit the default trace comments");
+        }
+
+        std::filesystem::remove_all(outputDirectory);
+        wolvrix::lib::diag::Diagnostics offDiagnostics;
+        const GrhSimAmCppResult offResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "TraceTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .traceComments = false,
+            },
+            offDiagnostics);
+        if (!offResult.success || offDiagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed with trace comments disabled");
+        }
+        const std::optional<std::string> plainText =
+            readTextFile(outputDirectory / "grhsim_TraceTop_blocks_0.cpp");
+        if (!plainText)
+        {
+            return fail("AM C++ emitter produced no blocks source with comments disabled");
+        }
+        if (plainText->find("// ===== block ") != std::string::npos ||
+            plainText->find("// --- atom ") != std::string::npos)
+        {
+            return fail("AM C++ emitter emitted trace comments despite traceComments=false");
         }
         return 0;
     }
@@ -4051,6 +4116,13 @@ int main()
     if (const int result = testMuxRunFusion(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-mux-run");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testTraceComments(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-trace-comments");
         result != 0)
     {
         return result;

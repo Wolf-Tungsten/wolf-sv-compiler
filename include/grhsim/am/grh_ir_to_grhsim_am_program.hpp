@@ -183,6 +183,11 @@ namespace wolvrix::lib::grhsim::am
         std::filesystem::path outputDirectory;
         std::string modelName;
         uint64_t maxOutputFileBytes = UINT64_C(4) * UINT64_C(1024) * UINT64_C(1024) * UINT64_C(1024);
+        // NO0006 trace comments: annotate the generated block sources with
+        // per-block banners and per-atom provenance comments
+        // (// ===== block ... ===== / // --- atom ... gsim_node=<id> ---).
+        // Comment-only; no semantic effect on the emitted model.
+        bool traceComments = true;
         std::map<std::string, std::string, std::less<>> attributes;
     };
 

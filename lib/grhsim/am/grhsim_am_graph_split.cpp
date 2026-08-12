@@ -1163,4 +1163,43 @@ namespace wolvrix::lib::grhsim::am
         return context;
     }
 
+    void propagateAtomGsimNodeIds(const AmGraph &graph,
+                                  const AmGraphSplitContext &context,
+                                  AmComputeActivityGraph &computeActivity,
+                                  AmCommitEventGraph &commitEvent)
+    {
+        // Per-atom value semantics: one shared member node id -> that id;
+        // every member unowned -> -1; mixed member node ids -> -2. Computed
+        // from the context's final atom member tables so atom-rewriting
+        // passes (tree-atom fold, fanout absorb) stay transparent to it.
+        std::vector<int64_t> globalNodeId(context.atomCount, -1);
+        for (uint32_t atom = 0; atom < context.atomCount; ++atom) {
+            const uint32_t begin = context.atomMemberOffsets[atom];
+            const uint32_t end = context.atomMemberOffsets[atom + 1];
+            if (begin == end) {
+                continue;
+            }
+            const int64_t first = graph.gsimNodeId(InstructionId{context.atomMembers[begin]});
+            bool mixed = false;
+            for (uint32_t offset = begin + 1; offset < end; ++offset) {
+                if (graph.gsimNodeId(InstructionId{context.atomMembers[offset]}) != first) {
+                    mixed = true;
+                    break;
+                }
+            }
+            globalNodeId[atom] = mixed ? -2 : first;
+        }
+
+        const AmComputeGraph &computeGraph = context.split.computeGraph;
+        computeActivity.atomGsimNodeId.assign(computeGraph.atomCount, -1);
+        for (uint32_t local = 0; local < computeGraph.atomCount; ++local) {
+            computeActivity.atomGsimNodeId[local] = globalNodeId[computeGraph.globalOfAtom[local]];
+        }
+        const AmCommitGraph &commitGraph = context.split.commitGraph;
+        commitEvent.atomGsimNodeId.assign(commitGraph.atomCount, -1);
+        for (uint32_t local = 0; local < commitGraph.atomCount; ++local) {
+            commitEvent.atomGsimNodeId[local] = globalNodeId[commitGraph.globalOfAtom[local]];
+        }
+    }
+
 } // namespace wolvrix::lib::grhsim::am

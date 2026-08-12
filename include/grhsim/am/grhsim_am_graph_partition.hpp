@@ -108,6 +108,10 @@ namespace wolvrix::lib::grhsim::am
         // 同组 mux 根 atom 排相邻，供 emitter 块级融合；非组成员为
         // kInvalidAtomSignature 同值的哨兵（0xFFFFFFFF）。
         std::vector<uint32_t> atomFusionAnchor;
+        // gsim node provenance per compute-local atom (NO0006 carry-out):
+        // the shared member node id, -1 when every member is unowned, -2
+        // when members mix node ids.
+        std::vector<int64_t> atomGsimNodeId;
         uint32_t blockCount = 0;
         std::size_t clustersAfterCoarsen = 0;
         std::size_t dpSegments = 0;
@@ -144,6 +148,9 @@ namespace wolvrix::lib::grhsim::am
     {
         std::vector<uint32_t> atomBlock; // per commit-local atom, 1..blockCount
         std::vector<uint32_t> atomTopo;  // commit-local atoms, bucket emission order
+        // gsim node provenance per commit-local atom (same -1/-2 convention
+        // as AmComputeActivityGraph::atomGsimNodeId).
+        std::vector<int64_t> atomGsimNodeId;
         uint32_t blockCount = 0;
     };
 

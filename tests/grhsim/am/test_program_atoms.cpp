@@ -100,7 +100,7 @@ namespace
 
         ScheduledProgramBuilder builder(linear.finish());
         builder.beginBlock();
-        builder.beginAtom(AmAtomKind::Tree, sel.value);
+        builder.beginAtom(AmAtomKind::Tree, sel.value, 42);
         builder.appendBlockInstruction(mux1);
         builder.appendBlockInstruction(mux2);
         builder.endAtom();
@@ -116,6 +116,7 @@ namespace
         const AtomId singleton = program.blockAtom(BlockId{0}, 1);
         if (program.atomKind(merged) != AmAtomKind::Tree ||
             program.atomSignature(merged) != sel.value ||
+            program.atomGsimNodeId(merged) != 42 ||
             program.atomInstructionCount(merged) != 2 ||
             program.atomInstruction(merged, 0) != mux1 ||
             program.atomInstruction(merged, 1) != mux2)
@@ -123,6 +124,7 @@ namespace
             return fail("explicit Tree atom metadata did not round-trip");
         }
         if (program.atomKind(singleton) != AmAtomKind::Singleton ||
+            program.atomGsimNodeId(singleton) != -1 ||
             program.atomInstructionCount(singleton) != 1 ||
             program.atomInstruction(singleton, 0) != assign)
         {
@@ -177,7 +179,7 @@ namespace
             copy.addInstruction(Opcode::Assign, std::array{y}, std::array{x});
             ScheduledProgramBuilder builder(copy.finish());
             builder.beginBlock();
-            builder.beginAtom(AmAtomKind::Singleton, 0);
+            builder.beginAtom(AmAtomKind::Singleton, 0, -1);
             builder.appendBlockInstruction(assign);
             bool caught = false;
             try
@@ -202,7 +204,7 @@ namespace
             copy.addInstruction(Opcode::Assign, std::array{y}, std::array{x});
             ScheduledProgramBuilder builder(copy.finish());
             builder.beginBlock();
-            builder.beginAtom(AmAtomKind::Singleton, 0);
+            builder.beginAtom(AmAtomKind::Singleton, 0, -1);
             bool caught = false;
             try
             {
@@ -238,7 +240,7 @@ namespace
             linear.addInstruction(Opcode::Assign, std::array{b}, std::array{r1});
         ScheduledProgramBuilder builder(linear.finish());
         builder.beginBlock();
-        builder.beginAtom(AmAtomKind::Tree, kInvalidAtomSignature);
+        builder.beginAtom(AmAtomKind::Tree, kInvalidAtomSignature, -1);
         builder.appendBlockInstruction(assign);
         builder.endAtom();
         builder.appendBlockInstruction(assign2);

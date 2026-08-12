@@ -292,6 +292,7 @@ namespace wolvrix::lib::grhsim::am
             AmGraph &graph, ProgramView program, const DefUseIndex &defUse,
             const std::vector<std::vector<uint32_t>> &blockAtoms,
             const AmGraphSplitContext &context,
+            const std::vector<int64_t> &atomGsimNodeId,
             const std::vector<std::vector<CommitEventPart>> &commitGateParts,
             std::vector<ActivationEdge> &activationEdges, uint32_t normalBlockCount,
             uint32_t commitBlockBegin, uint32_t commitBlockEnd, TypeId eventType,
@@ -362,7 +363,7 @@ namespace wolvrix::lib::grhsim::am
                     for (const uint32_t atom : blockAtoms[block]) {
                         builder.beginAtom(
                             static_cast<AmAtomKind>(context.atomKinds[atom]),
-                            context.atomSignatures[atom]);
+                            context.atomSignatures[atom], atomGsimNodeId[atom]);
                         for (uint32_t offset = context.atomMemberOffsets[atom];
                              offset < context.atomMemberOffsets[atom + 1]; ++offset) {
                             const InstructionId instruction{context.atomMembers[offset]};
@@ -453,6 +454,21 @@ namespace wolvrix::lib::grhsim::am
         }
         for (const uint32_t local : commitEvent.atomTopo) {
             atomTopo.push_back(graphSplit.commitGraph.globalOfAtom[local]);
+        }
+        // gsim node provenance (NO0006), merged into the same global atom
+        // numbering; atoms the partition results do not cover keep -1.
+        std::vector<int64_t> atomGsimNodeId(atomCount, -1);
+        if (computeActivity.atomGsimNodeId.size() == graphSplit.computeGraph.atomCount) {
+            for (uint32_t local = 0; local < graphSplit.computeGraph.atomCount; ++local) {
+                atomGsimNodeId[graphSplit.computeGraph.globalOfAtom[local]] =
+                    computeActivity.atomGsimNodeId[local];
+            }
+        }
+        if (commitEvent.atomGsimNodeId.size() == graphSplit.commitGraph.atomCount) {
+            for (uint32_t local = 0; local < graphSplit.commitGraph.atomCount; ++local) {
+                atomGsimNodeId[graphSplit.commitGraph.globalOfAtom[local]] =
+                    commitEvent.atomGsimNodeId[local];
+            }
         }
         uint32_t normalBlockCount = computeActivity.blockCount + commitEvent.blockCount;
         if (options.collectStats) {
@@ -878,7 +894,7 @@ namespace wolvrix::lib::grhsim::am
         }
 
         std::optional<ExecutableModel> finalized = finalizeScheduledModel(
-            graph, program, defUse, blockAtoms, context, commitGateParts,
+            graph, program, defUse, blockAtoms, context, atomGsimNodeId, commitGateParts,
             activationEdges, normalBlockCount, commitBlockBegin, commitBlockEnd, eventType,
             needsEventType, materialization, headDetectorCount, instructionCount, diagnostics);
         if (!finalized) {

@@ -5,12 +5,18 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
+
+namespace wolvrix::lib::diag
+{
+    class Diagnostics;
+}
 
 namespace wolvrix::lib::grhsim::am
 {
@@ -402,6 +408,7 @@ namespace wolvrix::lib::grhsim::am
         AtomInstructionOffsets,
         AtomKinds,
         AtomSignatures,
+        AtomGsimNodeIds,
         Count,
     };
 
@@ -533,6 +540,10 @@ namespace wolvrix::lib::grhsim::am
             std::vector<uint32_t> atomInstructionOffsets;
             std::vector<uint8_t> atomKinds;
             std::vector<uint32_t> atomSignatures;
+            // gsim node provenance per atom (NO0006): the shared member node
+            // id, -1 when the atom has no provenance (implicit/helper atoms)
+            // or every member is unowned, -2 when members mix node ids.
+            std::vector<int64_t> atomGsimNodeIds;
         };
     } // namespace detail
 
@@ -631,6 +642,7 @@ namespace wolvrix::lib::grhsim::am
         InstructionId atomInstruction(AtomId atom, std::size_t index) const;
         AmAtomKind atomKind(AtomId atom) const;
         uint32_t atomSignature(AtomId atom) const;
+        int64_t atomGsimNodeId(AtomId atom) const;
 
     private:
         explicit ScheduledProgram(std::unique_ptr<detail::ProgramStorage> storage);
@@ -729,6 +741,17 @@ namespace wolvrix::lib::grhsim::am
         uint32_t commitBlockBegin = 0;
         uint32_t commitBlockEnd = 0;
     };
+
+    // Block/atom membership export (NO0006 trace): one JSON object per
+    // line — a block line ({"block", "role", "atom_count", "instr_count"})
+    // followed by its atom lines ({"atom", "block", "kind", "gsim_node",
+    // "instr_count"}), all in the dense BlockId/AtomId numbering the C++
+    // emitter uses. Block role: block 0 is "entry", the
+    // [commitBlockBegin, commitBlockEnd) suffix is "commit", everything
+    // else "compute".
+    bool exportGrhSimAmBlockAtomJsonl(const ExecutableModel &model,
+                                      const std::filesystem::path &path,
+                                      wolvrix::lib::diag::Diagnostics &diagnostics);
 
     struct ProgramReserve
     {
@@ -864,8 +887,9 @@ namespace wolvrix::lib::grhsim::am
         void addBlock(std::span<const InstructionId> instructions);
         // beginBlock/endBlock 之间可显式包 atom；未显式打开的指令由
         // appendBlockInstruction 自动包成 Singleton atom（signature=0），
-        // 因此 addBlock 与逐条 append 的旧调用点保持合法。
-        void beginAtom(AmAtomKind kind, uint32_t signature);
+        // 因此 addBlock 与逐条 append 的旧调用点保持合法。gsimNodeId 携带
+        // atom 的 gsim node 溯源（无溯源的辅助 atom 传 -1）。
+        void beginAtom(AmAtomKind kind, uint32_t signature, int64_t gsimNodeId);
         void endAtom();
 
         ProgramView view() const noexcept;

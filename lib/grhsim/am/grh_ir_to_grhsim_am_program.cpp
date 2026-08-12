@@ -1155,7 +1155,7 @@ namespace wolvrix::lib::grhsim::am
         // Activity-driven partitioning of the compute graph, producing the
         // GRHSIM AM Compute Activity Graph.
         std::string blockError;
-        const auto computeActivity =
+        auto computeActivity =
             partitionAmComputeGraph(blockInput, context->split, blockError);
         if (!computeActivity) {
             diagnostics.error(std::move(blockError), std::string(detail::kDiagnosticContext));
@@ -1165,11 +1165,15 @@ namespace wolvrix::lib::grhsim::am
         // ---- stage: partition-am-commit-graph ---------------------------
         // Event-clustering partitioning of the commit graph, producing the
         // GRHSIM AM Commit Event Graph.
-        const auto commitEvent = partitionAmCommitGraph(blockInput, context->split, blockError);
+        auto commitEvent = partitionAmCommitGraph(blockInput, context->split, blockError);
         if (!commitEvent) {
             diagnostics.error(std::move(blockError), std::string(detail::kDiagnosticContext));
             return std::nullopt;
         }
+
+        // NO0006 carry-out: stamp both partition results with the per-atom
+        // gsim node provenance (computed on the final atom tables).
+        propagateAtomGsimNodeIds(graph, *context, *computeActivity, *commitEvent);
 
         // ---- stage: materialize -----------------------------------------
         return materializeAmProgram(graph, *context, *computeActivity, *commitEvent, options,

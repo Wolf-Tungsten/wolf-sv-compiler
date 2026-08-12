@@ -93,6 +93,17 @@ namespace wolvrix::lib::grhsim::am
                       const ActivityScheduleOptions &options,
                       wolvrix::lib::diag::Diagnostics &diagnostics);
 
+    // NO0006 provenance carry-out: fills the per-atom gsim node id arrays
+    // of both partition result graphs from the (final) split-context atom
+    // tables. Per atom: one shared member node id -> that id; every member
+    // unowned -> -1; mixed member node ids -> -2. Must run after the
+    // atom-table-rewriting passes (tree-atom fold, fanout absorb), i.e. on
+    // the same tables the partition passes consumed.
+    void propagateAtomGsimNodeIds(const AmGraph &graph,
+                                  const AmGraphSplitContext &context,
+                                  AmComputeActivityGraph &computeActivity,
+                                  AmCommitEventGraph &commitEvent);
+
     // Research export of the pre-scheduling instruction graph (def-use +
     // ordered-effect edges plus the atom packing) as JSONL. Atom fields come
     // from the split context, so the export reflects the mux-merge atom pass

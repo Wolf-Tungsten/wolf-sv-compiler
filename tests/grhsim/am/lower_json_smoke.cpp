@@ -7,6 +7,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -140,7 +141,7 @@ int main(int argc, char **argv)
                      "[--dp-coarsen-atom-budget <count>] [--dp-coarsen-instr-budget <count>] [--disable-coarsening] "
                      "[--tree-atom-fold-max-instr <count>] "
                      "[--runtime-profile] [--full-evaluation] [--changed-trace] "
-                     "[--branchy-mux] "
+                     "[--branchy-mux] [--no-trace-comments] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -172,6 +173,7 @@ int main(int argc, char **argv)
     bool fullEvaluation = false;
     bool changedTrace = false;
     bool branchyMux = false;
+    bool traceComments = true;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
     {
@@ -399,6 +401,10 @@ int main(int argc, char **argv)
         else if (argument == "--branchy-mux")
         {
             branchyMux = true;
+        }
+        else if (argument == "--no-trace-comments")
+        {
+            traceComments = false;
         }
         else if (argument == "--no-am-optimize")
         {
@@ -691,6 +697,23 @@ int main(int argc, char **argv)
             commitBlocks = model->commitBlockBegin == 0
                                ? 0
                                : model->commitBlockEnd - model->commitBlockBegin;
+            // Block/atom membership export (NO0006 trace): same env-gated
+            // strictness as the split-stage audit dumps — set to a path to
+            // write, empty string is an error.
+            if (const char *blockAtomPath =
+                    std::getenv("WOLVRIX_GRHSIM_AM_BLOCK_ATOM_JSONL"))
+            {
+                if (blockAtomPath[0] == '\0' ||
+                    !exportGrhSimAmBlockAtomJsonl(
+                        *model, std::filesystem::path(blockAtomPath), diagnostics))
+                {
+                    diagnostics.error("AM block/atom export failed",
+                                      "grhsim-am-lower-json");
+                    printDiagnostics(diagnostics);
+                    return 1;
+                }
+                printNewDiagnostics(diagnostics, diagnosticsCursor);
+            }
             if (!emitDirectory.empty())
             {
                 phaseStart = std::chrono::steady_clock::now();
@@ -700,6 +723,7 @@ int main(int argc, char **argv)
                     .modelName = top,
                     .attributes = {{"collectStats", "true"}},
                 };
+                emitOptions.traceComments = traceComments;
                 if (blocksPerSource)
                 {
                     emitOptions.attributes.emplace("blocksPerSource", *blocksPerSource);

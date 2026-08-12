@@ -216,6 +216,10 @@ namespace wolvrix::lib::grhsim::am
             // bodies into many small basic blocks so the C++ backend never
             // faces one giant straight-line region (emit-cost NO0001 B2).
             bool branchyMux = false;
+            // NO0006 trace comments (GrhSimAmCppOptions::traceComments,
+            // default on): per-block banner and per-atom provenance comment
+            // lines in the block sources. Comment-only.
+            bool traceComments = false;
             std::unordered_map<uint32_t, uint32_t> onceSlotByInstruction;
             uint32_t onceSlotCount = 0;
             std::unordered_map<uint32_t, uint32_t> pendingEventSlotByInstruction;
@@ -401,6 +405,11 @@ namespace wolvrix::lib::grhsim::am
                 VariableId select;
                 std::vector<InstructionId> preamble; // cone members, atom order
                 std::vector<InstructionId> arms;     // root muxes, atom order
+                // Covered atom range (dense AtomId values, inclusive): runs
+                // cover whole contiguous atoms, so the trace comments of every
+                // covered atom emit at the head position.
+                uint32_t firstAtom = 0;
+                uint32_t lastAtom = 0;
             };
             std::vector<int32_t> instructionMuxRun;
             std::vector<MuxRunPlan> muxRunPlans;
@@ -3147,6 +3156,114 @@ namespace wolvrix::lib::grhsim::am
                    "#include \"" + std::string(prefix) + "_support.hpp\"\n";
         }
 
+        // NO0006 trace comments (GrhSimAmCppOptions::traceComments): block
+        // banners and per-atom provenance comment lines. atomKindName is a
+        // local equivalent of the split stage's helper (deliberately not a
+        // new cross-file helper).
+        std::string_view atomKindName(AmAtomKind kind)
+        {
+            switch (kind)
+            {
+            case AmAtomKind::Singleton:
+                return "Singleton";
+            case AmAtomKind::Tree:
+                return "Tree";
+            case AmAtomKind::CombLoopScc:
+                return "CombLoopScc";
+            case AmAtomKind::CommitEvent:
+                return "CommitEvent";
+            }
+            return "Unknown";
+        }
+
+        std::string_view blockTraceRole(const ExecutableModel &model, uint32_t blockIndex)
+        {
+            if (blockIndex == 0)
+            {
+                return "entry";
+            }
+            if (model.commitBlockBegin != 0 && blockIndex >= model.commitBlockBegin &&
+                blockIndex < model.commitBlockEnd)
+            {
+                return "commit";
+            }
+            return "compute";
+        }
+
+        std::string blockTraceBanner(const ExecutableModel &model, uint32_t blockIndex)
+        {
+            const BlockId block{blockIndex};
+            return "// ===== block " + std::to_string(blockIndex) +
+                   " role=" + std::string(blockTraceRole(model, blockIndex)) +
+                   " atoms=" + std::to_string(model.program.blockAtomCount(block)) +
+                   " instrs=" + std::to_string(model.program.blockSize(block)) +
+                   " =====\n";
+        }
+
+        std::string atomTraceComment(const ScheduledProgram &program, AtomId atom)
+        {
+            return "// --- atom " + std::to_string(atom.value) +
+                   " kind=" + std::string(atomKindName(program.atomKind(atom))) +
+                   " gsim_node=" + std::to_string(program.atomGsimNodeId(atom)) +
+                   " ---\n";
+        }
+
+        // Atoms tile their Block's flat instruction range contiguously: the
+        // boundary list maps an atom's block-local start position to its id.
+        struct AtomTraceBoundary
+        {
+            uint32_t position = 0;
+            AtomId atom;
+        };
+
+        std::vector<AtomTraceBoundary> blockAtomTraceBoundaries(
+            const ScheduledProgram &program, BlockId block)
+        {
+            std::vector<AtomTraceBoundary> boundaries;
+            boundaries.reserve(program.blockAtomCount(block));
+            uint32_t position = 0;
+            for (std::size_t index = 0; index < program.blockAtomCount(block); ++index)
+            {
+                const AtomId atom = program.blockAtom(block, index);
+                boundaries.push_back(AtomTraceBoundary{
+                    .position = position,
+                    .atom = atom,
+                });
+                position += static_cast<uint32_t>(program.atomInstructionCount(atom));
+            }
+            return boundaries;
+        }
+
+        // One boundary position of the per-atom trace comments. Atoms covered
+        // by a fused mux run carry their code at the run head's position, so
+        // the head emits every covered atom's comment and the later covered
+        // boundaries emit nothing.
+        std::string atomTraceCommentsAt(const EmitState &state,
+                                        const ScheduledProgram &program, AtomId atom,
+                                        InstructionId instruction)
+        {
+            const int32_t runId =
+                instruction.value < state.instructionMuxRun.size()
+                    ? state.instructionMuxRun[instruction.value]
+                    : -1;
+            if (runId < 0)
+            {
+                return atomTraceComment(program, atom);
+            }
+            const EmitState::MuxRunPlan &plan =
+                state.muxRunPlans[static_cast<std::size_t>(runId)];
+            if (plan.head != instruction.value)
+            {
+                return {};
+            }
+            std::string comments;
+            for (uint32_t covered = plan.firstAtom; covered <= plan.lastAtom; ++covered)
+            {
+                comments += atomTraceComment(program, AtomId{covered});
+            }
+            return comments;
+        }
+
         std::string entryBlockSourcePrologue(std::string_view className)
         {
             return "\nvoid " + std::string(className) + "::execute_block_0() {\n";
@@ -3482,10 +3599,52 @@ namespace wolvrix::lib::grhsim::am
                 detectorPlanFor(state, blockIndex);
             std::vector<uint8_t> detectorGroupDeclared(
                 detectorPlan != nullptr ? detectorPlan->groups.size() : 0, 0);
+            if (state.traceComments)
+            {
+                const std::optional<uint64_t> bannerBytes = indentedLineByteCount(
+                    blockTraceBanner(model, static_cast<uint32_t>(blockIndex)),
+                    indentation);
+                if (!bannerBytes || !addByteCount(byteCount, *bannerBytes))
+                {
+                    endLocalityBlock(state);
+                    diagnostics.error("AM C++ emitter source size overflow: block=" +
+                                          std::to_string(blockIndex),
+                                      std::string(kContext));
+                    return std::nullopt;
+                }
+            }
+            const std::vector<AtomTraceBoundary> atomBoundaries =
+                state.traceComments ? blockAtomTraceBoundaries(model.program, block)
+                                    : std::vector<AtomTraceBoundary>{};
+            std::size_t atomBoundaryCursor = 0;
             for (std::size_t index = 0; index < model.program.blockSize(block); ++index)
             {
                 const InstructionId instruction =
                     model.program.blockInstruction(block, index);
+                if (state.traceComments)
+                {
+                    while (atomBoundaryCursor < atomBoundaries.size() &&
+                           atomBoundaries[atomBoundaryCursor].position ==
+                               static_cast<uint32_t>(index))
+                    {
+                        const std::optional<uint64_t> commentBytes =
+                            indentedLineByteCount(
+                                atomTraceCommentsAt(
+                                    state, model.program,
+                                    atomBoundaries[atomBoundaryCursor].atom,
+                                    instruction),
+                                indentation);
+                        if (!commentBytes || !addByteCount(byteCount, *commentBytes))
+                        {
+                            endLocalityBlock(state);
+                            diagnostics.error("AM C++ emitter source size overflow: block=" +
+                                                  std::to_string(blockIndex),
+                                              std::string(kContext));
+                            return std::nullopt;
+                        }
+                        ++atomBoundaryCursor;
+                    }
+                }
                 std::string error;
                 const std::optional<std::string> code =
                     emitBlockPositionCode(state, detectorPlan, arrayPlan, scalarPlan,
@@ -4515,6 +4674,10 @@ namespace wolvrix::lib::grhsim::am
                 std::vector<InstructionId> runArms;
                 std::unordered_set<uint32_t> runRootResults;
                 uint32_t runSelect = kInvalidAtomSignature;
+                constexpr uint32_t kInvalidRunAtom =
+                    std::numeric_limits<uint32_t>::max();
+                uint32_t runFirstAtom = kInvalidRunAtom;
+                uint32_t runLastAtom = kInvalidRunAtom;
                 const auto flushRun = [&]() {
                     if (runArms.size() >= 2)
                     {
@@ -4525,6 +4688,8 @@ namespace wolvrix::lib::grhsim::am
                         plan.select = VariableId{runSelect};
                         plan.preamble = runPreamble;
                         plan.arms = runArms;
+                        plan.firstAtom = runFirstAtom;
+                        plan.lastAtom = runLastAtom;
                         const int32_t planId =
                             static_cast<int32_t>(state.muxRunPlans.size());
                         for (const InstructionId member : plan.preamble)
@@ -4542,6 +4707,8 @@ namespace wolvrix::lib::grhsim::am
                     runArms.clear();
                     runRootResults.clear();
                     runSelect = kInvalidAtomSignature;
+                    runFirstAtom = kInvalidRunAtom;
+                    runLastAtom = kInvalidRunAtom;
                 };
                 for (std::size_t atomIndex = 0;
                      atomIndex < model.program.blockAtomCount(block); ++atomIndex)
@@ -4599,6 +4766,11 @@ namespace wolvrix::lib::grhsim::am
                         flushRun();
                         runSelect = select;
                     }
+                    if (runFirstAtom == kInvalidRunAtom)
+                    {
+                        runFirstAtom = atom.value;
+                    }
+                    runLastAtom = atom.value;
                     for (std::size_t member = 0; member + 1 < memberCount; ++member)
                     {
                         runPreamble.push_back(
@@ -4664,6 +4836,7 @@ namespace wolvrix::lib::grhsim::am
         const auto branchyMuxAttribute = options.attributes.find("branchyMux");
         state.branchyMux = branchyMuxAttribute != options.attributes.end() &&
                            branchyMuxAttribute->second == "true";
+        state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
         for (uint32_t index = 0; index < program.variableCount(); ++index)
@@ -7144,6 +7317,12 @@ namespace
                 const auto writeBlockBody = [&](std::size_t blockIndex,
                                                 std::string_view indentation,
                                                 const EmitState::CommitGate *gate = nullptr) {
+                    if (state.traceComments)
+                    {
+                        blockSource << indentation
+                                    << blockTraceBanner(
+                                           model, static_cast<uint32_t>(blockIndex));
+                    }
                     beginLocalityBlock(state, static_cast<uint32_t>(blockIndex));
                     writeIndentedLines(blockSource,
                                        localValueDeclarations(state),
@@ -7166,6 +7345,10 @@ namespace
                         detectorPlanFor(state, blockIndex);
                     std::vector<uint8_t> detectorGroupDeclared(
                         detectorPlan != nullptr ? detectorPlan->groups.size() : 0, 0);
+                    const std::vector<AtomTraceBoundary> atomBoundaries =
+                        state.traceComments ? blockAtomTraceBoundaries(model.program, block)
+                                            : std::vector<AtomTraceBoundary>{};
+                    std::size_t atomBoundaryCursor = 0;
                     for (std::size_t index = 0;
                          index < blockSize;
                          ++index)
@@ -7180,6 +7363,24 @@ namespace
                         }
                         const InstructionId instruction =
                             model.program.blockInstruction(block, index);
+                        if (state.traceComments)
+                        {
+                            while (atomBoundaryCursor < atomBoundaries.size() &&
+                                   atomBoundaries[atomBoundaryCursor].position ==
+                                       static_cast<uint32_t>(index))
+                            {
+                                writeIndentedLines(
+                                    blockSource,
+                                    atomTraceCommentsAt(
+                                        state, model.program,
+                                        atomBoundaries[atomBoundaryCursor].atom,
+                                        instruction),
+                                    gate != nullptr && index >= gate->headCount
+                                        ? gatedIndentation
+                                        : indentation);
+                                ++atomBoundaryCursor;
+                            }
+                        }
                         std::string error;
                         const std::optional<std::string> code =
                             emitBlockPositionCode(state, detectorPlan, arrayPlan, scalarPlan,
@@ -7251,11 +7452,24 @@ namespace
                     // Block's chunks (chunked references never re-declare).
                     std::vector<uint8_t> detectorGroupDeclared(
                         detectorPlan != nullptr ? detectorPlan->groups.size() : 0, 0);
+                    // Atom boundaries are also continuous across chunks: an
+                    // atom's trace comment lands in the chunk holding its
+                    // first instruction.
+                    const std::vector<AtomTraceBoundary> atomBoundaries =
+                        state.traceComments ? blockAtomTraceBoundaries(model.program, block)
+                                            : std::vector<AtomTraceBoundary>{};
+                    std::size_t atomBoundaryCursor = 0;
                     for (std::size_t chunk = 0; chunk < chunkRanges.size(); ++chunk)
                     {
                         chunkDefs << "\nvoid " << className << "::"
                                   << blockChunkFunctionName(blockIndex, chunk) << "("
                                   << parameterList << ") {\n";
+                        if (state.traceComments)
+                        {
+                            chunkDefs << "    "
+                                      << blockTraceBanner(
+                                             model, static_cast<uint32_t>(blockIndex));
+                        }
                         const auto [firstPosition, endPosition] = chunkRanges[chunk];
                         for (std::size_t index = firstPosition;
                              index < endPosition;
@@ -7263,6 +7477,22 @@ namespace
                         {
                             const InstructionId instruction =
                                 model.program.blockInstruction(block, index);
+                            if (state.traceComments)
+                            {
+                                while (atomBoundaryCursor < atomBoundaries.size() &&
+                                       atomBoundaries[atomBoundaryCursor].position ==
+                                           static_cast<uint32_t>(index))
+                                {
+                                    writeIndentedLines(
+                                        chunkDefs,
+                                        atomTraceCommentsAt(
+                                            state, model.program,
+                                            atomBoundaries[atomBoundaryCursor].atom,
+                                            instruction),
+                                        "    ");
+                                    ++atomBoundaryCursor;
+                                }
+                            }
                             std::string error;
                             const std::optional<std::string> code =
                                 emitBlockPositionCode(state, detectorPlan, arrayPlan,
@@ -7281,6 +7511,12 @@ namespace
                             writeIndentedLines(chunkDefs, *code, "    ");
                         }
                         chunkDefs << "}\n";
+                    }
+                    if (state.traceComments)
+                    {
+                        blockSource << indentation
+                                    << blockTraceBanner(
+                                           model, static_cast<uint32_t>(blockIndex));
                     }
                     writeIndentedLines(blockSource,
                                        chunkedLocalValueDeclarations(state),

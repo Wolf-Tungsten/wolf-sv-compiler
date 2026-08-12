@@ -87,7 +87,7 @@ namespace
             expectedElementBytes = {
                 12, 4, 1, 12, 48, 20, 8, 1, 8, 8, 1, 4, 4,
                 4, 4, 8, 12, 16, 16, 12, 4, 20, 12, 4, 4,
-                4, 4, 1, 4,
+                4, 4, 1, 4, 8,
             };
         uint64_t sizeBytes = 0;
         uint64_t capacityBytes = 0;

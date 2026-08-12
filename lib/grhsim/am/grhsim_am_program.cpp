@@ -1,11 +1,15 @@
 #include "grhsim/am/grhsim_am_program.hpp"
 
+#include "core/diagnostics.hpp"
+
 #include <algorithm>
 #include <array>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -529,6 +533,7 @@ namespace wolvrix::lib::grhsim::am
         setArena(ProgramArena::AtomInstructionOffsets, storage_->atomInstructionOffsets);
         setArena(ProgramArena::AtomKinds, storage_->atomKinds);
         setArena(ProgramArena::AtomSignatures, storage_->atomSignatures);
+        setArena(ProgramArena::AtomGsimNodeIds, storage_->atomGsimNodeIds);
         stats.instructionBytes =
             vectorBytes(storage_->opcodes) + vectorBytes(storage_->operandOffsets) +
             vectorBytes(storage_->operands) + vectorBytes(storage_->resultOffsets) +
@@ -552,7 +557,8 @@ namespace wolvrix::lib::grhsim::am
                            vectorBytes(storage_->blockAtomOffsets) +
                            vectorBytes(storage_->atomInstructionOffsets) +
                            vectorBytes(storage_->atomKinds) +
-                           vectorBytes(storage_->atomSignatures);
+                           vectorBytes(storage_->atomSignatures) +
+                           vectorBytes(storage_->atomGsimNodeIds);
         stats.estimatedBytes = stats.instructionBytes + stats.variableBytes +
                                stats.initAndLiteralBytes + stats.attributeBytes +
                                stats.stringAndLabelBytes + stats.blockBytes;
@@ -682,6 +688,15 @@ namespace wolvrix::lib::grhsim::am
             throw std::out_of_range("invalid AM AtomId");
         }
         return storage_->atomSignatures[atom.value];
+    }
+
+    int64_t ScheduledProgram::atomGsimNodeId(AtomId atom) const
+    {
+        if (!storage_ || !atom.valid() || static_cast<std::size_t>(atom.value) >= atomCount())
+        {
+            throw std::out_of_range("invalid AM AtomId");
+        }
+        return storage_->atomGsimNodeIds[atom.value];
     }
 
     namespace
@@ -1463,6 +1478,7 @@ namespace wolvrix::lib::grhsim::am
         storage_->atomInstructionOffsets.clear();
         storage_->atomKinds.clear();
         storage_->atomSignatures.clear();
+        storage_->atomGsimNodeIds.clear();
         storage_->blockOffsets.push_back(0);
         storage_->blockAtomOffsets.push_back(0);
         storage_->atomInstructionOffsets.push_back(0);
@@ -1527,6 +1543,8 @@ namespace wolvrix::lib::grhsim::am
         storage.atomKinds.reserve(storage.atomKinds.size() + reserve.blockInstructionIds);
         storage.atomSignatures.reserve(storage.atomSignatures.size() +
                                        reserve.blockInstructionIds);
+        storage.atomGsimNodeIds.reserve(storage.atomGsimNodeIds.size() +
+                                        reserve.blockInstructionIds);
         blockInstructionReserve_ =
             std::max(blockInstructionReserve_,
                      static_cast<std::size_t>(layoutInstructionCount_) +
@@ -1690,11 +1708,12 @@ namespace wolvrix::lib::grhsim::am
 
         // Implicit Singleton atom: instruction appended outside any explicit
         // beginAtom/endAtom pair. The no-select signature keeps the atom out
-        // of mux-run fusion planning.
+        // of mux-run fusion planning; -1 marks the atom as carrying no gsim
+        // node provenance.
         const bool implicitAtom = !atomOpen_;
         if (implicitAtom)
         {
-            beginAtom(AmAtomKind::Singleton, kInvalidAtomSignature);
+            beginAtom(AmAtomKind::Singleton, kInvalidAtomSignature, -1);
         }
         if (blockLayoutIdentity_ && instruction.value != layoutInstructionCount_)
         {
@@ -1740,7 +1759,8 @@ namespace wolvrix::lib::grhsim::am
         blockOpen_ = false;
     }
 
-    void ScheduledProgramBuilder::beginAtom(AmAtomKind kind, uint32_t signature)
+    void ScheduledProgramBuilder::beginAtom(AmAtomKind kind, uint32_t signature,
+                                            int64_t gsimNodeId)
     {
         auto &storage = requireStorage(storage_, finished_);
         if (!blockOpen_)
@@ -1757,8 +1777,10 @@ namespace wolvrix::lib::grhsim::am
         }
         ensureAppendCapacity(storage.atomKinds, 1);
         ensureAppendCapacity(storage.atomSignatures, 1);
+        ensureAppendCapacity(storage.atomGsimNodeIds, 1);
         storage.atomKinds.push_back(static_cast<uint8_t>(kind));
         storage.atomSignatures.push_back(signature);
+        storage.atomGsimNodeIds.push_back(gsimNodeId);
         atomStart_ = layoutInstructionCount_;
         atomOpen_ = true;
     }
@@ -1813,6 +1835,7 @@ namespace wolvrix::lib::grhsim::am
             storage.blockInstructions.resize(originalExplicitSize);
             storage.atomKinds.resize(originalAtomCount);
             storage.atomSignatures.resize(originalAtomCount);
+            storage.atomGsimNodeIds.resize(originalAtomCount);
             storage.atomInstructionOffsets.resize(originalAtomOffsetSize);
             storage.blockAtomOffsets.resize(originalBlockAtomOffsetSize);
             blockLayoutIdentity_ = originalIdentity;
@@ -1875,6 +1898,105 @@ namespace wolvrix::lib::grhsim::am
         }
         finished_ = true;
         return ScheduledProgram(std::move(storage_));
+    }
+
+    namespace
+    {
+        constexpr std::string_view kBlockAtomExportContext = "grhsim-am-block-atom-export";
+
+        // Local equivalent of the split stage's atomKindName (kept
+        // file-local on purpose: no cross-file helper for this).
+        std::string_view atomKindName(AmAtomKind kind)
+        {
+            switch (kind)
+            {
+            case AmAtomKind::Singleton:
+                return "Singleton";
+            case AmAtomKind::Tree:
+                return "Tree";
+            case AmAtomKind::CombLoopScc:
+                return "CombLoopScc";
+            case AmAtomKind::CommitEvent:
+                return "CommitEvent";
+            }
+            return "Unknown";
+        }
+    } // namespace
+
+    bool exportGrhSimAmBlockAtomJsonl(const ExecutableModel &model,
+                                      const std::filesystem::path &path,
+                                      wolvrix::lib::diag::Diagnostics &diagnostics)
+    {
+        const ScheduledProgram &program = model.program;
+        if (!program.valid())
+        {
+            diagnostics.error("AM block/atom export requires a valid ScheduledProgram",
+                              std::string(kBlockAtomExportContext));
+            return false;
+        }
+        if (path.has_parent_path())
+        {
+            std::error_code error;
+            std::filesystem::create_directories(path.parent_path(), error);
+            if (error)
+            {
+                diagnostics.error("failed to create AM block/atom export directory: " +
+                                      path.parent_path().string(),
+                                  std::string(kBlockAtomExportContext));
+                return false;
+            }
+        }
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        if (!output)
+        {
+            diagnostics.error("failed to open AM block/atom export path: " + path.string(),
+                              std::string(kBlockAtomExportContext));
+            return false;
+        }
+
+        const auto blockRole = [&](uint32_t block) {
+            if (block == 0)
+            {
+                return "entry";
+            }
+            if (model.commitBlockBegin != 0 && block >= model.commitBlockBegin &&
+                block < model.commitBlockEnd)
+            {
+                return "commit";
+            }
+            return "compute";
+        };
+        const auto blockCount = static_cast<uint32_t>(program.blockCount());
+        for (uint32_t blockIndex = 0; blockIndex < blockCount; ++blockIndex)
+        {
+            const BlockId block{blockIndex};
+            output << "{\"block\":" << blockIndex << ",\"role\":\""
+                   << blockRole(blockIndex) << "\",\"atom_count\":"
+                   << program.blockAtomCount(block) << ",\"instr_count\":"
+                   << program.blockSize(block) << "}\n";
+            for (std::size_t atomIndex = 0; atomIndex < program.blockAtomCount(block);
+                 ++atomIndex)
+            {
+                const AtomId atom = program.blockAtom(block, atomIndex);
+                output << "{\"atom\":" << atom.value << ",\"block\":" << blockIndex
+                       << ",\"kind\":\"" << atomKindName(program.atomKind(atom))
+                       << "\",\"gsim_node\":" << program.atomGsimNodeId(atom)
+                       << ",\"instr_count\":" << program.atomInstructionCount(atom)
+                       << "}\n";
+            }
+        }
+        output.flush();
+        if (!output)
+        {
+            diagnostics.error("failed while writing AM block/atom export: " + path.string(),
+                              std::string(kBlockAtomExportContext));
+            return false;
+        }
+        diagnostics.info("exported AM block/atom membership: path=" + path.string() +
+                             " blocks=" + std::to_string(blockCount) +
+                             " atoms=" + std::to_string(program.atomCount()),
+                         std::string(kBlockAtomExportContext));
+        return true;
     }
 
 } // namespace wolvrix::lib::grhsim::am

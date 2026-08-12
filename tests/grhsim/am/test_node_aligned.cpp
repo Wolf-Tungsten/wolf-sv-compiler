@@ -5,6 +5,8 @@
 #include "grhsim/am/grhsim_am_program.hpp"
 
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -250,21 +252,51 @@ namespace
         }
         uint32_t treeAtoms = 0;
         uint32_t commitAtoms = 0;
+        bool provenanceOk = true;
+        const ProgramView scheduledView = model->program.view();
         for (uint32_t block = 0; block < model->program.blockCount(); ++block)
         {
             const BlockId blockId{block};
             for (std::size_t index = 0; index < model->program.blockAtomCount(blockId);
                  ++index)
             {
-                const AmAtomKind kind =
-                    model->program.atomKind(model->program.blockAtom(blockId, index));
+                const AtomId atom = model->program.blockAtom(blockId, index);
+                const AmAtomKind kind = model->program.atomKind(atom);
                 treeAtoms += kind == AmAtomKind::Tree ? 1 : 0;
                 commitAtoms += kind == AmAtomKind::CommitEvent ? 1 : 0;
+                // Per-atom provenance: the node-grouped atoms carry their
+                // gsim node id (tree 42, lone node 43, commit write 45);
+                // every helper atom (detectors, activation traffic) stays
+                // unowned (-1).
+                bool hasAnd = false;
+                bool hasMux = false;
+                bool hasOr = false;
+                for (std::size_t member = 0;
+                     member < model->program.atomInstructionCount(atom); ++member)
+                {
+                    const Opcode opcode = scheduledView.opcode(
+                        model->program.atomInstruction(atom, member));
+                    hasAnd = hasAnd || opcode == Opcode::And;
+                    hasMux = hasMux || opcode == Opcode::Mux;
+                    hasOr = hasOr || opcode == Opcode::Or;
+                }
+                const int64_t expected = (hasAnd && hasMux) ? 42
+                                         : hasOr           ? 43
+                                         : kind == AmAtomKind::CommitEvent ? 45
+                                                                           : -1;
+                if (model->program.atomGsimNodeId(atom) != expected)
+                {
+                    provenanceOk = false;
+                }
             }
         }
         if (treeAtoms != 1 || commitAtoms != 1)
         {
             return fail("scheduled model does not carry the Tree/CommitEvent atoms");
+        }
+        if (!provenanceOk)
+        {
+            return fail("scheduled atom gsim node ids were not propagated as expected");
         }
         return 0;
     }
@@ -303,6 +335,147 @@ namespace
         return 0;
     }
 
+    int testNodeAlignedCombLoopUnion()
+    {
+        // Two compute ops in one combinational cycle, owned by different
+        // gsim nodes: the SCC-union fallback packs them into one
+        // CombLoopScc atom whose mixed provenance must surface as -2.
+        grh::Design design;
+        grh::Graph &graph = design.createGraph("node_aligned_loop");
+        const auto a = logic(graph, "a", 8);
+        const auto b = logic(graph, "b", 8);
+        graph.bindInputPort("a", a);
+        graph.bindInputPort("b", b);
+        const auto x = logic(graph, "x", 8);
+        const auto y = logic(graph, "y", 8);
+        const auto andOp = graph.createOperation(grh::OperationKind::kAnd,
+                                                 graph.internSymbol("loop_and"));
+        graph.addOperand(andOp, a);
+        graph.addOperand(andOp, y);
+        graph.addResult(andOp, x);
+        graph.setAttr(andOp, "gsim.node_id", int64_t{60});
+        const auto orOp = graph.createOperation(grh::OperationKind::kOr,
+                                                graph.internSymbol("loop_or"));
+        graph.addOperand(orOp, x);
+        graph.addOperand(orOp, b);
+        graph.addResult(orOp, y);
+        graph.setAttr(orOp, "gsim.node_id", int64_t{61});
+
+        diag::Diagnostics diagnostics;
+        GrhIRToGrhSimAMGraphLowering lowering;
+        std::optional<AmGraph> lowered = lowering.lower(graph, diagnostics);
+        if (!lowered || diagnostics.hasError())
+        {
+            return fail("lowering failed for the comb-loop fixture");
+        }
+        std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
+            std::move(*lowered), ActivityScheduleOptions{}, diagnostics);
+        if (!model || diagnostics.hasError())
+        {
+            return fail("comb-loop graphToProgram failed");
+        }
+        uint32_t loopAtoms = 0;
+        for (uint32_t block = 0; block < model->program.blockCount(); ++block)
+        {
+            const BlockId blockId{block};
+            for (std::size_t index = 0; index < model->program.blockAtomCount(blockId);
+                 ++index)
+            {
+                const AtomId atom = model->program.blockAtom(blockId, index);
+                if (model->program.atomKind(atom) != AmAtomKind::CombLoopScc)
+                {
+                    continue;
+                }
+                ++loopAtoms;
+                if (model->program.atomGsimNodeId(atom) != -2)
+                {
+                    return fail("comb-loop union atom did not get the mixed (-2) node id");
+                }
+            }
+        }
+        if (loopAtoms != 1)
+        {
+            return fail("expected exactly one CombLoopScc atom for the two-node cycle");
+        }
+        return 0;
+    }
+
+    int testBlockAtomExport()
+    {
+        Fixture fixture = makeFixture();
+        diag::Diagnostics diagnostics;
+        GrhIRToGrhSimAMGraphLowering lowering;
+        std::optional<AmGraph> lowered = lowering.lower(*fixture.graph, diagnostics);
+        if (!lowered || diagnostics.hasError())
+        {
+            return fail("lowering failed for the block/atom export fixture");
+        }
+        std::optional<ExecutableModel> model = GrhIRToGrhSimAMProgram::graphToProgram(
+            std::move(*lowered), ActivityScheduleOptions{}, diagnostics);
+        if (!model || diagnostics.hasError())
+        {
+            return fail("block/atom export graphToProgram failed");
+        }
+        const std::filesystem::path path = std::filesystem::temp_directory_path() /
+                                           "wolvrix_grhsim_am_block_atom_test.jsonl";
+        if (!exportGrhSimAmBlockAtomJsonl(*model, path, diagnostics) ||
+            diagnostics.hasError())
+        {
+            return fail("block/atom export failed");
+        }
+        std::ifstream input(path);
+        if (!input)
+        {
+            return fail("block/atom export did not produce a readable file");
+        }
+        std::string firstLine;
+        std::getline(input, firstLine);
+        bool sawTree = false;
+        bool sawCommit = false;
+        std::size_t blockLines = 0;
+        std::size_t atomLines = 0;
+        for (std::string line; std::getline(input, line);)
+        {
+            if (line.starts_with("{\"block\":"))
+            {
+                ++blockLines;
+                continue;
+            }
+            if (!line.starts_with("{\"atom\":"))
+            {
+                return fail("block/atom export produced an unrecognized line");
+            }
+            ++atomLines;
+            if (line.find("\"kind\":\"Tree\"") != std::string::npos)
+            {
+                sawTree = true;
+                if (line.find("\"gsim_node\":42") == std::string::npos ||
+                    line.find("\"instr_count\":2") == std::string::npos)
+                {
+                    return fail("tree atom export line lost its provenance");
+                }
+            }
+            if (line.find("\"kind\":\"CommitEvent\"") != std::string::npos)
+            {
+                sawCommit = true;
+                if (line.find("\"gsim_node\":45") == std::string::npos)
+                {
+                    return fail("commit atom export line lost its provenance");
+                }
+            }
+        }
+        std::error_code removeError;
+        std::filesystem::remove(path, removeError);
+        if (firstLine.find("\"block\":0") == std::string::npos ||
+            firstLine.find("\"role\":\"entry\"") == std::string::npos || !sawTree ||
+            !sawCommit || blockLines + 1 != model->program.blockCount() ||
+            atomLines != model->program.atomCount())
+        {
+            return fail("block/atom export content is inconsistent");
+        }
+        return 0;
+    }
+
 } // namespace
 
 int main()
@@ -312,6 +485,14 @@ int main()
         return result;
     }
     if (const int result = testNodeAlignedFullSchedule())
+    {
+        return result;
+    }
+    if (const int result = testNodeAlignedCombLoopUnion())
+    {
+        return result;
+    }
+    if (const int result = testBlockAtomExport())
     {
         return result;
     }
