@@ -88,6 +88,11 @@ namespace wolvrix::lib::grhsim::am
         // group out-sizes this threshold (gsim MergeWhenSize). Values < 2
         // disable the sweep.
         std::size_t mergeWhenMinGroup = 5;
+        // State-anchor sweeps (NO0018, partition-am-compute-graph): rebuild
+        // gsim's value-graph register edges as virtual anchors. 0 = off;
+        // 1 = read-anchor grouping only; 2 = full (write anchors + degree
+        // guards). See grhsim_am_compute_graph_partition.cpp.
+        std::size_t stateAnchorMode = 0;
         // Fanout absorption (NO0015): absorb compute atoms with >= 2
         // consumer atoms and at most fanoutAbsorbMaxInstructions member
         // instructions into every consumer atom (pre-partition replication,

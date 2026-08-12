@@ -544,6 +544,7 @@ namespace wolvrix::lib::grhsim::am
             .segmentPenalty = segmentPenalty,
             .refinementRounds = refinementRounds,
             .mergeWhenMinGroup = mergeWhenMinGroup,
+            .stateAnchorMode = stateAnchorMode,
         };
     }
 
@@ -1079,6 +1080,7 @@ namespace wolvrix::lib::grhsim::am
         context.segmentPenalty = options.dpSegmentPenalty;
         context.refinementRounds = options.dpRefinementRounds;
         context.mergeWhenMinGroup = options.mergeWhenMinGroup;
+        context.stateAnchorMode = options.stateAnchorMode;
 
         // ---- stage: split-am-graph --------------------------------------
         // The atom DAG is decomposed into the GRHSIM AM Compute Graph and

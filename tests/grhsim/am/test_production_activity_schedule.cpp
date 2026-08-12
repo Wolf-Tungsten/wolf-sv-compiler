@@ -3035,6 +3035,11 @@ namespace
         return 0;
     }
 
+    // NO0018 block-local anchor behavior, pinned: fusion anchors are computed
+    // block-locally after the DP (same block + same select share one anchor),
+    // decoupled from the mergeWhen coarsen threshold -- the three same-select
+    // atoms below are not clustered (below minGroup 5) but they do land in one
+    // block, so they share one block-local fusion anchor.
     int testMergeWhenRespectsMinGroup()
     {
         MergeWhenInput data = makeMergeWhenInput(3, {});
@@ -3045,9 +3050,13 @@ namespace
         if (compute->coarsenWhenGroups != 0 || compute->coarsenWhenMerges != 0) {
             return fail("mergeWhen clustered a group below the minimum size");
         }
-        for (uint32_t atom = 1; atom <= 3; ++atom) {
-            if (compute->atomFusionAnchor[atom] != kInvalidAtomSignature) {
-                return fail("below-threshold group gained a fusion anchor");
+        const uint32_t anchor = compute->atomFusionAnchor[1];
+        if (anchor == kInvalidAtomSignature) {
+            return fail("block-local same-select atoms lost their fusion anchor");
+        }
+        for (uint32_t atom = 2; atom <= 3; ++atom) {
+            if (compute->atomFusionAnchor[atom] != anchor) {
+                return fail("block-local same-select atoms do not share one fusion anchor");
             }
         }
         return 0;
@@ -3069,8 +3078,12 @@ namespace
                         std::to_string(compute->coarsenWhenGroups) +
                         " merges=" + std::to_string(compute->coarsenWhenMerges));
         }
-        if (compute->atomFusionAnchor[7] != kInvalidAtomSignature) {
-            return fail("chained member joined the mergeWhen cluster");
+        // NO0018: fusion anchors are block-local (same block + same select),
+        // decoupled from mergeWhen clustering — atom 7 is co-block and
+        // same-select, so it shares the block-local anchor; the emitter's
+        // use-before-def run-close rule keeps its emission correct.
+        if (compute->atomFusionAnchor[7] == kInvalidAtomSignature) {
+            return fail("chained member lost the block-local fusion anchor");
         }
         return 0;
     }

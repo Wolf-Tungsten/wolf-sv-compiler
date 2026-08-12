@@ -51,6 +51,13 @@ namespace wolvrix::lib::grhsim::am
         // atoms ready at one select wavefront merge into a coarsen cluster
         // when the group out-sizes this threshold; < 2 disables the sweep.
         std::size_t mergeWhenMinGroup = 5;
+        // State-anchor sweeps (NO0018): rebuild gsim's value-graph register
+        // edges as virtual anchors for the merge sweeps. 0 = off (bare
+        // induced-subgraph sweeps); 1 = read-anchor grouping only (state-only
+        // readers group per state variable, gsim in1-into-register analogue);
+        // 2 = full (additionally: write-anchor sinks, out1/in1 effective-degree
+        // guards, sibling keys include read anchors).
+        std::size_t stateAnchorMode = 0;
     };
 
     // ------------------------------------------------------------------
@@ -103,15 +110,20 @@ namespace wolvrix::lib::grhsim::am
     {
         std::vector<uint32_t> atomBlock; // per compute-local atom, 1..blockCount
         std::vector<uint32_t> atomTopo;  // compute-local atoms, block-grouped topological
-        // mergeWhen 融合锚点（compute 局部索引）：同组 atom 共享的排序键
-        // （组内最小 atomMinInstruction），materialize 的块内 Kahn 用它把
-        // 同组 mux 根 atom 排相邻，供 emitter 块级融合；非组成员为
-        // kInvalidAtomSignature 同值的哨兵（0xFFFFFFFF）。
+        // 融合锚点（compute 局部索引）：同块同 select 的 mux 根 atom 共享的
+        // 排序键（组内最小 atomMinInstruction，NO0018 起在 DP 后按块局部计
+        // 算，不影响分区几何）；materialize 的块内 Kahn 用它把同组 mux 根
+        // atom 排相邻，供 emitter 块级融合；非组成员为 kInvalidAtomSignature
+        // 同值的哨兵（0xFFFFFFFF）。
         std::vector<uint32_t> atomFusionAnchor;
         // gsim node provenance per compute-local atom (NO0006 carry-out):
         // the shared member node id, -1 when every member is unowned, -2
         // when members mix node ids.
         std::vector<int64_t> atomGsimNodeId;
+        // Coarsen cluster per compute-local atom (NO0018 diagnostics): the
+        // dense post-coarsen cluster id (resort position, 0..clustersAfterCoarsen-1).
+        // Diagnostics only — materialize never reads this.
+        std::vector<uint32_t> atomCluster;
         uint32_t blockCount = 0;
         std::size_t clustersAfterCoarsen = 0;
         std::size_t dpSegments = 0;
@@ -126,6 +138,15 @@ namespace wolvrix::lib::grhsim::am
         std::size_t coarsenOut1Merges = 0;
         std::size_t coarsenIn1Merges = 0;
         std::size_t coarsenSiblingMerges = 0;
+        // NO0018 state-anchor sweep stats: read-anchor merges (state-only
+        // readers grouped per state variable, gsim in1-into-register
+        // analogue), write-anchor merges (commit-feeding sinks grouped per
+        // commit atom, gsim out1-into-register analogue), and out1 merges
+        // blocked because the register write edge raises the effective
+        // out-degree past one.
+        std::size_t coarsenAnchorReadMerges = 0;
+        std::size_t coarsenAnchorWriteMerges = 0;
+        std::size_t coarsenOut1AnchorBlocked = 0;
         std::string initialDegreeHistogram;
         // Post-DP local-move refinement stats (0 when disabled).
         std::size_t refinementRounds = 0;

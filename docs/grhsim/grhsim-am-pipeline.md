@@ -61,6 +61,19 @@ normalized GRH
 > `--fanout-absorb-budget-mult` / `--fanout-absorb-max-consumers` 与
 > `XS_WOLF_GRHSIM_AM_FANOUT_ABSORB_*`。
 >
+> 实现进展（2026-08-12，supernode-align NO0018）：分区映射校准落成。
+> atom→block 与 gsim node→supernode 的贴合度以 pair-F1 度量（join 口径见
+> NO0009/NO0018）：校准点 cap15 + coarsen 预算 7000 atoms + mergeWhen 关停
+> （flatten 图上 gsim mergeWhenNodes 实质死亡，remove 仅 1,183）达
+> pair-F1 0.9255（基线 0.4260），已锁定为 grhsim-am-lower-json 默认。
+> 融合锚点改为 DP 后按块内同 select 局部计算（`atomFusionAnchor`），与
+> mergeWhen 彻底解耦——mergeWhen 关停不再损失 emitter 块级 mux-run 融合。
+> state-anchor 扫描（value 图寄存器边的虚拟锚点重建：读锚点按状态变量
+> 归组/写锚点按 commit atom 归组/有效度数守卫）以
+> `--dp-state-anchor-mode`（0 关 / 1 仅读归组 / 2 全量）保留为实验装置，
+> 两种模式均被 pair-F1 否决（0.8935 / 0.8268），默认关。新增
+> `WOLVRIX_GRHSIM_AM_CLUSTER_ASSIGN_JSONL`（atom→coarsen cluster 导出）。
+>
 > 实现进展（2026-08-08，NO0008）：atom 单输出树化 + mergeWhen 降为 coarsen，
 > 取代 NO0006 的 mux-merge atom 路线（该路线经 supernode-align NO0014 诊断为
 > 层级错误：多输出 atom 破坏链合并并制造跨块扇出）。**P1**：

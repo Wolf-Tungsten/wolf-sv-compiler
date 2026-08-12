@@ -15,6 +15,7 @@
 #include <charconv>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <span>
 #include <string>
@@ -1174,6 +1175,36 @@ namespace wolvrix::lib::grhsim::am
         // NO0006 carry-out: stamp both partition results with the per-atom
         // gsim node provenance (computed on the final atom tables).
         propagateAtomGsimNodeIds(graph, *context, *computeActivity, *commitEvent);
+
+        // NO0018 research export: per-compute-atom coarsen cluster assignment
+        // (dense post-coarsen cluster id) alongside the gsim node id, so the
+        // AM merge sweeps can be compared against gsim's coarsen stage
+        // cluster-by-cluster in the shared node-id space.
+        if (const char *exportPath = std::getenv("WOLVRIX_GRHSIM_AM_CLUSTER_ASSIGN_JSONL")) {
+            if (exportPath[0] == '\0') {
+                diagnostics.error("WOLVRIX_GRHSIM_AM_CLUSTER_ASSIGN_JSONL must not be empty",
+                                  std::string(detail::kDiagnosticContext));
+                return std::nullopt;
+            }
+            const std::filesystem::path path(exportPath);
+            if (path.has_parent_path()) {
+                std::error_code ec;
+                std::filesystem::create_directories(path.parent_path(), ec);
+            }
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                diagnostics.error("failed to open AM cluster assignment export path: " +
+                                      path.string(),
+                                  std::string(detail::kDiagnosticContext));
+                return std::nullopt;
+            }
+            const AmComputeGraph &computeGraph = context->split.computeGraph;
+            for (uint32_t local = 0; local < computeGraph.atomCount; ++local) {
+                out << "{\"atom\":" << computeGraph.globalOfAtom[local]
+                    << ",\"cluster\":" << computeActivity->atomCluster[local]
+                    << ",\"gsim_node\":" << computeActivity->atomGsimNodeId[local] << "}\n";
+            }
+        }
 
         // ---- stage: materialize -----------------------------------------
         return materializeAmProgram(graph, *context, *computeActivity, *commitEvent, options,

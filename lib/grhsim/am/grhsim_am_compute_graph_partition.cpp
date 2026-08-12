@@ -509,13 +509,18 @@ namespace wolvrix::lib::grhsim::am
         std::size_t whenGroups = 0;
         std::size_t whenMerges = 0;
         std::string mergeWhenDiag;
-        // mergeWhen 融合锚点（compute 局部 atom 索引）：同组成员共享组内最
-        // 小 atomMinInstruction 作为块内排序键，使同组 mux 根 atom 在块内
-        // 相邻，供 emitter 块级同 select 融合。
+        // 融合锚点（compute 局部 atom 索引）：同块同 select 的 mux 根 atom
+        // 共享组内最小 atomMinInstruction 作为块内排序键，使它们在块内相邻，
+        // 供 emitter 块级同 select 融合。NO0018 起改为 DP 后按块局部计算
+        // （见下方 result.atomBlock 赋值之后），不再由 mergeWhen sweep 赋值，
+        // 锚点因此对分区几何零影响。
         std::vector<uint32_t> fusionAnchor(n, kInvalidIndex);
         std::size_t out1Merges = 0;
         std::size_t in1Merges = 0;
         std::size_t siblingMerges = 0;
+        std::size_t anchorReadMerges = 0;
+        std::size_t anchorWriteMerges = 0;
+        std::size_t out1AnchorBlocked = 0;
         if (input.enableCoarsening) {
             // mergeWhen (gsim mergeNodes.cpp mergeWhenNodes, NO0008): atoms
             // whose root mux shares one select merge into a single coarsen
@@ -709,12 +714,6 @@ namespace wolvrix::lib::grhsim::am
                     const auto applyGroup = [&](const std::vector<uint32_t> &group,
                                                 std::size_t &mergeCounter) {
                         const uint32_t host = group.front();
-                        uint32_t anchorKey = kInvalidIndex;
-                        for (const uint32_t rid : group) {
-                            anchorKey = std::min(
-                                anchorKey,
-                                input.atomMinInstruction[computeGraph.globalOfAtom[atomOfRid[rid]]]);
-                        }
                         for (const uint32_t rid : group) {
                             if (rid != host && mergeInstrLimit != 0 &&
                                 memberInstructions[host] > mergeInstrLimit) {
@@ -723,7 +722,6 @@ namespace wolvrix::lib::grhsim::am
                                 // out1/in1 sweeps below.
                                 continue;
                             }
-                            fusionAnchor[atomOfRid[rid]] = anchorKey;
                             if (rid == host) {
                                 continue;
                             }
@@ -835,7 +833,6 @@ namespace wolvrix::lib::grhsim::am
                                     member[rid] = 1;
                                     memberInstructions[rid] =
                                         input.atomInstructions[computeGraph.globalOfAtom[atomOfRid[rid]]];
-                                    fusionAnchor[atomOfRid[rid]] = kInvalidIndex;
                                 }
                                 --whenGroups;
                                 whenMerges -= static_cast<std::size_t>(group.size()) - 1;
@@ -870,9 +867,123 @@ namespace wolvrix::lib::grhsim::am
                            ? memberInstructions[host] > mergeInstrLimit
                            : member[host] > mergeLimit;
             };
+
+            // State-anchor relations (NO0018): gsim's merge sweeps run on its
+            // value graph, where a register node contributes a value edge to
+            // every state reader and a value edge from every next-value cone
+            // root. The AM compute induced subgraph has neither (state reads
+            // are external reads; writes live in commit atoms), so bare chain
+            // sweeps systematically diverge from the reference: state-only
+            // readers can never chain-merge (AM in-degree 0 vs gsim 1), a
+            // one-compute-pred state reader over-merges via in1 (AM in-degree
+            // 1 vs gsim 2), and commit-feeding nodes over-merge via out1 (the
+            // register edge raises the effective out-degree). The two
+            // relations rebuilt here per rid:
+            //   readAnchors:  distinct producer-less variables the atom reads
+            //                 (count as predecessors; grouped per variable);
+            //   writeAnchors: distinct commit atoms using the atom's results
+            //                 (count as successors; grouped per commit atom).
+            // Mode 1 builds read anchors only; mode 2 adds write anchors.
+            std::vector<uint32_t> readAnchorOff(n + 1, 0);
+            std::vector<uint32_t> readAnchorVars;
+            std::vector<uint32_t> writeAnchorOff(n + 1, 0);
+            std::vector<uint32_t> writeAnchorAtoms;
+            if (input.stateAnchorMode != 0) {
+                std::vector<std::pair<uint32_t, uint32_t>> readPairs;
+                std::vector<std::pair<uint32_t, uint32_t>> writePairs;
+                const bool withWriteAnchors = input.stateAnchorMode >= 2;
+                for (uint32_t variable = 0; variable < input.variableCount; ++variable) {
+                    const uint32_t definition = input.definitions[variable];
+                    if (definition == kInvalidIndex) {
+                        for (uint32_t offset = input.useOffsets[variable];
+                             offset < input.useOffsets[variable + 1]; ++offset) {
+                            const uint32_t use = input.uses[offset];
+                            const uint32_t local =
+                                computeGraph.localOfAtom[input.instructionAtom[use]];
+                            if (local != kInvalidIndex) {
+                                readPairs.emplace_back(ridOfAtom[local], variable);
+                            }
+                        }
+                        continue;
+                    }
+                    if (!withWriteAnchors) {
+                        continue;
+                    }
+                    const uint32_t defLocal =
+                        computeGraph.localOfAtom[input.instructionAtom[definition]];
+                    if (defLocal == kInvalidIndex) {
+                        continue;
+                    }
+                    const uint32_t defRid = ridOfAtom[defLocal];
+                    for (uint32_t offset = input.useOffsets[variable];
+                         offset < input.useOffsets[variable + 1]; ++offset) {
+                        const uint32_t useAtom = input.instructionAtom[input.uses[offset]];
+                        if (input.atomIsCommit[useAtom] != 0) {
+                            writePairs.emplace_back(defRid, useAtom);
+                        }
+                    }
+                }
+                const auto buildCsr = [](std::vector<std::pair<uint32_t, uint32_t>> &pairs,
+                                         std::vector<uint32_t> &offsets,
+                                         std::vector<uint32_t> &targets) {
+                    std::sort(pairs.begin(), pairs.end());
+                    pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
+                    for (const auto &[rid, key] : pairs) {
+                        ++offsets[rid + 1];
+                    }
+                    std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
+                    targets.reserve(pairs.size());
+                    for (const auto &[rid, key] : pairs) {
+                        targets.push_back(key);
+                    }
+                };
+                buildCsr(readPairs, readAnchorOff, readAnchorVars);
+                buildCsr(writePairs, writeAnchorOff, writeAnchorAtoms);
+            }
+            std::vector<uint32_t> readAnchorHost(input.variableCount, kInvalidIndex);
+            std::vector<uint32_t> writeAnchorHost(input.atomCount, kInvalidIndex);
+
             for (uint32_t s = n; s-- > 0;) {
                 std::vector<uint32_t> &ns = nexts[s];
                 if (ns.size() != 1) {
+                    // Write-anchor merge (NO0018): a compute sink whose results
+                    // feed exactly one commit atom mirrors gsim's out1 merge
+                    // into the register super; the anchor host inherits the
+                    // sink's in-neighborhood and the single-use chain above it
+                    // then collapses into the host through the normal sweep.
+                    if (ns.empty() && alive[s] != 0 &&
+                        writeAnchorOff[s + 1] - writeAnchorOff[s] == 1) {
+                        const uint32_t anchor = writeAnchorAtoms[writeAnchorOff[s]];
+                        uint32_t host = writeAnchorHost[anchor];
+                        if (host == kInvalidIndex) {
+                            writeAnchorHost[anchor] = s;
+                            continue;
+                        }
+                        host = findRoot(host);
+                        if (host == s || overMergeLimit(host)) {
+                            continue;
+                        }
+                        std::vector<uint32_t> &ph = prevs[host];
+                        for (const uint32_t p : prevs[s]) {
+                            sortedErase(nexts[p], s);
+                            sortedInsert(nexts[p], host);
+                        }
+                        sortedUnionInto(ph, prevs[s]);
+                        member[host] += member[s];
+                        member[s] = 0;
+                        memberInstructions[host] += memberInstructions[s];
+                        memberInstructions[s] = 0;
+                        alive[s] = 0;
+                        parent[s] = host;
+                        prevs[s].clear();
+                        ++anchorWriteMerges;
+                    }
+                    continue;
+                }
+                if (writeAnchorOff[s + 1] != writeAnchorOff[s]) {
+                    // The register edge raises the effective out-degree past
+                    // one (gsim never out1-merges such a node).
+                    ++out1AnchorBlocked;
                     continue;
                 }
                 const uint32_t t = ns.front();
@@ -900,12 +1011,53 @@ namespace wolvrix::lib::grhsim::am
             }
 
             // mergeIn1: forward sweep, mirror image (merge into the unique
-            // predecessor).
+            // predecessor). NO0018 state-anchor modes: a state-only reader
+            // (no compute predecessor, exactly one read anchor) merges into
+            // its state variable's anchor group in modes 1/2 (gsim
+            // in1-into-register analogue); mode 2 additionally counts read
+            // anchors toward the effective in-degree, so a one-compute-pred
+            // state reader no longer merges.
             for (uint32_t s = 0; s < n; ++s) {
                 if (alive[s] == 0) {
                     continue;
                 }
                 std::vector<uint32_t> &sp = prevs[s];
+                const uint32_t readCount = readAnchorOff[s + 1] - readAnchorOff[s];
+                if (sp.empty()) {
+                    if (readCount != 1) {
+                        continue;
+                    }
+                    const uint32_t anchor = readAnchorVars[readAnchorOff[s]];
+                    uint32_t host = readAnchorHost[anchor];
+                    if (host == kInvalidIndex) {
+                        readAnchorHost[anchor] = s;
+                        continue;
+                    }
+                    host = findRoot(host);
+                    if (host == s || overMergeLimit(host)) {
+                        continue;
+                    }
+                    std::vector<uint32_t> &nh = nexts[host];
+                    for (const uint32_t d : nexts[s]) {
+                        sortedErase(prevs[d], s);
+                        sortedInsert(prevs[d], host);
+                    }
+                    sortedUnionInto(nh, nexts[s]);
+                    member[host] += member[s];
+                    member[s] = 0;
+                    memberInstructions[host] += memberInstructions[s];
+                    memberInstructions[s] = 0;
+                    alive[s] = 0;
+                    parent[s] = host;
+                    nexts[s].clear();
+                    ++anchorReadMerges;
+                    continue;
+                }
+                if (input.stateAnchorMode >= 2 && readCount != 0) {
+                    // The register edge raises the effective in-degree past
+                    // one (gsim never in1-merges such a node).
+                    continue;
+                }
                 if (sp.size() != 1) {
                     continue;
                 }
@@ -935,21 +1087,47 @@ namespace wolvrix::lib::grhsim::am
             // merge into the first host still below the member cap, a full
             // host is replaced by the current node. Membership only moves
             // here; the adjacency is rebuilt from the edge list afterwards.
+            // NO0018 mode 2: the equality key is the EFFECTIVE predecessor
+            // set — compute predecessors plus read anchors as synthetic
+            // ids >= n — matching gsim's value-graph prev equality.
+            const bool anchorSiblingKeys = input.stateAnchorMode >= 2;
+            std::vector<std::vector<uint32_t>> effPrevs(anchorSiblingKeys ? n : 0);
             std::vector<uint32_t> candidates;
             candidates.reserve(n);
             for (uint32_t s = 0; s < n; ++s) {
-                if (alive[s] != 0 && !prevs[s].empty()) {
-                    candidates.push_back(s);
+                if (alive[s] == 0) {
+                    continue;
                 }
+                if (!anchorSiblingKeys) {
+                    if (!prevs[s].empty()) {
+                        candidates.push_back(s);
+                    }
+                    continue;
+                }
+                const uint32_t anchorBegin = readAnchorOff[s];
+                const uint32_t anchorEnd = readAnchorOff[s + 1];
+                if (prevs[s].empty() && anchorBegin == anchorEnd) {
+                    continue;
+                }
+                effPrevs[s] = prevs[s];
+                for (uint32_t index = anchorBegin; index < anchorEnd; ++index) {
+                    // anchor keys (n + variable) sort past every rid.
+                    effPrevs[s].push_back(n + readAnchorVars[index]);
+                }
+                candidates.push_back(s);
             }
+            const auto &prevKeyOf = [&](uint32_t s) -> const std::vector<uint32_t> & {
+                return anchorSiblingKeys ? effPrevs[s] : prevs[s];
+            };
             std::sort(candidates.begin(), candidates.end(), [&](uint32_t lhs, uint32_t rhs) {
-                return prevs[lhs] != prevs[rhs] ? prevs[lhs] < prevs[rhs] : lhs < rhs;
+                return prevKeyOf(lhs) != prevKeyOf(rhs) ? prevKeyOf(lhs) < prevKeyOf(rhs)
+                                                        : lhs < rhs;
             });
             std::size_t begin = 0;
             while (begin < candidates.size()) {
                 std::size_t end = begin + 1;
                 while (end < candidates.size() &&
-                       prevs[candidates[end]] == prevs[candidates[begin]]) {
+                       prevKeyOf(candidates[end]) == prevKeyOf(candidates[begin])) {
                     ++end;
                 }
                 if (end - begin >= 2) {
@@ -1207,12 +1385,51 @@ namespace wolvrix::lib::grhsim::am
             result.atomBlock[atom] = segmentOfPos[graph.clusterOfAtom[atom]];
         }
 
+        // Block-local same-select fusion anchors (NO0018): mux-rooted atoms
+        // sharing one select inside one block share the group's minimum
+        // atomMinInstruction as their block-internal sort key, so the Kahn
+        // below emits them adjacently and the emitter's block-level fusion
+        // sees a run. Computed only after block assignment is final, so
+        // anchoring never perturbs partition geometry (mergeWhen groups land
+        // in one block by construction and are subsumed by this grouping).
+        {
+            std::map<std::pair<uint32_t, uint32_t>, std::pair<uint32_t, uint32_t>>
+                anchorGroups; // (block, select) -> (member count, min minInstruction)
+            for (uint32_t atom = 0; atom < computeAtomCount; ++atom) {
+                const uint32_t global = computeGraph.globalOfAtom[atom];
+                const uint32_t select = input.atomSignatures[global];
+                if (select == kInvalidIndex) {
+                    continue;
+                }
+                const auto key = std::make_pair(result.atomBlock[atom], select);
+                const auto [it, inserted] = anchorGroups.try_emplace(
+                    key, std::pair<uint32_t, uint32_t>{1, input.atomMinInstruction[global]});
+                if (!inserted) {
+                    it->second.first += 1;
+                    it->second.second =
+                        std::min(it->second.second, input.atomMinInstruction[global]);
+                }
+            }
+            for (uint32_t atom = 0; atom < computeAtomCount; ++atom) {
+                const uint32_t global = computeGraph.globalOfAtom[atom];
+                const uint32_t select = input.atomSignatures[global];
+                if (select == kInvalidIndex) {
+                    continue;
+                }
+                const auto it = anchorGroups.find(std::make_pair(result.atomBlock[atom], select));
+                if (it != anchorGroups.end() && it->second.first >= 2) {
+                    fusionAnchor[atom] = it->second.second;
+                }
+            }
+        }
+
         // A block-grouped Kahn keeps the compute topo topological both across
-        // and inside blocks. mergeWhen group members share their group's
-        // minimum atomMinInstruction as the primary sort key, so same-select
-        // mux-rooted atoms emit adjacently inside a block (the emitter's
-        // block-level fusion consumes those runs; readiness gating keeps the
-        // order topological regardless).
+        // and inside blocks. Atoms sharing a block-local same-select fusion
+        // anchor (computed above) use the group's minimum atomMinInstruction
+        // as the primary sort key, so same-select mux-rooted atoms emit
+        // adjacently inside a block (the emitter's block-level fusion
+        // consumes those runs; readiness gating keeps the order topological
+        // regardless).
         result.atomTopo.reserve(computeAtomCount);
         {
             using Candidate = std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>;
@@ -1256,6 +1473,7 @@ namespace wolvrix::lib::grhsim::am
         }
 
         result.atomFusionAnchor = std::move(fusionAnchor);
+        result.atomCluster = std::move(graph.clusterOfAtom);
         result.clustersAfterCoarsen = graph.count;
         result.dpSegments = computeBlockCount;
         result.coarsenMs = coarsenMs;
@@ -1268,6 +1486,9 @@ namespace wolvrix::lib::grhsim::am
         result.coarsenOut1Merges = out1Merges;
         result.coarsenIn1Merges = in1Merges;
         result.coarsenSiblingMerges = siblingMerges;
+        result.coarsenAnchorReadMerges = anchorReadMerges;
+        result.coarsenAnchorWriteMerges = anchorWriteMerges;
+        result.coarsenOut1AnchorBlocked = out1AnchorBlocked;
         result.initialDegreeHistogram = std::move(degreeHistogram);
         result.refinementRounds = refinement.rounds;
         result.refinementMoves = refinement.moves;

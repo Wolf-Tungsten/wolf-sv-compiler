@@ -3707,11 +3707,13 @@ int main()
         return 0;
     }
 
-    // NO0008 run-break behavior, pinned: same-select mux atoms interrupted
-    // by a different-select mux never form a multi-atom run -- plain
-    // ternaries only. (mergeWhenMinGroup stays at the default 5, so the
-    // two-member same-select set is not clustered either.)
-    int testSelectChangeBreaksMuxRun(const std::filesystem::path &outputDirectory)
+    // NO0018 block-local regrouping, pinned: same-select mux atoms landing in
+    // one block are pulled adjacent by the block-local fusion anchors and fuse
+    // into one run even when another select's mux sits between them in program
+    // order; the different-select mux still emits as a plain ternary.
+    // (mergeWhenMinGroup stays at the default 5, so the two-member same-select
+    // set is not coarsen-clustered either.)
+    int testSelectChangeRegroupsMuxRun(const std::filesystem::path &outputDirectory)
     {
         std::filesystem::remove_all(outputDirectory);
         LinearProgramBuilder builder;
@@ -3804,11 +3806,14 @@ int main()
             "if ((v" + std::to_string(sel.value) + " != 0)) { ";
         const std::string ternaryHead =
             " = ((v" + std::to_string(sel.value) + " != 0) ? ";
-        if (emitResult.muxAtomFused != 0 ||
-            countOccurrences(*blocksText, fusedGate) != 0 ||
-            countOccurrences(*blocksText, ternaryHead) != 2)
+        const std::string ternaryHead2 =
+            " = ((v" + std::to_string(sel2.value) + " != 0) ? ";
+        if (emitResult.muxAtomFused != 2 ||
+            countOccurrences(*blocksText, fusedGate) != 1 ||
+            countOccurrences(*blocksText, ternaryHead) != 0 ||
+            countOccurrences(*blocksText, ternaryHead2) != 1)
         {
-            return fail("select-interrupted mux atoms were still fused");
+            return fail("same-select mux atoms were not regrouped into one fused run");
         }
         return 0;
     }
@@ -4141,7 +4146,7 @@ int main()
     {
         return result;
     }
-    if (const int result = testSelectChangeBreaksMuxRun(
+    if (const int result = testSelectChangeRegroupsMuxRun(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-mux-run-break");
         result != 0)

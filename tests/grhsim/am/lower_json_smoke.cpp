@@ -154,16 +154,21 @@ int main(int argc, char **argv)
     std::optional<std::string> maxCommitSourceBytes;
     std::optional<std::string> blockChunkInstructions;
     // Default partition configuration = the gsim-aligned point locked by
-    // emit-cost NO0002 (2026-08-10): fold cap 2 + 9 atoms/block + 32768
-    // instruction coarsen budget + 0 penalty + 0 refinement rounds lands
-    // L2 0.95x / L3 0.98x structural parity with gsim on the same exec-GRH.
-    std::size_t maxAtomsPerBlock = 9;
+    // supernode-align NO0018 (2026-08-12): on the flatten graph the mapping
+    // to gsim's supernodes is measured by pair-F1 against the members join —
+    // 15 atoms/block + 7000-atom coarsen budget + mergeWhen off lands
+    // pair-F1 0.9255 (was 0.4260 at the NO0002 point); state-anchor sweeps
+    // were evaluated and rejected by F1 (mode 1: 0.8935, mode 2: 0.8268).
+    // Fusion anchors are computed block-locally after the DP, so disabling
+    // mergeWhen no longer costs emitter same-select fusion.
+    std::size_t maxAtomsPerBlock = 15;
     std::size_t maxCommitAtomsPerBlock = 4096;
     double dpSegmentPenalty = 0.0;
-    std::size_t dpCoarsenAtomBudget = 0;
-    std::size_t dpCoarsenInstrBudget = 32768;
+    std::size_t dpCoarsenAtomBudget = 7000;
+    std::size_t dpCoarsenInstrBudget = 0;
     std::size_t treeAtomFoldMaxInstr = 2;
-    std::size_t mergeWhenMinGroup = 5;
+    std::size_t mergeWhenMinGroup = 1;
+    std::size_t stateAnchorMode = 0;
     std::size_t dpRefinementRounds = 0;
     std::size_t fanoutAbsorbMaxInstructions = 0;
     double fanoutAbsorbBudgetMult = 1.0;
@@ -342,6 +347,19 @@ int main(int argc, char **argv)
                 return 2;
             }
             dpRefinementRounds = value;
+        }
+        else if (argument == "--dp-state-anchor-mode" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            std::size_t value = 0;
+            const auto [end, error] =
+                std::from_chars(text.data(), text.data() + text.size(), value);
+            if (error != std::errc{} || end != text.data() + text.size() || value > 2)
+            {
+                std::cerr << "invalid --dp-state-anchor-mode value: " << text << '\n';
+                return 2;
+            }
+            stateAnchorMode = value;
         }
         else if (argument == "--fanout-absorb-max-instructions" && index + 1 < argc)
         {
@@ -623,6 +641,7 @@ int main(int argc, char **argv)
             .dpCoarsenInstrBudget = dpCoarsenInstrBudget,
             .dpRefinementRounds = dpRefinementRounds,
             .mergeWhenMinGroup = mergeWhenMinGroup,
+            .stateAnchorMode = stateAnchorMode,
             .fanoutAbsorbMaxInstructions = fanoutAbsorbMaxInstructions,
             .fanoutAbsorbBudgetMult = fanoutAbsorbBudgetMult,
             .fanoutAbsorbMaxConsumers = fanoutAbsorbMaxConsumers,

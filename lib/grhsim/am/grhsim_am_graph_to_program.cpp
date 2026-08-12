@@ -490,6 +490,12 @@ namespace wolvrix::lib::grhsim::am
                                  std::to_string(computeActivity.coarsenIn1Merges) +
                                  " sibling_merges=" +
                                  std::to_string(computeActivity.coarsenSiblingMerges) +
+                                 " anchor_read_merges=" +
+                                 std::to_string(computeActivity.coarsenAnchorReadMerges) +
+                                 " anchor_write_merges=" +
+                                 std::to_string(computeActivity.coarsenAnchorWriteMerges) +
+                                 " out1_anchor_blocked=" +
+                                 std::to_string(computeActivity.coarsenOut1AnchorBlocked) +
                                  " refine_rounds=" +
                                  std::to_string(computeActivity.refinementRounds) +
                                  " refine_moves=" +

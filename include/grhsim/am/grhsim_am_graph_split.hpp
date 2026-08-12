@@ -76,6 +76,7 @@ namespace wolvrix::lib::grhsim::am
         double segmentPenalty = 1.0;
         std::size_t refinementRounds = 10;
         std::size_t mergeWhenMinGroup = 5;
+        std::size_t stateAnchorMode = 0;
         AmGraphSplit split;
 
         // Assembles the span POD consumed by the partition passes; the spans
