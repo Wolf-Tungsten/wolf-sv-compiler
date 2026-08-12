@@ -947,6 +947,22 @@ slice 融合、ROM 折叠与根集合安全性。
 `tests/grhsim/am/test_node_aligned.cpp` 覆盖戳记、Tree atom 成形与 anchor 序、
 commit singleton、无归属检测器、Off 模式回退旧路径。
 
+### 3.2.7 oversized Block 分块与 chunk 函数 `__restrict__`（2026-08-11/12）
+
+超大 Block（指令数超 `blockChunkInstructions`，默认 3000，不可拆 atom 可超过）
+的语句体拆成 `block_<id>_chunk_<k>()` 成员函数顺序调用；Block 局部值/watch
+标志以父作用域数组（`localblk_<id>[k]` 等）经指针参数共享给 chunk 函数。
+
+**关键陷阱（2026-08-12 实锤）**：chunk 函数的共享数组指针参数必须带
+`__restrict__`。缺失时，chunk 体内每条经裸指针的 store 对 LLVM 而言
+may-alias 全部成员变量（XiangShan 模型 142 万个 `uint64_t` 成员），GVN 的
+非局部 clobber 查询（`MemoryDependenceResults::getNonLocalPointerDepFromBB`
+→ TBAA）随语句数超线性爆炸：62k 行 TU 单任务 -O3 40 分钟编不完（gdb 栈采样
+实锤卡在 GVN）。加 `__restrict__` 后同一 TU **10.31s**（>230x）；合法性依据是
+这些指针恒指向调用方栈数组，绝不指向成员存储。gsim 无此问题：其临时量是
+函数内真 C++ 局部变量（纯 SSA）。全量 emu（351 TU）-O3 零降级构建 7m44s。
+详见 pdocs/grh-notepad/emit-cost NO0007 §12。
+
 ### 3.3 临时 scheduling facts
 
 以下内容只属于 scheduler workspace，不进入 ScheduledProgram 或 session 的长期公共契约：

@@ -2227,12 +2227,12 @@ namespace wolvrix::lib::grhsim::am
 
             // Materialize the collected state writes: writes to one target are
             // ordered exactly like the legacy per-target effect order, then
-            // partitioned by event signature. Register/latch writes inside one
-            // signature fold cond and mask into a single nextValue expression
-            // and collapse to one write per signature; memory element writes
-            // keep their cond/mask operands and stay one instruction per write
-            // (a disabled write is suppressed outright, so no read-old value
-            // is ever needed).
+            // partitioned by event signature. Every write stays one instruction
+            // per write (register/latch/memory alike), keeping its cond/mask
+            // operands; same-target writes commit in ordinal order inside their
+            // commit block, so a later write blends onto the earlier one's
+            // result (a disabled write is suppressed outright, so no read-old
+            // value is ever needed).
             void materializeStateWrites()
             {
                 std::map<uint32_t, std::vector<PendingStateWrite>> writesByTarget;

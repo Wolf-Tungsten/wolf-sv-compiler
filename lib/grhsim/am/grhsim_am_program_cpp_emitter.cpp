@@ -253,6 +253,15 @@ namespace wolvrix::lib::grhsim::am
             mutable std::vector<uint32_t> localValueIndices;
             mutable uint32_t activeLocalityBlock = std::numeric_limits<uint32_t>::max();
             mutable std::vector<uint32_t> activeLocalityDeclarations;
+            // Oversized-Block chunking (blockChunkInstructions): while an
+            // oversized Block's instruction stream is emitted as
+            // block_<id>_chunk_<k>() member functions, this holds the chunked
+            // Block's id. The Block's locals (localblk_<id>[k]), write-point
+            // watch flags (wrChgblk_<id>[k] / arrChgblk_<id>[k]) and
+            // detector-group flags (detGrpblk_<id>[k]) are addressed as
+            // parent-scope arrays so every chunk function can share them
+            // through pointer parameters.
+            mutable uint32_t activeChunkedBlock = std::numeric_limits<uint32_t>::max();
             // Static-scan local-relay context. While a compute Block is emitted
             // into the byte-chunk scan form, forward activations whose target
             // bit is owned by the current byte chunk set the scan-local
@@ -414,10 +423,25 @@ namespace wolvrix::lib::grhsim::am
                    state.localValueStamps[variable.value] == state.activeLocalityBlock + 1;
         }
 
+        // True while an oversized Block's chunks are emitted: its locals and
+        // watch/detector flags are named as parent-scope array elements
+        // (localblk_<id>[k] and friends) instead of plain block-function
+        // locals, so the chunk functions can share them by pointer.
+        bool chunkedBlockNaming(const EmitState &state)
+        {
+            return state.activeChunkedBlock != kInvalidLocalityBlock &&
+                   state.activeChunkedBlock == state.activeLocalityBlock;
+        }
+
         std::string valueExpr(const EmitState &state, VariableId variable)
         {
             if (isLocalValue(state, variable))
             {
+                if (chunkedBlockNaming(state))
+                {
+                    return "localblk_" + std::to_string(state.activeChunkedBlock) + "[" +
+                           std::to_string(state.localValueIndices[variable.value]) + "]";
+                }
                 return "local_" + std::to_string(state.localValueIndices[variable.value]);
             }
             const uint32_t denseIndex = state.changedResultDenseIndex[variable.value];
@@ -431,6 +455,42 @@ namespace wolvrix::lib::grhsim::am
         std::string boolExpr(const EmitState &state, VariableId variable)
         {
             return "(" + valueExpr(state, variable) + " != 0)";
+        }
+
+        // Block-local ST00013 scalar write-point flag: a plain local in the
+        // inline form, a parent-scope array element in the chunked form.
+        std::string scalarWatchFlagExpr(const EmitState &state, uint32_t flag)
+        {
+            if (chunkedBlockNaming(state))
+            {
+                return "wrChgblk_" + std::to_string(state.activeChunkedBlock) + "[" +
+                       std::to_string(flag) + "]";
+            }
+            return "wrChg_" + std::to_string(flag);
+        }
+
+        // Same for the ST00011 array write-point accumulator flags.
+        std::string arrayWatchAccumExpr(const EmitState &state, uint32_t accum)
+        {
+            if (chunkedBlockNaming(state))
+            {
+                return "arrChgblk_" + std::to_string(state.activeChunkedBlock) + "[" +
+                       std::to_string(accum) + "]";
+            }
+            return "arrChg_" + std::to_string(accum);
+        }
+
+        // Same for the ST00010 detector-group accumulator flags. The chunked
+        // form declares the zero-initialized array in the parent function, so
+        // chunked references never carry the inline first-use declaration.
+        std::string detectorGroupExpr(const EmitState &state, uint32_t group)
+        {
+            if (chunkedBlockNaming(state))
+            {
+                return "detGrpblk_" + std::to_string(state.activeChunkedBlock) + "[" +
+                       std::to_string(group) + "]";
+            }
+            return "detGrp_" + std::to_string(group);
         }
 
         void beginLocalityBlock(const EmitState &state, uint32_t block)
@@ -1792,8 +1852,10 @@ namespace wolvrix::lib::grhsim::am
                         // ST00011: the change flag was accumulated at this
                         // Block's own write sites; the whole-array compare and
                         // baseline copy are gone.
-                        return setResult + "arrChg_" +
-                               std::to_string(state.arrayDetectorAccum) + ");\n";
+                        return setResult +
+                               arrayWatchAccumExpr(
+                                   state, static_cast<uint32_t>(state.arrayDetectorAccum)) +
+                               ");\n";
                     }
                     const uint64_t words = storedWordCount(state, operands.front());
                     const std::string current = wordDataExpr(state, operands[0]);
@@ -1898,7 +1960,8 @@ namespace wolvrix::lib::grhsim::am
                     if (isRegisterWriteOpcode(opcode) && state.scalarWriteRaise >= 0)
                     {
                         // ST00013: report a real change for the raise flag.
-                        body += "wrChg_" + std::to_string(state.scalarWriteRaise) +
+                        body += scalarWatchFlagExpr(
+                                    state, static_cast<uint32_t>(state.scalarWriteRaise)) +
                                 " |= masked_write_words_detect(" + writeArgs + ";\n";
                     }
                     else
@@ -1909,7 +1972,8 @@ namespace wolvrix::lib::grhsim::am
                 else if (isRegisterWriteOpcode(opcode) && state.scalarWriteRaise >= 0)
                 {
                     // ST00013: report a real change for the raise flag.
-                    body = "wrChg_" + std::to_string(state.scalarWriteRaise) +
+                    body = scalarWatchFlagExpr(
+                               state, static_cast<uint32_t>(state.scalarWriteRaise)) +
                            " |= assign_words_detect(" + wideDataExpr(state, target) +
                            ", " + std::to_string(width) + ", " +
                            wideDataExpr(state, data) + ", " +
@@ -2224,8 +2288,10 @@ namespace wolvrix::lib::grhsim::am
                             "wrNext_" + std::to_string(instruction.value);
                         body = "{ const auto " + next + " = " + nextValue + ";\nif (" + next +
                                " != " + valueExpr(state, target) + ") { " +
-                               valueExpr(state, target) + " = " + next + "; wrChg_" +
-                               std::to_string(state.scalarWriteRaise) + " = true; } }\n";
+                               valueExpr(state, target) + " = " + next + "; " +
+                               scalarWatchFlagExpr(
+                                   state, static_cast<uint32_t>(state.scalarWriteRaise)) +
+                               " = true; } }\n";
                     }
                     else
                     {
@@ -2320,7 +2386,8 @@ namespace wolvrix::lib::grhsim::am
                             // ST00011: fuse reader-activation change detection
                             // into the element write (exact: only a real element
                             // change raises the flag).
-                            body += "arrChg_" + std::to_string(state.arrayWriteAccum) +
+                            body += arrayWatchAccumExpr(
+                                        state, static_cast<uint32_t>(state.arrayWriteAccum)) +
                                     " |= masked_write_words_detect(" + writeArgs + ";";
                         }
                         else
@@ -2340,7 +2407,8 @@ namespace wolvrix::lib::grhsim::am
                         {
                             // ST00011: same write-point change fusion as the
                             // masked form, at whole-element granularity.
-                            body = "arrChg_" + std::to_string(state.arrayWriteAccum) +
+                            body = arrayWatchAccumExpr(
+                                       state, static_cast<uint32_t>(state.arrayWriteAccum)) +
                                    " |= assign_words_detect(" + writeArgs + ";";
                         }
                         else
@@ -2377,7 +2445,8 @@ namespace wolvrix::lib::grhsim::am
                     {
                         // ST00011: same write-point change fusion as
                         // mem.write, at whole-lane granularity.
-                        body = "arrChg_" + std::to_string(state.arrayWriteAccum) +
+                        body = arrayWatchAccumExpr(
+                                   state, static_cast<uint32_t>(state.arrayWriteAccum)) +
                                " |= array_write_scatter_detect(" + scatterArgs + ";";
                     }
                     else
@@ -2409,8 +2478,8 @@ namespace wolvrix::lib::grhsim::am
                         // ST00011: a re-fill of identical values must not
                         // re-activate readers (eval convergence), so the flag
                         // tracks real per-element change inside the loop.
-                        const std::string accum =
-                            "arrChg_" + std::to_string(state.arrayWriteAccum);
+                        const std::string accum = arrayWatchAccumExpr(
+                            state, static_cast<uint32_t>(state.arrayWriteAccum));
                         elementWrite =
                             accum + " |= slice_words_detect(" + target + ", " +
                             std::to_string(memoryType.bitWidth) + ", " +
@@ -2568,6 +2637,59 @@ namespace wolvrix::lib::grhsim::am
             return code + ";\n";
         }
 
+        // Oversized-Block chunking: a chunked Block's local values live in
+        // one parent-scope array (uninitialized, exactly like the inline
+        // per-value locals) shared with the chunk functions through a pointer
+        // parameter. Requires beginLocalityBlock + activeChunkedBlock.
+        std::string chunkedLocalValueDeclarations(const EmitState &state)
+        {
+            if (state.activeLocalityDeclarations.empty())
+            {
+                return {};
+            }
+            return "std::uint64_t localblk_" +
+                   std::to_string(state.activeChunkedBlock) + "[" +
+                   std::to_string(state.activeLocalityDeclarations.size()) + "];\n";
+        }
+
+        // Chunked-form watch flags: same reset-at-Block-entry semantics as
+        // the inline declarations, as a zero-initialized parent-scope array.
+        std::string chunkedScalarWatchDeclarations(const EmitState &state,
+                                                   const EmitState::ScalarWatchPlan *plan)
+        {
+            if (plan == nullptr || plan->flagCount == 0)
+            {
+                return {};
+            }
+            return "bool wrChgblk_" + std::to_string(state.activeChunkedBlock) + "[" +
+                   std::to_string(plan->flagCount) + "] = {};\n";
+        }
+
+        std::string chunkedArrayWatchDeclarations(const EmitState &state,
+                                                  const EmitState::ArrayWatchPlan *plan)
+        {
+            if (plan == nullptr || plan->accumCount == 0)
+            {
+                return {};
+            }
+            return "bool arrChgblk_" + std::to_string(state.activeChunkedBlock) + "[" +
+                   std::to_string(plan->accumCount) + "] = {};\n";
+        }
+
+        // Chunked-form detector-group flags: the inline form declares each
+        // flag at its first accumulate; the chunks share one zero-initialized
+        // parent-scope array instead.
+        std::string chunkedDetectorGroupDeclarations(const EmitState &state,
+                                                     const EmitState::DetectorGroupPlan *plan)
+        {
+            if (plan == nullptr || plan->groups.empty())
+            {
+                return {};
+            }
+            return "bool detGrpblk_" + std::to_string(state.activeChunkedBlock) + "[" +
+                   std::to_string(plan->groups.size()) + "] = {};\n";
+        }
+
         // ST00010: emits the branchless accumulate for one folded detector:
         // the change comparison feeds the group flag(s) and the detector's
         // private old baseline is updated unconditionally, exactly as the
@@ -2587,14 +2709,27 @@ namespace wolvrix::lib::grhsim::am
             const std::string event =
                 narrowChangedEventExpr(state, opcode, operands[0], operands[1]);
             std::string code;
+            // First-use declaration state: the inline form declares the
+            // block-local flag at its first accumulate; the chunked form
+            // references the parent-scope array element instead (declared and
+            // zero-initialized with the chunk calls).
+            const auto groupRef = [&](uint32_t group, bool &declared) {
+                declared = groupDeclared[group] != 0;
+                std::string reference;
+                if (!declared && !chunkedBlockNaming(state))
+                {
+                    reference = "bool ";
+                }
+                reference += detectorGroupExpr(state, group);
+                groupDeclared[group] = 1;
+                return reference;
+            };
             if (groups.size() == 1)
             {
-                const uint32_t group = groups.front();
-                code += groupDeclared[group] ? "detGrp_" : "bool detGrp_";
-                code += std::to_string(group);
-                code += groupDeclared[group] ? " |= (" : " = (";
+                bool declared = false;
+                code += groupRef(groups.front(), declared);
+                code += declared ? " |= (" : " = (";
                 code += event + ");\n";
-                groupDeclared[group] = 1;
             }
             else
             {
@@ -2602,11 +2737,10 @@ namespace wolvrix::lib::grhsim::am
                 code += "const bool " + temporary + " = (" + event + ");\n";
                 for (const uint32_t group : groups)
                 {
-                    code += groupDeclared[group] ? "detGrp_" : "bool detGrp_";
-                    code += std::to_string(group);
-                    code += groupDeclared[group] ? " |= " : " = ";
+                    bool declared = false;
+                    code += groupRef(group, declared);
+                    code += declared ? " |= " : " = ";
                     code += temporary + ";\n";
-                    groupDeclared[group] = 1;
                 }
             }
             code += valueExpr(state, operands[1]) + " = " + valueExpr(state, operands[0]) +
@@ -2630,7 +2764,7 @@ namespace wolvrix::lib::grhsim::am
             }
             return emitActivationMerge(state, group.forward, relayMask, masks,
                                        group.originalTargetCount,
-                                       "detGrp_" + std::to_string(groupId),
+                                       detectorGroupExpr(state, groupId),
                                        /*allowBranchlessRelay=*/true);
         }
 
@@ -2657,14 +2791,18 @@ namespace wolvrix::lib::grhsim::am
                 // ST00013: the flag raised at the Block's own write sites
                 // feeds the group accumulator (folded) or the event variable.
                 const uint32_t flag = scalarPlan->detectorRaise.at(index);
-                const std::string flagExpr = "wrChg_" + std::to_string(flag);
+                const std::string flagExpr = scalarWatchFlagExpr(state, flag);
                 if (plan != nullptr && plan->accumGroups.count(index) != 0)
                 {
                     for (const uint32_t group : plan->accumGroups.at(index))
                     {
-                        code += groupDeclared[group] ? "detGrp_" : "bool detGrp_";
-                        code += std::to_string(group);
-                        code += groupDeclared[group] ? " |= " : " = ";
+                        const bool declared = groupDeclared[group] != 0;
+                        if (!declared && !chunkedBlockNaming(state))
+                        {
+                            code += "bool ";
+                        }
+                        code += detectorGroupExpr(state, group);
+                        code += declared ? " |= " : " = ";
                         code += flagExpr + ";\n";
                         groupDeclared[group] = 1;
                     }
@@ -2822,6 +2960,38 @@ namespace wolvrix::lib::grhsim::am
             {
                 diagnostics.error(
                     "AM C++ emitter maxCommitSourceBytes must be a positive integer: " +
+                        attribute->second,
+                    std::string(kContext));
+                return std::nullopt;
+            }
+            return value;
+        }
+
+        // Oversized-Block chunking threshold: a Block whose instruction count
+        // exceeds this budget emits its stream as block_<id>_chunk_<k>()
+        // member calls instead of inline code, keeping every generated
+        // function small enough for the C++ optimizer (one 145k-instruction
+        // XiangShan Block produced a single 106k-line function that neither
+        // clang -O1 nor -O3 could compile).
+        std::optional<std::size_t>
+        parseBlockChunkInstructions(const GrhSimAmCppOptions &options,
+                                    wolvrix::lib::diag::Diagnostics &diagnostics)
+        {
+            constexpr std::size_t kDefaultBlockChunkInstructions = 3000;
+            const auto attribute = options.attributes.find("blockChunkInstructions");
+            if (attribute == options.attributes.end())
+            {
+                return kDefaultBlockChunkInstructions;
+            }
+
+            std::size_t value = 0;
+            const char *const begin = attribute->second.data();
+            const char *const end = begin + attribute->second.size();
+            const auto [parsedEnd, error] = std::from_chars(begin, end, value);
+            if (error != std::errc{} || parsedEnd != end || value == 0)
+            {
+                diagnostics.error(
+                    "AM C++ emitter blockChunkInstructions must be a positive integer: " +
                         attribute->second,
                     std::string(kContext));
                 return std::nullopt;
@@ -3078,6 +3248,152 @@ namespace wolvrix::lib::grhsim::am
                         "] += 1; ++profileCommitBlockExecs_; }\n";
             }
             return text;
+        }
+
+        std::string blockChunkFunctionName(std::size_t blockIndex, std::size_t chunkIndex)
+        {
+            return "block_" + std::to_string(blockIndex) + "_chunk_" +
+                   std::to_string(chunkIndex);
+        }
+
+        // Instruction ranges [first, end) covered by each chunk of an
+        // oversized Block: at most chunkInstructions per chunk, never
+        // splitting one instruction, with a forced boundary at the commit
+        // gate head so the gate's "if" can wrap whole chunk calls at the call
+        // site. Empty when the Block fits in one function.
+        std::vector<std::pair<std::size_t, std::size_t>>
+        blockChunkRanges(std::size_t blockSize,
+                         std::size_t chunkInstructions,
+                         std::size_t gateBoundary)
+        {
+            std::vector<std::pair<std::size_t, std::size_t>> ranges;
+            if (blockSize <= chunkInstructions)
+            {
+                return ranges;
+            }
+            const auto append = [&](std::size_t first, std::size_t end) {
+                for (std::size_t at = first; at < end; at += chunkInstructions)
+                {
+                    ranges.emplace_back(at, std::min(at + chunkInstructions, end));
+                }
+            };
+            append(0, gateBoundary);
+            append(gateBoundary, blockSize);
+            return ranges;
+        }
+
+        // Pointer/reference parameters a chunked Block's chunk functions
+        // share: one per non-empty parent-scope array, plus the scan
+        // byte-flags relay for Blocks emitted inside a byte-chunk scan
+        // (every Block except the entry Block).
+        struct BlockChunkParams
+        {
+            bool locals = false;
+            bool scalarWatch = false;
+            bool arrayWatch = false;
+            bool detectorGroups = false;
+            bool byteFlags = false;
+        };
+
+        BlockChunkParams blockChunkParamsFor(const EmitState &state,
+                                             std::size_t blockIndex)
+        {
+            BlockChunkParams params;
+            beginLocalityBlock(state, static_cast<uint32_t>(blockIndex));
+            params.locals = !state.activeLocalityDeclarations.empty();
+            endLocalityBlock(state);
+            const EmitState::ScalarWatchPlan *scalarPlan =
+                scalarWatchPlanFor(state, blockIndex);
+            params.scalarWatch = scalarPlan != nullptr && scalarPlan->flagCount != 0;
+            const EmitState::ArrayWatchPlan *arrayPlan =
+                arrayWatchPlanFor(state, blockIndex);
+            params.arrayWatch = arrayPlan != nullptr && arrayPlan->accumCount != 0;
+            const EmitState::DetectorGroupPlan *detectorPlan =
+                detectorPlanFor(state, blockIndex);
+            params.detectorGroups =
+                detectorPlan != nullptr && !detectorPlan->groups.empty();
+            params.byteFlags = blockIndex != 0;
+            return params;
+        }
+
+        // Parameter names carry the Block id because the emitted instruction
+        // code addresses the arrays as localblk_<id>[k] and friends.
+        std::string blockChunkParameterList(std::size_t blockIndex,
+                                            const BlockChunkParams &params)
+        {
+            const std::string suffix = "_" + std::to_string(blockIndex);
+            std::string list;
+            const auto append = [&](std::string parameter) {
+                if (!list.empty())
+                {
+                    list += ", ";
+                }
+                list += parameter;
+            };
+            // __restrict__ on every shared-array parameter: without it each
+            // store through these pointers may-alias every member-variable
+            // access in the chunk body, which sends GVN's memory-dependence
+            // queries quadratic on the oversized Blocks (measured: -O3 did
+            // not finish a 62k-line TU in 40 minutes; the parent-scope
+            // arrays never alias member storage, so restrict is valid).
+            if (params.locals)
+            {
+                append("std::uint64_t *__restrict__ localblk" + suffix);
+            }
+            if (params.scalarWatch)
+            {
+                append("bool *__restrict__ wrChgblk" + suffix);
+            }
+            if (params.arrayWatch)
+            {
+                append("bool *__restrict__ arrChgblk" + suffix);
+            }
+            if (params.detectorGroups)
+            {
+                append("bool *__restrict__ detGrpblk" + suffix);
+            }
+            if (params.byteFlags)
+            {
+                append("std::uint8_t &__restrict__ byteFlags");
+            }
+            return list;
+        }
+
+        // Call arguments matching blockChunkParameterList: the parent-scope
+        // arrays by name (each decays to the pointer parameter).
+        std::string blockChunkArgumentList(std::size_t blockIndex,
+                                           const BlockChunkParams &params)
+        {
+            const std::string suffix = "_" + std::to_string(blockIndex);
+            std::string list;
+            const auto append = [&](std::string argument) {
+                if (!list.empty())
+                {
+                    list += ", ";
+                }
+                list += argument;
+            };
+            if (params.locals)
+            {
+                append("localblk" + suffix);
+            }
+            if (params.scalarWatch)
+            {
+                append("wrChgblk" + suffix);
+            }
+            if (params.arrayWatch)
+            {
+                append("arrChgblk" + suffix);
+            }
+            if (params.detectorGroups)
+            {
+                append("detGrpblk" + suffix);
+            }
+            if (params.byteFlags)
+            {
+                append("byteFlags");
+            }
+            return list;
         }
 
         bool addByteCount(uint64_t &total, uint64_t increment)
@@ -4647,6 +4963,12 @@ namespace wolvrix::lib::grhsim::am
         {
             return result;
         }
+        const std::optional<std::size_t> blockChunkInstructions =
+            parseBlockChunkInstructions(options, diagnostics);
+        if (!blockChunkInstructions)
+        {
+            return result;
+        }
         const std::size_t blockCount = model.program.blockCount();
 
         // ST00009: escape analysis for block-local value localization. A value keeps
@@ -4978,6 +5300,33 @@ namespace wolvrix::lib::grhsim::am
                            << commitSourceFunctionName(part.sourceIndex,
                                                        part.partIndex)
                            << "();\n";
+                }
+                // Chunk functions of this part's oversized Blocks (whose
+                // instruction streams exceed blockChunkInstructions).
+                for (std::size_t blockIndex = part.firstBlock;
+                     blockIndex < part.endBlock;
+                     ++blockIndex)
+                {
+                    const BlockId block{static_cast<uint32_t>(blockIndex)};
+                    const std::size_t blockSize = model.program.blockSize(block);
+                    const std::vector<std::pair<std::size_t, std::size_t>> chunkRanges =
+                        blockChunkRanges(blockSize,
+                                         *blockChunkInstructions,
+                                         state.blockCommitGate[blockIndex].headCount);
+                    if (chunkRanges.empty())
+                    {
+                        continue;
+                    }
+                    const BlockChunkParams chunkParams =
+                        blockChunkParamsFor(state, blockIndex);
+                    const std::string parameterList =
+                        blockChunkParameterList(blockIndex, chunkParams);
+                    for (std::size_t chunk = 0; chunk < chunkRanges.size(); ++chunk)
+                    {
+                        header << "    void "
+                               << blockChunkFunctionName(blockIndex, chunk) << "("
+                               << parameterList << ");\n";
+                    }
                 }
             }
         }
@@ -6857,6 +7206,134 @@ namespace
                     endLocalityBlock(state);
                     return true;
                 };
+                // Chunk definitions of this part's oversized Blocks: emitted
+                // into a side buffer while the parent scan/commit/entry
+                // function streams (so the byte-chunk relay context active at
+                // the call site applies), then appended after the parent
+                // function's epilogue — member-function definition order in
+                // the TU is free.
+                std::ostringstream chunkDefs;
+                const auto flushChunkDefs = [&] {
+                    blockSource << chunkDefs.str();
+                    chunkDefs.str(std::string());
+                };
+                // Oversized-Block form of writeBlockBody: the Block's
+                // instruction stream becomes a sequence of chunk-function
+                // definitions (same per-position emission, array-named
+                // locals/watch/detector flags), and the parent body keeps the
+                // shared array declarations plus one call per chunk. The
+                // commit gate wraps exactly the chunks past the gate head
+                // boundary, preserving the inline gate's semantics.
+                const auto writeChunkedBlockBody = [&](std::size_t blockIndex,
+                                                       std::string_view indentation,
+                                                       const EmitState::CommitGate *gate) {
+                    const BlockId block{static_cast<uint32_t>(blockIndex)};
+                    const std::size_t blockSize = model.program.blockSize(block);
+                    const std::size_t gateBoundary =
+                        gate != nullptr ? gate->headCount : 0;
+                    const std::vector<std::pair<std::size_t, std::size_t>> chunkRanges =
+                        blockChunkRanges(blockSize, *blockChunkInstructions, gateBoundary);
+                    const BlockChunkParams chunkParams =
+                        blockChunkParamsFor(state, blockIndex);
+                    const std::string parameterList =
+                        blockChunkParameterList(blockIndex, chunkParams);
+                    const std::string argumentList =
+                        blockChunkArgumentList(blockIndex, chunkParams);
+                    beginLocalityBlock(state, static_cast<uint32_t>(blockIndex));
+                    state.activeChunkedBlock = static_cast<uint32_t>(blockIndex);
+                    const EmitState::ArrayWatchPlan *arrayPlan =
+                        arrayWatchPlanFor(state, blockIndex);
+                    const EmitState::ScalarWatchPlan *scalarPlan =
+                        scalarWatchPlanFor(state, blockIndex);
+                    const EmitState::DetectorGroupPlan *detectorPlan =
+                        detectorPlanFor(state, blockIndex);
+                    // First-use declaration state is continuous across the
+                    // Block's chunks (chunked references never re-declare).
+                    std::vector<uint8_t> detectorGroupDeclared(
+                        detectorPlan != nullptr ? detectorPlan->groups.size() : 0, 0);
+                    for (std::size_t chunk = 0; chunk < chunkRanges.size(); ++chunk)
+                    {
+                        chunkDefs << "\nvoid " << className << "::"
+                                  << blockChunkFunctionName(blockIndex, chunk) << "("
+                                  << parameterList << ") {\n";
+                        const auto [firstPosition, endPosition] = chunkRanges[chunk];
+                        for (std::size_t index = firstPosition;
+                             index < endPosition;
+                             ++index)
+                        {
+                            const InstructionId instruction =
+                                model.program.blockInstruction(block, index);
+                            std::string error;
+                            const std::optional<std::string> code =
+                                emitBlockPositionCode(state, detectorPlan, arrayPlan,
+                                                      scalarPlan, instruction,
+                                                      static_cast<uint32_t>(index),
+                                                      detectorGroupDeclared, error);
+                            if (!code)
+                            {
+                                state.activeChunkedBlock = kInvalidLocalityBlock;
+                                endLocalityBlock(state);
+                                diagnostics.error(error + ": instruction=" +
+                                                      std::to_string(instruction.value),
+                                                  std::string(kContext));
+                                return false;
+                            }
+                            writeIndentedLines(chunkDefs, *code, "    ");
+                        }
+                        chunkDefs << "}\n";
+                    }
+                    writeIndentedLines(blockSource,
+                                       chunkedLocalValueDeclarations(state),
+                                       indentation);
+                    writeIndentedLines(blockSource,
+                                       chunkedArrayWatchDeclarations(state, arrayPlan),
+                                       indentation);
+                    writeIndentedLines(blockSource,
+                                       chunkedScalarWatchDeclarations(state, scalarPlan),
+                                       indentation);
+                    writeIndentedLines(blockSource,
+                                       chunkedDetectorGroupDeclarations(state, detectorPlan),
+                                       indentation);
+                    const std::size_t ungatedChunks =
+                        gateBoundary == 0
+                            ? chunkRanges.size()
+                            : (gateBoundary + *blockChunkInstructions - 1U) /
+                                  *blockChunkInstructions;
+                    const std::string gatedIndentation = std::string(indentation) + "    ";
+                    for (std::size_t chunk = 0; chunk < chunkRanges.size(); ++chunk)
+                    {
+                        if (gate != nullptr && chunk == ungatedChunks)
+                        {
+                            // The Block's single merged event gate: the chunks
+                            // past the gate head run only when a gate detector
+                            // fired (the inline form wraps the instructions).
+                            blockSource << indentation << "if (" << gate->expression
+                                        << ") {\n";
+                        }
+                        blockSource << (chunk < ungatedChunks ? indentation
+                                                              : gatedIndentation)
+                                    << blockChunkFunctionName(blockIndex, chunk) << "("
+                                    << argumentList << ");\n";
+                    }
+                    if (gate != nullptr && ungatedChunks < chunkRanges.size())
+                    {
+                        blockSource << indentation << "}\n";
+                    }
+                    state.activeChunkedBlock = kInvalidLocalityBlock;
+                    endLocalityBlock(state);
+                    return true;
+                };
+                const auto writeBlockBodyOrChunks =
+                    [&](std::size_t blockIndex,
+                        std::string_view indentation,
+                        const EmitState::CommitGate *gate = nullptr) {
+                        const BlockId block{static_cast<uint32_t>(blockIndex)};
+                        if (model.program.blockSize(block) > *blockChunkInstructions)
+                        {
+                            return writeChunkedBlockBody(blockIndex, indentation, gate);
+                        }
+                        return writeBlockBody(blockIndex, indentation, gate);
+                    };
                 // A scan Block with no instructions and no local declarations
                 // emits no bit test; the byte-chunk clear still consumes its
                 // activity bit.
@@ -6878,12 +7355,13 @@ namespace
                     {
                         blockSource << entryBlockProfileLine();
                     }
-                    if (!writeBlockBody(0, "    "))
+                    if (!writeBlockBodyOrChunks(0, "    "))
                     {
                         blocksGenerated = false;
                         break;
                     }
                     blockSource << kBlockSourceFunctionEpilogue;
+                    flushChunkDefs();
                 }
                 const auto [scanLo, scanHi] =
                     computeBlockRange(part.firstBlock,
@@ -6914,7 +7392,7 @@ namespace
                             }
                             blockSource << scanBlockTestPrologue(
                                 blockIndex, state.runtimeProfile);
-                            if (!writeBlockBody(blockIndex, "                "))
+                            if (!writeBlockBodyOrChunks(blockIndex, "                "))
                             {
                                 blocksGenerated = false;
                                 break;
@@ -6934,6 +7412,7 @@ namespace
                         break;
                     }
                     blockSource << kBlockSourceFunctionEpilogue;
+                    flushChunkDefs();
                 }
                 const auto [commitLo, commitHi] =
                     commitBlockRange(part.firstBlock,
@@ -6969,7 +7448,7 @@ namespace
                                 state.blockCommitGate[blockIndex];
                             const EmitState::CommitGate *gate =
                                 commitGate.headCount != 0 ? &commitGate : nullptr;
-                            if (!writeBlockBody(blockIndex, "                ", gate))
+                            if (!writeBlockBodyOrChunks(blockIndex, "                ", gate))
                             {
                                 blocksGenerated = false;
                                 break;
@@ -6989,6 +7468,7 @@ namespace
                         break;
                     }
                     blockSource << kBlockSourceFunctionEpilogue;
+                    flushChunkDefs();
                 }
                 if (!finishWrittenFile(blockSource,
                                        blockPath,

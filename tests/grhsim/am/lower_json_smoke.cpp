@@ -134,6 +134,7 @@ int main(int argc, char **argv)
         std::cerr << "usage: grhsim-am-lower-json <design.json> [top] [--schedule] "
                      "[--emit <output-directory>] [--blocks-per-source <count>] "
                      "[--max-source-bytes <count>] [--max-commit-source-bytes <count>] "
+                     "[--block-chunk-instructions <count>] "
                      "[--max-atoms-per-block <count>] "
                      "[--dp-segment-penalty <value>] [--merge-when-min-group <count>] "
                      "[--dp-coarsen-atom-budget <count>] [--dp-coarsen-instr-budget <count>] [--disable-coarsening] "
@@ -150,6 +151,7 @@ int main(int argc, char **argv)
     std::optional<std::string> blocksPerSource;
     std::optional<std::string> maxSourceBytes;
     std::optional<std::string> maxCommitSourceBytes;
+    std::optional<std::string> blockChunkInstructions;
     // Default partition configuration = the gsim-aligned point locked by
     // emit-cost NO0002 (2026-08-10): fold cap 2 + 9 atoms/block + 32768
     // instruction coarsen budget + 0 penalty + 0 refinement rounds lands
@@ -221,6 +223,19 @@ int main(int argc, char **argv)
                 return 2;
             }
             maxCommitSourceBytes = std::to_string(value);
+        }
+        else if (argument == "--block-chunk-instructions" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            uint64_t value = 0;
+            const auto [end, error] =
+                std::from_chars(text.data(), text.data() + text.size(), value);
+            if (error != std::errc{} || end != text.data() + text.size() || value == 0)
+            {
+                std::cerr << "invalid --block-chunk-instructions value: " << text << '\n';
+                return 2;
+            }
+            blockChunkInstructions = std::to_string(value);
         }
         else if (argument == "--max-atoms-per-block" && index + 1 < argc)
         {
@@ -697,6 +712,11 @@ int main(int argc, char **argv)
                 {
                     emitOptions.attributes.emplace("maxCommitSourceBytes",
                                                    *maxCommitSourceBytes);
+                }
+                if (blockChunkInstructions)
+                {
+                    emitOptions.attributes.emplace("blockChunkInstructions",
+                                                   *blockChunkInstructions);
                 }
                 if (runtimeProfile)
                 {
