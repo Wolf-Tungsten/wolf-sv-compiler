@@ -3269,11 +3269,17 @@ namespace wolvrix::lib::grhsim::am
             return "\nvoid " + std::string(className) + "::execute_block_0() {\n";
         }
 
-        // Runtime-profile counter for the entry Block: per-Block count only
-        // (B0 is neither a scan-dispatched compute Block nor a commit Block).
+        // Runtime-profile counter for the entry Block: per-Block count plus the
+        // NO0010 cycle pair (t0 here, accumulation in entryBlockProfileEpilogue).
         std::string entryBlockProfileLine()
         {
-            return "    if (runtimeProfileEnabled_) { profilePerBlockExecs_[0] += 1; }\n";
+            return "    std::uint64_t profileBlockT0 = 0;\n"
+                   "    if (runtimeProfileEnabled_) { profilePerBlockExecs_[0] += 1; profileBlockT0 = wolvrixAmRdtsc(); }\n";
+        }
+
+        std::string entryBlockProfileEpilogue()
+        {
+            return "    if (runtimeProfileEnabled_) { profilePerBlockCycles_[0] += wolvrixAmRdtsc() - profileBlockT0; }\n";
         }
 
         std::string scanSourcePrologue(std::string_view className,
@@ -3340,14 +3346,31 @@ namespace wolvrix::lib::grhsim::am
                 ") != 0) {\n";
             if (runtimeProfile)
             {
+                // NO0010: the t0 local lives in this Block's if-scope (sibling
+                // Blocks redeclare it in their own scopes) and is consumed by
+                // scanBlockTestEpilogue, so the timed region is exactly the fired
+                // Block body (including chunk calls on the split path).
+                text += "                std::uint64_t profileBlockT0 = 0;\n";
                 text += "                if (runtimeProfileEnabled_) { profilePerBlockExecs_[" +
                         std::to_string(blockIndex) +
-                        "] += 1; ++profileBlockExecs_; }\n";
+                        "] += 1; ++profileBlockExecs_; profileBlockT0 = wolvrixAmRdtsc(); }\n";
             }
             return text;
         }
 
-        constexpr std::string_view kScanBlockTestEpilogue = "            }\n";
+        std::string scanBlockTestEpilogue(std::size_t blockIndex,
+                                          bool runtimeProfile)
+        {
+            std::string text;
+            if (runtimeProfile)
+            {
+                text += "                if (runtimeProfileEnabled_) { profilePerBlockCycles_[" +
+                        std::to_string(blockIndex) +
+                        "] += wolvrixAmRdtsc() - profileBlockT0; }\n";
+            }
+            text += "            }\n";
+            return text;
+        }
 
         std::string commitBlockTestPrologue(std::size_t blockIndex,
                                             bool runtimeProfile)
@@ -3360,9 +3383,10 @@ namespace wolvrix::lib::grhsim::am
                 ") != 0) {\n";
             if (runtimeProfile)
             {
+                text += "                std::uint64_t profileBlockT0 = 0;\n";
                 text += "                if (runtimeProfileEnabled_) { profilePerBlockExecs_[" +
                         std::to_string(blockIndex) +
-                        "] += 1; ++profileCommitBlockExecs_; }\n";
+                        "] += 1; ++profileCommitBlockExecs_; profileBlockT0 = wolvrixAmRdtsc(); }\n";
             }
             return text;
         }
@@ -3706,7 +3730,8 @@ namespace wolvrix::lib::grhsim::am
             uint64_t byteCount = static_cast<uint64_t>(
                 scanBlockTestPrologue(blockIndex, state.runtimeProfile).size());
             if (!addByteCount(byteCount, *bodyBytes) ||
-                !addByteCount(byteCount, kScanBlockTestEpilogue.size()))
+                !addByteCount(byteCount,
+                              scanBlockTestEpilogue(blockIndex, state.runtimeProfile).size()))
             {
                 diagnostics.error("AM C++ emitter source size overflow: block=" +
                                       std::to_string(blockIndex),
@@ -3742,7 +3767,8 @@ namespace wolvrix::lib::grhsim::am
                 return std::nullopt;
             }
             if (!addByteCount(byteCount, *bodyBytes) ||
-                !addByteCount(byteCount, kScanBlockTestEpilogue.size()))
+                !addByteCount(byteCount,
+                              scanBlockTestEpilogue(blockIndex, state.runtimeProfile).size()))
             {
                 diagnostics.error("AM C++ emitter source size overflow: block=" +
                                       std::to_string(blockIndex),
@@ -3765,8 +3791,10 @@ namespace wolvrix::lib::grhsim::am
             }
             uint64_t byteCount = 0;
             if (state.runtimeProfile &&
-                !addByteCount(byteCount,
-                              static_cast<uint64_t>(entryBlockProfileLine().size())))
+                (!addByteCount(byteCount,
+                               static_cast<uint64_t>(entryBlockProfileLine().size())) ||
+                 !addByteCount(byteCount,
+                               static_cast<uint64_t>(entryBlockProfileEpilogue().size()))))
             {
                 diagnostics.error("AM C++ emitter source size overflow: block=0",
                                   std::string(kContext));
@@ -5410,6 +5438,19 @@ namespace wolvrix::lib::grhsim::am
         {
             header << "#include <cstdio>\n#include <cstdlib>\n\n";
         }
+        if (state.runtimeProfile)
+        {
+            // NO0010: rdtsc helper for per-Block cycle accounting. Plain rdtsc with
+            // a compiler barrier (no lfence): cluster-level aggregation plus
+            // median-of-3 runs absorbs the reordering jitter.
+            header << "static inline std::uint64_t wolvrixAmRdtsc()\n"
+                   << "{\n"
+                   << "    std::uint32_t lo = 0;\n"
+                   << "    std::uint32_t hi = 0;\n"
+                   << "    __asm__ __volatile__(\"rdtsc\" : \"=a\"(lo), \"=d\"(hi) :: \"memory\");\n"
+                   << "    return (static_cast<std::uint64_t>(hi) << 32) | lo;\n"
+                   << "}\n\n";
+        }
         header << "#define WOLVRIX_GRHSIM_PERF 0\n\n"
                << "class " << className << " {\npublic:\n"
                << "    " << className << "();\n"
@@ -5661,7 +5702,9 @@ namespace wolvrix::lib::grhsim::am
                    << "    std::uint64_t profileComputeNs_ = 0;\n"
                    << "    std::uint64_t profileCommitNs_ = 0;\n"
                    << "    std::uint64_t profileEvalNs_ = 0;\n"
-                   << "    std::array<std::uint64_t, kBlockCount> profilePerBlockExecs_{};\n";
+                   << "    std::array<std::uint64_t, kBlockCount> profilePerBlockExecs_{};\n"
+                   // NO0010: accumulated cycles per Block, same indexing as execs.
+                   << "    std::array<std::uint64_t, kBlockCount> profilePerBlockCycles_{};\n";
         }
         if (state.changedTrace)
         {
@@ -7128,6 +7171,21 @@ namespace
                     << "bool " << className
                     << "::runtime_profile_enabled() const { return runtimeProfileEnabled_; }\n"
                     << "void " << className << "::dump_runtime_profile() const {\n"
+                    // NO0010: one-time rdtsc calibration at dump time (same host,
+                    // once per run): empty pair cost + TSC frequency, so offline
+                    // analysis can subtract per-fire overhead and convert cycles.
+                    << "    std::uint64_t profileRdtscOverhead = 0;\n"
+                    << "    std::uint64_t profileTscHz = 0;\n"
+                    << "    {\n"
+                    << "        std::uint64_t best = ~0ull;\n"
+                    << "        for (int i = 0; i < 100000; ++i) { const std::uint64_t a = wolvrixAmRdtsc(); const std::uint64_t b = wolvrixAmRdtsc(); if (b - a < best) best = b - a; }\n"
+                    << "        profileRdtscOverhead = best;\n"
+                    << "        const std::chrono::steady_clock::time_point calStart = std::chrono::steady_clock::now();\n"
+                    << "        const std::uint64_t calT0 = wolvrixAmRdtsc();\n"
+                    << "        while (std::chrono::steady_clock::now() - calStart < std::chrono::milliseconds(2)) {}\n"
+                    << "        profileTscHz = (wolvrixAmRdtsc() - calT0) * 500;\n"
+                    << "    }\n"
+                    << "    std::cerr << \"[am-profile] tsc_hz: \" << profileTscHz << \", rdtsc_overhead: \" << profileRdtscOverhead << \"\\n\";\n"
                     << "    const std::uint64_t totalBlockExecs = profileBlockExecs_ + profileCommitBlockExecs_;\n"
                     << "    const double evalMs = static_cast<double>(profileEvalNs_) / 1.0e6;\n"
                     << "    const double computeMs = static_cast<double>(profileComputeNs_) / 1.0e6;\n"
@@ -7159,9 +7217,10 @@ namespace
                     << "    if (const char *blockExecsPath = std::getenv(\"EMU_AM_BLOCK_EXECS\")) {\n"
                     << "        if (std::FILE *blockExecsFile = std::fopen(blockExecsPath, \"w\")) {\n"
                     << "            for (std::size_t block = 0; block < kBlockCount; ++block) {\n"
-                    << "                std::fprintf(blockExecsFile, \"%zu %c %llu\\n\", block,\n"
+                    << "                std::fprintf(blockExecsFile, \"%zu %c %llu %llu\\n\", block,\n"
                     << "                             is_commit_block(block) ? 'c' : 'w',\n"
-                    << "                             static_cast<unsigned long long>(profilePerBlockExecs_[block]));\n"
+                    << "                             static_cast<unsigned long long>(profilePerBlockExecs_[block]),\n"
+                    << "                             static_cast<unsigned long long>(profilePerBlockCycles_[block]));\n"
                     << "            }\n"
                     << "            std::fclose(blockExecsFile);\n"
                     << "        }\n"
@@ -7596,6 +7655,10 @@ namespace
                         blocksGenerated = false;
                         break;
                     }
+                    if (state.runtimeProfile)
+                    {
+                        blockSource << entryBlockProfileEpilogue();
+                    }
                     blockSource << kBlockSourceFunctionEpilogue;
                     flushChunkDefs();
                 }
@@ -7633,7 +7696,8 @@ namespace
                                 blocksGenerated = false;
                                 break;
                             }
-                            blockSource << kScanBlockTestEpilogue;
+                            blockSource << scanBlockTestEpilogue(
+                                blockIndex, state.runtimeProfile);
                         }
                         state.scanRelayByte = -1;
                         state.scanRelayMask = 0;
@@ -7689,7 +7753,8 @@ namespace
                                 blocksGenerated = false;
                                 break;
                             }
-                            blockSource << kScanBlockTestEpilogue;
+                            blockSource << scanBlockTestEpilogue(
+                                blockIndex, state.runtimeProfile);
                         }
                         state.scanRelayByte = -1;
                         state.scanRelayMask = 0;

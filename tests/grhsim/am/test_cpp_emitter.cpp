@@ -2177,19 +2177,27 @@ namespace
         // count at the top of their bit-test branch, the commit Block counts
         // inside its own activity bit test (commit Blocks are
         // activation-filtered like every other Block), and B0 counts only its
-        // per-Block entry. The scan itself is straight-line: no switch,
+        // per-Block entry. NO0010: each counted site also wraps the fired body
+        // in an rdtsc pair (profileBlockT0 local + profilePerBlockCycles_
+        // accumulation). The scan itself is straight-line: no switch,
         // countr_zero, or do-while.
         if (generatedSourceText.find(
                 "if ((byteFlags & UINT8_C(0x1)) != 0) {\n"
-                "                if (runtimeProfileEnabled_) { profilePerBlockExecs_[64] += 1; ++profileBlockExecs_; }") ==
+                "                std::uint64_t profileBlockT0 = 0;\n"
+                "                if (runtimeProfileEnabled_) { profilePerBlockExecs_[64] += 1; ++profileBlockExecs_; profileBlockT0 = wolvrixAmRdtsc(); }") ==
+                std::string::npos ||
+            generatedSourceText.find(
+                "if (runtimeProfileEnabled_) { profilePerBlockCycles_[64] += wolvrixAmRdtsc() - profileBlockT0; }") ==
                 std::string::npos ||
             generatedSourceText.find(
                 "if ((byteFlags & UINT8_C(0x4)) != 0) {\n"
-                "                if (runtimeProfileEnabled_) { profilePerBlockExecs_[130] += 1; ++profileCommitBlockExecs_; }") ==
+                "                std::uint64_t profileBlockT0 = 0;\n"
+                "                if (runtimeProfileEnabled_) { profilePerBlockExecs_[130] += 1; ++profileCommitBlockExecs_; profileBlockT0 = wolvrixAmRdtsc(); }") ==
                 std::string::npos ||
             generatedSourceText.find(
                 "::execute_block_0() {\n"
-                "    if (runtimeProfileEnabled_) { profilePerBlockExecs_[0] += 1; }") ==
+                "    std::uint64_t profileBlockT0 = 0;\n"
+                "    if (runtimeProfileEnabled_) { profilePerBlockExecs_[0] += 1; profileBlockT0 = wolvrixAmRdtsc(); }") ==
                 std::string::npos ||
             generatedSourceText.find("std::countr_zero") != std::string::npos ||
             generatedSourceText.find("do {") != std::string::npos ||

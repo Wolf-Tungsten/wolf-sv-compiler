@@ -1,5 +1,7 @@
 #include "grhsim/am/grh_ir_to_grhsim_am_graph.hpp"
 
+#include "grhsim_am_const_eval.hpp"
+
 #include "grhsim/am/grhsim_am_program.hpp"
 #include "grhsim/am/grhsim_am_opcode_traits.hpp"
 
@@ -10,6 +12,7 @@
 #include <bit>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <optional>
@@ -176,6 +179,13 @@ namespace wolvrix::lib::grhsim::am
                             const GrhIRToGrhSimAMGraphLoweringOptions &options)
                 : graph_(graph), diagnostics_(diagnostics), options_(options)
             {
+                // Escape hatches for A/B bisection of the lowering-time
+                // constant fold and the constant state-write merge (NO0010).
+                disableLoweringConstFold_ =
+                    std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_LOWERING_CONST_FOLD") !=
+                    nullptr;
+                disableWriteMerge_ =
+                    std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_WRITE_MERGE") != nullptr;
             }
 
             std::optional<AmGraph> run()
@@ -195,6 +205,7 @@ namespace wolvrix::lib::grhsim::am
                         return std::nullopt;
                     }
                     createInterface();
+                    computeFirstUseOrdinals();
                     lowerInstructions();
                     if (failed_)
                     {
@@ -240,6 +251,15 @@ namespace wolvrix::lib::grhsim::am
                             " result_bridge=" + std::to_string(assignResultBridgeCount_) +
                             " dpi_bridge=" + std::to_string(assignDpiBridgeCount_),
                         "grhsim-am-lowering");
+                    if (lowerConstFoldCount_ != 0 || mergedStateWriteCount_ != 0)
+                    {
+                        diagnostics_.info(
+                            "am.import const fold: folded_ops=" +
+                                std::to_string(lowerConstFoldCount_) +
+                                " merged_state_writes=" +
+                                std::to_string(mergedStateWriteCount_),
+                            "grhsim-am-lowering");
+                    }
                     return std::optional<AmGraph>(std::move(amGraph_));
                 }
                 catch (const std::exception &ex)
@@ -1643,6 +1663,21 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return VariableId::invalid();
                 }
+                // Coercing a constant is itself a constant: resize the literal
+                // instead of emitting a runtime Assign (NO0010 lowering fold).
+                if (!disableLoweringConstFold_)
+                {
+                    if (std::optional<std::vector<uint64_t>> words =
+                            constantWordsOf(source))
+                    {
+                        ++lowerConstFoldCount_;
+                        return internConstant(
+                            targetType,
+                            detail::resizedWords(*words, sourceType.bitWidth,
+                                                 targetType.bitWidth,
+                                                 sourceType.signedness));
+                    }
+                }
                 const VariableId converted = addVariable(targetType, amGraph_.zeroInit());
                 const std::array<VariableId, 1> results{converted};
                 const std::array<VariableId, 1> operands{source};
@@ -2120,6 +2155,63 @@ namespace wolvrix::lib::grhsim::am
                         }
                     }
                 }
+                // Lowering-time constant fold (NO0010): a pure op over
+                // literal operands lowers to a shared constant variable
+                // instead of a runtime instruction. gsim's executable-GRH
+                // export materializes per-element vector-register writes as
+                // full-width slice/concat rebuild chains over constant bases;
+                // without this fold each such chain costs O(width) word
+                // traffic per element per activation in the emitted model.
+                // Results with interface roles keep their declared variable
+                // (the label binding must survive). The use-order guard keeps
+                // the valueMap_ repoint safe on non-topological op orderings:
+                // lowerOpOrdinal_ was already bumped for the current op.
+                if (!disableLoweringConstFold_ && resultType.kind == TypeKind::BitVector &&
+                    !exposedValues_.contains(results.front().index) &&
+                    !declaredValueIndices_.contains(results.front().index) &&
+                    results.front().index < firstUseOrdinal_.size() &&
+                    firstUseOrdinal_[results.front().index] >= lowerOpOrdinal_)
+                {
+                    std::vector<std::vector<uint64_t>> wordStorage;
+                    wordStorage.reserve(loweredOperands.size());
+                    std::vector<detail::ConstOperand> constOperands;
+                    constOperands.reserve(loweredOperands.size());
+                    bool allConstant = !loweredOperands.empty();
+                    for (VariableId operand : loweredOperands)
+                    {
+                        const Type *operandType = variableTypeOf(operand);
+                        std::optional<std::vector<uint64_t>> words =
+                            operandType ? constantWordsOf(operand) : std::nullopt;
+                        if (!words)
+                        {
+                            allConstant = false;
+                            break;
+                        }
+                        wordStorage.push_back(std::move(*words));
+                        constOperands.push_back(detail::ConstOperand{
+                            .type = *operandType, .words = wordStorage.back()});
+                    }
+                    if (allConstant)
+                    {
+                        std::vector<uint64_t> folded;
+                        if (detail::evaluatePure(opcode, *nativeType, constOperands,
+                                                 sliceLsb, folded))
+                        {
+                            if (*nativeType != resultType)
+                            {
+                                // Mirror the native -> declared bridge Assign
+                                // on the constant itself.
+                                folded = detail::resizedWords(
+                                    folded, nativeType->bitWidth,
+                                    resultType.bitWidth, nativeType->signedness);
+                            }
+                            valueMap_[results.front().index] =
+                                internConstant(resultType, std::move(folded));
+                            ++lowerConstFoldCount_;
+                            return;
+                        }
+                    }
+                }
                 const VariableId destination = mappedValue(results.front(), op);
                 if (!destination.valid())
                 {
@@ -2372,6 +2464,59 @@ namespace wolvrix::lib::grhsim::am
                 return classifyConstant(variable, 1) == ConstClass::Zero;
             }
 
+            // Full constant words of a lowering-time variable, normalized
+            // (zero-extended) to the variable's declared width. Only
+            // Constant-initialized bit-vector literals qualify; anything
+            // computed at runtime stays unknown.
+            std::optional<std::vector<uint64_t>> constantWordsOf(
+                VariableId variable) const
+            {
+                if (!variable.valid() ||
+                    variable.value >= amGraph_.program().variableCount())
+                {
+                    return std::nullopt;
+                }
+                const VariableRecord &record = amGraph_.program().variable(variable);
+                const InitDescriptor &init = amGraph_.program().init(record.init);
+                if (init.kind != InitKind::Constant)
+                {
+                    return std::nullopt;
+                }
+                const LiteralView literal =
+                    amGraph_.program().literal(LiteralId{init.payload});
+                const Type &literalType = amGraph_.program().type(literal.type);
+                const Type &variableType = amGraph_.program().type(record.type);
+                if (literalType.kind != TypeKind::BitVector ||
+                    variableType.kind != TypeKind::BitVector)
+                {
+                    return std::nullopt;
+                }
+                return detail::resizedWords(literal.words, literalType.bitWidth,
+                                            variableType.bitWidth,
+                                            Signedness::Unsigned);
+            }
+
+            // Intern a compile-time constant as a shared Constant-initialized
+            // variable (one representative per (type, value), like the
+            // optimizer's constant canonicalization).
+            VariableId internConstant(const Type &type, std::vector<uint64_t> words)
+            {
+                detail::normalizeWords(words, type.bitWidth);
+                const auto key = std::make_pair(type, words);
+                if (const auto found = foldedConstants_.find(key);
+                    found != foldedConstants_.end())
+                {
+                    return found->second;
+                }
+                const TypeId typeId = internType(type);
+                const LiteralId literal = amGraph_.addBitLiteral(typeId, words);
+                const VariableId variable =
+                    addVariable(typeId, amGraph_.addConstantInit(literal));
+                foldedConstants_.emplace(std::make_pair(type, std::move(words)),
+                                         variable);
+                return variable;
+            }
+
             VariableId addPureTyped(Opcode opcode, const Type &type,
                                     std::span<const VariableId> operands)
             {
@@ -2450,6 +2595,13 @@ namespace wolvrix::lib::grhsim::am
             // earlier one's result -- the same value the old folded
             // snapshot+blend+mux chain computed. A write that can never
             // change the target (constant-0 cond or mask) emits nothing.
+            //
+            // NO0010 merge: a run of ordered writes that share one cond and
+            // carry constant mask+data collapses into a single write whose
+            // constant image is the sequential blend folded at lowering time
+            // (gsim exports per-element vector-register writes as thousands
+            // of full-width constant-masked ports; the merge restores the
+            // single gated write gsim emits for the same update).
             void emitScalarWrites(
                 const std::vector<PendingStateWrite> &signatureGroup, uint32_t group,
                 uint32_t &ordinal)
@@ -2457,24 +2609,14 @@ namespace wolvrix::lib::grhsim::am
                 const PendingStateWrite &head = signatureGroup.front();
                 const Type targetType =
                     amGraph_.program().type(amGraph_.program().variable(head.target).type);
-                for (const PendingStateWrite &write : signatureGroup)
-                {
+
+                const auto emitOne = [&](const PendingStateWrite &write) {
                     // Commit instructions inherit the source write op's gsim
                     // node id (NO0006).
                     const ScopedGsimNodeId writeNode(currentGsimNodeId_,
                                                      write.gsimNodeId);
-                    if (isConstantZero(write.cond))
-                    {
-                        // A write that never fires has no effect, ever.
-                        continue;
-                    }
                     const ConstClass maskClass =
                         classifyConstant(write.mask, targetType.bitWidth);
-                    if (maskClass == ConstClass::Zero)
-                    {
-                        // A write that never changes a bit has no effect.
-                        continue;
-                    }
                     const bool hasCond = !isConstantOne(write.cond);
                     const bool hasMask = maskClass != ConstClass::AllOnes;
                     Opcode opcode = write.opcode;
@@ -2508,7 +2650,96 @@ namespace wolvrix::lib::grhsim::am
                                     write.events.end());
                     const InstructionId instruction = addInstruction(opcode, {}, operands);
                     recordWriteEffect(instruction, group, ordinal);
+                };
+
+                // Run state for the constant-image merge.
+                bool mergeActive = false;
+                Opcode mergeOpcode = Opcode::RegisterWrite;
+                VariableId mergeCond = VariableId::invalid();
+                int64_t mergeGsimNodeId = -1;
+                std::string mergeContext;
+                std::vector<VariableId> mergeEvents;
+                std::vector<uint64_t> mergeMaskWords;
+                std::vector<uint64_t> mergeDataWords;
+                uint64_t mergeMembers = 0;
+
+                const auto flushMerge = [&]() {
+                    if (!mergeActive)
+                    {
+                        return;
+                    }
+                    mergeActive = false;
+                    if (mergeMembers > 1)
+                    {
+                        mergedStateWriteCount_ += mergeMembers - 1;
+                    }
+                    if (detail::isZero(mergeMaskWords))
+                    {
+                        // The run never changes a bit: no effect, ever.
+                        return;
+                    }
+                    PendingStateWrite merged;
+                    merged.opcode = mergeOpcode;
+                    merged.target = head.target;
+                    merged.cond = mergeCond;
+                    merged.mask = internConstant(targetType, mergeMaskWords);
+                    merged.data = internConstant(targetType, mergeDataWords);
+                    merged.events = mergeEvents;
+                    merged.context = mergeContext;
+                    merged.gsimNodeId = mergeGsimNodeId;
+                    emitOne(merged);
+                };
+
+                for (const PendingStateWrite &write : signatureGroup)
+                {
+                    if (isConstantZero(write.cond) ||
+                        classifyConstant(write.mask, targetType.bitWidth) ==
+                            ConstClass::Zero)
+                    {
+                        // No effect, ever: drop without breaking the run.
+                        continue;
+                    }
+                    std::optional<std::vector<uint64_t>> maskWords;
+                    std::optional<std::vector<uint64_t>> dataWords;
+                    if (!disableWriteMerge_)
+                    {
+                        maskWords = constantWordsOf(write.mask);
+                        dataWords = constantWordsOf(write.data);
+                    }
+                    const bool mergeable = maskWords.has_value() && dataWords.has_value();
+                    if (mergeable && mergeActive && write.opcode == mergeOpcode &&
+                        (write.cond.value == mergeCond.value ||
+                         (isConstantOne(write.cond) && isConstantOne(mergeCond))))
+                    {
+                        // Fold the sequential blend: later writes win on
+                        // overlap, untouched bits keep the earlier image.
+                        for (std::size_t word = 0; word < mergeDataWords.size(); ++word)
+                        {
+                            mergeDataWords[word] =
+                                (mergeDataWords[word] & ~(*maskWords)[word]) |
+                                ((*dataWords)[word] & (*maskWords)[word]);
+                            mergeMaskWords[word] |= (*maskWords)[word];
+                        }
+                        ++mergeMembers;
+                        continue;
+                    }
+                    flushMerge();
+                    if (mergeable)
+                    {
+                        mergeActive = true;
+                        mergeOpcode = write.opcode;
+                        mergeCond = write.cond;
+                        mergeGsimNodeId = write.gsimNodeId;
+                        mergeContext = write.context;
+                        mergeEvents = write.events;
+                        mergeMaskWords = std::move(*maskWords);
+                        mergeDataWords = std::move(*dataWords);
+                        mergeMembers = 1;
+                        continue;
+                    }
+                    emitOne(write);
                 }
+                flushMerge();
             }
 
             // mem.write chains: one instruction per write, cond/mask kept as
@@ -3425,11 +3656,38 @@ namespace wolvrix::lib::grhsim::am
                 }
             }
 
+            // Earliest consumer position (in graph_.operations() order) of
+            // every value. The lowering-time constant fold repoints a folded
+            // value's variable; a consumer lowered BEFORE its producer would
+            // otherwise keep referencing the pre-created (never computed)
+            // variable. The fold is skipped unless every use comes after the
+            // producing op.
+            void computeFirstUseOrdinals()
+            {
+                firstUseOrdinal_.assign(valueMap_.size(),
+                                        std::numeric_limits<uint32_t>::max());
+                uint32_t ordinal = 0;
+                for (OperationId operation : graph_.operations())
+                {
+                    const Operation op = graph_.getOperation(operation);
+                    for (ValueId operand : op.operands())
+                    {
+                        if (operand.valid() && operand.index < firstUseOrdinal_.size())
+                        {
+                            uint32_t &slot = firstUseOrdinal_[operand.index];
+                            slot = std::min(slot, ordinal);
+                        }
+                    }
+                    ++ordinal;
+                }
+            }
+
             void lowerInstructions()
             {
                 for (OperationId operation : graph_.operations())
                 {
                     const Operation op = graph_.getOperation(operation);
+                    const uint32_t currentOpOrdinal = lowerOpOrdinal_++;
                     // NO0006: every instruction created while lowering this
                     // op inherits the op's gsim node id (trigger-owner
                     // rule); ops without provenance lower unowned (-1).
@@ -3541,8 +3799,18 @@ namespace wolvrix::lib::grhsim::am
             std::unordered_map<uint32_t, uint32_t> stateOrderGroups_;
             std::map<std::pair<Opcode, uint32_t>, VariableId> eventDetectorMemo_;
             std::unordered_map<uint32_t, VariableId> preCommitSnapshots_;
+            std::vector<uint32_t> firstUseOrdinal_;
+            uint32_t lowerOpOrdinal_ = 0;
             uint64_t freshTemporaryCount_ = 0;
             std::size_t flattenedUnknownLiterals_ = 0;
+            // Interning cache for lowering-time folded constants and the
+            // escape hatch for the fold/merge (NO0010), see the constructor.
+            std::map<std::pair<Type, std::vector<uint64_t>>, VariableId>
+                foldedConstants_;
+            bool disableLoweringConstFold_ = false;
+            bool disableWriteMerge_ = false;
+            uint64_t lowerConstFoldCount_ = 0;
+            uint64_t mergedStateWriteCount_ = 0;
             // NO0004 import QC: per-site attribution of Assign instructions so
             // the pre-optimize opcode census can be reconciled exactly against
             // the source GRH op census.

@@ -45,6 +45,20 @@ normalized GRH
 > B0 activation target 到实际 reader 的完整性、边沿分支的联合完备性和
 > ordered-effect 完整性证明。
 
+> 实现进展（2026-08-13，emit-cost NO0011）：lowering 常量折叠 + 常量写合并。
+> lowering-to-am-graph 新增构建期常量折叠 peephole——纯 op 的操作数全为字面
+> 常量时直接求值并 intern 为常量变量（求值器与 opt-am-graph 共用
+> `grhsim_am_const_eval.hpp` 的 `evaluatePure`，与解释器逐位一致），
+> `coerceToType` 常量直通；仅当结果值的全部消费者都在生产者之后
+> （`firstUseOrdinal_` 守卫，乱序消费安全）且不带接口角色时折叠。
+> `emitScalarWrites` 新增同 cond、常量 mask+data 的连续写合并（顺序 blend
+> 折叠为单条常量映像写）。针对 gsim 导出器把向量寄存器逐元素写物化为全宽
+> slice/concat 重建链的形态（NO0010 #2-#12 巨 atom），香山全图 folded_ops
+> ≈49.97 万、merged_state_writes ≈3.34 万，coremark 50k difftest 逐位一致，
+> host 692s→486s。escape hatch：
+> `WOLVRIX_GRHSIM_AM_DISABLE_LOWERING_CONST_FOLD` /
+> `WOLVRIX_GRHSIM_AM_DISABLE_WRITE_MERGE`。
+
 > 实现进展（2026-08-08，NO0015）：`absorbFanoutAtoms` 落入 opt-am-compute-graph
 > （tree-atom fold 之后、导出与分区之前）——消费方 atom ≥2 且成员指令数 ≤
 > `fanoutAbsorbMaxInstructions`（**默认 0=禁用**：指标收益与指令复制量近似
