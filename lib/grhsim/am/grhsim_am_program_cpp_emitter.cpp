@@ -1934,6 +1934,37 @@ namespace wolvrix::lib::grhsim::am
                 }
             }
 
+            if (opcode == Opcode::RegisterWriteDynLane)
+            {
+                // Dynamic-lane register write (NO0012 Tier 3): replace bits
+                // [offset, offset + width(data)) of the target when cond
+                // holds; the helper has an aligned fast path for the
+                // word-aligned lanes this opcode was built for.
+                const VariableId target = operands[3];
+                const VariableId offset = operands[1];
+                const VariableId data = operands[2];
+                const uint32_t targetWidth = variableType(state, target).bitWidth;
+                const uint32_t dataWidth = variableType(state, data).bitWidth;
+                const std::string writeArgs =
+                    wordDataExpr(state, target) + ", " +
+                    std::to_string(targetWidth) + ", " +
+                    wordDataExpr(state, offset) + ", " +
+                    wordDataExpr(state, data) + ", " +
+                    std::to_string(dataWidth) + ")";
+                std::string body;
+                if (state.scalarWriteRaise >= 0)
+                {
+                    body = scalarWatchFlagExpr(
+                               state, static_cast<uint32_t>(state.scalarWriteRaise)) +
+                           " |= dynlane_write_words_detect(" + writeArgs + ";\n";
+                }
+                else
+                {
+                    body = "dynlane_write_words(" + writeArgs + ";\n";
+                }
+                return "if (" + boolExpr(state, operands[0]) + ") { " + body + "}\n";
+            }
+
             const StateWriteLayout wideWriteLayout = stateWriteLayout(opcode);
             if (wideWriteLayout.isStateWrite && !wideWriteLayout.memory &&
                 isWideBitVector(state, operands[wideWriteLayout.targetIndex]))
@@ -5079,7 +5110,7 @@ namespace wolvrix::lib::grhsim::am
         if (statsAttribute != options.attributes.end() && statsAttribute->second == "true")
         {
             constexpr std::size_t opcodeCount =
-                static_cast<std::size_t>(Opcode::MemoryWriteCondMask) + 1U;
+                static_cast<std::size_t>(Opcode::RegisterWriteDynLane) + 1U;
             std::array<uint64_t, opcodeCount> nonScalarOpcodes{};
             for (uint32_t index = 0; index < program.instructionCount(); ++index)
             {
@@ -5571,6 +5602,8 @@ namespace wolvrix::lib::grhsim::am
                << "    static void assign_words_from_scalar(std::uint64_t *target, std::uint32_t targetWidth, std::uint64_t source, std::uint32_t sourceWidth, bool signExtend);\n"
                << "    static void masked_write_words(std::uint64_t *target, const std::uint64_t *data, const std::uint64_t *mask, std::uint32_t width);\n"
                << "    static bool masked_write_words_detect(std::uint64_t *target, const std::uint64_t *data, const std::uint64_t *mask, std::uint32_t width);\n"
+               << "    static void dynlane_write_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *offset, const std::uint64_t *source, std::uint32_t sourceWidth);\n"
+               << "    static bool dynlane_write_words_detect(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *offset, const std::uint64_t *source, std::uint32_t sourceWidth);\n"
                << "    static bool assign_words_detect(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, bool signExtend);\n"
                << "    static bool slice_words_detect(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, std::uint64_t start);\n"
                << "    static std::uint64_t resized_word(const std::uint64_t *source, std::uint32_t sourceWidth, bool signExtend, std::size_t index);\n"
@@ -6266,6 +6299,34 @@ namespace
                << "        target[index] = next;\n"
                << "    }\n"
                << "    return changed;\n"
+               << "}\n"
+               << "bool " << className
+               << "::dynlane_write_words_detect(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *offset, const std::uint64_t *source, std::uint32_t sourceWidth) {\n"
+               << "    const std::uint64_t bitOffset = offset[0];\n"
+               << "    if (bitOffset >= targetWidth) { return false; }\n"
+               << "    const std::uint64_t limit = std::min<std::uint64_t>(static_cast<std::uint64_t>(sourceWidth), static_cast<std::uint64_t>(targetWidth) - bitOffset);\n"
+               << "    bool changed = false;\n"
+               << "    if ((bitOffset % 64U) == 0 && (sourceWidth % 64U) == 0) {\n"
+               << "        const std::size_t firstWord = static_cast<std::size_t>(bitOffset / 64U);\n"
+               << "        const std::size_t words = static_cast<std::size_t>(limit / 64U);\n"
+               << "        for (std::size_t index = 0; index < words; ++index) {\n"
+               << "            changed = changed || (target[firstWord + index] != source[index]);\n"
+               << "            target[firstWord + index] = source[index];\n"
+               << "        }\n"
+               << "        return changed;\n"
+               << "    }\n"
+               << "    for (std::uint64_t bit = 0; bit < limit; ++bit) {\n"
+               << "        const std::uint64_t sourceBit = (source[bit / 64U] >> (bit % 64U)) & UINT64_C(1);\n"
+               << "        const std::uint64_t targetBit = bitOffset + bit;\n"
+               << "        const std::uint64_t mask = UINT64_C(1) << (targetBit % 64U);\n"
+               << "        changed = changed || (((target[targetBit / 64U] & mask) != 0) != (sourceBit != 0));\n"
+               << "        target[targetBit / 64U] = (target[targetBit / 64U] & ~mask) | (sourceBit << (targetBit % 64U));\n"
+               << "    }\n"
+               << "    return changed;\n"
+               << "}\n"
+               << "void " << className
+               << "::dynlane_write_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *offset, const std::uint64_t *source, std::uint32_t sourceWidth) {\n"
+               << "    (void)dynlane_write_words_detect(target, targetWidth, offset, source, sourceWidth);\n"
                << "}\n"
                << "bool " << className
                << "::assign_words_detect(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, bool signExtend) {\n"

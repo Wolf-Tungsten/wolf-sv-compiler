@@ -64,7 +64,7 @@ namespace wolvrix::lib::grhsim::am
 
         bool validOpcode(Opcode opcode) noexcept
         {
-            return opcode <= Opcode::Insert;
+            return opcode <= Opcode::RegisterWriteDynLane;
         }
 
         bool validString(ProgramView view, StringId id)
@@ -517,6 +517,7 @@ namespace wolvrix::lib::grhsim::am
                 case Opcode::RegisterWriteCond:
                 case Opcode::RegisterWriteMask:
                 case Opcode::RegisterWriteCondMask:
+                case Opcode::RegisterWriteDynLane:
                 case Opcode::MemoryWrite:
                 case Opcode::MemoryWriteCond:
                 case Opcode::MemoryWriteMask:
@@ -989,6 +990,26 @@ namespace wolvrix::lib::grhsim::am
             bool valid = true;
             switch (opcode)
             {
+            case Opcode::RegisterWriteDynLane:
+            {
+                // [cond, bitOffset, data, target, events...]: cond is 1-bit,
+                // the offset any bit vector, the data a bit vector no wider
+                // than the target (the generic same-type write checks do
+                // not apply to the narrow lane data).
+                if (!results.empty() || operands.size() < 4)
+                {
+                    return;
+                }
+                const VariableId target = operands[3];
+                const Type *targetType = variableType(view, target);
+                const Type *dataType = variableType(view, operands[2]);
+                valid = isMutable(view, target) && isBitVector1(variableType(view, operands[0])) &&
+                        isBitVector(variableType(view, operands[1])) &&
+                        isBitVector(targetType) && isBitVector(dataType) &&
+                        dataType->bitWidth <= targetType->bitWidth &&
+                        validateEventRange(view, operands, 4, target);
+                break;
+            }
             case Opcode::RegisterWrite:
             case Opcode::RegisterWriteCond:
             case Opcode::RegisterWriteMask:

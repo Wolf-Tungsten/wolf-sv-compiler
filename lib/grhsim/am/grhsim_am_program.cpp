@@ -116,7 +116,7 @@ namespace wolvrix::lib::grhsim::am
 
     std::string_view toString(Opcode opcode) noexcept
     {
-        static constexpr std::array<std::string_view, 69> names = {
+        static constexpr std::array<std::string_view, 70> names = {
             "assign",
             "add",
             "sub",
@@ -186,6 +186,7 @@ namespace wolvrix::lib::grhsim::am
             "mem.write.m",
             "mem.write.cm",
             "insert",
+            "reg.write.dynlane",
         };
         const std::size_t index = static_cast<std::size_t>(opcode);
         return index < names.size() ? names[index] : std::string_view("unknown");

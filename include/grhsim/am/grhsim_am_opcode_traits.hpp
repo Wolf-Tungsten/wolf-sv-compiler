@@ -72,6 +72,13 @@ namespace wolvrix::lib::grhsim::am
                 .hasOrderedEffect = true,
                 .variadicOperands = true,
             };
+        case Opcode::RegisterWriteDynLane:
+            return OpcodeTraits{
+                .effect = OpcodeEffect::StateReadWrite,
+                .stateTargetOperand = 3,
+                .hasOrderedEffect = true,
+                .variadicOperands = true,
+            };
         case Opcode::MemoryRead:
             return OpcodeTraits{
                 .effect = OpcodeEffect::StateRead,
@@ -228,6 +235,12 @@ namespace wolvrix::lib::grhsim::am
         case Opcode::RegisterWriteCondMask:
         case Opcode::LatchWriteCondMask:
             return make(false, true, true);
+        case Opcode::RegisterWriteDynLane:
+            // Operand layout [cond, bitOffset, data, target, events...]: the
+            // mask slot carries the runtime bit offset; the generic blend
+            // paths must never see this opcode (emitter and interpreter
+            // intercept it first).
+            return make(false, true, true);
         case Opcode::MemoryWrite:
             return make(true, false, false);
         case Opcode::MemoryWriteCond:
@@ -244,7 +257,9 @@ namespace wolvrix::lib::grhsim::am
     constexpr bool isRegisterWriteOpcode(Opcode opcode) noexcept
     {
         return opcode == Opcode::RegisterWrite || opcode == Opcode::RegisterWriteCond ||
-               opcode == Opcode::RegisterWriteMask || opcode == Opcode::RegisterWriteCondMask;
+               opcode == Opcode::RegisterWriteMask ||
+               opcode == Opcode::RegisterWriteCondMask ||
+               opcode == Opcode::RegisterWriteDynLane;
     }
 
     constexpr bool isLatchWriteOpcode(Opcode opcode) noexcept

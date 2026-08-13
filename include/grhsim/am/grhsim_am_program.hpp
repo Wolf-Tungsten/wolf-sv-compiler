@@ -287,6 +287,16 @@ namespace wolvrix::lib::grhsim::am
         // equal the row type. Fused by the AM optimizer from the
         // slice/slice/concat element-write insert pattern (NO0004).
         Insert,
+        // NO0012 Tier 3: dynamic-lane register write. Operand layout is
+        // [cond, bitOffset, data, target, events...]: when the commit fires
+        // and cond holds, bits [bitOffset, bitOffset + width(data)) of the
+        // register are replaced by data (bitOffset is a runtime value, in
+        // bits; out-of-range offsets write nothing). This is the dynamic
+        // write-port update gsim emits as a scalar array element store —
+        // the gsim flatten export materializes it as a full-width
+        // mux/blend chain plus a full-width masked write, which this opcode
+        // collapses back into one element-granular commit.
+        RegisterWriteDynLane,
     };
 
     static_assert(sizeof(Opcode) == sizeof(uint8_t));

@@ -1279,6 +1279,41 @@ namespace wolvrix::lib::grhsim::am {
                 values[operandIds[1].value] = operands[0];
                 return {};
             }
+            if (opcode == Opcode::RegisterWriteDynLane) {
+                // Dynamic-lane register write (NO0012 Tier 3): when cond
+                // holds, replace bits [bitOffset, bitOffset + width(data))
+                // of the target, mirroring dynlane_write_words in the C++
+                // emitter bit for bit (aligned fast path included).
+                if (!truth(operands[0])) {
+                    return {};
+                }
+                const InterpreterValue &data = operands[2];
+                InterpreterValue next = operands[3];
+                const uint32_t width = next.type().bitWidth;
+                const uint64_t bitOffset = operands[1].words().empty()
+                                               ? 0
+                                               : operands[1].words()[0];
+                if (bitOffset < width) {
+                    const uint64_t limit = std::min<uint64_t>(
+                        data.type().bitWidth, width - bitOffset);
+                    const std::size_t words = wordCount(width);
+                    next.words_.resize(words, 0);
+                    for (uint64_t bit = 0; bit < limit; ++bit) {
+                        const uint64_t sourceBit =
+                            (bit / 64U) < data.words().size()
+                                ? (data.words()[bit / 64U] >> (bit % 64U)) & 1U
+                                : 0;
+                        const uint64_t targetBit = bitOffset + bit;
+                        const uint64_t mask = UINT64_C(1) << (targetBit % 64U);
+                        next.words_[targetBit / 64U] =
+                            (next.words_[targetBit / 64U] & ~mask) |
+                            (sourceBit << (targetBit % 64U));
+                    }
+                    next.words_.back() &= highWordMask(width);
+                }
+                values[operandIds[3].value] = std::move(next);
+                return {};
+            }
             const StateWriteLayout writeLayout = stateWriteLayout(opcode);
             if (writeLayout.isStateWrite && !writeLayout.memory) {
                 // Register/latch write variant: cond gates the whole commit,

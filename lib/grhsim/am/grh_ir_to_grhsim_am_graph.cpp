@@ -195,6 +195,8 @@ namespace wolvrix::lib::grhsim::am
                 disableLaneWriteMerge_ =
                     std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_LANE_WRITE_MERGE") !=
                     nullptr;
+                disableDynLane_ =
+                    std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_DYNLANE") != nullptr;
                 if (const char *debugNode =
                         std::getenv("WOLVRIX_GRHSIM_AM_CHAIN_DEBUG_NODE"))
                 {
@@ -227,6 +229,7 @@ namespace wolvrix::lib::grhsim::am
                     }
                     createInterface();
                     computeFirstUseOrdinals();
+                    detectDynLaneWrites();
                     planChainReplay();
                     lowerInstructions();
                     if (failed_)
@@ -298,7 +301,19 @@ namespace wolvrix::lib::grhsim::am
                                 " lane_write_merged=" +
                                 std::to_string(laneWriteMergedCount_) +
                                 " lane_fan_rejected=" +
-                                std::to_string(laneWriteFanRejectCount_),
+                                std::to_string(laneWriteFanRejectCount_) +
+                                " dynlane_rewritten=" +
+                                std::to_string(dynLaneRewriteCount_) +
+                                " dynlane_cone_skipped=" +
+                                std::to_string(dynLaneConeSkipCount_) +
+                                " dynlane_rejected=" +
+                                std::to_string(dynLaneRejectCount_) +
+                                " stages(m/shl,ones,step,amt,chain)=" +
+                                std::to_string(dynLaneRejectStage_[0]) + "/" +
+                                std::to_string(dynLaneRejectStage_[1]) + "/" +
+                                std::to_string(dynLaneRejectStage_[2]) + "/" +
+                                std::to_string(dynLaneRejectStage_[3]) + "/" +
+                                std::to_string(dynLaneRejectStage_[4]),
                             "grhsim-am-lowering");
                     }
                     return std::optional<AmGraph>(std::move(amGraph_));
@@ -2417,18 +2432,24 @@ namespace wolvrix::lib::grhsim::am
 
                     // Partition by event signature, keeping first-appearance
                     // order of the signatures and in-signature write order.
+                    // NO0012: the write form (dynamic-lane vs scalar) joins
+                    // the key — mixed-form groups would route a dynlane
+                    // write through the scalar masked-write path.
                     std::vector<std::vector<PendingStateWrite>> signatureGroups;
                     std::map<std::vector<uint32_t>, std::size_t> signatureIndex;
                     for (PendingStateWrite &write : ordered)
                     {
                         std::vector<uint32_t> key;
-                        key.reserve(write.events.size());
+                        key.reserve(write.events.size() + 1);
                         for (const VariableId event : write.events)
                         {
                             key.push_back(event.value);
                         }
                         std::sort(key.begin(), key.end());
                         key.erase(std::unique(key.begin(), key.end()), key.end());
+                        key.push_back(write.opcode == Opcode::RegisterWriteDynLane
+                                          ? 1U
+                                          : 0U);
                         const auto [it, inserted] =
                             signatureIndex.try_emplace(std::move(key),
                                                        signatureGroups.size());
@@ -2838,6 +2859,25 @@ namespace wolvrix::lib::grhsim::am
                 uint32_t &ordinal)
             {
                 const PendingStateWrite &head = signatureGroup.front();
+                if (head.opcode == Opcode::RegisterWriteDynLane)
+                {
+                    // Dynamic-lane writes emit directly: the PendingStateWrite
+                    // already carries cond/index/data in final form.
+                    for (const PendingStateWrite &write : signatureGroup)
+                    {
+                        const ScopedGsimNodeId writeNode(currentGsimNodeId_,
+                                                         write.gsimNodeId);
+                        std::vector<VariableId> operands{write.cond, write.addr,
+                                                         write.data,
+                                                         write.target};
+                        operands.insert(operands.end(), write.events.begin(),
+                                        write.events.end());
+                        const InstructionId instruction = addInstruction(
+                            Opcode::RegisterWriteDynLane, {}, operands);
+                        recordWriteEffect(instruction, group, ordinal);
+                    }
+                    return;
+                }
                 if (head.opcode == Opcode::RegisterWrite ||
                     head.opcode == Opcode::LatchWrite)
                 {
@@ -3779,6 +3819,33 @@ namespace wolvrix::lib::grhsim::am
                 std::vector<OperationId> absorbedPrefix;
                 OperationId flushOp;
             };
+            // NO0012 Tier 3: one recognized dynamic-lane write. The gsim
+            // flatten export materializes a register element write port as a
+            // full-width lane-replace chain (mux(cond, or(and(prev,
+            // not(shl(ones64, amt))), shl(and(resize(elem), ones64), amt)),
+            // prev)) plus a full-width masked write whose mask is the same
+            // shl(ones64, amt) one-hot. The pattern proves to a single
+            // conditional dynamic-lane RMW: dynlane(cond_w && cond_k,
+            // bitOffset=amt, elem). The whole chain cone is skipped when its
+            // only consumers are the rewritten writes.
+            struct DynLaneWritePlan
+            {
+                OperationId op;
+                ValueId condW;
+                ValueId condK;
+                ValueId indexValue;
+                ValueId elemValue;
+                ValueId baseValue;  // chain base (register read / constant)
+                int64_t nodeId = -1;
+            };
+            std::unordered_map<uint32_t, DynLaneWritePlan> dynLanePlans_;
+            std::unordered_set<uint32_t> dynLaneSkipOps_;
+            bool disableDynLane_ = false;
+            uint64_t dynLaneRewriteCount_ = 0;
+            uint64_t dynLaneConeSkipCount_ = 0;
+            uint64_t dynLaneRejectCount_ = 0;
+            std::array<uint64_t, 5> dynLaneRejectStage_{};
+
             std::vector<LaneWriteFan> laneWriteFans_;
             std::unordered_map<uint32_t, uint32_t> laneWriteSkipFan_;
             std::unordered_set<uint32_t> laneWriteMemberOps_;
@@ -3789,6 +3856,397 @@ namespace wolvrix::lib::grhsim::am
             bool disableLaneWriteMerge_ = false;
             uint64_t laneWriteMergedCount_ = 0;
             uint64_t laneWriteFanRejectCount_ = 0;
+
+            // NO0012 Tier 3: detect (full-width masked write, lane-replace
+            // chain step) pairs and plan their rewrite into dynamic-lane
+            // register writes. See DynLaneWritePlan for the exact pattern.
+            // Anything not matching the full proof is left untouched.
+            void detectDynLaneWrites()
+            {
+                if (disableDynLane_)
+                {
+                    return;
+                }
+                auto isOnes64Constant = [&](ValueId value) {
+                    if (!value.valid() || value.index >= valueMap_.size())
+                    {
+                        return false;
+                    }
+                    const std::optional<std::vector<uint64_t>> words =
+                        constantWordsOf(valueMap_[value.index]);
+                    if (!words || words->empty() ||
+                        words->front() != UINT64_MAX)
+                    {
+                        return false;
+                    }
+                    for (std::size_t index = 1; index < words->size(); ++index)
+                    {
+                        if ((*words)[index] != 0)
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                auto kindOf = [&](ValueId value) -> std::optional<OperationKind> {
+                    if (!value.valid())
+                    {
+                        return std::nullopt;
+                    }
+                    const OperationId def = graph_.valueDef(value);
+                    if (!def.valid())
+                    {
+                        return std::nullopt;
+                    }
+                    return graph_.opKind(def);
+                };
+                // Prove one lane-replace step:
+                //   value = mux(condK, or(and(prev, not(shl(ones64, amt))),
+                //                        shl(and(assign(elem), ones64), amt)),
+                //                prev)
+                // On success appends the proven cone ops and returns amt/elem
+                // via out params; prev is returned for the recursive walk.
+                struct StepProof
+                {
+                    ValueId condK;
+                    ValueId amt;
+                    ValueId elem;
+                    ValueId prev;
+                };
+                std::unordered_map<uint32_t, OperationId> coneOps;
+                std::unordered_map<uint32_t, OperationId> *activeCone =
+                    &coneOps;
+                std::function<bool(ValueId, StepProof &)> proveStep =
+                    [&](ValueId value, StepProof &proof) -> bool {
+                    if (kindOf(value) != OperationKind::kMux)
+                    {
+                        return false;
+                    }
+                    const Operation mux =
+                        graph_.getOperation(graph_.valueDef(value));
+                    if (mux.operands().size() != 3)
+                    {
+                        return false;
+                    }
+                    proof.condK = mux.operands()[0];
+                    proof.prev = mux.operands()[2];
+                    const ValueId blendV = mux.operands()[1];
+                    if (kindOf(blendV) != OperationKind::kOr)
+                    {
+                        return false;
+                    }
+                    const Operation blend =
+                        graph_.getOperation(graph_.valueDef(blendV));
+                    ValueId andV, placedV;
+                    for (ValueId candidate : blend.operands())
+                    {
+                        if (kindOf(candidate) == OperationKind::kAnd)
+                        {
+                            andV = candidate;
+                        }
+                        else if (kindOf(candidate) == OperationKind::kShl)
+                        {
+                            placedV = candidate;
+                        }
+                    }
+                    if (!andV.valid() || !placedV.valid())
+                    {
+                        return false;
+                    }
+                    const Operation andOp =
+                        graph_.getOperation(graph_.valueDef(andV));
+                    ValueId notV;
+                    bool prevSeen = false;
+                    for (ValueId candidate : andOp.operands())
+                    {
+                        if (candidate == proof.prev)
+                        {
+                            prevSeen = true;
+                        }
+                        else
+                        {
+                            notV = candidate;
+                        }
+                    }
+                    if (!prevSeen || !notV.valid() ||
+                        kindOf(notV) != OperationKind::kNot)
+                    {
+                        return false;
+                    }
+                    const Operation notOp =
+                        graph_.getOperation(graph_.valueDef(notV));
+                    if (notOp.operands().size() != 1 ||
+                        kindOf(notOp.operands()[0]) != OperationKind::kShl)
+                    {
+                        return false;
+                    }
+                    const Operation onesShift =
+                        graph_.getOperation(graph_.valueDef(notOp.operands()[0]));
+                    if (onesShift.operands().size() != 2 ||
+                        !isOnes64Constant(onesShift.operands()[0]))
+                    {
+                        return false;
+                    }
+                    proof.amt = onesShift.operands()[1];
+                    const Operation placed =
+                        graph_.getOperation(graph_.valueDef(placedV));
+                    if (placed.operands().size() != 2 ||
+                        placed.operands()[1] != proof.amt)
+                    {
+                        return false;
+                    }
+                    if (kindOf(placed.operands()[0]) != OperationKind::kAnd)
+                    {
+                        return false;
+                    }
+                    const Operation placedData = graph_.getOperation(
+                        graph_.valueDef(placed.operands()[0]));
+                    ValueId resizedV;
+                    bool onesSeen = false;
+                    for (ValueId candidate : placedData.operands())
+                    {
+                        if (isOnes64Constant(candidate))
+                        {
+                            onesSeen = true;
+                        }
+                        else
+                        {
+                            resizedV = candidate;
+                        }
+                    }
+                    if (!onesSeen || !resizedV.valid() ||
+                        kindOf(resizedV) != OperationKind::kAssign)
+                    {
+                        return false;
+                    }
+                    const Operation resized =
+                        graph_.getOperation(graph_.valueDef(resizedV));
+                    if (resized.operands().size() != 1 ||
+                        static_cast<uint32_t>(
+                            graph_.valueWidth(resized.operands()[0])) > 64)
+                    {
+                        return false;
+                    }
+                    proof.elem = resized.operands()[0];
+                    const OperationId muxDef = graph_.valueDef(value);
+                    const OperationId blendDef = graph_.valueDef(blendV);
+                    const OperationId andDef = graph_.valueDef(andV);
+                    const OperationId notDef = graph_.valueDef(notV);
+                    const OperationId onesShiftDef =
+                        graph_.valueDef(notOp.operands()[0]);
+                    const OperationId placedDef = graph_.valueDef(placedV);
+                    const OperationId placedDataDef =
+                        graph_.valueDef(placed.operands()[0]);
+                    const OperationId resizedDef = graph_.valueDef(resizedV);
+                    activeCone->emplace(muxDef.index, muxDef);
+                    activeCone->emplace(blendDef.index, blendDef);
+                    activeCone->emplace(andDef.index, andDef);
+                    activeCone->emplace(notDef.index, notDef);
+                    activeCone->emplace(onesShiftDef.index, onesShiftDef);
+                    activeCone->emplace(placedDef.index, placedDef);
+                    activeCone->emplace(placedDataDef.index, placedDataDef);
+                    activeCone->emplace(resizedDef.index, resizedDef);
+                    return true;
+                };
+
+                for (OperationId opId : graph_.operations())
+                {
+                    const Operation writeOp = graph_.getOperation(opId);
+                    if (writeOp.kind() != OperationKind::kRegisterWritePort ||
+                        writeOp.operands().size() < 4)
+                    {
+                        continue;
+                    }
+                    const auto target = stateTarget(writeOp, "regSymbol",
+                                                    OperationKind::kRegister);
+                    if (!target)
+                    {
+                        continue;
+                    }
+                    // mask = shl(ones64, amt): the dynamic one-hot lane.
+                    const ValueId maskV = writeOp.operands()[2];
+                    if (kindOf(maskV) != OperationKind::kShl)
+                    {
+                        ++dynLaneRejectStage_[0];
+                        continue;
+                    }
+                    const Operation maskShl =
+                        graph_.getOperation(graph_.valueDef(maskV));
+                    if (maskShl.operands().size() != 2 ||
+                        !isOnes64Constant(maskShl.operands()[0]))
+                    {
+                        ++dynLaneRejectStage_[1];
+                        continue;
+                    }
+                    const ValueId maskAmt = maskShl.operands()[1];
+                    const ValueId dataV = writeOp.operands()[1];
+                    StepProof proof;
+                    std::unordered_map<uint32_t, OperationId> writeCone;
+                    activeCone = &writeCone;
+                    if (!proveStep(dataV, proof))
+                    {
+                        ++dynLaneRejectStage_[2];
+                        activeCone = &coneOps;
+                        continue;
+                    }
+                    if (proof.amt != maskAmt)
+                    {
+                        ++dynLaneRejectStage_[3];
+                        activeCone = &coneOps;
+                        continue;
+                    }
+                    // The write's mask shl is consumed by the rewrite too.
+                    const OperationId maskDef = graph_.valueDef(maskV);
+                    writeCone.emplace(maskDef.index, maskDef);
+                    // Walk the prev chain back to its base: every link must
+                    // be another lane-replace step; the walk ends at the
+                    // first non-step value (register read port, constant, or
+                    // any other producer) — that value's lane is the
+                    // write's fall-back data when its step cond is false.
+                    // NOTE: the rewrite assumes distinct lanes within one
+                    // eval across rewritten writes on one target (the
+                    // register-file write-port discipline these patterns
+                    // come from); duplicate lanes with mixed conds would
+                    // need the accumulated chain value as fall-back.
+                    bool chainOk = true;
+                    std::unordered_set<uint32_t> visiting;
+                    ValueId cursor = proof.prev;
+                    while (true)
+                    {
+                        const std::optional<OperationKind> cursorKind =
+                            kindOf(cursor);
+                        if (!cursorKind || *cursorKind != OperationKind::kMux)
+                        {
+                            break;  // chain base reached
+                        }
+                        if (visiting.contains(cursor.index))
+                        {
+                            chainOk = false;
+                            break;
+                        }
+                        visiting.insert(cursor.index);
+                        StepProof link;
+                        if (!proveStep(cursor, link))
+                        {
+                            chainOk = false;
+                            break;
+                        }
+                        cursor = link.prev;
+                    }
+                    if (!chainOk)
+                    {
+                        activeCone = &coneOps;
+                        if (dynLaneRejectStage_[4] < 5)
+                        {
+                            const OperationId cursorDef =
+                                graph_.valueDef(cursor);
+                            diagnostics_.info(
+                                "dynlane debug: chain walk stopped at value " +
+                                    std::to_string(cursor.index) +
+                                    (cursorDef.valid()
+                                         ? " def_kind=" +
+                                               std::string(grh::toString(
+                                                   graph_.opKind(cursorDef)))
+                                         : " no_def") +
+                                    " target_var=" +
+                                    std::to_string(target->value),
+                                "grhsim-am-lowering");
+                        }
+                        ++dynLaneRejectStage_[4];
+                        ++dynLaneRejectCount_;
+                        continue;
+                    }
+                    coneOps.insert(writeCone.begin(), writeCone.end());
+                    activeCone = &coneOps;
+                    const std::optional<int64_t> nodeId =
+                        optionalAttr<int64_t>(writeOp, kGsimNodeIdAttr);
+                    dynLanePlans_.emplace(
+                        opId.index,
+                        DynLaneWritePlan{
+                            .op = opId,
+                            .condW = writeOp.operands()[0],
+                            .condK = proof.condK,
+                            .indexValue = proof.amt,
+                            .elemValue = proof.elem,
+                            .baseValue = cursor,
+                            .nodeId = nodeId.value_or(-1),
+                        });
+                }
+
+                // Cone skip set: a proven cone op lowers away only when every
+                // consumer of its result is itself in the cone or a rewritten
+                // write; keep-set propagates backwards from any escape.
+                std::unordered_set<uint32_t> rewrittenWrites;
+                for (const auto &[opIndex, plan] : dynLanePlans_)
+                {
+                    rewrittenWrites.insert(opIndex);
+                }
+                std::vector<std::vector<uint32_t>> users(valueMap_.size());
+                for (OperationId opId : graph_.operations())
+                {
+                    const Operation op = graph_.getOperation(opId);
+                    for (ValueId operand : op.operands())
+                    {
+                        if (operand.valid() && operand.index < users.size())
+                        {
+                            users[operand.index].push_back(opId.index);
+                        }
+                    }
+                }
+                std::unordered_set<uint32_t> keep;
+                std::vector<uint32_t> worklist;
+                for (const auto &[coneOpIndex, coneOpId] : coneOps)
+                {
+                    const Operation coneOperation =
+                        graph_.getOperation(coneOpId);
+                    bool external = false;
+                    for (ValueId result : coneOperation.results())
+                    {
+                        for (uint32_t user : users[result.index])
+                        {
+                            if (!coneOps.contains(user) &&
+                                !rewrittenWrites.contains(user))
+                            {
+                                external = true;
+                                break;
+                            }
+                        }
+                        if (external)
+                        {
+                            break;
+                        }
+                    }
+                    if (external)
+                    {
+                        keep.insert(coneOpIndex);
+                        worklist.push_back(coneOpIndex);
+                    }
+                }
+                while (!worklist.empty())
+                {
+                    const uint32_t current = worklist.back();
+                    worklist.pop_back();
+                    const Operation op =
+                        graph_.getOperation(coneOps.at(current));
+                    for (ValueId operand : op.operands())
+                    {
+                        const OperationId def = graph_.valueDef(operand);
+                        if (def.valid() && coneOps.contains(def.index) &&
+                            keep.insert(def.index).second)
+                        {
+                            worklist.push_back(def.index);
+                        }
+                    }
+                }
+                for (const auto &[coneOpIndex, coneOpId] : coneOps)
+                {
+                    if (!keep.contains(coneOpIndex))
+                    {
+                        dynLaneSkipOps_.insert(coneOpIndex);
+                        ++dynLaneConeSkipCount_;
+                    }
+                }
+            }
 
             // NO0012 Tier 2 pass 0: detect lane-write fans before chain
             // planning so the chain escape analysis can stop counting fan
@@ -4005,6 +4463,33 @@ namespace wolvrix::lib::grhsim::am
                         {
                             continue;
                         }
+                        const auto otherOrder = orderKeyOf(other);
+                        const bool beforeAll = std::all_of(
+                            fan.members.begin(), fan.members.end(),
+                            [&](const LaneWriteMember &member) {
+                                return otherOrder < orderKeyOf(member.op);
+                            });
+                        const bool afterAll = std::all_of(
+                            fan.members.begin(), fan.members.end(),
+                            [&](const LaneWriteMember &member) {
+                                return orderKeyOf(member.op) < otherOrder;
+                            });
+                        if (afterAll)
+                        {
+                            // Applies on top of the merged write in the same
+                            // relative order — its event key, opcode form,
+                            // and mask/data constness are all irrelevant.
+                            continue;
+                        }
+                        if (dynLanePlans_.contains(other.index))
+                        {
+                            // A dynamic-lane write ordered before the fan:
+                            // its effect cannot join the merged write's old
+                            // value, so the fan cannot form.
+                            ++laneWriteFanRejectCount_;
+                            rejected = true;
+                            break;
+                        }
                         const Operation otherOp = graph_.getOperation(other);
                         const auto otherEdges = requiredAttr<std::vector<std::string>>(
                             otherOp, "eventEdge");
@@ -4029,27 +4514,6 @@ namespace wolvrix::lib::grhsim::am
                             rejected = true;
                             break;
                         }
-                        const auto otherOrder = orderKeyOf(other);
-                        const bool beforeAll = std::all_of(
-                            fan.members.begin(), fan.members.end(),
-                            [&](const LaneWriteMember &member) {
-                                return otherOrder < orderKeyOf(member.op);
-                            });
-                        const bool afterAll = std::all_of(
-                            fan.members.begin(), fan.members.end(),
-                            [&](const LaneWriteMember &member) {
-                                return orderKeyOf(member.op) < otherOrder;
-                            });
-                        if (afterAll)
-                        {
-                            continue;
-                        }
-                        if (!beforeAll)
-                        {
-                            ++laneWriteFanRejectCount_;
-                            rejected = true;
-                            break;
-                        }
                         // Absorbable prefix writes must be constant mask+data
                         // (their blend folds into the merged write's old
                         // value at flush time).
@@ -4060,6 +4524,12 @@ namespace wolvrix::lib::grhsim::am
                                 valueMap_[otherOp.operands()[1].index]) ||
                             !constantWordsOf(
                                 valueMap_[otherOp.operands()[2].index]))
+                        {
+                            ++laneWriteFanRejectCount_;
+                            rejected = true;
+                            break;
+                        }
+                        if (!beforeAll)
                         {
                             ++laneWriteFanRejectCount_;
                             rejected = true;
@@ -4079,6 +4549,22 @@ namespace wolvrix::lib::grhsim::am
                     const uint32_t fanIndex =
                         static_cast<uint32_t>(laneWriteFans_.size());
                     laneWriteFans_.push_back(std::move(fan));
+                    if (std::getenv("WOLVRIX_GRHSIM_AM_LANE_FAN_DEBUG") !=
+                            nullptr &&
+                        laneWriteFans_.back().members.size() >= 32)
+                    {
+                        diagnostics_.info(
+                            "lane fan debug: members=" +
+                                std::to_string(
+                                    laneWriteFans_.back().members.size()) +
+                                " target=" +
+                                std::to_string(
+                                    laneWriteFans_.back().target.value) +
+                                " absorbed=" +
+                                std::to_string(
+                                    laneWriteFans_.back().absorbedPrefix.size()),
+                            "grhsim-am-lowering");
+                    }
                     for (const LaneWriteMember &member :
                          laneWriteFans_.back().members)
                     {
@@ -4418,6 +4904,15 @@ namespace wolvrix::lib::grhsim::am
                     }
                     if (rejected || unresolved != 0)
                     {
+                        if (debugChainNode_ && *debugChainNode_ == nodeId)
+                        {
+                            diagnostics_.info(
+                                "chain replay debug: node " +
+                                    std::to_string(nodeId) +
+                                    " rejected (unresolved=" +
+                                    std::to_string(unresolved) + ")",
+                                "grhsim-am-lowering");
+                        }
                         ++chainReplayRejectCount_;
                         continue;
                     }
@@ -4476,6 +4971,19 @@ namespace wolvrix::lib::grhsim::am
                     }
                     if (dynamicEscaped != 0 && replayWords * 2 >= chainWords)
                     {
+                        if (debugChainNode_ && *debugChainNode_ == nodeId)
+                        {
+                            diagnostics_.info(
+                                "chain replay debug: node " +
+                                    std::to_string(nodeId) +
+                                    " gate-rejected (dynamicEscaped=" +
+                                    std::to_string(dynamicEscaped) +
+                                    " replayWords=" +
+                                    std::to_string(replayWords) +
+                                    " chainWords=" + std::to_string(chainWords) +
+                                    ")",
+                                "grhsim-am-lowering");
+                        }
                         ++chainReplayRejectCount_;
                         continue;
                     }
@@ -4540,6 +5048,16 @@ namespace wolvrix::lib::grhsim::am
                     }
                     const uint32_t groupIndex =
                         static_cast<uint32_t>(chainReplayGroups_.size());
+                    if (debugChainNode_ && *debugChainNode_ == nodeId)
+                    {
+                        diagnostics_.info(
+                            "chain replay debug: node " + std::to_string(nodeId) +
+                                " planned (items=" +
+                                std::to_string(group.items.size()) +
+                                " chainOps=" + std::to_string(opValues.size()) +
+                                ")",
+                            "grhsim-am-lowering");
+                    }
                     chainReplayGroups_.push_back(std::move(group));
                     for (OperationId chainOpId : opValues)
                     {
@@ -4994,6 +5512,111 @@ namespace wolvrix::lib::grhsim::am
                     }
                     const ScopedGsimNodeId gsimNodeScope(currentGsimNodeId_,
                                                          gsimNodeId.value_or(-1));
+                    // NO0012 Tier 3: cone ops of proven lane-replace chains
+                    // lower away (their values are consumed only by the
+                    // rewritten dynamic-lane writes).
+                    if (dynLaneSkipOps_.contains(operation.index))
+                    {
+                        continue;
+                    }
+                    if (const auto planIt = dynLanePlans_.find(operation.index);
+                        planIt != dynLanePlans_.end())
+                    {
+                        const DynLaneWritePlan &plan = planIt->second;
+                        const auto target = stateTarget(op, "regSymbol",
+                                                        OperationKind::kRegister);
+                        const auto edges = requiredAttr<std::vector<std::string>>(
+                            op, "eventEdge");
+                        if (!target || !edges)
+                        {
+                            error("dynamic-lane write plan lacks target/events",
+                                  opContext(op));
+                            continue;
+                        }
+                        const auto events = lowerEvents(op, 3, *edges);
+                        if (!events || events->empty())
+                        {
+                            error("dynamic-lane write event lowering failed",
+                                  opContext(op));
+                            continue;
+                        }
+                        const VariableId condW =
+                            mappedValue(plan.condW, op);
+                        const VariableId condK =
+                            mappedValue(plan.condK, op);
+                        if (!condW.valid() || !condK.valid())
+                        {
+                            continue;
+                        }
+                        const VariableId index = preCommitValue(
+                            plan.indexValue,
+                            mappedValue(plan.indexValue, op), op);
+                        VariableId elem = preCommitValue(
+                            plan.elemValue,
+                            mappedValue(plan.elemValue, op), op);
+                        if (!elem.valid() || !index.valid())
+                        {
+                            continue;
+                        }
+                        const uint32_t elemWidth = static_cast<uint32_t>(
+                            graph_.valueWidth(plan.elemValue));
+                        // Fall-back data for a false step cond: the chain
+                        // base's lane at the same dynamic offset.
+                        if (!isConstantOne(condK))
+                        {
+                            const VariableId base = preCommitValue(
+                                plan.baseValue,
+                                mappedValue(plan.baseValue, op), op);
+                            if (!base.valid())
+                            {
+                                continue;
+                            }
+                            const VariableId baseLane = addVariable(
+                                Type::bitVector(elemWidth),
+                                amGraph_.zeroInit());
+                            ++freshTemporaryCount_;
+                            const std::array<VariableId, 1> laneResults{
+                                baseLane};
+                            const std::array<VariableId, 2> laneOperands{
+                                base, index};
+                            addInstruction(Opcode::SliceDynamic,
+                                           laneResults, laneOperands);
+                            const VariableId muxed = addVariable(
+                                Type::bitVector(elemWidth),
+                                amGraph_.zeroInit());
+                            ++freshTemporaryCount_;
+                            const std::array<VariableId, 1> muxResults{muxed};
+                            const std::array<VariableId, 3> muxOperands{
+                                condK, elem, baseLane};
+                            addInstruction(Opcode::Mux, muxResults,
+                                           muxOperands);
+                            elem = muxed;
+                        }
+                        PendingStateWrite write{
+                            .opcode = Opcode::RegisterWriteDynLane,
+                            .target = *target,
+                            .cond = condW,
+                            .mask = VariableId::invalid(),
+                            .data = elem,
+                            .addr = index,
+                            .events = *events,
+                            .explicitOrder =
+                                op.id().index <
+                                        explicitOrderByOperation_.size()
+                                    ? explicitOrderByOperation_[op.id().index]
+                                    : std::nullopt,
+                            .context = opContext(op),
+                            .gsimNodeId = plan.nodeId,
+                        };
+                        if (!write.cond.valid() || !write.data.valid() ||
+                            !write.addr.valid())
+                        {
+                            continue;
+                        }
+                        ++dynLaneRewriteCount_;
+                        pendingStateWrites_.push_back(std::move(write));
+                        continue;
+                    }
                     // NO0012 Tier 2: fan member write ops are absorbed into
                     // the merged write emitted at the fan's flush op.
                     if (const auto fanIt = laneWriteSkipFan_.find(operation.index);
