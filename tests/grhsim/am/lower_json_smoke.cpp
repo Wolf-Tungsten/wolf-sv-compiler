@@ -700,6 +700,12 @@ int main(int argc, char **argv)
         uint64_t windowedRemappedSlices = 0;
         uint64_t windowedMaterialized = 0;
         uint64_t windowedBailedChains = 0;
+        uint64_t dynBlendChains = 0;
+        uint64_t dynBlendCones = 0;
+        uint64_t dynBlendSkipped = 0;
+        uint64_t dynBlendRemapped = 0;
+        uint64_t dynBlendMaterialized = 0;
+        uint64_t dynBlendBailed = 0;
         if (runSchedule)
         {
             phaseStart = std::chrono::steady_clock::now();
@@ -806,6 +812,12 @@ int main(int argc, char **argv)
                 windowedRemappedSlices = emitResult.windowedRemappedSlices;
                 windowedMaterialized = emitResult.windowedMaterialized;
                 windowedBailedChains = emitResult.windowedBailedChains;
+                dynBlendChains = emitResult.dynBlendChains;
+                dynBlendCones = emitResult.dynBlendCones;
+                dynBlendSkipped = emitResult.dynBlendSkipped;
+                dynBlendRemapped = emitResult.dynBlendRemapped;
+                dynBlendMaterialized = emitResult.dynBlendMaterialized;
+                dynBlendBailed = emitResult.dynBlendBailed;
             }
         }
         std::cout << "{\n"
@@ -843,6 +855,12 @@ int main(int argc, char **argv)
                   << "  \"windowed_remapped_slices\": " << windowedRemappedSlices << ",\n"
                   << "  \"windowed_materialized\": " << windowedMaterialized << ",\n"
                   << "  \"windowed_bailed_chains\": " << windowedBailedChains << ",\n"
+                  << "  \"dynblend_chains\": " << dynBlendChains << ",\n"
+                  << "  \"dynblend_cones\": " << dynBlendCones << ",\n"
+                  << "  \"dynblend_skipped\": " << dynBlendSkipped << ",\n"
+                  << "  \"dynblend_remapped\": " << dynBlendRemapped << ",\n"
+                  << "  \"dynblend_materialized\": " << dynBlendMaterialized << ",\n"
+                  << "  \"dynblend_bailed\": " << dynBlendBailed << ",\n"
                   << "  \"current_rss_kib\": " << currentRssKiB() << ",\n"
                   << "  \"peak_rss_kib\": " << peakRssKiB() << '\n'
                   << "}\n";

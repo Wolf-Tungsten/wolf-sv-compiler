@@ -213,6 +213,13 @@ namespace wolvrix::lib::grhsim::am
         uint64_t windowedRemappedSlices = 0;
         uint64_t windowedMaterialized = 0;
         uint64_t windowedBailedChains = 0;
+        // NO0014 dynamic bit-field functional-update cone collapse.
+        uint64_t dynBlendChains = 0;
+        uint64_t dynBlendCones = 0;
+        uint64_t dynBlendSkipped = 0;
+        uint64_t dynBlendRemapped = 0;
+        uint64_t dynBlendMaterialized = 0;
+        uint64_t dynBlendBailed = 0;
     };
 
     // The pipeline currency is the AmGraph: lowering builds the graph

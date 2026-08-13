@@ -465,6 +465,48 @@ namespace wolvrix::lib::grhsim::am
             uint64_t windowedRemappedSlices = 0;
             uint64_t windowedMaterialized = 0;
             uint64_t windowedBailedChains = 0;
+            // NO0014 dynamic bit-field functional-update cone collapse
+            // (dynblend). Cone signature: or(and(base, not(shl(ones, idx))),
+            // shl(and(zext(elem), ones), idx)) with an optional
+            // mux(cond, merged, base) tail, chaining where a cone's result
+            // is the next cone's base (multi-port register-table updates,
+            // e.g. intRat/vecRat/vlRat difftest_table). Stock emission
+            // materializes every intermediate as full-width helper calls
+            // (4-8 cross-TU calls per cone); the collapsed form copies the
+            // chain base once into the last cone's slot D and emits one
+            // conditional blend_window_dyn_words call per cone, matching
+            // gsim's per-port `if (wen) next[addr] = data` scalar stores.
+            struct DynBlendPlan
+            {
+                struct Cone
+                {
+                    InstructionId tail;   // mux (conditional) or or (blend site)
+                    InstructionId internal[7]; // onehot,elemm,placed,notoh,cleared,merged[,zext]
+                    uint32_t internalCount = 0;
+                    VariableId result;    // cone result var
+                    VariableId base;
+                    VariableId idx;
+                    VariableId ones;
+                    VariableId elem;
+                    uint32_t elemWidth = 0;
+                    VariableId cond;      // invalid when unconditional
+                };
+                VariableId finalVar;      // accumulator D (last cone result)
+                uint32_t width = 0;
+                std::vector<Cone> cones;
+            };
+            // Actions: -1 none, 0 chain head (copy base + blend), 1 blend,
+            // 2 skip (cone-internal), 3 slice consumer re-pointed at D.
+            std::vector<int32_t> instructionDynBlendPlan;
+            std::vector<int8_t> instructionDynBlendAction;
+            std::vector<uint8_t> instructionDynBlendMaterialize;
+            std::vector<DynBlendPlan> dynBlendPlans;
+            uint64_t dynBlendChainCount = 0;
+            uint64_t dynBlendConeCount = 0;
+            uint64_t dynBlendSkipped = 0;
+            uint64_t dynBlendRemapped = 0;
+            uint64_t dynBlendMaterialized = 0;
+            uint64_t dynBlendBailed = 0;
         };
 
         constexpr uint8_t kEscapeGlobal = 1U << 0U;
@@ -479,6 +521,11 @@ namespace wolvrix::lib::grhsim::am
         constexpr int8_t kWindowActionSkip = 2;
         constexpr int8_t kWindowActionRemapSlice = 3;
         constexpr int8_t kWindowActionConcat = 4;
+        // NO0014 dynblend cone actions (EmitState::instructionDynBlendAction).
+        constexpr int8_t kDynBlendHead = 0;
+        constexpr int8_t kDynBlendCone = 1;
+        constexpr int8_t kDynBlendSkip = 2;
+        constexpr int8_t kDynBlendRemapSlice = 3;
 
         bool isLocalValue(const EmitState &state, VariableId variable)
         {
@@ -1524,6 +1571,91 @@ namespace wolvrix::lib::grhsim::am
                    std::to_string(attributes->lsb) + "));\n";
         }
 
+        // NO0014 dynblend cone collapse emission (plan documented in
+        // EmitState). Emits one conditional blend_window_dyn_words per cone
+        // into the chain accumulator, matching gsim's per-port conditional
+        // dynamic scalar stores.
+        std::optional<std::string> emitDynBlendInstruction(const EmitState &state,
+                                                           InstructionId instruction,
+                                                           std::string &error)
+        {
+            const int8_t action = state.instructionDynBlendAction[instruction.value];
+            const auto operands = state.program.operands(instruction);
+            const auto results = state.program.results(instruction);
+            if (action == kDynBlendSkip)
+            {
+                return std::string();
+            }
+            const EmitState::DynBlendPlan &plan =
+                state.dynBlendPlans[static_cast<std::size_t>(
+                    state.instructionDynBlendPlan[instruction.value])];
+            const std::string accumulator = wordDataExpr(state, plan.finalVar);
+            if (action == kDynBlendRemapSlice)
+            {
+                // Slice consumer of an intermediate result, re-pointed at D.
+                const Type &resultType = variableType(state, results.front());
+                if (state.program.opcode(instruction) == Opcode::SliceStatic)
+                {
+                    const auto attributes = state.program.sliceStaticAttributes(instruction);
+                    return "slice_words(" + wordDataExpr(state, results.front()) + ", " +
+                           std::to_string(resultType.bitWidth) + ", " + accumulator +
+                           ", " + std::to_string(plan.width) + ", UINT64_C(" +
+                           std::to_string(attributes->lsb) + "));\n";
+                }
+                const Type &indexType = variableType(state, operands[1]);
+                return "slice_dynamic_words(" + wordDataExpr(state, results.front()) +
+                       ", " + std::to_string(resultType.bitWidth) + ", " + accumulator +
+                       ", " + std::to_string(plan.width) + ", " +
+                       wordDataExpr(state, operands[1]) + ", " +
+                       std::to_string(indexType.bitWidth) + ");\n";
+            }
+            const EmitState::DynBlendPlan::Cone *cone = nullptr;
+            for (const auto &candidate : plan.cones)
+            {
+                if (candidate.tail == instruction)
+                {
+                    cone = &candidate;
+                    break;
+                }
+            }
+            if (cone == nullptr)
+            {
+                error = "dynblend cone tail missing from plan";
+                return std::nullopt;
+            }
+            std::string code;
+            if (action == kDynBlendHead)
+            {
+                // Chain head: seed the accumulator with the external base.
+                code += "assign_words(" + accumulator + ", " +
+                        std::to_string(plan.width) + ", " +
+                        wordDataExpr(state, cone->base) + ", " +
+                        std::to_string(plan.width) + ", false);\n";
+            }
+            const Type &indexType = variableType(state, cone->idx);
+            const std::string blend =
+                "blend_window_dyn_words(" + accumulator + ", " +
+                std::to_string(plan.width) + ", " + wordDataExpr(state, cone->idx) +
+                ", " + std::to_string(indexType.bitWidth) + ", " +
+                wordDataExpr(state, cone->ones) + ", " + wordDataExpr(state, cone->elem) +
+                ", " + std::to_string(cone->elemWidth) + ");\n";
+            if (cone->cond.valid())
+            {
+                code += "if (" + boolExpr(state, cone->cond) + ") { " + blend + "}\n";
+            }
+            else
+            {
+                code += blend;
+            }
+            if (state.instructionDynBlendMaterialize[instruction.value] != 0)
+            {
+                code += "assign_words(" + wordDataExpr(state, cone->result) + ", " +
+                        std::to_string(plan.width) + ", " + accumulator + ", " +
+                        std::to_string(plan.width) + ", false);\n";
+            }
+            return code;
+        }
+
         std::optional<std::string> emitNonScalarInstruction(const EmitState &state,
                                                             InstructionId instruction,
                                                             std::string &error)
@@ -1540,12 +1672,6 @@ namespace wolvrix::lib::grhsim::am
                 error = "non-scalar pure AM instruction requires bit-vector operands: " +
                         std::string(toString(opcode));
                 return std::nullopt;
-            }
-
-            if (instruction.value < state.instructionWindowAction.size() &&
-                state.instructionWindowAction[instruction.value] >= 0)
-            {
-                return emitWindowedInstruction(state, instruction, error);
             }
 
             const auto binaryCall = [&](std::string_view helper, uint32_t operation) {
@@ -1976,6 +2102,21 @@ namespace wolvrix::lib::grhsim::am
                     }
                     return emitMuxFusionRun(state, plan, error);
                 }
+            }
+
+            // NO0013/NO0014 planned emission actions: checked here (not in
+            // emitNonScalarInstruction) because some planned instructions
+            // (e.g. dynblend zext Assigns) route through the special paths
+            // below instead of the non-scalar switch.
+            if (instruction.value < state.instructionDynBlendAction.size() &&
+                state.instructionDynBlendAction[instruction.value] >= 0)
+            {
+                return emitDynBlendInstruction(state, instruction, error);
+            }
+            if (instruction.value < state.instructionWindowAction.size() &&
+                state.instructionWindowAction[instruction.value] >= 0)
+            {
+                return emitWindowedInstruction(state, instruction, error);
             }
 
             if (opcode == Opcode::Assign &&
@@ -4887,6 +5028,641 @@ namespace wolvrix::lib::grhsim::am
         // would read an earlier run root's result (the fused if/else would
         // otherwise become a use-before-def); the atom then starts a fresh
         // run. Runs with a single arm emit plainly.
+        // NO0014: plan dynamic bit-field functional-update cone collapse
+        // (semantics and cone signature documented in EmitState). Emitter
+        // side only; the scheduled program is untouched (atom connectivity
+        // invariant by construction). Planned after planWindowedChains so
+        // F1-claimed instructions can be excluded.
+        void planDynBlendCones(const ExecutableModel &model, EmitState &state)
+        {
+            constexpr uint32_t kMinBlendWidth = 256;
+
+            const std::size_t instructionCount = state.program.instructionCount();
+            state.instructionDynBlendPlan.assign(instructionCount, -1);
+            state.instructionDynBlendAction.assign(instructionCount, -1);
+            state.instructionDynBlendMaterialize.assign(instructionCount, 0);
+            state.dynBlendPlans.clear();
+            state.dynBlendChainCount = 0;
+            state.dynBlendConeCount = 0;
+            state.dynBlendSkipped = 0;
+            state.dynBlendRemapped = 0;
+            state.dynBlendMaterialized = 0;
+            state.dynBlendBailed = 0;
+            if (std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_DYNBLEND") != nullptr)
+            {
+                return;
+            }
+
+            const uint32_t variableCount = state.program.variableCount();
+            const uint32_t blockCount = state.blockCount;
+            constexpr uint32_t kInvalidVar = std::numeric_limits<uint32_t>::max();
+
+            std::vector<uint8_t> visible(variableCount, 0);
+            for (const PortBinding &port : model.interface.ports)
+            {
+                if (port.input.valid())
+                {
+                    visible[port.input.value] = 1;
+                }
+                if (port.output.valid())
+                {
+                    visible[port.output.value] = 1;
+                }
+                if (port.outputEnable.valid())
+                {
+                    visible[port.outputEnable.value] = 1;
+                }
+            }
+            for (const VariableLabel &declared : model.interface.declaredVariables)
+            {
+                visible[declared.variable.value] = 1;
+            }
+
+            // Consumer lists (CSR) over wide vars (cone internals/results).
+            std::vector<uint32_t> instructionBlock(instructionCount, kInvalidVar);
+            std::vector<uint32_t> instructionPos(instructionCount, 0);
+            std::vector<uint8_t> candidate(variableCount, 0);
+            for (uint32_t blockIndex = 0; blockIndex < blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                for (std::size_t position = 0; position < model.program.blockSize(block);
+                     ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    instructionBlock[instruction.value] = blockIndex;
+                    instructionPos[instruction.value] = static_cast<uint32_t>(position);
+                    const auto results = state.program.results(instruction);
+                    if (!results.empty() &&
+                        variableType(state, results.front()).bitWidth > 64)
+                    {
+                        candidate[results.front().value] = 1;
+                    }
+                }
+            }
+            std::vector<uint32_t> useOffsets(variableCount + 1, 0);
+            for (uint32_t blockIndex = 0; blockIndex < blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                for (std::size_t position = 0; position < model.program.blockSize(block);
+                     ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    for (const VariableId operand : state.program.operands(instruction))
+                    {
+                        if (operand.valid() && candidate[operand.value])
+                        {
+                            ++useOffsets[operand.value + 1];
+                        }
+                    }
+                }
+            }
+            for (uint32_t index = 0; index < variableCount; ++index)
+            {
+                useOffsets[index + 1] += useOffsets[index];
+            }
+            std::vector<uint32_t> useList(useOffsets[variableCount]);
+            std::vector<uint32_t> useCursor(useOffsets.begin(), useOffsets.end() - 1);
+            for (uint32_t blockIndex = 0; blockIndex < blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                for (std::size_t position = 0; position < model.program.blockSize(block);
+                     ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    for (const VariableId operand : state.program.operands(instruction))
+                    {
+                        if (operand.valid() && candidate[operand.value])
+                        {
+                            useList[useCursor[operand.value]++] = instruction.value;
+                        }
+                    }
+                }
+            }
+            const auto usesOf = [&](VariableId variable) {
+                return std::pair(useOffsets[variable.value], useOffsets[variable.value + 1]);
+            };
+
+            for (uint32_t blockIndex = 0; blockIndex < blockCount; ++blockIndex)
+            {
+                if (blockIndex >= model.commitBlockBegin && blockIndex < model.commitBlockEnd)
+                {
+                    continue;
+                }
+                const BlockId block{blockIndex};
+                const std::size_t blockSize = model.program.blockSize(block);
+                const auto blockInstr = [&](std::size_t position) {
+                    return model.program.blockInstruction(block, position);
+                };
+                const auto defInstruction = [&](VariableId variable) {
+                    return blockInstr(state.variableDefPosition[variable.value]);
+                };
+                const auto muxCovered = [&](InstructionId instruction) {
+                    return instruction.value < state.instructionMuxRun.size() &&
+                           state.instructionMuxRun[instruction.value] >= 0;
+                };
+                const auto windowClaimed = [&](InstructionId instruction) {
+                    return instruction.value < state.instructionWindowAction.size() &&
+                           state.instructionWindowAction[instruction.value] >= 0;
+                };
+                // Cone match anchored at an Or instruction.
+                struct ConeMatch
+                {
+                    InstructionId onehot, notoh, cleared, elemm, placed, merged, zext;
+                    bool hasZext = false;
+                    InstructionId tail;
+                    VariableId result, base, idx, ones, elem, cond;
+                    uint32_t elemWidth = 0;
+                };
+                std::unordered_map<uint32_t, ConeMatch> coneByResult;
+                for (std::size_t position = 0; position < blockSize; ++position)
+                {
+                    const InstructionId orInstr = blockInstr(position);
+                    if (state.program.opcode(orInstr) != Opcode::Or || muxCovered(orInstr) ||
+                        windowClaimed(orInstr))
+                    {
+                        continue;
+                    }
+                    const auto orOperands = state.program.operands(orInstr);
+                    const auto orResults = state.program.results(orInstr);
+                    if (orOperands.size() != 2 || orResults.empty())
+                    {
+                        continue;
+                    }
+                    const uint32_t width =
+                        variableType(state, orResults.front()).bitWidth;
+                    if (width < kMinBlendWidth ||
+                        variableType(state, orResults.front()).kind !=
+                            TypeKind::BitVector)
+                    {
+                        continue;
+                    }
+                    // Match both operand orders of (cleared, placed).
+                    ConeMatch match;
+                    bool matched = false;
+                    for (uint32_t order = 0; order < 2 && !matched; ++order)
+                    {
+                        const VariableId clearedVar = orOperands[order];
+                        const VariableId placedVar = orOperands[1 - order];
+                        if (!clearedVar.valid() || !placedVar.valid() ||
+                            state.variableDefBlock[clearedVar.value] != blockIndex ||
+                            state.variableDefBlock[placedVar.value] != blockIndex)
+                        {
+                            continue;
+                        }
+                        const InstructionId andInstr = defInstruction(clearedVar);
+                        const InstructionId shlInstr = defInstruction(placedVar);
+                        if (state.program.opcode(andInstr) != Opcode::And ||
+                            state.program.opcode(shlInstr) != Opcode::Shl ||
+                            muxCovered(andInstr) || muxCovered(shlInstr) ||
+                            windowClaimed(andInstr) || windowClaimed(shlInstr))
+                        {
+                            continue;
+                        }
+                        // placed = shl(elemm, idx)
+                        const auto shlOperands = state.program.operands(shlInstr);
+                        const VariableId elemmVar = shlOperands[0];
+                        const VariableId idxVar = shlOperands[1];
+                        // cleared = and(base, notoh)
+                        const auto andOperands = state.program.operands(andInstr);
+                        VariableId baseVar, notohVar;
+                        baseVar = notohVar = VariableId{};
+                        for (uint32_t k = 0; k < 2; ++k)
+                        {
+                            const VariableId operand = andOperands[k];
+                            if (operand.valid() &&
+                                state.variableDefBlock[operand.value] == blockIndex &&
+                                state.program.opcode(defInstruction(operand)) ==
+                                    Opcode::Not)
+                            {
+                                notohVar = operand;
+                            }
+                            else
+                            {
+                                baseVar = operand;
+                            }
+                        }
+                        if (!baseVar.valid() || !notohVar.valid() ||
+                            variableType(state, baseVar).bitWidth != width ||
+                            variableType(state, baseVar).kind != TypeKind::BitVector)
+                        {
+                            continue;
+                        }
+                        const InstructionId notInstr = defInstruction(notohVar);
+                        if (muxCovered(notInstr) || windowClaimed(notInstr))
+                        {
+                            continue;
+                        }
+                        // notoh = not(onehot); onehot = shl(ones, idx)
+                        const VariableId onehotVar =
+                            state.program.operands(notInstr).front();
+                        if (!onehotVar.valid() ||
+                            state.variableDefBlock[onehotVar.value] != blockIndex)
+                        {
+                            continue;
+                        }
+                        const InstructionId onehotInstr = defInstruction(onehotVar);
+                        if (state.program.opcode(onehotInstr) != Opcode::Shl ||
+                            muxCovered(onehotInstr) || windowClaimed(onehotInstr))
+                        {
+                            continue;
+                        }
+                        const auto onehotOperands = state.program.operands(onehotInstr);
+                        const VariableId onesVar = onehotOperands[0];
+                        if (onehotOperands[1] != idxVar ||
+                            variableType(state, onesVar).bitWidth != width ||
+                            variableType(state, onesVar).kind != TypeKind::BitVector)
+                        {
+                            continue;
+                        }
+                        // elemm = and(elemSource, ones)
+                        if (!elemmVar.valid() ||
+                            state.variableDefBlock[elemmVar.value] != blockIndex)
+                        {
+                            continue;
+                        }
+                        const InstructionId elemmInstr = defInstruction(elemmVar);
+                        if (state.program.opcode(elemmInstr) != Opcode::And ||
+                            muxCovered(elemmInstr) || windowClaimed(elemmInstr))
+                        {
+                            continue;
+                        }
+                        const auto elemmOperands = state.program.operands(elemmInstr);
+                        VariableId elemSource;
+                        if (elemmOperands[0] == onesVar)
+                        {
+                            elemSource = elemmOperands[1];
+                        }
+                        else if (elemmOperands[1] == onesVar)
+                        {
+                            elemSource = elemmOperands[0];
+                        }
+                        else
+                        {
+                            continue;
+                        }
+                        // elem: zext assign (narrow -> wide) or direct narrow.
+                        VariableId elemVar = elemSource;
+                        uint32_t elemWidth =
+                            variableType(state, elemSource).bitWidth;
+                        InstructionId zextInstr{};
+                        bool hasZext = false;
+                        if (elemSource.valid() &&
+                            state.variableDefBlock[elemSource.value] == blockIndex)
+                        {
+                            const InstructionId sourceDef = defInstruction(elemSource);
+                            if (state.program.opcode(sourceDef) == Opcode::Assign &&
+                                !state.program.operands(sourceDef).empty())
+                            {
+                                const VariableId narrow =
+                                    state.program.operands(sourceDef).front();
+                                const uint32_t narrowWidth =
+                                    variableType(state, narrow).bitWidth;
+                                if (narrowWidth <= 64)
+                                {
+                                    elemVar = narrow;
+                                    elemWidth = narrowWidth;
+                                    zextInstr = sourceDef;
+                                    hasZext = true;
+                                }
+                            }
+                        }
+                        if (elemWidth == 0 || elemWidth > 64)
+                        {
+                            continue;
+                        }
+                        match.onehot = onehotInstr;
+                        match.notoh = notInstr;
+                        match.cleared = andInstr;
+                        match.elemm = elemmInstr;
+                        match.placed = shlInstr;
+                        match.merged = orInstr;
+                        match.zext = zextInstr;
+                        match.hasZext = hasZext;
+                        match.base = baseVar;
+                        match.idx = idxVar;
+                        match.ones = onesVar;
+                        match.elem = elemVar;
+                        match.elemWidth = elemWidth;
+                        match.cond = VariableId{};
+                        matched = true;
+                    }
+                    if (!matched)
+                    {
+                        continue;
+                    }
+                    // Conditional tail: mux(cond, merged, base) as the sole
+                    // merged consumer turns the cone conditional.
+                    match.tail = orInstr;
+                    match.result = orResults.front();
+                    const auto [ub, ue] = usesOf(match.result);
+                    if (ue - ub == 1)
+                    {
+                        const InstructionId only{useList[ub]};
+                        if (instructionBlock[only.value] == blockIndex &&
+                            !muxCovered(only) && !windowClaimed(only) &&
+                            state.program.opcode(only) == Opcode::Mux)
+                        {
+                            const auto muxOperands = state.program.operands(only);
+                            if (muxOperands.size() == 3 &&
+                                muxOperands[1] == match.result &&
+                                muxOperands[2] == match.base)
+                            {
+                                match.tail = only;
+                                match.result =
+                                    state.program.results(only).front();
+                                match.cond = muxOperands[0];
+                            }
+                        }
+                    }
+                    else if (ue - ub > 1)
+                    {
+                        continue; // merged fans out: cannot skip the or
+                    }
+                    coneByResult.emplace(match.result.value, std::move(match));
+                }
+                if (coneByResult.empty())
+                {
+                    continue;
+                }
+                // Internal closure: every internal result's consumers must
+                // stay inside the cone.
+                std::unordered_set<uint32_t> bailedResults;
+                for (const auto &[resultVar, cone] : coneByResult)
+                {
+                    std::unordered_set<uint32_t> internalInstrs;
+                    internalInstrs.insert(cone.onehot.value);
+                    internalInstrs.insert(cone.notoh.value);
+                    internalInstrs.insert(cone.cleared.value);
+                    internalInstrs.insert(cone.elemm.value);
+                    internalInstrs.insert(cone.placed.value);
+                    internalInstrs.insert(cone.merged.value);
+                    internalInstrs.insert(cone.tail.value);
+                    if (cone.hasZext)
+                    {
+                        internalInstrs.insert(cone.zext.value);
+                    }
+                    bool closed = true;
+                    const InstructionId internalResults[6] = {
+                        cone.onehot, cone.notoh, cone.cleared,
+                        cone.elemm, cone.placed, cone.merged};
+                    for (const InstructionId internal : internalResults)
+                    {
+                        const VariableId internalResult =
+                            state.program.results(internal).front();
+                        if (internalResult == cone.result)
+                        {
+                            continue;
+                        }
+                        const auto [ub, ue] = usesOf(internalResult);
+                        for (uint32_t use = ub; use < ue && closed; ++use)
+                        {
+                            if (internalInstrs.count(useList[use]) == 0)
+                            {
+                                closed = false;
+                            }
+                        }
+                        if (!closed)
+                        {
+                            break;
+                        }
+                    }
+                    if (cone.hasZext)
+                    {
+                        const VariableId zextResult =
+                            state.program.results(cone.zext).front();
+                        const auto [ub, ue] = usesOf(zextResult);
+                        for (uint32_t use = ub; use < ue && closed; ++use)
+                        {
+                            if (internalInstrs.count(useList[use]) == 0)
+                            {
+                                closed = false;
+                            }
+                        }
+                    }
+                    if (!closed)
+                    {
+                        bailedResults.insert(resultVar);
+                        ++state.dynBlendBailed;
+                    }
+                }
+                // Chain linking: cone A.base == cone B.result.
+                std::unordered_map<uint32_t, uint32_t> childOf;
+                std::unordered_set<uint32_t> blocked;
+                for (const auto &[resultVar, cone] : coneByResult)
+                {
+                    if (bailedResults.count(resultVar) != 0)
+                    {
+                        continue;
+                    }
+                    if (coneByResult.count(cone.base.value) == 0 ||
+                        bailedResults.count(cone.base.value) != 0)
+                    {
+                        continue;
+                    }
+                    const auto [it, inserted] =
+                        childOf.emplace(cone.base.value, resultVar);
+                    if (!inserted)
+                    {
+                        blocked.insert(cone.base.value);
+                        blocked.insert(it->second);
+                        blocked.insert(resultVar);
+                    }
+                }
+                for (const auto &[firstVar, firstCone] : coneByResult)
+                {
+                    if (bailedResults.count(firstVar) != 0 ||
+                        blocked.count(firstVar) != 0)
+                    {
+                        continue;
+                    }
+                    // Chain start: its base is not another cone's result.
+                    if (coneByResult.count(firstCone.base.value) != 0 &&
+                        bailedResults.count(firstCone.base.value) == 0)
+                    {
+                        continue;
+                    }
+                    std::vector<uint32_t> members; // result vars, cone order
+                    members.push_back(firstVar);
+                    bool okChain = true;
+                    while (okChain)
+                    {
+                        const auto childIt = childOf.find(members.back());
+                        if (childIt == childOf.end())
+                        {
+                            break;
+                        }
+                        if (blocked.count(childIt->second) != 0 ||
+                            bailedResults.count(childIt->second) != 0)
+                        {
+                            okChain = false;
+                            break;
+                        }
+                        members.push_back(childIt->second);
+                    }
+                    if (!okChain)
+                    {
+                        ++state.dynBlendBailed;
+                        continue;
+                    }
+                    // Validate intermediate result consumers.
+                    bool bail = false;
+                    std::vector<std::pair<uint32_t, int8_t>> pending;
+                    std::vector<uint32_t> materializeTails;
+                    for (std::size_t k = 0; k + 1 < members.size() && !bail; ++k)
+                    {
+                        const uint32_t resultVar = members[k];
+                        const ConeMatch &cone = coneByResult[resultVar];
+                        const uint32_t tailPos = instructionPos[cone.tail.value];
+                        const uint32_t nextTailPos =
+                            instructionPos[coneByResult[members[k + 1]].tail.value];
+                        bool materialize = visible[resultVar] != 0;
+                        const auto [ub, ue] = usesOf(VariableId{resultVar});
+                        for (uint32_t use = ub; use < ue && !bail; ++use)
+                        {
+                            const uint32_t user = useList[use];
+                            if (user == coneByResult[members[k + 1]].cleared.value ||
+                                user == coneByResult[members[k + 1]].tail.value)
+                            {
+                                // Next cone's base read: realized by the
+                                // accumulator (cleared is skipped; the
+                                // conditional tail's false arm is "no blend").
+                                continue;
+                            }
+                            if (instructionBlock[user] != blockIndex)
+                            {
+                                materialize = true;
+                                continue;
+                            }
+                            if (muxCovered(InstructionId{user}) ||
+                                windowClaimed(InstructionId{user}))
+                            {
+                                bail = true;
+                                break;
+                            }
+                            const InstructionId userInstr{user};
+                            const Opcode userOp = state.program.opcode(userInstr);
+                            if (userOp != Opcode::SliceStatic &&
+                                userOp != Opcode::SliceDynamic)
+                            {
+                                materialize = true;
+                                continue;
+                            }
+                            const uint32_t userPos = instructionPos[user];
+                            if (userPos <= tailPos)
+                            {
+                                materialize = true; // reads a previous round
+                                continue;
+                            }
+                            if (userPos >= nextTailPos)
+                            {
+                                materialize = true; // reads a torn value
+                                continue;
+                            }
+                            pending.emplace_back(user, kDynBlendRemapSlice);
+                        }
+                        if (materialize)
+                        {
+                            materializeTails.push_back(cone.tail.value);
+                        }
+                    }
+                    // Final result: same-block early use or mux coverage
+                    // would tear the accumulator.
+                    {
+                        const uint32_t lastVar = members.back();
+                        const uint32_t lastPos =
+                            instructionPos[coneByResult[lastVar].tail.value];
+                        const auto [ub, ue] = usesOf(VariableId{lastVar});
+                        for (uint32_t use = ub; use < ue && !bail; ++use)
+                        {
+                            const uint32_t user = useList[use];
+                            if (muxCovered(InstructionId{user}) ||
+                                windowClaimed(InstructionId{user}))
+                            {
+                                bail = true;
+                                break;
+                            }
+                            if (instructionBlock[user] == blockIndex &&
+                                instructionPos[user] <= lastPos)
+                            {
+                                bail = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (bail)
+                    {
+                        ++state.dynBlendBailed;
+                        continue;
+                    }
+                    const int32_t planId =
+                        static_cast<int32_t>(state.dynBlendPlans.size());
+                    EmitState::DynBlendPlan plan;
+                    plan.finalVar = VariableId{members.back()};
+                    plan.width =
+                        variableType(state, VariableId{members.back()}).bitWidth;
+                    plan.cones.reserve(members.size());
+                    for (const uint32_t memberVar : members)
+                    {
+                        const ConeMatch &match = coneByResult[memberVar];
+                        EmitState::DynBlendPlan::Cone cone;
+                        cone.tail = match.tail;
+                        cone.result = match.result;
+                        cone.base = match.base;
+                        cone.idx = match.idx;
+                        cone.ones = match.ones;
+                        cone.elem = match.elem;
+                        cone.elemWidth = match.elemWidth;
+                        cone.cond = match.cond;
+                        const InstructionId internalInstrs[7] = {
+                            match.onehot, match.notoh, match.cleared,
+                            match.elemm, match.placed, match.merged,
+                            match.hasZext ? match.zext : match.merged};
+                        cone.internalCount = match.hasZext ? 7 : 6;
+                        for (uint32_t i = 0; i < cone.internalCount; ++i)
+                        {
+                            cone.internal[i] = internalInstrs[i];
+                        }
+                        plan.cones.push_back(cone);
+                    }
+                    for (std::size_t k = 0; k < plan.cones.size(); ++k)
+                    {
+                        const auto &cone = plan.cones[k];
+                        state.instructionDynBlendPlan[cone.tail.value] = planId;
+                        state.instructionDynBlendAction[cone.tail.value] =
+                            k == 0 ? kDynBlendHead : kDynBlendCone;
+                        for (uint32_t i = 0; i < cone.internalCount; ++i)
+                        {
+                            const uint32_t internal = cone.internal[i].value;
+                            if (internal != cone.tail.value &&
+                                state.instructionDynBlendAction[internal] < 0)
+                            {
+                                state.instructionDynBlendAction[internal] =
+                                    kDynBlendSkip;
+                                ++state.dynBlendSkipped;
+                            }
+                        }
+                    }
+                    for (const auto &[user, action] : pending)
+                    {
+                        state.instructionDynBlendPlan[user] = planId;
+                        state.instructionDynBlendAction[user] = action;
+                        ++state.dynBlendRemapped;
+                    }
+                    for (const uint32_t tail : materializeTails)
+                    {
+                        state.instructionDynBlendMaterialize[tail] = 1;
+                    }
+                    state.dynBlendChainCount += 1;
+                    state.dynBlendConeCount += plan.cones.size();
+                    state.dynBlendMaterialized += materializeTails.size();
+                    state.dynBlendPlans.push_back(std::move(plan));
+                }
+            }
+        }
+
         // NO0013 F1/F2: plan windowed emission for lane-build concat chains
         // (F1) and standalone wide concats (F2). See EmitState's
         // WindowChainPlan comment for the semantics. Planning is purely an
@@ -6038,6 +6814,9 @@ namespace wolvrix::lib::grhsim::am
         // NO0013 F1/F2 windowed emission of lane-build concat cones:
         // planned after mux fusion (mux-covered instructions are excluded).
         planWindowedChains(model, state);
+        // NO0014 dynamic bit-field functional-update cone collapse
+        // (intRat/vecRat/vlRat-style multi-port table updates).
+        planDynBlendCones(model, state);
 
         if (statsAttribute != options.attributes.end() && statsAttribute->second == "true")
         {
@@ -6267,6 +7046,8 @@ namespace wolvrix::lib::grhsim::am
                << "    static void insert_words(std::uint64_t *target, std::uint32_t targetWidth, std::uint64_t targetLsb, const std::uint64_t *source, std::uint32_t sourceWidth);\n"
                << "    static void insert_replace_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *row, std::uint32_t rowWidth, std::uint64_t targetLsb, const std::uint64_t *source, std::uint32_t sourceWidth);\n"
                << "    static void replace_window_words(std::uint64_t *target, std::uint32_t targetWidth, std::uint64_t targetLsb, const std::uint64_t *source, std::uint32_t sourceWidth);\n"
+               << "    static std::uint64_t shl_word(const std::uint64_t *source, std::uint32_t width, std::uint64_t shift, std::size_t word);\n"
+               << "    static void blend_window_dyn_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *index, std::uint32_t indexWidth, const std::uint64_t *ones, const std::uint64_t *elem, std::uint32_t elemWidth);\n"
                << "    static void slice_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, std::uint64_t start);\n"
                << "    static void slice_dynamic_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, const std::uint64_t *index, std::uint32_t indexWidth);\n"
                << "    static void slice_array_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, const std::uint64_t *index, std::uint32_t indexWidth);\n"
@@ -7201,6 +7982,34 @@ namespace
                << "            target[targetIndex + 1U] = (target[targetIndex + 1U] & ~window) | ((value >> (64U - shift)) & window);\n"
                << "        }\n"
                << "    }\n"
+               << "}\n"
+               << "std::uint64_t " << className
+               << "::shl_word(const std::uint64_t *source, std::uint32_t width, std::uint64_t shift, std::size_t word) {\n"
+               << "    const std::int64_t start = static_cast<std::int64_t>(word) * 64 - static_cast<std::int64_t>(shift);\n"
+               << "    if (start >= 0) return extract_word(source, width, static_cast<std::uint64_t>(start));\n"
+               << "    const std::uint32_t back = static_cast<std::uint32_t>(-start);\n"
+               << "    if (back >= 64) return 0;\n"
+               << "    return (extract_word(source, width, 0) & ((UINT64_C(1) << (64U - back)) - 1U)) << back;\n"
+               << "}\n"
+               << "void " << className
+               << "::blend_window_dyn_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *index, std::uint32_t indexWidth, const std::uint64_t *ones, const std::uint64_t *elem, std::uint32_t elemWidth) {\n"
+               << "    const std::size_t words = word_count(targetWidth);\n"
+               << "    const std::uint64_t idx = static_cast<std::uint64_t>(index_words(index, indexWidth, targetWidth));\n"
+               << "    const std::uint64_t maskedElem = elem[0] & (ones[0] & bit_mask(elemWidth >= 64U ? 64U : elemWidth));\n"
+               << "    if (elemWidth == 8U && (idx & 7U) == 0 && idx + 8U <= targetWidth && ones[0] == UINT64_C(0xFF)) {\n"
+               << "        bool upperZero = true;\n"
+               << "        for (std::size_t i = 1; i < words; ++i) if (ones[i] != 0) { upperZero = false; break; }\n"
+               << "        if (upperZero) {\n"
+               << "            reinterpret_cast<std::uint8_t *>(target)[idx >> 3U] = static_cast<std::uint8_t>(maskedElem);\n"
+               << "            return;\n"
+               << "        }\n"
+               << "    }\n"
+               << "    for (std::size_t i = 0; i < words; ++i) {\n"
+               << "        const std::uint64_t mask = shl_word(ones, targetWidth, idx, i);\n"
+               << "        const std::uint64_t ev = shl_word(&maskedElem, 64U, idx, i);\n"
+               << "        target[i] = (target[i] & ~mask) | ev;\n"
+               << "    }\n"
+               << "    target[words - 1U] &= bit_mask(targetWidth - static_cast<std::uint32_t>((words - 1U) * 64U));\n"
                << "}\n"
                << "void " << className
                << "::slice_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, std::uint64_t start) {\n"
@@ -8554,6 +9363,12 @@ namespace
         result.windowedRemappedSlices = state.windowedRemappedSlices;
         result.windowedMaterialized = state.windowedMaterialized;
         result.windowedBailedChains = state.windowedBailedChains;
+        result.dynBlendChains = state.dynBlendChainCount;
+        result.dynBlendCones = state.dynBlendConeCount;
+        result.dynBlendSkipped = state.dynBlendSkipped;
+        result.dynBlendRemapped = state.dynBlendRemapped;
+        result.dynBlendMaterialized = state.dynBlendMaterialized;
+        result.dynBlendBailed = state.dynBlendBailed;
         result.artifacts.reserve(stagedArtifacts.size());
         for (const StagedArtifact &artifact : stagedArtifacts)
         {
