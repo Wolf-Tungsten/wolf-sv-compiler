@@ -7,6 +7,7 @@
 #include <charconv>
 #include <chrono>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -417,6 +418,53 @@ namespace wolvrix::lib::grhsim::am
             // Re-entrancy guard: emitMuxFusionRun emits the preamble through
             // emitInstruction, which must not re-enter the run hook.
             mutable bool muxRunEmissionActive = false;
+            // NO0013 F1/F2 windowed emission of lane-build concat cones. A
+            // lane-build chain is Concat C_0..C_n where every step C_j
+            // (j >= 1) re-splices a few narrow element windows over the
+            // previous chain value through identity-placed SliceStatic
+            // operands. The stock emission rebuilds all W bits per step
+            // (zero_words + full-width insert_words), so a 260-step chain on
+            // a 1040-bit value moves ~9 MB of words per block activation.
+            // The windowed form emits C_0 once into the final step's slot D
+            // and each later step as element-window replaces into D; chain
+            // intermediates are never materialized (escape fallback: a full
+            // assign_words copy at the step's own position). SliceStatic
+            // consumers of an intermediate are re-pointed at D when their
+            // emission position precedes the first step that overwrites
+            // their window, otherwise the intermediate is materialized.
+            // (The F2 standalone-concat variant was reverted after
+            // measurement: per-word replace-RMW is pricier than the stock
+            // zero fill + OR-insert; see NO0013 §9.)
+            struct WindowChainPlan
+            {
+                struct Step
+                {
+                    InstructionId instruction;
+                    // (operand index, concat bit offset) of the element
+                    // (non-backbone) operands spliced by this step.
+                    std::vector<std::pair<uint32_t, uint64_t>> elems;
+                };
+                VariableId finalVar; // D: last chain concat's result
+                uint32_t width = 0;  // chain bit width W
+                std::vector<Step> steps;
+                std::unordered_map<uint32_t, uint32_t> stepIndexByInstr;
+            };
+            // Per-instruction action (indexed by InstructionId value):
+            // -1 none, 0 chain head, 1 chain step, 2 skip (backbone slice),
+            // 3 slice re-pointed at the chain final var, 4 windowed concat.
+            std::vector<int32_t> instructionWindowPlan;
+            std::vector<int8_t> instructionWindowAction;
+            // Chain member also materializes its own slot (assign copy from
+            // the final var right after its window replaces).
+            std::vector<uint8_t> instructionWindowMaterialize;
+            std::vector<WindowChainPlan> windowChainPlans;
+            uint64_t windowedChainCount = 0;
+            uint64_t windowedStepCount = 0;
+            uint64_t windowedConcatCount = 0;
+            uint64_t windowedSkippedSlices = 0;
+            uint64_t windowedRemappedSlices = 0;
+            uint64_t windowedMaterialized = 0;
+            uint64_t windowedBailedChains = 0;
         };
 
         constexpr uint8_t kEscapeGlobal = 1U << 0U;
@@ -425,6 +473,12 @@ namespace wolvrix::lib::grhsim::am
         constexpr uint32_t kInvalidLocalityBlock = std::numeric_limits<uint32_t>::max();
         constexpr uint32_t kInvalidChangedResultIndex =
             std::numeric_limits<uint32_t>::max();
+        // NO0013 windowed emission actions (EmitState::instructionWindowAction).
+        constexpr int8_t kWindowActionChainHead = 0;
+        constexpr int8_t kWindowActionChainStep = 1;
+        constexpr int8_t kWindowActionSkip = 2;
+        constexpr int8_t kWindowActionRemapSlice = 3;
+        constexpr int8_t kWindowActionConcat = 4;
 
         bool isLocalValue(const EmitState &state, VariableId variable)
         {
@@ -1364,6 +1418,112 @@ namespace wolvrix::lib::grhsim::am
             return code;
         }
 
+        // NO0013 F1/F2 windowed emission (plan fields documented in
+        // EmitState). Handles the per-instruction actions planned by
+        // planWindowedChains; returns nullopt only on plan inconsistency.
+        std::optional<std::string> emitWindowedInstruction(const EmitState &state,
+                                                           InstructionId instruction,
+                                                           std::string &error)
+        {
+            const int8_t action = state.instructionWindowAction[instruction.value];
+            const auto operands = state.program.operands(instruction);
+            const auto results = state.program.results(instruction);
+            if (action == kWindowActionSkip)
+            {
+                return std::string();
+            }
+            if (action == kWindowActionConcat)
+            {
+                // F2 (currently unplanned — reverted after measurement, see
+                // NO0013 §9): operand windows tile the full result width, so
+                // the stock zero_words preamble is dead; replaces suffice.
+                const Type &resultType = variableType(state, results.front());
+                const uint32_t width = resultType.bitWidth;
+                const std::string target = wordDataExpr(state, results.front());
+                std::string code;
+                uint32_t remaining = width;
+                for (VariableId operand : operands)
+                {
+                    const Type &type = variableType(state, operand);
+                    remaining -= type.bitWidth;
+                    code += "replace_window_words(" + target + ", " +
+                            std::to_string(width) + ", " + std::to_string(remaining) + ", " +
+                            wordDataExpr(state, operand) + ", " +
+                            std::to_string(type.bitWidth) + ");\n";
+                }
+                // No top-word mask: every reader masks by width
+                // (equal_words/any_words/extract_word/slice_words/...), so
+                // bits above the concat width are unobservable; the extra
+                // RMW statement per concat measured as a cold-line cost.
+                return code;
+            }
+            const EmitState::WindowChainPlan &plan =
+                state.windowChainPlans[static_cast<std::size_t>(
+                    state.instructionWindowPlan[instruction.value])];
+            const std::string chainTarget = wordDataExpr(state, plan.finalVar);
+            if (action == kWindowActionChainHead)
+            {
+                // C_0 full build, straight into the chain final slot D.
+                std::string code = "zero_words(" + chainTarget + ", " +
+                                   std::to_string(plan.width) + ");\n";
+                uint32_t remaining = plan.width;
+                for (VariableId operand : operands)
+                {
+                    const Type &type = variableType(state, operand);
+                    remaining -= type.bitWidth;
+                    code += "insert_words(" + chainTarget + ", " +
+                            std::to_string(plan.width) + ", " +
+                            std::to_string(remaining) + ", " +
+                            wordDataExpr(state, operand) + ", " +
+                            std::to_string(type.bitWidth) + ");\n";
+                }
+                if (state.instructionWindowMaterialize[instruction.value] != 0)
+                {
+                    code += "assign_words(" + wordDataExpr(state, results.front()) + ", " +
+                            std::to_string(plan.width) + ", " + chainTarget + ", " +
+                            std::to_string(plan.width) + ", false);\n";
+                }
+                return code;
+            }
+            if (action == kWindowActionChainStep)
+            {
+                // Later steps only splice their element windows into D; the
+                // backbone content is already there by construction.
+                const auto stepIt = plan.stepIndexByInstr.find(instruction.value);
+                if (stepIt == plan.stepIndexByInstr.end())
+                {
+                    error = "window chain step missing from plan";
+                    return std::nullopt;
+                }
+                const EmitState::WindowChainPlan::Step &step = plan.steps[stepIt->second];
+                std::string code;
+                for (const auto &[operandIndex, offset] : step.elems)
+                {
+                    const VariableId operand = operands[operandIndex];
+                    const Type &type = variableType(state, operand);
+                    code += "replace_window_words(" + chainTarget + ", " +
+                            std::to_string(plan.width) + ", " + std::to_string(offset) +
+                            ", " + wordDataExpr(state, operand) + ", " +
+                            std::to_string(type.bitWidth) + ");\n";
+                }
+                if (state.instructionWindowMaterialize[instruction.value] != 0)
+                {
+                    code += "assign_words(" + wordDataExpr(state, results.front()) + ", " +
+                            std::to_string(plan.width) + ", " + chainTarget + ", " +
+                            std::to_string(plan.width) + ", false);\n";
+                }
+                return code;
+            }
+            // kWindowActionRemapSlice: SliceStatic re-pointed at D (the
+            // planner proved the read happens before any overwriting step).
+            const Type &resultType = variableType(state, results.front());
+            const auto attributes = state.program.sliceStaticAttributes(instruction);
+            return "slice_words(" + wordDataExpr(state, results.front()) + ", " +
+                   std::to_string(resultType.bitWidth) + ", " + chainTarget + ", " +
+                   std::to_string(plan.width) + ", UINT64_C(" +
+                   std::to_string(attributes->lsb) + "));\n";
+        }
+
         std::optional<std::string> emitNonScalarInstruction(const EmitState &state,
                                                             InstructionId instruction,
                                                             std::string &error)
@@ -1380,6 +1540,12 @@ namespace wolvrix::lib::grhsim::am
                 error = "non-scalar pure AM instruction requires bit-vector operands: " +
                         std::string(toString(opcode));
                 return std::nullopt;
+            }
+
+            if (instruction.value < state.instructionWindowAction.size() &&
+                state.instructionWindowAction[instruction.value] >= 0)
+            {
+                return emitWindowedInstruction(state, instruction, error);
             }
 
             const auto binaryCall = [&](std::string_view helper, uint32_t operation) {
@@ -4721,6 +4887,472 @@ namespace wolvrix::lib::grhsim::am
         // would read an earlier run root's result (the fused if/else would
         // otherwise become a use-before-def); the atom then starts a fresh
         // run. Runs with a single arm emit plainly.
+        // NO0013 F1/F2: plan windowed emission for lane-build concat chains
+        // (F1) and standalone wide concats (F2). See EmitState's
+        // WindowChainPlan comment for the semantics. Planning is purely an
+        // emit-time code-shape decision: the scheduled program is untouched
+        // (atom connectivity invariant by construction). Planned after
+        // planMuxFusionRuns so mux-run-covered instructions can be excluded.
+        void planWindowedChains(const ExecutableModel &model, EmitState &state)
+        {
+            constexpr uint32_t kMinChainWidth = 256;
+            constexpr std::size_t kMinChainSteps = 3;
+
+            const std::size_t instructionCount = state.program.instructionCount();
+            state.instructionWindowPlan.assign(instructionCount, -1);
+            state.instructionWindowAction.assign(instructionCount, -1);
+            state.instructionWindowMaterialize.assign(instructionCount, 0);
+            state.windowChainPlans.clear();
+            state.windowedChainCount = 0;
+            state.windowedStepCount = 0;
+            state.windowedConcatCount = 0;
+            state.windowedSkippedSlices = 0;
+            state.windowedRemappedSlices = 0;
+            state.windowedMaterialized = 0;
+            state.windowedBailedChains = 0;
+            if (std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_WINDOWED_EMIT") != nullptr)
+            {
+                return;
+            }
+
+            const uint32_t variableCount = state.program.variableCount();
+            const uint32_t blockCount = state.blockCount;
+            constexpr uint32_t kInvalidVar = std::numeric_limits<uint32_t>::max();
+
+            // Interface-visible variables must keep their own slot contents.
+            std::vector<uint8_t> visible(variableCount, 0);
+            for (const PortBinding &port : model.interface.ports)
+            {
+                if (port.input.valid())
+                {
+                    visible[port.input.value] = 1;
+                }
+                if (port.output.valid())
+                {
+                    visible[port.output.value] = 1;
+                }
+                if (port.outputEnable.valid())
+                {
+                    visible[port.outputEnable.value] = 1;
+                }
+            }
+            for (const VariableLabel &declared : model.interface.declaredVariables)
+            {
+                visible[declared.variable.value] = 1;
+            }
+
+            // Per-instruction (block, position) plus consumer lists (CSR)
+            // over candidate vars = results of SliceStatic or wide Concat.
+            std::vector<uint32_t> instructionBlock(instructionCount, kInvalidVar);
+            std::vector<uint32_t> instructionPos(instructionCount, 0);
+            std::vector<uint8_t> candidate(variableCount, 0);
+            for (uint32_t blockIndex = 0; blockIndex < blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                for (std::size_t position = 0; position < model.program.blockSize(block);
+                     ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    instructionBlock[instruction.value] = blockIndex;
+                    instructionPos[instruction.value] = static_cast<uint32_t>(position);
+                    const Opcode opcode = state.program.opcode(instruction);
+                    const auto results = state.program.results(instruction);
+                    if (results.empty())
+                    {
+                        continue;
+                    }
+                    if (opcode == Opcode::SliceStatic)
+                    {
+                        candidate[results.front().value] = 1;
+                    }
+                    else if (opcode == Opcode::Concat &&
+                             variableType(state, results.front()).bitWidth >= kMinChainWidth)
+                    {
+                        candidate[results.front().value] = 1;
+                    }
+                }
+            }
+            std::vector<uint32_t> useOffsets(variableCount + 1, 0);
+            for (uint32_t blockIndex = 0; blockIndex < blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                for (std::size_t position = 0; position < model.program.blockSize(block);
+                     ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    for (const VariableId operand : state.program.operands(instruction))
+                    {
+                        if (operand.valid() && candidate[operand.value])
+                        {
+                            ++useOffsets[operand.value + 1];
+                        }
+                    }
+                }
+            }
+            for (uint32_t index = 0; index < variableCount; ++index)
+            {
+                useOffsets[index + 1] += useOffsets[index];
+            }
+            std::vector<uint32_t> useList(useOffsets[variableCount]);
+            std::vector<uint32_t> useCursor(useOffsets.begin(), useOffsets.end() - 1);
+            for (uint32_t blockIndex = 0; blockIndex < blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                for (std::size_t position = 0; position < model.program.blockSize(block);
+                     ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    for (const VariableId operand : state.program.operands(instruction))
+                    {
+                        if (operand.valid() && candidate[operand.value])
+                        {
+                            useList[useCursor[operand.value]++] = instruction.value;
+                        }
+                    }
+                }
+            }
+
+            struct StepInfo
+            {
+                uint32_t pred = kInvalidVar;
+                std::vector<std::pair<uint32_t, uint64_t>> elems; // (operand index, offset)
+            };
+            for (uint32_t blockIndex = 0; blockIndex < blockCount; ++blockIndex)
+            {
+                if (blockIndex >= model.commitBlockBegin && blockIndex < model.commitBlockEnd)
+                {
+                    continue;
+                }
+                const BlockId block{blockIndex};
+                const std::size_t blockSize = model.program.blockSize(block);
+                const auto blockInstr = [&](std::size_t position) {
+                    return model.program.blockInstruction(block, position);
+                };
+                const auto defInstruction = [&](VariableId variable) {
+                    return blockInstr(state.variableDefPosition[variable.value]);
+                };
+                // Classify wide concats: chain steps carry >= 1 backbone
+                // operand (SliceStatic of one in-block concat predecessor,
+                // identity-placed); everything else is an element operand.
+                std::unordered_map<uint32_t, StepInfo> stepByVar;
+                for (std::size_t position = 0; position < blockSize; ++position)
+                {
+                    const InstructionId instruction = blockInstr(position);
+                    if (state.program.opcode(instruction) != Opcode::Concat)
+                    {
+                        continue;
+                    }
+                    const auto operands = state.program.operands(instruction);
+                    const auto results = state.program.results(instruction);
+                    const uint32_t width = variableType(state, results.front()).bitWidth;
+                    if (width < kMinChainWidth)
+                    {
+                        continue;
+                    }
+                    if (instruction.value < state.instructionMuxRun.size() &&
+                        state.instructionMuxRun[instruction.value] >= 0)
+                    {
+                        continue;
+                    }
+                    StepInfo info;
+                    bool ok = true;
+                    uint64_t offset = width;
+                    for (uint32_t index = 0; index < operands.size() && ok; ++index)
+                    {
+                        const VariableId operand = operands[index];
+                        const uint32_t operandWidth = variableType(state, operand).bitWidth;
+                        offset -= operandWidth;
+                        bool isBackbone = false;
+                        if (operand.valid() &&
+                            state.variableDefBlock[operand.value] == blockIndex &&
+                            (state.variableEscapeFlags[operand.value] & kEscapeEarlyUse) == 0)
+                        {
+                            const InstructionId sliceInstr = defInstruction(operand);
+                            if (state.program.opcode(sliceInstr) == Opcode::SliceStatic &&
+                                (sliceInstr.value >= state.instructionMuxRun.size() ||
+                                 state.instructionMuxRun[sliceInstr.value] < 0))
+                            {
+                                const auto attributes =
+                                    state.program.sliceStaticAttributes(sliceInstr);
+                                const VariableId source =
+                                    state.program.operands(sliceInstr).front();
+                                if (attributes && attributes->lsb == offset &&
+                                    source.valid() &&
+                                    variableType(state, source).bitWidth == width &&
+                                    state.variableDefBlock[source.value] == blockIndex)
+                                {
+                                    const InstructionId predInstr = defInstruction(source);
+                                    if (state.program.opcode(predInstr) == Opcode::Concat &&
+                                        (predInstr.value >= state.instructionMuxRun.size() ||
+                                         state.instructionMuxRun[predInstr.value] < 0))
+                                    {
+                                        isBackbone = true;
+                                        if (info.pred != kInvalidVar &&
+                                            info.pred != source.value)
+                                        {
+                                            ok = false; // two concat predecessors
+                                        }
+                                        info.pred = source.value;
+                                    }
+                                }
+                            }
+                        }
+                        if (!isBackbone)
+                        {
+                            info.elems.emplace_back(index, offset);
+                        }
+                    }
+                    if (ok && info.pred != kInvalidVar)
+                    {
+                        stepByVar.emplace(results.front().value, std::move(info));
+                    }
+                }
+                if (!stepByVar.empty())
+                {
+                // Link steps into chains; branching predecessors block both
+                // sides (kept conservative, windowing bails on such chains).
+                std::unordered_map<uint32_t, uint32_t> childOf;
+                std::unordered_set<uint32_t> blocked;
+                for (const auto &[resultVar, info] : stepByVar)
+                {
+                    const auto [it, inserted] = childOf.emplace(info.pred, resultVar);
+                    if (!inserted)
+                    {
+                        blocked.insert(info.pred);
+                        blocked.insert(it->second);
+                        blocked.insert(resultVar);
+                    }
+                }
+                for (const auto &[firstVar, firstInfo] : stepByVar)
+                {
+                    if (stepByVar.count(firstInfo.pred) != 0)
+                    {
+                        continue; // mid-chain step; the head's walk covers it
+                    }
+                    std::vector<uint32_t> members;
+                    members.push_back(firstInfo.pred);
+                    bool okChain = blocked.count(firstInfo.pred) == 0;
+                    while (okChain)
+                    {
+                        const auto childIt = childOf.find(members.back());
+                        if (childIt == childOf.end())
+                        {
+                            break;
+                        }
+                        if (blocked.count(childIt->second) != 0)
+                        {
+                            okChain = false;
+                            break;
+                        }
+                        members.push_back(childIt->second);
+                    }
+                    if (!okChain || members.size() - 1 < kMinChainSteps)
+                    {
+                        if (!okChain)
+                        {
+                            ++state.windowedBailedChains;
+                        }
+                        continue;
+                    }
+                    const uint32_t width =
+                        variableType(state, VariableId{members.back()}).bitWidth;
+                    // Validate consumers of every non-final member.
+                    bool bail = false;
+                    bool memberMaterialize = false;
+                    std::vector<std::pair<uint32_t, int8_t>> pending;
+                    std::vector<uint32_t> materializeInstrs;
+                    for (std::size_t j = 0; j + 1 < members.size() && !bail; ++j)
+                    {
+                        const uint32_t memberVar = members[j];
+                        const uint32_t memberPos = state.variableDefPosition[memberVar];
+                        const uint32_t nextVar = members[j + 1];
+                        const uint32_t nextInstr =
+                            defInstruction(VariableId{nextVar}).value;
+                        bool materialize = visible[memberVar] != 0;
+                        for (uint32_t use = useOffsets[memberVar];
+                             use < useOffsets[memberVar + 1] && !bail; ++use)
+                        {
+                            const uint32_t user = useList[use];
+                            if (user == nextInstr)
+                            {
+                                continue;
+                            }
+                            if (instructionBlock[user] != blockIndex)
+                            {
+                                materialize = true;
+                                continue;
+                            }
+                            if (user < state.instructionMuxRun.size() &&
+                                state.instructionMuxRun[user] >= 0)
+                            {
+                                bail = true; // fused emission moves positions
+                                break;
+                            }
+                            const InstructionId userInstr{user};
+                            if (state.program.opcode(userInstr) != Opcode::SliceStatic)
+                            {
+                                materialize = true;
+                                continue;
+                            }
+                            const uint32_t userResult =
+                                state.program.results(userInstr).front().value;
+                            const uint32_t userUsesBegin = useOffsets[userResult];
+                            const uint32_t userUsesEnd = useOffsets[userResult + 1];
+                            if (userUsesEnd - userUsesBegin == 1 &&
+                                useList[userUsesBegin] == nextInstr)
+                            {
+                                pending.emplace_back(user, kWindowActionSkip);
+                                continue;
+                            }
+                            const uint32_t userPos = instructionPos[user];
+                            if (userPos <= memberPos)
+                            {
+                                materialize = true; // reads a previous round
+                                continue;
+                            }
+                            const auto attributes =
+                                state.program.sliceStaticAttributes(userInstr);
+                            const uint64_t sliceLsb = attributes->lsb;
+                            const uint64_t sliceWidth =
+                                variableType(state, VariableId{userResult}).bitWidth;
+                            bool remap = true;
+                            for (std::size_t m = j + 1; m < members.size(); ++m)
+                            {
+                                const StepInfo &stepInfo = stepByVar[members[m]];
+                                const uint32_t stepPos =
+                                    state.variableDefPosition[members[m]];
+                                const InstructionId stepInstr =
+                                    defInstruction(VariableId{members[m]});
+                                bool touches = false;
+                                for (const auto &[operandIndex, elemOffset] :
+                                     stepInfo.elems)
+                                {
+                                    const uint64_t elemWidth =
+                                        variableType(state,
+                                                     state.program.operands(
+                                                         stepInstr)[operandIndex])
+                                            .bitWidth;
+                                    if (elemOffset < sliceLsb + sliceWidth &&
+                                        sliceLsb < elemOffset + elemWidth)
+                                    {
+                                        touches = true;
+                                        break;
+                                    }
+                                }
+                                if (touches)
+                                {
+                                    remap = userPos < stepPos;
+                                    break;
+                                }
+                            }
+                            if (remap)
+                            {
+                                pending.emplace_back(user, kWindowActionRemapSlice);
+                            }
+                            else
+                            {
+                                materialize = true;
+                            }
+                        }
+                        if (materialize)
+                        {
+                            memberMaterialize = true;
+                            materializeInstrs.push_back(
+                                defInstruction(VariableId{memberVar}).value);
+                        }
+                    }
+                    // The final member's slot accumulates from the head's
+                    // position on: a same-block read at or before its own
+                    // definition (or a mux-run-moved read) would tear.
+                    const uint32_t lastVar = members.back();
+                    const uint32_t lastPos = state.variableDefPosition[lastVar];
+                    for (uint32_t use = useOffsets[lastVar];
+                         use < useOffsets[lastVar + 1] && !bail; ++use)
+                    {
+                        const uint32_t user = useList[use];
+                        if (user < state.instructionMuxRun.size() &&
+                            state.instructionMuxRun[user] >= 0)
+                        {
+                            bail = true;
+                            break;
+                        }
+                        if (instructionBlock[user] == blockIndex &&
+                            instructionPos[user] <= lastPos)
+                        {
+                            bail = true;
+                            break;
+                        }
+                    }
+                    if (bail)
+                    {
+                        ++state.windowedBailedChains;
+                        continue;
+                    }
+                    const int32_t planId =
+                        static_cast<int32_t>(state.windowChainPlans.size());
+                    EmitState::WindowChainPlan plan;
+                    plan.finalVar = VariableId{lastVar};
+                    plan.width = width;
+                    plan.steps.reserve(members.size() - 1);
+                    for (std::size_t j = 1; j < members.size(); ++j)
+                    {
+                        const InstructionId stepInstr =
+                            defInstruction(VariableId{members[j]});
+                        EmitState::WindowChainPlan::Step step;
+                        step.instruction = stepInstr;
+                        step.elems = stepByVar[members[j]].elems;
+                        plan.stepIndexByInstr.emplace(
+                            stepInstr.value,
+                            static_cast<uint32_t>(plan.steps.size()));
+                        plan.steps.push_back(std::move(step));
+                    }
+                    const InstructionId headInstr =
+                        defInstruction(VariableId{members.front()});
+                    state.instructionWindowPlan[headInstr.value] = planId;
+                    state.instructionWindowAction[headInstr.value] =
+                        kWindowActionChainHead;
+                    for (const auto &step : plan.steps)
+                    {
+                        state.instructionWindowPlan[step.instruction.value] = planId;
+                        state.instructionWindowAction[step.instruction.value] =
+                            kWindowActionChainStep;
+                    }
+                    for (const auto &[user, action] : pending)
+                    {
+                        state.instructionWindowPlan[user] = planId;
+                        state.instructionWindowAction[user] = action;
+                        if (action == kWindowActionSkip)
+                        {
+                            ++state.windowedSkippedSlices;
+                        }
+                        else
+                        {
+                            ++state.windowedRemappedSlices;
+                        }
+                    }
+                    for (const uint32_t instr : materializeInstrs)
+                    {
+                        state.instructionWindowMaterialize[instr] = 1;
+                    }
+                    state.windowedChainCount += 1;
+                    state.windowedStepCount += plan.steps.size();
+                    state.windowedMaterialized += materializeInstrs.size();
+                    (void)memberMaterialize;
+                    state.windowChainPlans.push_back(std::move(plan));
+                }
+                }
+                // F2 (standalone wide concat -> plain window replaces) was
+                // REVERTED after measurement: replace-RMW costs more per
+                // word than the stock zero_words fill + OR-insert
+                // (b77703 +24.6%, b38653 +5.2%), so standalone concats keep
+                // the stock emission. The kWindowConcat case remains in
+                // emitWindowedInstruction for reference.
+            }
+        }
+
         void planMuxFusionRuns(const ExecutableModel &model, EmitState &state)
         {
             state.instructionMuxRun.assign(state.program.instructionCount(), -1);
@@ -5403,6 +6035,9 @@ namespace wolvrix::lib::grhsim::am
         // NO0008 block-level same-select mux fusion: adjacent mux-rooted
         // atoms sharing one select emit one fused if/else per run.
         planMuxFusionRuns(model, state);
+        // NO0013 F1/F2 windowed emission of lane-build concat cones:
+        // planned after mux fusion (mux-covered instructions are excluded).
+        planWindowedChains(model, state);
 
         if (statsAttribute != options.attributes.end() && statsAttribute->second == "true")
         {
@@ -5431,7 +6066,21 @@ namespace wolvrix::lib::grhsim::am
                                  " scalar_watch_fused=" +
                                  std::to_string(state.scalarWatchFusedCount) +
                                  " mux_atom_fused=" +
-                                 std::to_string(state.muxAtomFusedCount),
+                                 std::to_string(state.muxAtomFusedCount) +
+                                 " windowed_chains=" +
+                                 std::to_string(state.windowedChainCount) +
+                                 " windowed_steps=" +
+                                 std::to_string(state.windowedStepCount) +
+                                 " windowed_concats_f2=" +
+                                 std::to_string(state.windowedConcatCount) +
+                                 " windowed_skipped_slices=" +
+                                 std::to_string(state.windowedSkippedSlices) +
+                                 " windowed_remapped_slices=" +
+                                 std::to_string(state.windowedRemappedSlices) +
+                                 " windowed_materialized=" +
+                                 std::to_string(state.windowedMaterialized) +
+                                 " windowed_bailed_chains=" +
+                                 std::to_string(state.windowedBailedChains),
                              std::string(kContext));
         }
 
@@ -5617,6 +6266,7 @@ namespace wolvrix::lib::grhsim::am
                << "    static std::uint64_t extract_word(const std::uint64_t *source, std::uint32_t width, std::uint64_t start);\n"
                << "    static void insert_words(std::uint64_t *target, std::uint32_t targetWidth, std::uint64_t targetLsb, const std::uint64_t *source, std::uint32_t sourceWidth);\n"
                << "    static void insert_replace_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *row, std::uint32_t rowWidth, std::uint64_t targetLsb, const std::uint64_t *source, std::uint32_t sourceWidth);\n"
+               << "    static void replace_window_words(std::uint64_t *target, std::uint32_t targetWidth, std::uint64_t targetLsb, const std::uint64_t *source, std::uint32_t sourceWidth);\n"
                << "    static void slice_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, std::uint64_t start);\n"
                << "    static void slice_dynamic_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, const std::uint64_t *index, std::uint32_t indexWidth);\n"
                << "    static void slice_array_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, const std::uint64_t *index, std::uint32_t indexWidth);\n"
@@ -6508,6 +7158,29 @@ namespace
                << "void " << className
                << "::insert_replace_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *row, std::uint32_t rowWidth, std::uint64_t targetLsb, const std::uint64_t *source, std::uint32_t sourceWidth) {\n"
                << "    assign_words(target, targetWidth, row, rowWidth, false);\n"
+               << "    if (targetLsb >= targetWidth) return;\n"
+               << "    const std::size_t targetWords = word_count(targetWidth);\n"
+               << "    const std::size_t sourceWords = word_count(sourceWidth);\n"
+               << "    const std::size_t firstTargetWord = static_cast<std::size_t>(targetLsb / 64U);\n"
+               << "    const std::uint32_t shift = static_cast<std::uint32_t>(targetLsb % 64U);\n"
+               << "    for (std::size_t index = 0; index < sourceWords; ++index) {\n"
+               << "        const std::uint32_t bits = index + 1U == sourceWords ? sourceWidth - static_cast<std::uint32_t>(index * 64U) : 64U;\n"
+               << "        const std::uint64_t value = source[index] & bit_mask(bits);\n"
+               << "        const std::size_t targetIndex = firstTargetWord + index;\n"
+               << "        const std::uint32_t covered = bits < 64U - shift ? bits : 64U - shift;\n"
+               << "        if (targetIndex < targetWords) {\n"
+               << "            const std::uint64_t window = covered >= 64U ? UINT64_MAX : (bit_mask(covered) << shift);\n"
+               << "            target[targetIndex] = (target[targetIndex] & ~window) | ((value << shift) & window);\n"
+               << "        }\n"
+               << "        if (shift != 0 && bits > covered && targetIndex + 1U < targetWords) {\n"
+               << "            const std::uint32_t spill = bits - covered;\n"
+               << "            const std::uint64_t window = bit_mask(spill);\n"
+               << "            target[targetIndex + 1U] = (target[targetIndex + 1U] & ~window) | ((value >> (64U - shift)) & window);\n"
+               << "        }\n"
+               << "    }\n"
+               << "}\n"
+               << "void " << className
+               << "::replace_window_words(std::uint64_t *target, std::uint32_t targetWidth, std::uint64_t targetLsb, const std::uint64_t *source, std::uint32_t sourceWidth) {\n"
                << "    if (targetLsb >= targetWidth) return;\n"
                << "    const std::size_t targetWords = word_count(targetWidth);\n"
                << "    const std::size_t sourceWords = word_count(sourceWidth);\n"
@@ -7874,6 +8547,13 @@ namespace
 
         result.success = true;
         result.muxAtomFused = state.muxAtomFusedCount;
+        result.windowedChains = state.windowedChainCount;
+        result.windowedSteps = state.windowedStepCount;
+        result.windowedConcatsF2 = state.windowedConcatCount;
+        result.windowedSkippedSlices = state.windowedSkippedSlices;
+        result.windowedRemappedSlices = state.windowedRemappedSlices;
+        result.windowedMaterialized = state.windowedMaterialized;
+        result.windowedBailedChains = state.windowedBailedChains;
         result.artifacts.reserve(stagedArtifacts.size());
         for (const StagedArtifact &artifact : stagedArtifacts)
         {

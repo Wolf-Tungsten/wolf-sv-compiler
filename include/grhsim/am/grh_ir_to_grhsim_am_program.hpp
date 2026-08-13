@@ -204,6 +204,15 @@ namespace wolvrix::lib::grhsim::am
         // mux-rooted atoms): number of mux assignments covered by fused
         // if/else segments in the emitted sources.
         uint64_t muxAtomFused = 0;
+        // NO0013 windowed emission of lane-build concat cones (F1 chains,
+        // F2 standalone concats): planned/rewritten instruction counts.
+        uint64_t windowedChains = 0;
+        uint64_t windowedSteps = 0;
+        uint64_t windowedConcatsF2 = 0;
+        uint64_t windowedSkippedSlices = 0;
+        uint64_t windowedRemappedSlices = 0;
+        uint64_t windowedMaterialized = 0;
+        uint64_t windowedBailedChains = 0;
     };
 
     // The pipeline currency is the AmGraph: lowering builds the graph

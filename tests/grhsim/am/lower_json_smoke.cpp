@@ -693,6 +693,13 @@ int main(int argc, char **argv)
         uint64_t emitMs = 0;
         uint64_t emittedArtifacts = 0;
         uint64_t muxAtomFused = 0;
+        uint64_t windowedChains = 0;
+        uint64_t windowedSteps = 0;
+        uint64_t windowedConcatsF2 = 0;
+        uint64_t windowedSkippedSlices = 0;
+        uint64_t windowedRemappedSlices = 0;
+        uint64_t windowedMaterialized = 0;
+        uint64_t windowedBailedChains = 0;
         if (runSchedule)
         {
             phaseStart = std::chrono::steady_clock::now();
@@ -792,6 +799,13 @@ int main(int argc, char **argv)
                 }
                 emittedArtifacts = emitResult.artifacts.size();
                 muxAtomFused = emitResult.muxAtomFused;
+                windowedChains = emitResult.windowedChains;
+                windowedSteps = emitResult.windowedSteps;
+                windowedConcatsF2 = emitResult.windowedConcatsF2;
+                windowedSkippedSlices = emitResult.windowedSkippedSlices;
+                windowedRemappedSlices = emitResult.windowedRemappedSlices;
+                windowedMaterialized = emitResult.windowedMaterialized;
+                windowedBailedChains = emitResult.windowedBailedChains;
             }
         }
         std::cout << "{\n"
@@ -822,6 +836,13 @@ int main(int argc, char **argv)
                   << "  \"emit_ms\": " << emitMs << ",\n"
                   << "  \"emitted_artifacts\": " << emittedArtifacts << ",\n"
                   << "  \"mux_atom_fused\": " << muxAtomFused << ",\n"
+                  << "  \"windowed_chains\": " << windowedChains << ",\n"
+                  << "  \"windowed_steps\": " << windowedSteps << ",\n"
+                  << "  \"windowed_concats_f2\": " << windowedConcatsF2 << ",\n"
+                  << "  \"windowed_skipped_slices\": " << windowedSkippedSlices << ",\n"
+                  << "  \"windowed_remapped_slices\": " << windowedRemappedSlices << ",\n"
+                  << "  \"windowed_materialized\": " << windowedMaterialized << ",\n"
+                  << "  \"windowed_bailed_chains\": " << windowedBailedChains << ",\n"
                   << "  \"current_rss_kib\": " << currentRssKiB() << ",\n"
                   << "  \"peak_rss_kib\": " << peakRssKiB() << '\n'
                   << "}\n";
