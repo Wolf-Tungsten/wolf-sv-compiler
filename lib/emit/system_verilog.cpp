@@ -622,6 +622,48 @@ namespace wolvrix::lib::emit
             return oss.str();
         }
 
+        std::string formatSpecAttribute(const wolvrix::lib::grh::Graph &graph,
+                                        wolvrix::lib::grh::OperationId opId)
+        {
+            if (!opId.valid())
+            {
+                return {};
+            }
+            const auto attr = graph.getOperation(opId).attr("spec.id");
+            if (!attr)
+            {
+                return {};
+            }
+            const auto *spec = std::get_if<std::string>(&*attr);
+            if (!spec || spec->empty())
+            {
+                return {};
+            }
+
+            std::string sanitized;
+            sanitized.reserve(spec->size() + 8);
+            for (std::size_t i = 0; i < spec->size(); ++i)
+            {
+                if (i + 1 < spec->size() && (*spec)[i] == '*' && (*spec)[i + 1] == '/')
+                {
+                    sanitized.append("* /");
+                    ++i;
+                    continue;
+                }
+                if (i + 1 < spec->size() && (*spec)[i] == '/' && (*spec)[i + 1] == '*')
+                {
+                    sanitized.append("/ *");
+                    ++i;
+                    continue;
+                }
+                sanitized.push_back((*spec)[i]);
+            }
+
+            std::ostringstream oss;
+            oss << "/* spec: " << sanitized << " */";
+            return oss.str();
+        }
+
         std::string graphSymbolRequired(const wolvrix::lib::grh::Graph &graph, wolvrix::lib::grh::SymbolId sym, std::string_view context)
         {
             if (!sym.valid())
@@ -5848,25 +5890,28 @@ namespace wolvrix::lib::emit
                 }
             }
 
+            auto emitOpAnnotations = [&](wolvrix::lib::grh::OperationId opId)
+            {
+                const std::string attr = formatSrcAttribute(
+                    opId.valid() ? graph->getOperation(opId).srcLoc()
+                                 : std::optional<wolvrix::lib::grh::SrcLoc>{});
+                if (!attr.empty())
+                {
+                    out << "  " << attr << '\n';
+                }
+                const std::string specAttr = formatSpecAttribute(*graph, opId);
+                if (!specAttr.empty())
+                {
+                    out << "  " << specAttr << '\n';
+                }
+            };
+
             if (!memoryDecls.empty())
             {
                 out << '\n';
-                auto opSrcLoc = [&](wolvrix::lib::grh::OperationId opId) -> std::optional<wolvrix::lib::grh::SrcLoc>
-                {
-                    if (!opId.valid())
-                    {
-                        return std::nullopt;
-                    }
-                    return graph->getOperation(opId).srcLoc();
-                };
                 for (const auto &[decl, opPtr] : memoryDecls)
                 {
-                    const std::string attr =
-                        formatSrcAttribute(opSrcLoc(opPtr));
-                    if (!attr.empty())
-                    {
-                        out << "  " << attr << "\n";
-                    }
+                    emitOpAnnotations(opPtr);
                     out << "  " << decl << '\n';
                 }
             }
@@ -5876,12 +5921,7 @@ namespace wolvrix::lib::emit
                 out << '\n';
                 for (const auto &[inst, opPtr] : instanceDecls)
                 {
-                    const std::string attr =
-                        formatSrcAttribute(opPtr.valid() ? graph->getOperation(opPtr).srcLoc() : std::optional<wolvrix::lib::grh::SrcLoc>{});
-                    if (!attr.empty())
-                    {
-                        out << "  " << attr << "\n";
-                    }
+                    emitOpAnnotations(opPtr);
                     out << "  " << inst << '\n';
                 }
             }
@@ -5891,12 +5931,7 @@ namespace wolvrix::lib::emit
                 out << '\n';
                 for (const auto &[decl, opPtr] : dpiImportDecls)
                 {
-                    const std::string attr =
-                        formatSrcAttribute(opPtr.valid() ? graph->getOperation(opPtr).srcLoc() : std::optional<wolvrix::lib::grh::SrcLoc>{});
-                    if (!attr.empty())
-                    {
-                        out << "  " << attr << "\n";
-                    }
+                    emitOpAnnotations(opPtr);
                     out << "  " << decl << '\n';
                 }
             }
@@ -5906,12 +5941,7 @@ namespace wolvrix::lib::emit
                 out << '\n';
                 for (const auto &[stmt, opPtr] : portBindingStmts)
                 {
-                    const std::string attr =
-                        formatSrcAttribute(opPtr.valid() ? graph->getOperation(opPtr).srcLoc() : std::optional<wolvrix::lib::grh::SrcLoc>{});
-                    if (!attr.empty())
-                    {
-                        out << "  " << attr << "\n";
-                    }
+                    emitOpAnnotations(opPtr);
                     out << "  " << stmt << '\n';
                 }
             }
@@ -5921,12 +5951,7 @@ namespace wolvrix::lib::emit
                 out << '\n';
                 for (const auto &[stmt, opPtr] : assignStmts)
                 {
-                    const std::string attr =
-                        formatSrcAttribute(opPtr.valid() ? graph->getOperation(opPtr).srcLoc() : std::optional<wolvrix::lib::grh::SrcLoc>{});
-                    if (!attr.empty())
-                    {
-                        out << "  " << attr << "\n";
-                    }
+                    emitOpAnnotations(opPtr);
                     out << "  " << stmt << '\n';
                 }
             }
@@ -5936,12 +5961,7 @@ namespace wolvrix::lib::emit
                 out << '\n';
                 for (const auto &[block, opPtr] : latchBlocks)
                 {
-                    const std::string attr =
-                        formatSrcAttribute(opPtr.valid() ? graph->getOperation(opPtr).srcLoc() : std::optional<wolvrix::lib::grh::SrcLoc>{});
-                    if (!attr.empty())
-                    {
-                        out << "  " << attr << '\n';
-                    }
+                    emitOpAnnotations(opPtr);
                     out << block << '\n';
                 }
             }
@@ -5951,13 +5971,7 @@ namespace wolvrix::lib::emit
                 out << '\n';
                 for (const auto &block : simpleBlocks)
                 {
-                    const std::string attr =
-                        formatSrcAttribute(block.op.valid() ? graph->getOperation(block.op).srcLoc()
-                                                            : std::optional<wolvrix::lib::grh::SrcLoc>{});
-                    if (!attr.empty())
-                    {
-                        out << "  " << attr << '\n';
-                    }
+                    emitOpAnnotations(block.op);
                     out << "  " << block.header << " begin\n";
                     for (const auto &stmt : block.stmts)
                     {
@@ -5982,12 +5996,7 @@ namespace wolvrix::lib::emit
                         reportError("Sequential block missing sensitivity list", graph->symbol());
                         continue;
                     }
-                    const std::string attr =
-                        formatSrcAttribute(seq.op.valid() ? graph->getOperation(seq.op).srcLoc() : std::optional<wolvrix::lib::grh::SrcLoc>{});
-                    if (!attr.empty())
-                    {
-                        out << "  " << attr << "\n";
-                    }
+                    emitOpAnnotations(seq.op);
                     out << "  always " << sens << " begin\n";
                     for (const auto &stmt : orderSequentialStmts(seq.stmts))
                     {
