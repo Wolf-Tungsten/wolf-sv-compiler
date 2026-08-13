@@ -1139,7 +1139,7 @@ namespace wolvrix::lib::grhsim::am
         // so the atom fields are the post-fold split-context values.
         if (const char *exportPath = std::getenv("WOLVRIX_GRHSIM_AM_INSTRUCTION_GRAPH_JSONL")) {
             if (exportPath[0] == '\0' ||
-                !exportInstructionGraphJsonl(graph.program(), *context,
+                !exportInstructionGraphJsonl(graph.program(), graph, *context,
                                              std::filesystem::path(exportPath), diagnostics)) {
                 diagnostics.error("AM instruction graph export failed",
                                   std::string(detail::kDiagnosticContext));

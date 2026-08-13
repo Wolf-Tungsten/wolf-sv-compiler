@@ -65,6 +65,7 @@ namespace wolvrix::lib::grhsim::am
     // the split context, so the export reflects the tree-atom fold pass
     // (the orchestrator invokes it after that pass).
     bool exportInstructionGraphJsonl(ProgramView program,
+                                     const AmGraph &graph,
                                      const AmGraphSplitContext &context,
                                      const std::filesystem::path &path,
                                      wolvrix::lib::diag::Diagnostics &diagnostics)
@@ -152,11 +153,50 @@ namespace wolvrix::lib::grhsim::am
                     .raw(",\"state_write\":")
                     .boolean(stateWriteTarget(program, instruction).has_value())
                     .raw(",\"atom\":")
-                    .number(atom)
-                    .raw(",\"comb_loop_atom\":")
-                    .boolean(context.atomKinds[atom] ==
-                             static_cast<uint8_t>(AmAtomKind::CombLoopScc))
-                    .raw("}");
+                    .number(atom);
+                // NO0012 additive fields: ordered result/operand variable ids
+                // with per-operand widths (and SliceStatic lsb + gsim node
+                // id), so the wide-chain window-provenance prototype can
+                // reconstruct exact dataflow without re-parsing emitted C++.
+                // Inserted between atom and comb_loop_atom so existing
+                // prefix/suffix consumers keep matching the v1 fields.
+                std::string tail;
+                tail += ",\"res\":[";
+                bool first = true;
+                for (const VariableId result : program.results(instruction)) {
+                    if (!first) {
+                        tail += ',';
+                    }
+                    first = false;
+                    tail += std::to_string(result.value);
+                }
+                tail += "],\"ops\":[";
+                first = true;
+                for (const VariableId operand : program.operands(instruction)) {
+                    if (!first) {
+                        tail += ',';
+                    }
+                    first = false;
+                    tail += '[';
+                    tail += std::to_string(operand.value);
+                    tail += ',';
+                    tail += std::to_string(exportedVariableWidth(program, operand));
+                    tail += ']';
+                }
+                tail += ']';
+                if (const auto slice = program.sliceStaticAttributes(instruction)) {
+                    tail += ",\"lsb\":";
+                    tail += std::to_string(slice->lsb);
+                }
+                tail += ",\"gnode\":";
+                tail += std::to_string(graph.gsimNodeId(instruction));
+                tail += ",\"comb_loop_atom\":";
+                tail += (context.atomKinds[atom] ==
+                                 static_cast<uint8_t>(AmAtomKind::CombLoopScc)
+                             ? "true"
+                             : "false");
+                tail += '}';
+                writer.raw(tail);
                 writer.endLine();
             }
 

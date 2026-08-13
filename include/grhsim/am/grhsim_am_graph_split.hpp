@@ -110,6 +110,7 @@ namespace wolvrix::lib::grhsim::am
     // from the split context, so the export reflects the mux-merge atom pass
     // when the orchestrator ran it (post-merge 口径).
     bool exportInstructionGraphJsonl(ProgramView program,
+                                     const AmGraph &graph,
                                      const AmGraphSplitContext &context,
                                      const std::filesystem::path &path,
                                      wolvrix::lib::diag::Diagnostics &diagnostics);

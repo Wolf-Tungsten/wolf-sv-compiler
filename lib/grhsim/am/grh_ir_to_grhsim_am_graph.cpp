@@ -11,8 +11,10 @@
 #include <array>
 #include <bit>
 #include <cctype>
+#include <charconv>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <optional>
@@ -186,6 +188,25 @@ namespace wolvrix::lib::grhsim::am
                     nullptr;
                 disableWriteMerge_ =
                     std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_WRITE_MERGE") != nullptr;
+                // Escape hatch for the NO0012 wide concat/slice chain lazy
+                // replay (A/B bisection of emitted-cost fixes).
+                disableChainReplay_ =
+                    std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_CHAIN_REPLAY") != nullptr;
+                disableLaneWriteMerge_ =
+                    std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_LANE_WRITE_MERGE") !=
+                    nullptr;
+                if (const char *debugNode =
+                        std::getenv("WOLVRIX_GRHSIM_AM_CHAIN_DEBUG_NODE"))
+                {
+                    int64_t parsed = 0;
+                    const auto [end, convError] =
+                        std::from_chars(debugNode, debugNode + std::strlen(debugNode),
+                                        parsed);
+                    if (convError == std::errc{} && *end == '\0')
+                    {
+                        debugChainNode_ = parsed;
+                    }
+                }
             }
 
             std::optional<AmGraph> run()
@@ -206,6 +227,7 @@ namespace wolvrix::lib::grhsim::am
                     }
                     createInterface();
                     computeFirstUseOrdinals();
+                    planChainReplay();
                     lowerInstructions();
                     if (failed_)
                     {
@@ -258,6 +280,25 @@ namespace wolvrix::lib::grhsim::am
                                 std::to_string(lowerConstFoldCount_) +
                                 " merged_state_writes=" +
                                 std::to_string(mergedStateWriteCount_),
+                            "grhsim-am-lowering");
+                    }
+                    if (chainReplaySkipCount_ != 0 || chainReplayRejectCount_ != 0)
+                    {
+                        diagnostics_.info(
+                            "am.import chain replay: groups=" +
+                                std::to_string(chainReplayGroups_.size()) +
+                                " skipped_ops=" +
+                                std::to_string(chainReplaySkipCount_) +
+                                " replay_instrs=" +
+                                std::to_string(chainReplayEmitCount_) +
+                                " plan_folded=" +
+                                std::to_string(chainReplayPlanFoldCount_) +
+                                " rejected_groups=" +
+                                std::to_string(chainReplayRejectCount_) +
+                                " lane_write_merged=" +
+                                std::to_string(laneWriteMergedCount_) +
+                                " lane_fan_rejected=" +
+                                std::to_string(laneWriteFanRejectCount_),
                             "grhsim-am-lowering");
                     }
                     return std::optional<AmGraph>(std::move(amGraph_));
@@ -3682,6 +3723,1260 @@ namespace wolvrix::lib::grhsim::am
                 }
             }
 
+            // NO0012 Tier 1: wide concat/slice chain lazy replay plan types.
+            struct ChainReplaySegment
+            {
+                ValueId root;      // external (non-chain) value supplying the bits
+                uint32_t lsb = 0;  // bit offset inside root
+                uint32_t width = 0;
+            };
+            struct ChainReplayItem
+            {
+                ValueId value;  // escaped chain-produced value to materialize
+                std::vector<ChainReplaySegment> segments;  // LSB-first
+                // Set when the whole chain evaluates to a constant (the
+                // gsim export's constant-but-guard-blocked chains, e.g. the
+                // ROB perfDebugInfo update fans): replay is one Assign from
+                // an interned constant, guard-immune because it computes
+                // into the escaped value's own pre-created variable.
+                std::optional<std::vector<uint64_t>> constant;
+            };
+            struct ChainReplayGroup
+            {
+                int64_t nodeId = -1;
+                OperationId flushOp;  // last chain op (ordinal order): replay
+                                      // emits right after skipping it
+                std::vector<ChainReplayItem> items;
+            };
+
+            // NO0012 Tier 2: lane-write fan merge. A fan is a set of
+            // register write ops that share one target and one event key,
+            // each with a constant one-hot-lane mask and pairwise-disjoint
+            // lanes. The whole fan collapses into a single write whose data
+            // is the per-lane mux of (member cond, member data lane window,
+            // old target lane) — restoring the element-granular update gsim
+            // emits natively, and removing the fan's demand for the full
+            // O(steps x width) chain values that fed each member.
+            struct LaneWriteMember
+            {
+                OperationId op;
+                ValueId condValue;
+                ValueId dataValue;
+                uint32_t laneLo = 0;   // bit offset of the lane inside target
+                uint32_t laneWidth = 0;
+                std::optional<ExplicitOrder> explicitOrder;
+            };
+            struct LaneWriteFan
+            {
+                VariableId target;
+                uint32_t targetWidth = 0;
+                std::vector<VariableId> events;
+                int64_t nodeId = -1;
+                std::vector<LaneWriteMember> members;  // commit order
+                // Non-fan writes to the same target ordered strictly before
+                // the fan (constant mask+data only), folded into the old
+                // value the merged write's per-lane muxes fall back to.
+                std::vector<OperationId> absorbedPrefix;
+                OperationId flushOp;
+            };
+            std::vector<LaneWriteFan> laneWriteFans_;
+            std::unordered_map<uint32_t, uint32_t> laneWriteSkipFan_;
+            std::unordered_set<uint32_t> laneWriteMemberOps_;
+            // Provenance of planned chain groups, queried by the fan flush to
+            // resolve a member's data lane window to its root source.
+            std::unordered_map<uint32_t, std::vector<ChainReplaySegment>>
+                chainProvenance_;
+            bool disableLaneWriteMerge_ = false;
+            uint64_t laneWriteMergedCount_ = 0;
+            uint64_t laneWriteFanRejectCount_ = 0;
+
+            // NO0012 Tier 2 pass 0: detect lane-write fans before chain
+            // planning so the chain escape analysis can stop counting fan
+            // members as full-value consumers (they only demand their lane
+            // window of the data value).
+            void detectLaneWriteFans()
+            {
+                if (disableLaneWriteMerge_)
+                {
+                    return;
+                }
+                struct Candidate
+                {
+                    OperationId op;
+                    VariableId target;
+                    uint32_t laneLo = 0;
+                    uint32_t laneWidth = 0;
+                    std::vector<uint64_t> maskWords;
+                    std::string eventKey;
+                };
+                std::map<std::pair<uint32_t, std::string>, std::vector<Candidate>>
+                    byTargetEvent;
+                std::unordered_map<uint32_t, std::vector<OperationId>> writesByTarget;
+                for (OperationId opId : graph_.operations())
+                {
+                    const Operation op = graph_.getOperation(opId);
+                    if (op.kind() != OperationKind::kRegisterWritePort)
+                    {
+                        continue;
+                    }
+                    const auto target = stateTarget(op, "regSymbol",
+                                                    OperationKind::kRegister);
+                    if (!target || op.operands().size() < 4)
+                    {
+                        continue;
+                    }
+                    writesByTarget[target->value].push_back(opId);
+                    const ValueId maskValue = op.operands()[2];
+                    if (!maskValue.valid() || maskValue.index >= valueMap_.size())
+                    {
+                        continue;
+                    }
+                    std::optional<std::vector<uint64_t>> maskWords =
+                        constantWordsOf(valueMap_[maskValue.index]);
+                    if (!maskWords)
+                    {
+                        continue;
+                    }
+                    // Exactly one contiguous set-bit region (the lane).
+                    uint64_t bitIndex = 0;
+                    int64_t laneLo = -1;
+                    uint64_t laneHi = 0;
+                    bool multiRegion = false;
+                    bool inRegion = false;
+                    for (uint64_t word : *maskWords)
+                    {
+                        for (uint32_t bit = 0; bit < 64; ++bit, ++bitIndex)
+                        {
+                            const bool set = ((word >> bit) & 1U) != 0;
+                            if (set && !inRegion)
+                            {
+                                if (laneLo >= 0)
+                                {
+                                    multiRegion = true;
+                                }
+                                inRegion = true;
+                                laneLo = static_cast<int64_t>(bitIndex);
+                            }
+                            else if (!set && inRegion)
+                            {
+                                inRegion = false;
+                                laneHi = bitIndex;
+                            }
+                        }
+                    }
+                    if (inRegion)
+                    {
+                        laneHi = bitIndex;
+                    }
+                    if (multiRegion || laneLo < 0)
+                    {
+                        continue;
+                    }
+                    const uint32_t targetWidth = static_cast<uint32_t>(
+                        amGraph_.program()
+                            .type(amGraph_.program().variable(*target).type)
+                            .bitWidth);
+                    if (laneHi > targetWidth)
+                    {
+                        continue;
+                    }
+                    const auto edges =
+                        requiredAttr<std::vector<std::string>>(op, "eventEdge");
+                    std::string eventKey;
+                    if (edges)
+                    {
+                        for (const std::string &edge : *edges)
+                        {
+                            eventKey += edge;
+                            eventKey += ';';
+                        }
+                    }
+                    for (std::size_t index = 3; index < op.operands().size();
+                         ++index)
+                    {
+                        eventKey += std::to_string(op.operands()[index].index);
+                        eventKey += ',';
+                    }
+                    byTargetEvent[{target->value, eventKey}].push_back(Candidate{
+                        .op = opId,
+                        .target = *target,
+                        .laneLo = static_cast<uint32_t>(laneLo),
+                        .laneWidth = static_cast<uint32_t>(laneHi - laneLo),
+                        .maskWords = std::move(*maskWords),
+                        .eventKey = std::move(eventKey),
+                    });
+                }
+
+                auto orderKeyOf = [&](OperationId opId)
+                    -> std::tuple<bool, uint32_t, uint32_t, uint32_t>
+                {
+                    if (opId.index < explicitOrderByOperation_.size() &&
+                        explicitOrderByOperation_[opId.index])
+                    {
+                        const ExplicitOrder &order =
+                            *explicitOrderByOperation_[opId.index];
+                        return {true, order.group, order.ordinal, opId.index};
+                    }
+                    return {false, 0, 0, opId.index};
+                };
+
+                for (auto &[key, candidates] : byTargetEvent)
+                {
+                    if (candidates.size() < 2)
+                    {
+                        continue;
+                    }
+                    // Disjoint lanes are required: overlapping lanes make the
+                    // original fan order-dependent, which a single merged
+                    // write cannot express.
+                    std::vector<std::pair<uint32_t, uint32_t>> lanes;
+                    for (const Candidate &candidate : candidates)
+                    {
+                        lanes.emplace_back(candidate.laneLo, candidate.laneWidth);
+                    }
+                    std::sort(lanes.begin(), lanes.end());
+                    bool overlap = false;
+                    for (std::size_t index = 1; index < lanes.size(); ++index)
+                    {
+                        if (lanes[index].first <
+                            lanes[index - 1].first + lanes[index - 1].second)
+                        {
+                            overlap = true;
+                            break;
+                        }
+                    }
+                    if (overlap)
+                    {
+                        ++laneWriteFanRejectCount_;
+                        continue;
+                    }
+                    LaneWriteFan fan;
+                    fan.target = candidates.front().target;
+                    fan.targetWidth = static_cast<uint32_t>(
+                        amGraph_.program()
+                            .type(
+                                amGraph_.program().variable(fan.target).type)
+                            .bitWidth);
+                    bool rejected = false;
+                    for (const Candidate &candidate : candidates)
+                    {
+                        const Operation op = graph_.getOperation(candidate.op);
+                        if (op.operands()[0].invalid() ||
+                            op.operands()[1].invalid())
+                        {
+                            rejected = true;
+                            break;
+                        }
+                        fan.members.push_back(LaneWriteMember{
+                            .op = candidate.op,
+                            .condValue = op.operands()[0],
+                            .dataValue = op.operands()[1],
+                            .laneLo = candidate.laneLo,
+                            .laneWidth = candidate.laneWidth,
+                            .explicitOrder =
+                                candidate.op.index <
+                                        explicitOrderByOperation_.size()
+                                    ? explicitOrderByOperation_[candidate.op.index]
+                                    : std::nullopt,
+                        });
+                    }
+                    if (rejected)
+                    {
+                        ++laneWriteFanRejectCount_;
+                        continue;
+                    }
+                    std::sort(fan.members.begin(), fan.members.end(),
+                              [&](const LaneWriteMember &lhs,
+                                  const LaneWriteMember &rhs) {
+                                  return orderKeyOf(lhs.op) < orderKeyOf(rhs.op);
+                              });
+                    fan.flushOp = fan.members.back().op;
+                    // Non-fan writes to the same target: only same-event-key
+                    // writes ordered strictly before every member can be
+                    // absorbed (their effect blends into the old value the
+                    // merged muxes fall back to); writes ordered strictly
+                    // after every member commute with the merge untouched.
+                    for (OperationId other : writesByTarget[key.first])
+                    {
+                        if (std::any_of(fan.members.begin(), fan.members.end(),
+                                        [&](const LaneWriteMember &member) {
+                                            return member.op == other;
+                                        }))
+                        {
+                            continue;
+                        }
+                        const Operation otherOp = graph_.getOperation(other);
+                        const auto otherEdges = requiredAttr<std::vector<std::string>>(
+                            otherOp, "eventEdge");
+                        std::string otherKey;
+                        if (otherEdges)
+                        {
+                            for (const std::string &edge : *otherEdges)
+                            {
+                                otherKey += edge;
+                                otherKey += ';';
+                            }
+                        }
+                        for (std::size_t index = 3; index < otherOp.operands().size();
+                             ++index)
+                        {
+                            otherKey += std::to_string(otherOp.operands()[index].index);
+                            otherKey += ',';
+                        }
+                        if (otherKey != key.second)
+                        {
+                            ++laneWriteFanRejectCount_;
+                            rejected = true;
+                            break;
+                        }
+                        const auto otherOrder = orderKeyOf(other);
+                        const bool beforeAll = std::all_of(
+                            fan.members.begin(), fan.members.end(),
+                            [&](const LaneWriteMember &member) {
+                                return otherOrder < orderKeyOf(member.op);
+                            });
+                        const bool afterAll = std::all_of(
+                            fan.members.begin(), fan.members.end(),
+                            [&](const LaneWriteMember &member) {
+                                return orderKeyOf(member.op) < otherOrder;
+                            });
+                        if (afterAll)
+                        {
+                            continue;
+                        }
+                        if (!beforeAll)
+                        {
+                            ++laneWriteFanRejectCount_;
+                            rejected = true;
+                            break;
+                        }
+                        // Absorbable prefix writes must be constant mask+data
+                        // (their blend folds into the merged write's old
+                        // value at flush time).
+                        if (otherOp.operands().size() < 3 ||
+                            otherOp.operands()[1].invalid() ||
+                            otherOp.operands()[2].invalid() ||
+                            !constantWordsOf(
+                                valueMap_[otherOp.operands()[1].index]) ||
+                            !constantWordsOf(
+                                valueMap_[otherOp.operands()[2].index]))
+                        {
+                            ++laneWriteFanRejectCount_;
+                            rejected = true;
+                            break;
+                        }
+                        fan.absorbedPrefix.push_back(other);
+                    }
+                    if (rejected)
+                    {
+                        continue;
+                    }
+                    std::sort(fan.absorbedPrefix.begin(),
+                              fan.absorbedPrefix.end(),
+                              [&](OperationId lhs, OperationId rhs) {
+                                  return orderKeyOf(lhs) < orderKeyOf(rhs);
+                              });
+                    const uint32_t fanIndex =
+                        static_cast<uint32_t>(laneWriteFans_.size());
+                    laneWriteFans_.push_back(std::move(fan));
+                    for (const LaneWriteMember &member :
+                         laneWriteFans_.back().members)
+                    {
+                        laneWriteSkipFan_.emplace(member.op.index, fanIndex);
+                        laneWriteMemberOps_.insert(member.op.index);
+                    }
+                    for (OperationId absorbed : laneWriteFans_.back().absorbedPrefix)
+                    {
+                        laneWriteMemberOps_.insert(absorbed.index);
+                        laneWriteSkipFan_.emplace(absorbed.index, fanIndex);
+                    }
+                }
+            }
+
+            // NO0012 Tier 1: plan lazy replay for wide concat/slice_static
+            // chains. Groups are the gsim-node op sets (node-aligned atoms);
+            // within a group, chain ops rebuild a wide value step by step
+            // (O(steps x width) word traffic in the emitted model). The plan
+            // replaces the whole chain with per-segment replay of the values
+            // that actually escape the chain: every chain-produced value is
+            // resolved to a list of (root, lsb, width) segments over values
+            // NOT produced by the group's chain ops, and only escaped values
+            // materialize (one slice per segment + at most one concat).
+            // Chain values only referenced inside the chain never
+            // materialize; their pre-created variables stay zero-initialized
+            // and unreferenced. All value variables are pre-created before
+            // lowering, and replay computes escaped values into their own
+            // pre-created variables, so no use-order guard is needed.
+            void planChainReplay()
+            {
+                if (disableChainReplay_)
+                {
+                    return;
+                }
+                constexpr uint32_t kMinWidth = 4096;
+                constexpr std::size_t kMaxSegmentsPerValue = 16384;
+                // Tier 2 fans first: their members stop counting as
+                // full-value consumers in the escape analysis below.
+                detectLaneWriteFans();
+                // Global value -> using ops map (chain values may be consumed
+                // anywhere, including state-write ops).
+                std::vector<std::vector<uint32_t>> users(valueMap_.size());
+                std::map<int64_t, std::vector<OperationId>> groupsByNode;
+                for (OperationId opId : graph_.operations())
+                {
+                    const Operation op = graph_.getOperation(opId);
+                    for (ValueId operand : op.operands())
+                    {
+                        if (operand.valid() && operand.index < users.size())
+                        {
+                            users[operand.index].push_back(opId.index);
+                        }
+                    }
+                    if (op.kind() != OperationKind::kConcat &&
+                        op.kind() != OperationKind::kSliceStatic)
+                    {
+                        continue;
+                    }
+                    const std::optional<int64_t> nodeId =
+                        optionalAttr<int64_t>(op, kGsimNodeIdAttr);
+                    if (!nodeId || *nodeId < 0)
+                    {
+                        continue;
+                    }
+                    auto isWide = [&](ValueId value) {
+                        return value.valid() &&
+                               static_cast<uint32_t>(graph_.valueWidth(value)) >=
+                                   kMinWidth;
+                    };
+                    bool wide = op.results().size() == 1 && isWide(op.results().front());
+                    for (ValueId operand : op.operands())
+                    {
+                        wide = wide || isWide(operand);
+                    }
+                    if (wide)
+                    {
+                        groupsByNode[*nodeId].push_back(opId);
+                    }
+                }
+
+                for (const auto &[nodeId, opValues] : groupsByNode)
+                {
+                    if (opValues.size() < 2)
+                    {
+                        continue;
+                    }
+                    std::unordered_set<uint32_t> chainOps;
+                    chainOps.reserve(opValues.size());
+                    for (OperationId chainOp : opValues)
+                    {
+                        chainOps.insert(chainOp.index);
+                    }
+                    // Segment resolution passes over the group's ops. Op
+                    // order inside a node is usually topological; stragglers
+                    // are retried in later passes. Values whose definition
+                    // sits outside the chain are segment roots.
+                    std::unordered_map<uint32_t, std::vector<ChainReplaySegment>>
+                        provenance;
+                    std::unordered_map<uint32_t,
+                                       std::optional<std::vector<uint64_t>>>
+                        constWords;
+                    bool rejected = false;
+                    std::size_t unresolved = opValues.size();
+                    for (std::size_t pass = 0; pass < opValues.size() && unresolved != 0;
+                         ++pass)
+                    {
+                        bool progress = false;
+                        for (OperationId chainOpId : opValues)
+                        {
+                            const Operation op = graph_.getOperation(chainOpId);
+                            if (op.results().size() != 1)
+                            {
+                                rejected = true;
+                                break;
+                            }
+                            const ValueId result = op.results().front();
+                            if (!result.valid() || provenance.contains(result.index))
+                            {
+                                continue;
+                            }
+                            const uint32_t resultWidth =
+                                static_cast<uint32_t>(graph_.valueWidth(result));
+                            std::vector<ChainReplaySegment> segments;
+                            bool ready = true;
+                            auto segmentsOf = [&](ValueId value,
+                                                  std::vector<ChainReplaySegment> &out) {
+                                const OperationId def = graph_.valueDef(value);
+                                if (def.valid() && chainOps.contains(def.index))
+                                {
+                                    const auto found = provenance.find(value.index);
+                                    if (found == provenance.end())
+                                    {
+                                        return false;
+                                    }
+                                    out.insert(out.end(), found->second.begin(),
+                                               found->second.end());
+                                    return true;
+                                }
+                                out.push_back(ChainReplaySegment{
+                                    .root = value,
+                                    .lsb = 0,
+                                    .width = static_cast<uint32_t>(
+                                        graph_.valueWidth(value)),
+                                });
+                                return true;
+                            };
+                            if (op.kind() == OperationKind::kConcat)
+                            {
+                                // GRH concat places operand[0] at the most
+                                // significant end; segments are LSB-first.
+                                uint64_t totalWidth = 0;
+                                const auto operands = op.operands();
+                                for (auto it = operands.rbegin(); it != operands.rend();
+                                     ++it)
+                                {
+                                    if (!it->valid())
+                                    {
+                                        rejected = true;
+                                        ready = false;
+                                        break;
+                                    }
+                                    if (!segmentsOf(*it, segments))
+                                    {
+                                        ready = false;
+                                        break;
+                                    }
+                                    totalWidth += static_cast<uint32_t>(
+                                        graph_.valueWidth(*it));
+                                }
+                                if (ready && totalWidth != resultWidth)
+                                {
+                                    rejected = true;
+                                    break;
+                                }
+                            }
+                            else  // kSliceStatic
+                            {
+                                const auto start =
+                                    requiredAttr<int64_t>(op, "sliceStart");
+                                const auto end = requiredAttr<int64_t>(op, "sliceEnd");
+                                if (op.operands().size() != 1 || !start || !end ||
+                                    *start < 0 || *end < *start ||
+                                    static_cast<uint64_t>(*end - *start + 1) !=
+                                        resultWidth)
+                                {
+                                    rejected = true;
+                                    break;
+                                }
+                                std::vector<ChainReplaySegment> source;
+                                if (!segmentsOf(op.operands().front(), source))
+                                {
+                                    ready = false;
+                                }
+                                else
+                                {
+                                    const uint64_t wantLo =
+                                        static_cast<uint64_t>(*start);
+                                    const uint64_t wantHi = wantLo + resultWidth;
+                                    uint64_t position = 0;
+                                    uint64_t covered = 0;
+                                    for (const ChainReplaySegment &seg : source)
+                                    {
+                                        const uint64_t segLo = position;
+                                        const uint64_t segHi = segLo + seg.width;
+                                        position = segHi;
+                                        const uint64_t lo = std::max(segLo, wantLo);
+                                        const uint64_t hi = std::min(segHi, wantHi);
+                                        if (lo < hi)
+                                        {
+                                            segments.push_back(ChainReplaySegment{
+                                                .root = seg.root,
+                                                .lsb = static_cast<uint32_t>(
+                                                    seg.lsb + (lo - segLo)),
+                                                .width =
+                                                    static_cast<uint32_t>(hi - lo),
+                                            });
+                                            covered += hi - lo;
+                                        }
+                                    }
+                                    if (covered != resultWidth)
+                                    {
+                                        rejected = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!ready)
+                            {
+                                continue;
+                            }
+                            if (segments.size() > kMaxSegmentsPerValue)
+                            {
+                                rejected = true;
+                                break;
+                            }
+                            // Guard-immune constant evaluation: when every
+                            // operand is constant (in-group memo or a
+                            // Constant-initialized outside variable), fold
+                            // the op with the same evaluator the lowering
+                            // fold (NO0010) uses. Unlike the lowering fold
+                            // this ignores the use-order guard on purpose —
+                            // replay materializes constants into the escaped
+                            // value's own pre-created variable, which is safe
+                            // for any consumer ordering.
+                            std::optional<std::vector<uint64_t>> foldedWords;
+                            {
+                                std::vector<std::vector<uint64_t>> wordStorage;
+                                std::vector<detail::ConstOperand> constOperands;
+                                bool allConstant = !op.operands().empty();
+                                for (ValueId operand : op.operands())
+                                {
+                                    const OperationId def = graph_.valueDef(operand);
+                                    if (def.valid() && chainOps.contains(def.index))
+                                    {
+                                        const auto found =
+                                            constWords.find(operand.index);
+                                        if (found == constWords.end() ||
+                                            !found->second)
+                                        {
+                                            allConstant = false;
+                                            break;
+                                        }
+                                        wordStorage.push_back(*found->second);
+                                    }
+                                    else
+                                    {
+                                        std::optional<std::vector<uint64_t>> words =
+                                            constantWordsOf(valueMap_[operand.index]);
+                                        if (!words)
+                                        {
+                                            allConstant = false;
+                                            break;
+                                        }
+                                        wordStorage.push_back(std::move(*words));
+                                    }
+                                }
+                                if (allConstant)
+                                {
+                                    bool operandTypesOk = true;
+                                    for (std::size_t index = 0;
+                                         index < op.operands().size(); ++index)
+                                    {
+                                        const Type *operandType = variableTypeOf(
+                                            valueMap_[op.operands()[index].index]);
+                                        if (!operandType)
+                                        {
+                                            operandTypesOk = false;
+                                            break;
+                                        }
+                                        constOperands.push_back(detail::ConstOperand{
+                                            .type = *operandType,
+                                            .words = wordStorage[index]});
+                                    }
+                                    if (operandTypesOk)
+                                    {
+                                        const Type resultType =
+                                            typeForValue(result);
+                                        const Opcode foldOpcode =
+                                            op.kind() == OperationKind::kConcat
+                                                ? Opcode::Concat
+                                                : Opcode::SliceStatic;
+                                        const uint32_t foldLsb =
+                                            op.kind() == OperationKind::kSliceStatic
+                                                ? static_cast<uint32_t>(
+                                                      *requiredAttr<int64_t>(
+                                                          op, "sliceStart"))
+                                                : 0;
+                                        const Type nativeType = Type::bitVector(
+                                            resultWidth, Signedness::Unsigned);
+                                        std::vector<uint64_t> folded;
+                                        if (detail::evaluatePure(
+                                                foldOpcode, nativeType,
+                                                constOperands, foldLsb, folded))
+                                        {
+                                            if (nativeType != resultType)
+                                            {
+                                                folded = detail::resizedWords(
+                                                    folded, nativeType.bitWidth,
+                                                    resultType.bitWidth,
+                                                    nativeType.signedness);
+                                            }
+                                            foldedWords = std::move(folded);
+                                        }
+                                    }
+                                }
+                            }
+                            constWords.emplace(result.index,
+                                               std::move(foldedWords));
+                            provenance.emplace(result.index, std::move(segments));
+                            --unresolved;
+                            progress = true;
+                        }
+                        if (rejected || !progress)
+                        {
+                            break;
+                        }
+                    }
+                    if (rejected || unresolved != 0)
+                    {
+                        ++chainReplayRejectCount_;
+                        continue;
+                    }
+
+                    // Profitability gate: a group whose escaped dynamic values
+                    // must (almost) all be rebuilt saves nothing over the
+                    // original chain and only pays finer-grained emission
+                    // overhead (the ROB lane-write fans are exactly this
+                    // shape — they wait for the write-fan merge instead).
+                    uint64_t chainWords = 0;
+                    for (OperationId chainOpId : opValues)
+                    {
+                        const Operation op = graph_.getOperation(chainOpId);
+                        const uint32_t width = static_cast<uint32_t>(
+                            graph_.valueWidth(op.results().front()));
+                        chainWords += (width + 63U) / 64U;
+                    }
+                    uint64_t replayWords = 0;
+                    uint64_t dynamicEscaped = 0;
+                    for (OperationId chainOpId : opValues)
+                    {
+                        const Operation op = graph_.getOperation(chainOpId);
+                        const ValueId result = op.results().front();
+                        if (const auto found = constWords.find(result.index);
+                            found != constWords.end() && found->second)
+                        {
+                            continue;  // constants re-point for free
+                        }
+                        bool escaped = exposedValues_.contains(result.index) ||
+                                       declaredValueIndices_.contains(result.index);
+                        if (!escaped && result.index < users.size())
+                        {
+                            for (uint32_t user : users[result.index])
+                            {
+                                if (!chainOps.contains(user) &&
+                                    !laneWriteMemberOps_.contains(user))
+                                {
+                                    escaped = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!escaped)
+                        {
+                            continue;
+                        }
+                        ++dynamicEscaped;
+                        const uint32_t width = static_cast<uint32_t>(
+                            graph_.valueWidth(result));
+                        replayWords += (width + 63U) / 64U;
+                        for (const ChainReplaySegment &segment :
+                             provenance.at(result.index))
+                        {
+                            replayWords += (segment.width + 63U) / 64U;
+                        }
+                    }
+                    if (dynamicEscaped != 0 && replayWords * 2 >= chainWords)
+                    {
+                        ++chainReplayRejectCount_;
+                        continue;
+                    }
+
+                    // Materialization decisions per chain value:
+                    //  - constant + not interface-labelled: re-point the
+                    //    value map to an interned constant NOW (plan time,
+                    //    before any instruction lowering), so every consumer
+                    //    — including earlier-ordered state writes and the
+                    //    NO0010 constant write merge — sees a plain constant.
+                    //    This is the guard-immune generalization of the
+                    //    lowering fold for chain shapes; the pre-created
+                    //    variable is left zero-initialized and unreferenced.
+                    //  - constant + labelled (exposed/declared): keep the
+                    //    declared variable and emit an Assign from the
+                    //    constant at flush (the label binding must survive).
+                    //  - dynamic + escaped: per-segment replay at flush.
+                    ChainReplayGroup group;
+                    group.nodeId = nodeId;
+                    group.flushOp = opValues.back();
+                    for (OperationId chainOpId : opValues)
+                    {
+                        const Operation op = graph_.getOperation(chainOpId);
+                        const ValueId result = op.results().front();
+                        const bool labelled =
+                            exposedValues_.contains(result.index) ||
+                            declaredValueIndices_.contains(result.index);
+                        bool escaped = labelled;
+                        if (!escaped && result.index < users.size())
+                        {
+                            for (uint32_t user : users[result.index])
+                            {
+                                if (!chainOps.contains(user) &&
+                                    !laneWriteMemberOps_.contains(user))
+                                {
+                                    escaped = true;
+                                    break;
+                                }
+                            }
+                        }
+                        std::optional<std::vector<uint64_t>> constant;
+                        if (const auto found = constWords.find(result.index);
+                            found != constWords.end() && found->second)
+                        {
+                            constant = *found->second;
+                        }
+                        if (constant && !labelled)
+                        {
+                            valueMap_[result.index] = internConstant(
+                                typeForValue(result), *constant);
+                            ++chainReplayPlanFoldCount_;
+                            continue;
+                        }
+                        if (constant || escaped)
+                        {
+                            group.items.push_back(ChainReplayItem{
+                                .value = result,
+                                .segments = provenance.at(result.index),
+                                .constant = std::move(constant),
+                            });
+                        }
+                    }
+                    const uint32_t groupIndex =
+                        static_cast<uint32_t>(chainReplayGroups_.size());
+                    chainReplayGroups_.push_back(std::move(group));
+                    for (OperationId chainOpId : opValues)
+                    {
+                        chainReplaySkipGroup_.emplace(chainOpId.index, groupIndex);
+                    }
+                    // Keep the accepted group's provenance for the Tier 2
+                    // fan flush (lane-window resolution of chain-produced
+                    // data values).
+                    for (auto &[valueIndex, segments] : provenance)
+                    {
+                        chainProvenance_.emplace(valueIndex,
+                                                 std::move(segments));
+                    }
+                }
+            }
+
+            // Emit the replay instructions for one planned group. Runs at the
+            // group's flush op position inside lowerInstructions; every
+            // escaped value is computed into its own pre-created variable.
+            void emitChainReplay(const ChainReplayGroup &group)
+            {
+                const ScopedGsimNodeId nodeScope(currentGsimNodeId_,
+                                                 group.nodeId);
+                for (const ChainReplayItem &item : group.items)
+                {
+                    if (!item.value.valid() || item.value.index >= valueMap_.size())
+                    {
+                        error("chain replay escaped value is unmapped",
+                              "grhsim-am-lowering");
+                        return;
+                    }
+                    const VariableId destination = valueMap_[item.value.index];
+                    if (!destination.valid())
+                    {
+                        error("chain replay escaped value is unmapped",
+                              "grhsim-am-lowering");
+                        return;
+                    }
+                    const uint32_t valueWidth =
+                        static_cast<uint32_t>(graph_.valueWidth(item.value));
+                    if (item.constant)
+                    {
+                        const VariableId constantVar = internConstant(
+                            typeForValue(item.value), *item.constant);
+                        const std::array<VariableId, 1> results{destination};
+                        const std::array<VariableId, 1> operands{constantVar};
+                        addInstruction(Opcode::Assign, results, operands);
+                        ++chainReplayEmitCount_;
+                        continue;
+                    }
+                    if (item.segments.size() == 1 &&
+                        item.segments.front().lsb == 0 &&
+                        item.segments.front().width == valueWidth &&
+                        static_cast<uint32_t>(
+                            graph_.valueWidth(item.segments.front().root)) ==
+                            valueWidth)
+                    {
+                        const VariableId source =
+                            valueMap_[item.segments.front().root.index];
+                        const std::array<VariableId, 1> results{destination};
+                        const std::array<VariableId, 1> operands{source};
+                        addInstruction(Opcode::Assign, results, operands);
+                        ++chainReplayEmitCount_;
+                        continue;
+                    }
+                    // AM Concat operand[0] sits at the most significant end;
+                    // reverse the LSB-first segment list.
+                    std::vector<VariableId> concatOperands;
+                    concatOperands.reserve(item.segments.size());
+                    bool failed = false;
+                    for (auto it = item.segments.rbegin(); it != item.segments.rend();
+                         ++it)
+                    {
+                        const ChainReplaySegment &segment = *it;
+                        if (!segment.root.valid() ||
+                            segment.root.index >= valueMap_.size())
+                        {
+                            failed = true;
+                            break;
+                        }
+                        const VariableId rootVar = valueMap_[segment.root.index];
+                        if (!rootVar.valid())
+                        {
+                            failed = true;
+                            break;
+                        }
+                        const uint32_t rootWidth = static_cast<uint32_t>(
+                            graph_.valueWidth(segment.root));
+                        if (segment.lsb == 0 && segment.width == rootWidth)
+                        {
+                            concatOperands.push_back(rootVar);
+                            continue;
+                        }
+                        const VariableId window = addVariable(
+                            Type::bitVector(segment.width), amGraph_.zeroInit());
+                        ++freshTemporaryCount_;
+                        const std::array<VariableId, 1> results{window};
+                        const std::array<VariableId, 1> operands{rootVar};
+                        const InstructionId slice =
+                            addInstruction(Opcode::SliceStatic, results, operands);
+                        amGraph_.setSliceStaticAttributes(slice, segment.lsb);
+                        ++chainReplayEmitCount_;
+                        concatOperands.push_back(window);
+                    }
+                    if (failed)
+                    {
+                        error("chain replay segment root is unmapped",
+                              "grhsim-am-lowering");
+                        return;
+                    }
+                    const InstructionId concat =
+                        addInstruction(Opcode::Concat,
+                                       std::span<const VariableId>{&destination, 1},
+                                       std::span<const VariableId>{
+                                           concatOperands.data(),
+                                           concatOperands.size()});
+                    (void)concat;
+                    ++chainReplayEmitCount_;
+                }
+            }
+
+            // Emit the merged write for one lane-write fan. Runs at the
+            // fan's flush op position inside lowerInstructions. The merged
+            // write's data is a full-width concat: member lanes carry
+            // mux(cond, data lane window, old target lane), gaps between
+            // lanes and any absorbed prefix-write effects fall back to the
+            // old target value, so the single write reproduces the whole
+            // fan's net update exactly.
+            void emitLaneWriteFan(const LaneWriteFan &fan)
+            {
+                const Operation flushOperation = graph_.getOperation(fan.flushOp);
+                const auto edges = requiredAttr<std::vector<std::string>>(
+                    flushOperation, "eventEdge");
+                if (!edges)
+                {
+                    error("lane write fan flush op lacks eventEdge",
+                          opContext(flushOperation));
+                    return;
+                }
+                const auto events = lowerEvents(flushOperation, 3, *edges);
+                if (!events || events->empty())
+                {
+                    error("lane write fan event lowering failed",
+                          opContext(flushOperation));
+                    return;
+                }
+                const ScopedGsimNodeId nodeScope(currentGsimNodeId_,
+                                                 fan.nodeId);
+
+                // Old-value base: the current target blended with any
+                // absorbed prefix writes in commit order.
+                VariableId oldValue = fan.target;
+                auto emitBinary = [&](Opcode opcode, VariableId lhs,
+                                      VariableId rhs, uint32_t width) {
+                    const VariableId result = addVariable(
+                        Type::bitVector(width), amGraph_.zeroInit());
+                    ++freshTemporaryCount_;
+                    const std::array<VariableId, 1> results{result};
+                    const std::array<VariableId, 2> operands{lhs, rhs};
+                    addInstruction(opcode, results, operands);
+                    return result;
+                };
+                const Type targetType = Type::bitVector(fan.targetWidth);
+                for (OperationId absorbed : fan.absorbedPrefix)
+                {
+                    const Operation op = graph_.getOperation(absorbed);
+                    const std::vector<uint64_t> maskWords =
+                        *constantWordsOf(valueMap_[op.operands()[2].index]);
+                    const std::vector<uint64_t> dataWords =
+                        *constantWordsOf(valueMap_[op.operands()[1].index]);
+                    std::vector<uint64_t> notMaskWords = maskWords;
+                    std::vector<uint64_t> maskedDataWords = maskWords;
+                    for (std::size_t word = 0; word < maskWords.size(); ++word)
+                    {
+                        notMaskWords[word] = ~maskWords[word];
+                        maskedDataWords[word] &= dataWords[word];
+                    }
+                    const VariableId notMaskVar =
+                        internConstant(targetType, std::move(notMaskWords));
+                    const VariableId maskedDataVar =
+                        internConstant(targetType, std::move(maskedDataWords));
+                    const VariableId kept = emitBinary(
+                        Opcode::And, oldValue, notMaskVar, fan.targetWidth);
+                    const VariableId blended = emitBinary(
+                        Opcode::Or, kept, maskedDataVar, fan.targetWidth);
+                    const VariableId condVar =
+                        valueMap_[op.operands()[0].index];
+                    if (isConstantZero(condVar))
+                    {
+                        continue;
+                    }
+                    if (isConstantOne(condVar))
+                    {
+                        oldValue = blended;
+                        continue;
+                    }
+                    const VariableId muxed = addVariable(
+                        targetType, amGraph_.zeroInit());
+                    ++freshTemporaryCount_;
+                    const std::array<VariableId, 1> results{muxed};
+                    const std::array<VariableId, 3> operands{condVar, blended,
+                                                             oldValue};
+                    addInstruction(Opcode::Mux, results, operands);
+                    oldValue = muxed;
+                }
+
+                // Per-member lane data: mux(cond, data lane window, old
+                // target lane). Assemble the full-width concat over member
+                // lanes; gaps carry zero (the merged write's union mask
+                // never commits them).
+                struct LanePiece
+                {
+                    uint32_t lo;
+                    uint32_t width;
+                    VariableId variable;
+                };
+                std::vector<LanePiece> pieces;
+                std::vector<uint64_t> unionMaskWords((fan.targetWidth + 63U) /
+                                                         64U,
+                                                     UINT64_C(0));
+                bool failed = false;
+                for (const LaneWriteMember &member : fan.members)
+                {
+                    // Resolve the data lane window.
+                    VariableId windowVar;
+                    const auto found =
+                        chainProvenance_.find(member.dataValue.index);
+                    if (found != chainProvenance_.end())
+                    {
+                        // Chain-produced data: the lane window must resolve
+                        // to exactly one root segment.
+                        std::vector<ChainReplaySegment> window;
+                        const uint64_t wantLo = member.laneLo;
+                        const uint64_t wantHi = wantLo + member.laneWidth;
+                        uint64_t position = 0;
+                        for (const ChainReplaySegment &seg : found->second)
+                        {
+                            const uint64_t segLo = position;
+                            const uint64_t segHi = segLo + seg.width;
+                            position = segHi;
+                            const uint64_t lo = std::max(segLo, wantLo);
+                            const uint64_t hi = std::min(segHi, wantHi);
+                            if (lo < hi)
+                            {
+                                window.push_back(ChainReplaySegment{
+                                    .root = seg.root,
+                                    .lsb = static_cast<uint32_t>(
+                                        seg.lsb + (lo - segLo)),
+                                    .width = static_cast<uint32_t>(hi - lo),
+                                });
+                            }
+                        }
+                        if (window.size() != 1)
+                        {
+                            failed = true;
+                            break;
+                        }
+                        const ChainReplaySegment &segment = window.front();
+                        const VariableId rootVar =
+                            valueMap_[segment.root.index];
+                        const uint32_t rootWidth = static_cast<uint32_t>(
+                            graph_.valueWidth(segment.root));
+                        if (segment.lsb == 0 && segment.width == rootWidth)
+                        {
+                            windowVar = rootVar;
+                        }
+                        else
+                        {
+                            windowVar = addVariable(
+                                Type::bitVector(segment.width),
+                                amGraph_.zeroInit());
+                            ++freshTemporaryCount_;
+                            const std::array<VariableId, 1> results{windowVar};
+                            const std::array<VariableId, 1> operands{rootVar};
+                            const InstructionId slice = addInstruction(
+                                Opcode::SliceStatic, results, operands);
+                            amGraph_.setSliceStaticAttributes(slice,
+                                                              segment.lsb);
+                        }
+                    }
+                    else
+                    {
+                        const VariableId dataVar =
+                            valueMap_[member.dataValue.index];
+                        windowVar = addVariable(
+                            Type::bitVector(member.laneWidth),
+                            amGraph_.zeroInit());
+                        ++freshTemporaryCount_;
+                        const std::array<VariableId, 1> results{windowVar};
+                        const std::array<VariableId, 1> operands{dataVar};
+                        const InstructionId slice = addInstruction(
+                            Opcode::SliceStatic, results, operands);
+                        amGraph_.setSliceStaticAttributes(slice,
+                                                          member.laneLo);
+                    }
+                    // Old target lane.
+                    VariableId oldLane = oldValue;
+                    if (member.laneWidth != fan.targetWidth ||
+                        member.laneLo != 0)
+                    {
+                        oldLane = addVariable(
+                            Type::bitVector(member.laneWidth),
+                            amGraph_.zeroInit());
+                        ++freshTemporaryCount_;
+                        const std::array<VariableId, 1> results{oldLane};
+                        const std::array<VariableId, 1> operands{oldValue};
+                        const InstructionId slice = addInstruction(
+                            Opcode::SliceStatic, results, operands);
+                        amGraph_.setSliceStaticAttributes(slice,
+                                                          member.laneLo);
+                    }
+                    const VariableId condVar =
+                        valueMap_[member.condValue.index];
+                    VariableId laneVar = windowVar;
+                    if (!isConstantOne(condVar))
+                    {
+                        if (isConstantZero(condVar))
+                        {
+                            laneVar = oldLane;
+                        }
+                        else
+                        {
+                            laneVar = addVariable(
+                                Type::bitVector(member.laneWidth),
+                                amGraph_.zeroInit());
+                            ++freshTemporaryCount_;
+                            const std::array<VariableId, 1> results{laneVar};
+                            const std::array<VariableId, 3> operands{
+                                condVar, windowVar, oldLane};
+                            addInstruction(Opcode::Mux, results, operands);
+                        }
+                    }
+                    pieces.push_back(LanePiece{.lo = member.laneLo,
+                                               .width = member.laneWidth,
+                                               .variable = laneVar});
+                    for (uint64_t bit = member.laneLo;
+                         bit < static_cast<uint64_t>(member.laneLo) +
+                                   member.laneWidth;
+                         ++bit)
+                    {
+                        unionMaskWords[bit / 64U] |= UINT64_C(1) << (bit % 64U);
+                    }
+                }
+                if (failed)
+                {
+                    error("lane write fan window resolution failed",
+                          opContext(flushOperation));
+                    return;
+                }
+                // Mask the tail bits of the union mask's last word.
+                if (fan.targetWidth % 64U != 0)
+                {
+                    unionMaskWords.back() &=
+                        (UINT64_C(1) << (fan.targetWidth % 64U)) - UINT64_C(1);
+                }
+                std::sort(pieces.begin(), pieces.end(),
+                          [](const LanePiece &lhs, const LanePiece &rhs) {
+                              return lhs.lo > rhs.lo;  // concat is MSB-first
+                          });
+                std::vector<VariableId> concatOperands;
+                concatOperands.reserve(pieces.size() + 2);
+                uint32_t cursor = fan.targetWidth;
+                for (const LanePiece &piece : pieces)
+                {
+                    const uint32_t gap = cursor - (piece.lo + piece.width);
+                    if (gap != 0)
+                    {
+                        concatOperands.push_back(internConstant(
+                            Type::bitVector(gap),
+                            std::vector<uint64_t>((gap + 63U) / 64U,
+                                                  UINT64_C(0))));
+                    }
+                    concatOperands.push_back(piece.variable);
+                    cursor = piece.lo;
+                }
+                if (cursor != 0)
+                {
+                    concatOperands.push_back(internConstant(
+                        Type::bitVector(cursor),
+                        std::vector<uint64_t>((cursor + 63U) / 64U,
+                                              UINT64_C(0))));
+                }
+                const VariableId dataVar = addVariable(
+                    targetType, amGraph_.zeroInit());
+                ++freshTemporaryCount_;
+                addInstruction(Opcode::Concat,
+                               std::span<const VariableId>{&dataVar, 1},
+                               std::span<const VariableId>{
+                                   concatOperands.data(),
+                                   concatOperands.size()});
+                // Merged cond: constant-one if any member cond is tied on,
+                // a single var when all share one, else an or-tree.
+                VariableId condMerged = VariableId::invalid();
+                VariableId constantOneCond = VariableId::invalid();
+                for (const LaneWriteMember &member : fan.members)
+                {
+                    const VariableId condVar =
+                        valueMap_[member.condValue.index];
+                    if (isConstantOne(condVar))
+                    {
+                        constantOneCond = condVar;
+                        break;
+                    }
+                    if (!condMerged.valid())
+                    {
+                        condMerged = condVar;
+                    }
+                    else if (condVar.value != condMerged.value)
+                    {
+                        condMerged = emitBinary(Opcode::Or, condMerged, condVar, 1);
+                    }
+                }
+                PendingStateWrite merged{
+                    .opcode = Opcode::RegisterWrite,
+                    .target = fan.target,
+                    .cond = constantOneCond.valid() ? constantOneCond
+                                                    : condMerged,
+                    .mask = internConstant(targetType,
+                                           std::move(unionMaskWords)),
+                    .data = dataVar,
+                    .addr = VariableId::invalid(),
+                    .events = *events,
+                    .explicitOrder = fan.members.back().explicitOrder,
+                    .context = opContext(flushOperation),
+                    .gsimNodeId = fan.nodeId,
+                };
+                if (!merged.cond.valid() || !merged.mask.valid() ||
+                    !merged.data.valid())
+                {
+                    error("lane write fan merged write is incomplete",
+                          opContext(flushOperation));
+                    return;
+                }
+                laneWriteMergedCount_ += fan.members.size() - 1;
+                pendingStateWrites_.push_back(std::move(merged));
+            }
+
             void lowerInstructions()
             {
                 for (OperationId operation : graph_.operations())
@@ -3699,6 +4994,33 @@ namespace wolvrix::lib::grhsim::am
                     }
                     const ScopedGsimNodeId gsimNodeScope(currentGsimNodeId_,
                                                          gsimNodeId.value_or(-1));
+                    // NO0012 Tier 2: fan member write ops are absorbed into
+                    // the merged write emitted at the fan's flush op.
+                    if (const auto fanIt = laneWriteSkipFan_.find(operation.index);
+                        fanIt != laneWriteSkipFan_.end())
+                    {
+                        const LaneWriteFan &fan = laneWriteFans_[fanIt->second];
+                        if (fan.flushOp == operation)
+                        {
+                            emitLaneWriteFan(fan);
+                        }
+                        continue;
+                    }
+                    // NO0012: planned chain ops skip the standard lowering;
+                    // the group's replay emits at its flush op position.
+                    if (const auto skipped =
+                            chainReplaySkipGroup_.find(operation.index);
+                        skipped != chainReplaySkipGroup_.end())
+                    {
+                        ++chainReplaySkipCount_;
+                        const ChainReplayGroup &replayGroup =
+                            chainReplayGroups_[skipped->second];
+                        if (replayGroup.flushOp == operation)
+                        {
+                            emitChainReplay(replayGroup);
+                        }
+                        continue;
+                    }
                     if (const auto opcode = combinationalOpcode(op.kind()))
                     {
                         lowerCombinational(op, *opcode);
@@ -3788,6 +5110,18 @@ namespace wolvrix::lib::grhsim::am
             std::vector<Type> stateTypeByOperation_;
             std::vector<DpiImportInfo> dpiImportByOperation_;
             std::vector<std::optional<ExplicitOrder>> explicitOrderByOperation_;
+            // NO0012 Tier 1: wide concat/slice chain lazy replay. One entry
+            // per gsim node group whose wide chain ops lower to per-segment
+            // replay instead of O(steps x width) full-width rebuilds.
+            std::vector<ChainReplayGroup> chainReplayGroups_;
+            std::unordered_map<uint32_t, uint32_t> chainReplaySkipGroup_;
+            bool disableChainReplay_ = false;
+            std::optional<int64_t> debugChainNode_;
+            uint64_t chainReplaySkipCount_ = 0;
+            uint64_t chainReplayEmitCount_ = 0;
+            uint64_t chainReplayRejectCount_ = 0;
+            uint64_t chainReplayPlanFoldCount_ = 0;
+
             std::unordered_set<uint32_t> exposedValues_;
             std::unordered_set<uint32_t> declaredValueIndices_;
             std::unordered_set<uint32_t> declaredStateIndices_;
