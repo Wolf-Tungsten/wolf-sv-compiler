@@ -990,6 +990,48 @@ may-alias 全部成员变量（XiangShan 模型 142 万个 `uint64_t` 成员）�
 函数内真 C++ 局部变量（纯 SSA）。全量 emu（351 TU）-O3 零降级构建 7m44s。
 详见 pdocs/grh-notepad/emit-cost NO0007 §12。
 
+### 3.2.8 宽状态标量炸开（`wideStateExplode`，NO0017 §5，2026-08-14）
+
+**默认 off；off 时 emit 与基线逐字节一致。** 动机（emit-cost NO0017 §4/§5）：
+>64bit 的 BitVector 状态打包进全局词池 `wideValues_`，其中「访问以统一宽度
+常量切片为主」的状态（典型：BPU ABTB takenCounter 银行，2048bit =
+1024×2bit 饱和计数器）每次元素访问都要付词提取（`extract_word` 跨词移位
++ 掩码）的成本，commit 侧掩码写对全宽跑词循环只更新 2bit；同逻辑的 gsim
+形态在声明处就炸开为标量数组、元素直读。炸开是纯 emit 表示变换——GRH IR
+与 scheduled program 不动，atom 边集不变（NO0013 起的硬约束）。
+
+机制：emit 时该类状态不进 `wideValues_` 词池，改为逐元素标量数组成员
+`wv<VariableId>_`（元素宽 K = 该状态全部常量切片站点宽度与 lsb 的 GCD，
+要求整除状态宽且 ≤64bit；元素类型按 K 取 `uint8_t/uint16_t/uint32_t/uint64_t`）。
+词池偏移在其后重排（pool 缩小，炸开状态让出预留）。
+
+- 读侧：常量 `SliceStatic`（结果 ≤64bit，lsb 与宽度均被 K 整除）→ 元素直读，
+  跨多元素拼装；`SliceArray`（结果宽 == K）→ 下标元素读；`SliceDynamic`
+  （结果宽 == K、窄下标）→ `e=start/K, r=start%K` 的两元素拼读（任意对齐
+  都精确，越界为 0，与 `extract_word` 一致）。
+- 写侧：常量掩码写 → 逐元素条件 RMW（单站点掩码横跨元素数 ≤32 才展开）；
+  全宽无掩码写 → 逐元素 store 循环（K 整除 64 时按词并行解包）；ST00013
+  融合后在写点处照旧做逐元素 change detect 喂 `wrChg` 标志。
+- init：仅接 literal（Undef/Zero/Constant 或全 literal 的 Set actions），
+  按元素升序 store（零元素由 `init()` 开头的 `wv_.fill(0)` 覆盖，常量串喂
+  clang 的 memset idiom）；random(-seeded) init 共享 `initRandomState` 链、
+  语句顺序不能动，一律不炸。
+
+守卫（任一命中即保留词池路径，宁少勿错）：全宽整体读写（含作为其它指令的
+宽操作数/结果、宽 mux 臂、changed.* 旧基线）；`SliceDynamic` 结果宽 ≠ K
+或宽下标；切片结果 >64bit 或全宽切片；切片宽度/lsb 无统一 GCD 或 K 不
+整除状态宽；`SliceArray` 结果宽 ≠ K；未融合的 changed.*（`ChangedPos/Neg`
+永不融合）；被 windowed/dynblend plan 捕获；`RegisterWriteDynLane`；掩码
+非常量或横跨 >32 元素；写数据本身炸开且 K 不一致；host-visible（端口/
+声明标签）；random init；本身是指令结果。无切片读站点的状态直接跳过
+（无收益，也不计入 bail 统计）。
+
+开关与统计：emitter 属性 `wideStateExplode`（`GrhSimAmCppOptions.attributes`），
+CLI `grhsim-am-lower-json --wide-state-explode`。`collectStats` 下向
+diagnostics 打 `wide-state explode stats`（炸开状态数/元素总数/回收词数/
+守卫 bail 分类计数），`GrhSimAmCppResult.wideStateExploded*` 供 CLI JSON
+输出。
+
 ### 3.3 临时 scheduling facts
 
 以下内容只属于 scheduler workspace，不进入 ScheduledProgram 或 session 的长期公共契约：

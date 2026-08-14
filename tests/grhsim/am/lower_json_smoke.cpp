@@ -141,7 +141,7 @@ int main(int argc, char **argv)
                      "[--dp-coarsen-atom-budget <count>] [--dp-coarsen-instr-budget <count>] [--disable-coarsening] "
                      "[--tree-atom-fold-max-instr <count>] "
                      "[--runtime-profile] [--full-evaluation] [--changed-trace] "
-                     "[--branchy-mux] [--no-trace-comments] "
+                     "[--branchy-mux] [--no-trace-comments] [--wide-state-explode] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -179,6 +179,7 @@ int main(int argc, char **argv)
     bool changedTrace = false;
     bool branchyMux = false;
     bool traceComments = true;
+    bool wideStateExplode = false;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
     {
@@ -419,6 +420,10 @@ int main(int argc, char **argv)
         else if (argument == "--branchy-mux")
         {
             branchyMux = true;
+        }
+        else if (argument == "--wide-state-explode")
+        {
+            wideStateExplode = true;
         }
         else if (argument == "--no-trace-comments")
         {
@@ -706,6 +711,9 @@ int main(int argc, char **argv)
         uint64_t dynBlendRemapped = 0;
         uint64_t dynBlendMaterialized = 0;
         uint64_t dynBlendBailed = 0;
+        uint64_t wideStateExploded = 0;
+        uint64_t wideStateExplodedElements = 0;
+        uint64_t wideStateExplodeBailed = 0;
         if (runSchedule)
         {
             phaseStart = std::chrono::steady_clock::now();
@@ -790,6 +798,10 @@ int main(int argc, char **argv)
                 {
                     emitOptions.attributes.emplace("branchyMux", "true");
                 }
+                if (wideStateExplode)
+                {
+                    emitOptions.attributes.emplace("wideStateExplode", "true");
+                }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,
                     emitOptions,
@@ -802,6 +814,21 @@ int main(int argc, char **argv)
                 {
                     printDiagnostics(diagnostics);
                     return 1;
+                }
+                if (wideStateExplode)
+                {
+                    // The emit-success path does not flush diagnostics;
+                    // surface the explode guard-bail breakdown for
+                    // attribution (see the collectStats-gated info message
+                    // in the emitter).
+                    for (const diag::Diagnostic &message : diagnostics.messages())
+                    {
+                        if (message.message.find("wide-state explode stats") !=
+                            std::string::npos)
+                        {
+                            std::cerr << message.message << '\n';
+                        }
+                    }
                 }
                 emittedArtifacts = emitResult.artifacts.size();
                 muxAtomFused = emitResult.muxAtomFused;
@@ -818,6 +845,9 @@ int main(int argc, char **argv)
                 dynBlendRemapped = emitResult.dynBlendRemapped;
                 dynBlendMaterialized = emitResult.dynBlendMaterialized;
                 dynBlendBailed = emitResult.dynBlendBailed;
+                wideStateExploded = emitResult.wideStateExploded;
+                wideStateExplodedElements = emitResult.wideStateExplodedElements;
+                wideStateExplodeBailed = emitResult.wideStateExplodeBailed;
             }
         }
         std::cout << "{\n"
@@ -861,6 +891,9 @@ int main(int argc, char **argv)
                   << "  \"dynblend_remapped\": " << dynBlendRemapped << ",\n"
                   << "  \"dynblend_materialized\": " << dynBlendMaterialized << ",\n"
                   << "  \"dynblend_bailed\": " << dynBlendBailed << ",\n"
+                  << "  \"wide_state_exploded\": " << wideStateExploded << ",\n"
+                  << "  \"wide_state_exploded_elements\": " << wideStateExplodedElements << ",\n"
+                  << "  \"wide_state_explode_bailed\": " << wideStateExplodeBailed << ",\n"
                   << "  \"current_rss_kib\": " << currentRssKiB() << ",\n"
                   << "  \"peak_rss_kib\": " << peakRssKiB() << '\n'
                   << "}\n";

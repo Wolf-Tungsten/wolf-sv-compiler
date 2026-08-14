@@ -220,6 +220,13 @@ namespace wolvrix::lib::grhsim::am
         uint64_t dynBlendRemapped = 0;
         uint64_t dynBlendMaterialized = 0;
         uint64_t dynBlendBailed = 0;
+        // NO0017 §5 wide-state scalar explode (attribute
+        // "wideStateExplode", default off): exploded state count, total
+        // element count, and the number of slice-read candidate states
+        // kept in the pool by the conservative guards.
+        uint64_t wideStateExploded = 0;
+        uint64_t wideStateExplodedElements = 0;
+        uint64_t wideStateExplodeBailed = 0;
     };
 
     // The pipeline currency is the AmGraph: lowering builds the graph

@@ -3827,6 +3827,453 @@ int main()
         return 0;
     }
 
+    // NO0017 §5 wide-state scalar explode fixture: a 128-bit state bank of
+    // 32 4-bit elements, read only through aligned constant slices
+    // (4-bit and 8-bit sites -> element width gcd 4), written by one
+    // constant-mask write (element 7) and one full-width write, with the
+    // commit tail changed.any fused into the write-point flags by ST00013.
+    // Literal constant init. This is the shape of the XiangShan BPU ABTB
+    // counter bank the rule was built for.
+    struct ExplodeEmitterFixture
+    {
+        ExecutableModel model;
+        VariableId bank;
+        VariableId writeEnable;
+        VariableId writeElement;
+        VariableId fullEnable;
+        VariableId fullData;
+        VariableId dynOffset;
+    };
+
+    ExplodeEmitterFixture makeExplodeEmitterFixture()
+    {
+        LinearProgramBuilder linear;
+        const TypeId u1Type = linear.addType(Type::bitVector(1));
+        const TypeId u4Type = linear.addType(Type::bitVector(4));
+        const TypeId u8Type = linear.addType(Type::bitVector(8));
+        const TypeId u28Type = linear.addType(Type::bitVector(28));
+        const TypeId u96Type = linear.addType(Type::bitVector(96));
+        const TypeId u128Type = linear.addType(Type::bitVector(128));
+
+        ProgramInterface interface;
+        const auto addInput = [&](TypeId type, std::string_view name) {
+            const VariableId variable = linear.addVariable(type, linear.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Input,
+                .input = variable,
+            });
+            return variable;
+        };
+        const auto addOutput = [&](TypeId type, std::string_view name) {
+            const VariableId variable = linear.addVariable(type, linear.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Output,
+                .output = variable,
+            });
+            return variable;
+        };
+        const auto addInstruction = [&](Opcode opcode,
+                                        std::initializer_list<VariableId> results,
+                                        std::initializer_list<VariableId> operands) {
+            return linear.addInstruction(
+                opcode,
+                std::span<const VariableId>(results.begin(), results.size()),
+                std::span<const VariableId>(operands.begin(), operands.size()));
+        };
+
+        const VariableId writeEnable = addInput(u1Type, "write_enable");
+        const VariableId writeElement = addInput(u4Type, "write_element");
+        const VariableId fullEnable = addInput(u1Type, "full_enable");
+        const VariableId fullData = addInput(u8Type, "full_data");
+        const VariableId dynOffset = addInput(u8Type, "dyn_offset");
+        const VariableId elem0 = addOutput(u4Type, "elem0");
+        const VariableId elem7 = addOutput(u4Type, "elem7");
+        const VariableId pair34 = addOutput(u8Type, "pair34");
+        const VariableId dynElem = addOutput(u4Type, "dyn_elem");
+
+        // The bank: element e initializes to e & 0xf (words 0xfedcba9876543210).
+        // Actions Set-literal init: a RegisterWrite target must not be
+        // Constant-init (isMutable), and the explode rule takes exactly
+        // this all-literal form.
+        const std::array<uint64_t, 2> bankInitWords = {
+            UINT64_C(0xfedcba9876543210), UINT64_C(0xfedcba9876543210)};
+        const LiteralId bankInitLiteral =
+            linear.addBitLiteral(u128Type, bankInitWords);
+        const InitAction bankInitAction{
+            .kind = InitActionKind::Set,
+            .expression = InitExpr{
+                .kind = InitExprKind::Literal,
+                .literal = bankInitLiteral,
+            },
+        };
+        const VariableId bank = linear.addVariable(
+            u128Type,
+            linear.addActionsInit(std::span<const InitAction>(&bankInitAction, 1)));
+        const VariableId bankOld = linear.addVariable(u128Type, linear.undefInit());
+        const VariableId bankChangedEvent = linear.addVariable(u1Type, linear.zeroInit());
+
+        // Write machinery: mask selecting element 7, the masked next image
+        // (element 7 <- write_element, other bits irrelevant), and the
+        // full-width next image (every byte <- full_data).
+        const std::array<uint64_t, 2> maskWords = {UINT64_C(0xf0000000), 0};
+        const VariableId maskConstant = linear.addVariable(
+            u128Type,
+            linear.addConstantInit(linear.addBitLiteral(u128Type, maskWords)));
+        const std::array<uint64_t, 2> zeroWords = {0, 0};
+        const VariableId zero96 = linear.addVariable(
+            u96Type, linear.addConstantInit(linear.addBitLiteral(u96Type, zeroWords)));
+        const std::array<uint64_t, 1> zero28Words = {0};
+        const VariableId zero28 = linear.addVariable(
+            u28Type, linear.addConstantInit(linear.addBitLiteral(u28Type, zero28Words)));
+        const VariableId maskedNext = linear.addVariable(u128Type, linear.zeroInit());
+        const VariableId fullNext = linear.addVariable(u128Type, linear.zeroInit());
+
+        // Commit gate detectors: one head changed.any per commit-read input,
+        // each with a private old baseline.
+        const std::array<VariableId, 4> gateWatched = {
+            writeEnable, writeElement, fullEnable, fullData,
+        };
+        const std::array<TypeId, 4> gateTypes = {
+            u1Type, u4Type, u1Type, u8Type,
+        };
+        std::array<VariableId, 4> gateEvents{};
+        std::array<InstructionId, 4> gateDetectors{};
+        for (std::size_t index = 0; index < gateWatched.size(); ++index)
+        {
+            const VariableId gateOld = linear.addVariable(gateTypes[index],
+                                                          linear.undefInit());
+            gateEvents[index] = linear.addVariable(u1Type, linear.zeroInit());
+            gateDetectors[index] = addInstruction(
+                Opcode::ChangedAny, {gateEvents[index]},
+                {gateWatched[index], gateOld});
+        }
+
+        // Compute (readers) block: aligned constant slices plus one
+        // dynamic-offset element read.
+        const InstructionId readElem0 = addInstruction(Opcode::SliceStatic,
+                                                       {elem0}, {bank});
+        linear.setSliceStaticAttributes(readElem0, 0);
+        const InstructionId readElem7 = addInstruction(Opcode::SliceStatic,
+                                                       {elem7}, {bank});
+        linear.setSliceStaticAttributes(readElem7, 28);
+        const InstructionId readPair34 = addInstruction(Opcode::SliceStatic,
+                                                        {pair34}, {bank});
+        linear.setSliceStaticAttributes(readPair34, 12);
+        const InstructionId readDyn = addInstruction(Opcode::SliceDynamic,
+                                                     {dynElem}, {bank, dynOffset});
+
+        // Commit block: next-image builders, the masked and full-width
+        // writes, and the ST00013-fused tail detector reactivating readers.
+        const InstructionId buildMaskedNext =
+            addInstruction(Opcode::Concat, {maskedNext}, {zero96, writeElement, zero28});
+        const InstructionId buildFullNext =
+            addInstruction(Opcode::Replicate, {fullNext}, {fullData});
+        const InstructionId maskedWrite = addInstruction(
+            Opcode::RegisterWriteCondMask, {},
+            {writeEnable, maskConstant, maskedNext, bank, gateEvents[0], gateEvents[1]});
+        const InstructionId fullWrite = addInstruction(
+            Opcode::RegisterWriteCond, {},
+            {fullEnable, fullNext, bank, gateEvents[2], gateEvents[3]});
+        const InstructionId detectBankChanged = addInstruction(
+            Opcode::ChangedAny, {bankChangedEvent}, {bank, bankOld});
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        std::vector<InstructionId> entry;
+        const auto addEntryDetector = [&](VariableId input,
+                                          std::span<const BlockId> targets) {
+            const TypeId type = scheduled.view().variable(input).type;
+            const VariableId oldValue = scheduled.addVariable(type, scheduled.undefInit());
+            const VariableId inputChanged = scheduled.addVariable(u1Type, scheduled.zeroInit());
+            const std::array<VariableId, 1> changedResults = {inputChanged};
+            const std::array<VariableId, 2> changedOperands = {input, oldValue};
+            const InstructionId detect = scheduled.addInstruction(
+                Opcode::ChangedAny, changedResults, changedOperands);
+            const std::array<VariableId, 1> activateOperands = {inputChanged};
+            const InstructionId activate = scheduled.addInstruction(
+                Opcode::ActForward, {}, activateOperands);
+            scheduled.setActivationTargets(activate, targets);
+            entry.push_back(detect);
+            entry.push_back(activate);
+        };
+        for (VariableId input : gateWatched)
+        {
+            const std::array<BlockId, 2> targets = {BlockId{1}, BlockId{2}};
+            addEntryDetector(input, targets);
+        }
+        // dyn_offset only feeds the readers block.
+        const std::array<BlockId, 1> readersTarget = {BlockId{1}};
+        addEntryDetector(dynOffset, readersTarget);
+        scheduled.addBlock(entry);
+        const std::array<InstructionId, 4> readers = {
+            readElem0, readElem7, readPair34, readDyn,
+        };
+        scheduled.addBlock(readers);
+        const InstructionId activateReaders = scheduled.addInstruction(
+            Opcode::ActBackward, {}, std::array{bankChangedEvent});
+        scheduled.setActivationTargets(activateReaders, std::array{BlockId{1}});
+        std::vector<InstructionId> commit(gateDetectors.begin(), gateDetectors.end());
+        commit.insert(commit.end(),
+                      {buildMaskedNext, buildFullNext, maskedWrite, fullWrite,
+                       detectBankChanged, activateReaders});
+        scheduled.addBlock(commit);
+
+        return ExplodeEmitterFixture{
+            .model = ExecutableModel{
+                .program = scheduled.finish(),
+                .interface = std::move(interface),
+                .commitBlockBegin = 2,
+                .commitBlockEnd = 3,
+            },
+            .bank = bank,
+            .writeEnable = writeEnable,
+            .writeElement = writeElement,
+            .fullEnable = fullEnable,
+            .fullData = fullData,
+            .dynOffset = dynOffset,
+        };
+    }
+
+    // NO0017 §5: with "wideStateExplode" on, the bank leaves the word pool
+    // for a per-element scalar array (slices -> element loads, masked write
+    // -> single-element RMW, full write -> per-element loop); with the
+    // attribute off the emission keeps the baseline wideValues_ form. The
+    // generated explode model is compiled and checked against the
+    // Interpreter oracle over masked/full write transactions.
+    int testWideStateExplode(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        ExplodeEmitterFixture fixture = makeExplodeEmitterFixture();
+
+        struct Transaction
+        {
+            uint64_t writeEnable;
+            uint64_t writeElement;
+            uint64_t fullEnable;
+            uint64_t fullData;
+            uint64_t dynOffset;
+            uint64_t expectElem0;
+            uint64_t expectElem7;
+            uint64_t expectPair34;
+            uint64_t expectDynElem;
+        };
+        const std::array<Transaction, 6> transactions = {
+            Transaction{0, 0, 0, 0, 8, 0x0, 0x7, 0x43, 0x2},
+            Transaction{1, 0xa, 0, 0, 6, 0x0, 0xa, 0x43, 0x8},
+            Transaction{0, 0x5, 0, 0, 200, 0x0, 0xa, 0x43, 0x0},
+            Transaction{0, 0x5, 1, 0xab, 124, 0xb, 0xa, 0xba, 0xa},
+            Transaction{0, 0x5, 0, 0, 8, 0xb, 0xa, 0xba, 0xb},
+            Transaction{1, 0x3, 0, 0, 0, 0xb, 0x3, 0xba, 0xb},
+        };
+        // Interpreter oracle: the model itself must produce the expected
+        // element values before any emission mode is trusted.
+        {
+            Interpreter reference(fixture.model);
+            if (!reference.ready())
+            {
+                std::string detail = "failed to build the AM explode reference fixture";
+                if (reference.initializationDiagnostic())
+                {
+                    detail += ": " + reference.initializationDiagnostic()->message;
+                }
+                return fail(detail);
+            }
+            const auto writeInput = [&](VariableId variable, uint32_t width,
+                                        uint64_t value) {
+                const std::array<uint64_t, 1> words = {value};
+                return reference
+                    .write(variable,
+                           InterpreterValue::bitVector(width, Signedness::Unsigned, words))
+                    .success();
+            };
+            for (const Transaction &transaction : transactions)
+            {
+                if (!writeInput(fixture.writeEnable, 1, transaction.writeEnable) ||
+                    !writeInput(fixture.writeElement, 4, transaction.writeElement) ||
+                    !writeInput(fixture.fullEnable, 1, transaction.fullEnable) ||
+                    !writeInput(fixture.fullData, 8, transaction.fullData) ||
+                    !writeInput(fixture.dynOffset, 8, transaction.dynOffset) ||
+                    !reference.eval().success())
+                {
+                    return fail("AM Interpreter failed an explode transaction");
+                }
+                const ProgramView program = fixture.model.program.view();
+                const auto output = [&](std::string_view name) {
+                    for (const PortBinding &port : fixture.model.interface.ports)
+                    {
+                        if (port.direction == PortDirection::Output &&
+                            program.string(port.name) == name)
+                        {
+                            return reference.value(port.output).lowWord();
+                        }
+                    }
+                    return ~uint64_t{0};
+                };
+                if (output("elem0") != transaction.expectElem0 ||
+                    output("elem7") != transaction.expectElem7 ||
+                    output("pair34") != transaction.expectPair34 ||
+                    output("dyn_elem") != transaction.expectDynElem)
+                {
+                    return fail("AM Interpreter disagreed with the explode oracle");
+                }
+            }
+        }
+
+        // Off mode: the attribute defaults off and the emission keeps the
+        // baseline wideValues_ form (no element-array member, word-extract
+        // slice reads).
+        {
+            wolvrix::lib::diag::Diagnostics diagnostics;
+            GrhSimAmCppEmitter emitter;
+            const GrhSimAmCppResult emitResult = emitter.emit(
+                fixture.model,
+                GrhSimAmCppOptions{
+                    .outputDirectory = outputDirectory / "off",
+                    .modelName = "ExplodeOffTop",
+                    .maxOutputFileBytes = 1024 * 1024,
+                },
+                diagnostics);
+            if (!emitResult.success || diagnostics.hasError())
+            {
+                return fail("AM C++ emitter failed to generate the explode-off model");
+            }
+            const std::optional<std::string> headerText =
+                readTextFile(outputDirectory / "off" / "grhsim_ExplodeOffTop.hpp");
+            const std::optional<std::string> blocksText =
+                readTextFile(outputDirectory / "off" / "grhsim_ExplodeOffTop_blocks_0.cpp");
+            if (!headerText || !blocksText)
+            {
+                return fail("AM C++ emitter produced no explode-off sources");
+            }
+            const std::string member =
+                "wv" + std::to_string(fixture.bank.value) + "_";
+            if (headerText->find(member) != std::string::npos ||
+                blocksText->find(member) != std::string::npos ||
+                blocksText->find("extract_word(wideValues_.data()") == std::string::npos ||
+                emitResult.wideStateExploded != 0)
+            {
+                return fail("AM C++ emitter changed the baseline form without "
+                            "wideStateExplode");
+            }
+        }
+
+        // On mode: the bank explodes into a per-element uint8 array.
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "ExplodeTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"wideStateExplode", "true"}},
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the explode model");
+        }
+        const std::string member = "wv" + std::to_string(fixture.bank.value) + "_";
+        if (emitResult.wideStateExploded != 1 ||
+            emitResult.wideStateExplodedElements != 32)
+        {
+            return fail("AM C++ emitter did not explode exactly the bank state");
+        }
+        const std::optional<std::string> headerText =
+            readTextFile(outputDirectory / "grhsim_ExplodeTop.hpp");
+        const std::optional<std::string> blocksText =
+            readTextFile(outputDirectory / "grhsim_ExplodeTop_blocks_0.cpp");
+        const std::optional<std::string> runtimeText =
+            readTextFile(outputDirectory / "grhsim_ExplodeTop_runtime.cpp");
+        if (!headerText || !blocksText || !runtimeText)
+        {
+            return fail("AM C++ emitter produced no explode sources");
+        }
+        if (headerText->find("std::array<std::uint8_t, 32> " + member + "{};") ==
+                std::string::npos ||
+            runtimeText->find(member + ".fill(0);") == std::string::npos ||
+            runtimeText->find(member + "[7] = (UINT64_C(7))") == std::string::npos)
+        {
+            return fail("AM C++ emitter did not declare/init the exploded element array");
+        }
+        // Element reads for the 4-bit sites (elem0/elem7) and the 2-element
+        // 8-bit site (pair34 assembles elements 3 and 4); the dynamic read
+        // blends two elements; the masked write updates element 7 in place
+        // and the full write loops per element.
+        if (blocksText->find("= (" + member + "[0]) &") == std::string::npos ||
+            blocksText->find("= (" + member + "[7]) &") == std::string::npos ||
+            blocksText->find("(std::uint64_t(" + member + "[4]) << 4)") ==
+                std::string::npos ||
+            blocksText->find("wvE_") == std::string::npos ||
+            blocksText->find(member + "[wvE_") == std::string::npos ||
+            blocksText->find("wnext = ((" + member + "[7] & ~UINT64_C(0xf))") ==
+                std::string::npos ||
+            blocksText->find(member + "[7] = wnext;") == std::string::npos ||
+            blocksText->find("wvIdx_") == std::string::npos)
+        {
+            return fail("AM C++ emitter did not rewrite the bank accesses to element form");
+        }
+
+        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << R"CPP(#include "grhsim_ExplodeTop.hpp"
+int main()
+{
+    GrhSIM_ExplodeTop model;
+    model.init();
+    model.write_enable = 0; model.write_element = 0; model.full_enable = 0; model.full_data = 0;
+    model.dyn_offset = 8;
+    model.eval();
+    if (model.elem0 != 0x0 || model.elem7 != 0x7 || model.pair34 != 0x43 || model.dyn_elem != 0x2) return 1;
+    model.write_enable = 1; model.write_element = 0xa; model.dyn_offset = 6;
+    model.eval();
+    if (model.elem0 != 0x0 || model.elem7 != 0xa || model.pair34 != 0x43 || model.dyn_elem != 0x8) return 2;
+    model.write_enable = 0; model.write_element = 0x5; model.dyn_offset = 200;
+    model.eval();
+    if (model.elem7 != 0xa || model.dyn_elem != 0x0) return 3;
+    model.full_enable = 1; model.full_data = 0xab; model.dyn_offset = 124;
+    model.eval();
+    if (model.elem0 != 0xb || model.elem7 != 0xa || model.pair34 != 0xba || model.dyn_elem != 0xa) return 4;
+    model.full_enable = 0; model.dyn_offset = 8;
+    model.eval();
+    if (model.elem0 != 0xb || model.elem7 != 0xa || model.pair34 != 0xba || model.dyn_elem != 0xb) return 5;
+    model.write_enable = 1; model.write_element = 0x3; model.dyn_offset = 0;
+    model.eval();
+    if (model.elem7 != 0x3 || model.pair34 != 0xba || model.dyn_elem != 0xb) return 6;
+    return 0;
+}
+)CPP";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the explode model harness");
+        }
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated explode AM model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (outputDirectory / "libgrhsim_ExplodeTop.a").string() + "' -o '" +
+            harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated explode AM model harness failed to compile");
+        }
+        const std::string runCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(runCommand.c_str()) != 0)
+        {
+            return fail("generated explode AM model disagreed with the oracle");
+        }
+        return 0;
+    }
+
 } // namespace
 
 int main()
@@ -4158,6 +4605,13 @@ int main()
     if (const int result = testSelectChangeRegroupsMuxRun(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-mux-run-break");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testWideStateExplode(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-wide-state-explode");
         result != 0)
     {
         return result;

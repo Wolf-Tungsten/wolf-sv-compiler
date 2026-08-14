@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <charconv>
 #include <chrono>
 #include <cctype>
@@ -12,6 +13,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -178,6 +180,26 @@ namespace wolvrix::lib::grhsim::am
             }
             return "UINT8_C(0x" + std::string(buffer, end) + ")";
         }
+
+        // NO0017 §5 explode guard-bail categories (EmitState::explodeBails
+        // index); the first recorded reason wins per state.
+        constexpr std::size_t kExplodeBailHostVisible = 0;   // port / declared label
+        constexpr std::size_t kExplodeBailRandomInit = 1;    // random(-seeded) init
+        constexpr std::size_t kExplodeBailResultDefined = 2; // instruction result
+        constexpr std::size_t kExplodeBailPlanCaptured = 3;  // windowed/dynblend plan
+        constexpr std::size_t kExplodeBailNonSliceRead = 4;  // whole-width read
+        constexpr std::size_t kExplodeBailDynamicSlice = 5;  // SliceDynamic source
+        constexpr std::size_t kExplodeBailWideSlice = 6;     // slice result > 64 bits
+        constexpr std::size_t kExplodeBailSliceWidth = 7;    // no uniform element width
+        constexpr std::size_t kExplodeBailArraySliceWidth = 8; // SliceArray width != K
+        constexpr std::size_t kExplodeBailChangedDetector = 9; // unfused changed.*
+        constexpr std::size_t kExplodeBailDynamicWrite = 10; // RegisterWriteDynLane
+        constexpr std::size_t kExplodeBailNonconstantMask = 11;
+        constexpr std::size_t kExplodeBailMaskElements = 12; // mask spans > 32 elements
+        constexpr std::size_t kExplodeBailWriteData = 13;    // write data exploded, K mismatch
+        constexpr std::size_t kExplodeBailCount = 14;
+        // Cap on the per-element unrolling of one constant-mask write site.
+        constexpr uint32_t kExplodeMaskElementLimit = 32;
 
         struct EmitState
         {
@@ -537,6 +559,26 @@ namespace wolvrix::lib::grhsim::am
             uint64_t dynBlendRemapped = 0;
             uint64_t dynBlendMaterialized = 0;
             uint64_t dynBlendBailed = 0;
+            // NO0017 §5 wide-state scalar explode (GrhSimAmCppOptions
+            // attribute "wideStateExplode", default off). A wide BitVector
+            // state whose accesses are all uniformly-sized aligned constant
+            // slices (reads) plus aligned constant-mask / full-width state
+            // writes leaves the wideValues_ word pool and becomes a
+            // per-element scalar array member (wv<K>_, element width K =
+            // gcd of every constant slice site's width and lsb): constant
+            // SliceStatic reads become element loads, SliceArray reads
+            // indexed element loads, constant-mask writes per-element RMWs,
+            // and full-width writes per-element loops. Planning is purely an
+            // emit-time representation decision (atom edge set untouched);
+            // explodedElementWidth[variable] != 0 marks an exploded state
+            // and holds K. Guards are deliberately conservative — any
+            // access outside the recognized forms keeps the pool path.
+            bool wideStateExplode = false;
+            std::vector<uint32_t> explodedElementWidth;
+            uint64_t explodedStateCount = 0;
+            uint64_t explodedElementTotal = 0;
+            uint64_t explodedReclaimedWords = 0;
+            std::array<uint64_t, kExplodeBailCount> explodeBails{};
             // NO0016: values pinned to the uint64_t storage class by
             // classifyLocalValueStorage (address-taken or non-scalar).
             uint64_t narrowLocalPinned = 0;
@@ -925,6 +967,266 @@ namespace wolvrix::lib::grhsim::am
             return valueExpr(state, result) + " = (extract_word(" + sourceWords + ", " +
                    std::to_string(sourceWidth) + ", " + startExpr + ")) & " +
                    maskExpr(width) + ";\n";
+        }
+
+        // NO0017 §5 exploded-state accessors. An exploded wide state leaves
+        // the wideValues_ word pool and becomes a per-element scalar array
+        // member wv<VariableId>_; K is the uniform element width in bits.
+        std::optional<std::vector<uint64_t>> constantWordsVector(const EmitState &state,
+                                                                 VariableId variable,
+                                                                 std::size_t words);
+
+        bool isExplodedState(const EmitState &state, VariableId variable)
+        {
+            return variable.value < state.explodedElementWidth.size() &&
+                   state.explodedElementWidth[variable.value] != 0;
+        }
+
+        const char *explodedElemCppType(uint32_t elemWidth)
+        {
+            if (elemWidth <= 8)
+            {
+                return "std::uint8_t";
+            }
+            if (elemWidth <= 16)
+            {
+                return "std::uint16_t";
+            }
+            if (elemWidth <= 32)
+            {
+                return "std::uint32_t";
+            }
+            return "std::uint64_t";
+        }
+
+        std::string explodedMemberName(VariableId variable)
+        {
+            return "wv" + std::to_string(variable.value) + "_";
+        }
+
+        // Constant aligned slice read of an exploded state: the site spans
+        // whole elements (planner invariant: K divides both lsb and the
+        // result width), so it assembles the covered elements directly.
+        std::string explodedSliceAssign(const EmitState &state,
+                                        VariableId result,
+                                        VariableId source,
+                                        uint64_t lsb)
+        {
+            const uint32_t elemWidth = state.explodedElementWidth[source.value];
+            const uint32_t width = variableType(state, result).bitWidth;
+            const uint64_t first = lsb / elemWidth;
+            const uint32_t elems = width / elemWidth;
+            const std::string member = explodedMemberName(source);
+            std::string value;
+            for (uint32_t elem = 0; elem < elems; ++elem)
+            {
+                std::string term = member + "[" + std::to_string(first + elem) + "]";
+                if (elem != 0)
+                {
+                    term = "(std::uint64_t(" + term + ") << " +
+                           std::to_string(elem * elemWidth) + ")";
+                }
+                value = value.empty() ? term : value + " | " + term;
+            }
+            return valueExpr(state, result) + " = (" + value + ") & " +
+                   maskExpr(width) + ";\n";
+        }
+
+        // The element value of an exploded state's write data at one
+        // element index: a direct element load when the data is itself
+        // exploded (same K, planner-checked), else an inline word extract.
+        std::string explodedWriteDataElem(const EmitState &state,
+                                          VariableId data,
+                                          uint32_t dataWidth,
+                                          uint64_t elem,
+                                          uint32_t elemWidth)
+        {
+            if (isExplodedState(state, data))
+            {
+                return explodedMemberName(data) + "[" + std::to_string(elem) + "]";
+            }
+            return "(extract_word(" + wordDataExpr(state, data) + ", " +
+                   std::to_string(dataWidth) + ", UINT64_C(" +
+                   std::to_string(elem * elemWidth) + ")))";
+        }
+
+        // Masked state write on an exploded target: one conditional RMW per
+        // mask-touched element (the constant mask's set bits are grouped per
+        // element), replacing the full-width masked_write_words word loop.
+        std::optional<std::string> emitExplodedMaskedWrite(const EmitState &state,
+                                                           VariableId target,
+                                                           VariableId data,
+                                                           VariableId mask,
+                                                           const std::string &flagExpr,
+                                                           std::string &error)
+        {
+            const uint32_t elemWidth = state.explodedElementWidth[target.value];
+            const uint32_t width = variableType(state, target).bitWidth;
+            const std::size_t words = (static_cast<std::size_t>(width) + 63U) / 64U;
+            std::optional<std::vector<uint64_t>> maskWords =
+                constantWordsVector(state, mask, words);
+            if (!maskWords)
+            {
+                error = "exploded state write lost its constant mask";
+                return std::nullopt;
+            }
+            std::map<uint64_t, uint64_t> elementMasks;
+            for (std::size_t word = 0; word < words; ++word)
+            {
+                uint64_t value = (*maskWords)[word];
+                if (word + 1U == words && width % 64U != 0)
+                {
+                    value &= (UINT64_C(1) << (width % 64U)) - UINT64_C(1);
+                }
+                while (value != 0)
+                {
+                    const uint32_t bit = static_cast<uint32_t>(std::countr_zero(value));
+                    value &= value - UINT64_C(1);
+                    const uint64_t global = word * 64U + bit;
+                    elementMasks[global / elemWidth] |= UINT64_C(1) << (global % elemWidth);
+                }
+            }
+            if (elementMasks.size() > kExplodeMaskElementLimit)
+            {
+                error = "exploded state write mask spans more elements than planned";
+                return std::nullopt;
+            }
+            const std::string member = explodedMemberName(target);
+            std::string code;
+            for (const auto &[elem, elemMask] : elementMasks)
+            {
+                const std::string targetElem = member + "[" + std::to_string(elem) + "]";
+                const std::string dataElem =
+                    explodedWriteDataElem(state, data, width, elem, elemWidth);
+                const std::string maskLit = wordMaskLiteral(elemMask);
+                const std::string next =
+                    "((" + targetElem + " & ~" + maskLit + ") | (" + dataElem + " & " +
+                    maskLit + "))";
+                if (flagExpr.empty())
+                {
+                    code += targetElem + " = " + next + ";\n";
+                }
+                else
+                {
+                    code += "{ const " + std::string(explodedElemCppType(elemWidth)) +
+                            " wnext = " + next + "; " + flagExpr + " |= (wnext != " +
+                            targetElem + "); " + targetElem + " = wnext; }\n";
+                }
+            }
+            return code;
+        }
+
+        // Full-width (unmasked) state write on an exploded target: a
+        // per-element store loop with optional change accumulation,
+        // replacing the assign_words(/_detect) whole-width word loop.
+        std::string emitExplodedFullWrite(const EmitState &state,
+                                          InstructionId instruction,
+                                          VariableId target,
+                                          VariableId data,
+                                          const std::string &flagExpr)
+        {
+            const uint32_t elemWidth = state.explodedElementWidth[target.value];
+            const uint32_t width = variableType(state, target).bitWidth;
+            const uint64_t elemCount = width / elemWidth;
+            const std::string member = explodedMemberName(target);
+            const std::string elemType = explodedElemCppType(elemWidth);
+            const std::string suffix = std::to_string(instruction.value);
+            const std::string changed = "wvChg_" + suffix;
+            const std::string index = "wvIdx_" + suffix;
+            const bool detect = !flagExpr.empty();
+            std::string code = "{ ";
+            if (detect)
+            {
+                code += "bool " + changed + " = false; ";
+            }
+            const auto store = [&](const std::string &indexExpr) {
+                return (detect ? changed + " |= (wnext != " + member + "[" + indexExpr + "]); "
+                               : "") +
+                       member + "[" + indexExpr + "] = wnext; ";
+            };
+            if (isExplodedState(state, data))
+            {
+                const std::string dataMember = explodedMemberName(data);
+                code += "for (std::size_t " + index + " = 0; " + index + " < " +
+                        std::to_string(elemCount) + "; ++" + index + ") { const " + elemType +
+                        " wnext = " + dataMember + "[" + index + "]; " +
+                        store(index) + "} ";
+            }
+            else if (64U % elemWidth == 0)
+            {
+                // Word-parallel unpack: every data word carries 64/K
+                // elements with constant shifts after the inner unroll.
+                const uint32_t elemsPerWord = 64U / elemWidth;
+                const std::size_t words = (static_cast<std::size_t>(width) + 63U) / 64U;
+                const std::string epw = std::to_string(elemsPerWord);
+                const std::string elemIndex = index + " * " + epw + " + wj";
+                code += "for (std::size_t " + index + " = 0; " + index + " < " +
+                        std::to_string(words) + "; ++" + index +
+                        ") { const std::uint64_t wdata = (" + wordDataExpr(state, data) +
+                        ")[" + index + "]; for (std::size_t wj = 0; wj < " + epw + " && " +
+                        elemIndex + " < " + std::to_string(elemCount) +
+                        "; ++wj) { const " + elemType + " wnext = static_cast<" + elemType +
+                        ">((wdata >> (wj * " + std::to_string(elemWidth) + ")) & " +
+                        maskExpr(elemWidth) + "); " + store(elemIndex) + "} } ";
+            }
+            else
+            {
+                code += "for (std::size_t " + index + " = 0; " + index + " < " +
+                        std::to_string(elemCount) + "; ++" + index + ") { const " + elemType +
+                        " wnext = static_cast<" + elemType + ">(extract_word(" +
+                        wordDataExpr(state, data) + ", " + std::to_string(width) + ", " +
+                        index + " * " + std::to_string(elemWidth) + ") & " +
+                        maskExpr(elemWidth) + "); " + store(index) + "} ";
+            }
+            if (detect)
+            {
+                code += flagExpr + " |= " + changed + "; ";
+            }
+            code += "}\n";
+            return code;
+        }
+
+        // Exploded-state write dispatch (NO0017 §5): constant-mask writes
+        // become per-element RMWs, full-width writes per-element loops; a
+        // present cond gates the whole statement and the ST00013 raise flag
+        // (when fused) accumulates the per-element change exactly like the
+        // word forms did.
+        std::optional<std::string> emitExplodedStateWrite(const EmitState &state,
+                                                          InstructionId instruction,
+                                                          const StateWriteLayout &layout,
+                                                          std::string &error)
+        {
+            const Opcode opcode = state.program.opcode(instruction);
+            const auto operands = state.program.operands(instruction);
+            const VariableId target = operands[layout.targetIndex];
+            const VariableId data = operands[layout.dataIndex];
+            std::string flag;
+            if (isRegisterWriteOpcode(opcode) && state.scalarWriteRaise >= 0)
+            {
+                flag = scalarWatchFlagExpr(state,
+                                           static_cast<uint32_t>(state.scalarWriteRaise));
+            }
+            std::string body;
+            if (layout.hasMask)
+            {
+                const VariableId mask = operands[layout.hasCond ? 1 : 0];
+                std::optional<std::string> masked =
+                    emitExplodedMaskedWrite(state, target, data, mask, flag, error);
+                if (!masked)
+                {
+                    return std::nullopt;
+                }
+                body = std::move(*masked);
+            }
+            else
+            {
+                body = emitExplodedFullWrite(state, instruction, target, data, flag);
+            }
+            if (layout.hasCond)
+            {
+                return "if (" + boolExpr(state, operands[0]) + ") { " + body + "}\n";
+            }
+            return body;
         }
 
         // The word value of a constant-initialized narrow bit-vector
@@ -2107,6 +2409,22 @@ namespace wolvrix::lib::grhsim::am
                     const Type &resultType = variableType(state, results.front());
                     const Type &sourceType = variableType(state, operands.front());
                     const auto attributes = state.program.sliceStaticAttributes(instruction);
+                    if (isExplodedState(state, operands.front()))
+                    {
+                        // NO0017 §5: the planner guarantees the site spans
+                        // whole elements (K divides lsb and the width).
+                        const uint32_t elemWidth =
+                            state.explodedElementWidth[operands.front().value];
+                        if (resultType.bitWidth > 64 ||
+                            resultType.bitWidth % elemWidth != 0 ||
+                            attributes->lsb % elemWidth != 0)
+                        {
+                            error = "exploded state slice is not element-aligned";
+                            return std::nullopt;
+                        }
+                        return explodedSliceAssign(state, results.front(),
+                                                   operands.front(), attributes->lsb);
+                    }
                     if (resultType.bitWidth <= 64 && !state.disableWideSliceInline)
                     {
                         return wideSliceAssign(state, results.front(),
@@ -2126,6 +2444,56 @@ namespace wolvrix::lib::grhsim::am
                     const Type &resultType = variableType(state, results.front());
                     const Type &sourceType = variableType(state, operands[0]);
                     const Type &indexType = variableType(state, operands[1]);
+                    if (opcode == Opcode::SliceArray && isExplodedState(state, operands[0]))
+                    {
+                        // NO0017 §5: element-indexed read; the planner
+                        // guarantees result width == element width.
+                        const uint32_t elemWidth =
+                            state.explodedElementWidth[operands[0].value];
+                        if (resultType.bitWidth != elemWidth)
+                        {
+                            error = "exploded state array-slice width mismatch";
+                            return std::nullopt;
+                        }
+                        const uint64_t count = sourceType.bitWidth / elemWidth;
+                        const std::string index = valueExpr(state, operands[1]);
+                        return valueExpr(state, results.front()) + " = (" + index +
+                               " >= " + std::to_string(count) + " ? 0 : " +
+                               explodedMemberName(operands[0]) + "[" + index + "]) & " +
+                               maskExpr(resultType.bitWidth) + ";\n";
+                    }
+                    if (opcode == Opcode::SliceDynamic && isExplodedState(state, operands[0]))
+                    {
+                        // NO0017 §5: dynamic bit-offset read of one element
+                        // width. Any alignment is exact: the window spans
+                        // elements e=floor(start/K) (bits r..K-1) and e+1
+                        // (bits 0..r-1); out-of-range reads produce 0,
+                        // matching extract_word.
+                        const uint32_t elemWidth =
+                            state.explodedElementWidth[operands[0].value];
+                        if (resultType.bitWidth != elemWidth)
+                        {
+                            error = "exploded state dynamic-slice width mismatch";
+                            return std::nullopt;
+                        }
+                        const uint64_t count = sourceType.bitWidth / elemWidth;
+                        const std::string start = valueExpr(state, operands[1]);
+                        const std::string suffix = std::to_string(instruction.value);
+                        const std::string elemVar = "wvE_" + suffix;
+                        const std::string remVar = "wvR_" + suffix;
+                        const std::string member = explodedMemberName(operands[0]);
+                        const std::string kText = std::to_string(elemWidth);
+                        return "{ const std::uint64_t " + elemVar + " = (" + start +
+                               ") / " + kText + "; const std::uint32_t " + remVar +
+                               " = (std::uint32_t)((" + start + ") % " + kText + "); " +
+                               valueExpr(state, results.front()) + " = (((" + elemVar +
+                               " < " + std::to_string(count) + ") ? (" + member + "[" +
+                               elemVar + "] >> " + remVar + ") : 0) | ((" + remVar +
+                               " != 0 && " + elemVar + " < " +
+                               std::to_string(count - 1) + ") ? (" + member + "[" +
+                               elemVar + " + 1] << (" + kText + " - " + remVar +
+                               ")) : 0)) & " + maskExpr(resultType.bitWidth) + ";\n}\n";
+                    }
                     if (resultType.bitWidth <= 64 && indexType.kind == TypeKind::BitVector &&
                         indexType.bitWidth <= 64 && !state.disableWideSliceInline)
                     {
@@ -2554,6 +2922,14 @@ namespace wolvrix::lib::grhsim::am
             if (wideWriteLayout.isStateWrite && !wideWriteLayout.memory &&
                 isWideBitVector(state, operands[wideWriteLayout.targetIndex]))
             {
+                if (isExplodedState(state, operands[wideWriteLayout.targetIndex]))
+                {
+                    // NO0017 §5: exploded states write per element (constant
+                    // mask) or per-element loops (full width); the commit
+                    // word loops are gone.
+                    return emitExplodedStateWrite(state, instruction, wideWriteLayout,
+                                                  error);
+                }
                 // Wide scalar write: target/data(/mask) share one Type, so all
                 // are wide word arrays. A present cond gates the whole
                 // statement; a present mask turns the plain copy into a
@@ -5976,6 +6352,457 @@ namespace wolvrix::lib::grhsim::am
         // case fails the C++ compile (uint8_t* vs uint64_t*), never silently
         // miscompiles. Escape hatch: WOLVRIX_GRHSIM_AM_DISABLE_NARROW_LOCALS
         // pins every value to class 3, reproducing pre-NO0016 output.
+        // NO0017 §5 wide-state scalar explode planning (attribute
+        // "wideStateExplode", default off — off leaves the emission
+        // byte-identical to the pre-NO0017 form). Purely an emit-time
+        // representation decision: the scheduled program is untouched
+        // (atom edge set invariant). A wide BitVector variable explodes
+        // into a per-element scalar array member when every access to it
+        // is one of the recognized forms:
+        //   read:  constant SliceStatic with a <=64-bit result (its width
+        //          and lsb join the element-width gcd), SliceArray with a
+        //          narrow index and result width == element width, or
+        //          SliceDynamic with a narrow index and result width ==
+        //          element width (two-element blend, exact for any
+        //          alignment);
+        //   write: RegisterWrite*/LatchWrite* on the state — masked with
+        //          a constant mask spanning <= 32 elements (per-element
+        //          RMW), or unmasked full-width (per-element loop);
+        //   watch: changed.* only when ST00013 fused it into the Block's
+        //          write-point flags (planScalarWatchGroups);
+        //   init:  Undef/Zero/Constant or all-literal Set actions (random
+        //          init keeps the pool path so the shared initRandomState
+        //          chain order never changes).
+        // Any other touch (whole-width read, SliceDynamic, windowed/
+        // dynblend plan capture, host-visible port/label, RegisterWrite-
+        // DynLane, being an instruction result) keeps the pool path.
+        // Element width K is the gcd of every constant slice site's width
+        // and lsb; K must divide the state width and be <= 64. Planned
+        // after the windowed/dynblend plans (capture is a guard) and
+        // before classifyLocalValueStorage; exploded states release their
+        // pool reservation (offsets compacted here).
+        void planWideStateExplode(const ExecutableModel &model, EmitState &state)
+        {
+            state.explodedElementWidth.clear();
+            if (!state.wideStateExplode)
+            {
+                return;
+            }
+            const ProgramView program = state.program;
+            const std::size_t variableCount = program.variableCount();
+            struct Candidate
+            {
+                uint64_t gcd = 0; // gcd of every constant slice width and lsb
+                uint64_t sliceSites = 0;
+                std::vector<uint32_t> arraySliceWidths;
+                std::vector<uint32_t> dynamicSliceWidths;
+                // (data, mask) variable pairs of the state-write sites;
+                // mask invalid for unmasked full-width writes.
+                std::vector<std::pair<VariableId, VariableId>> writeSites;
+                std::size_t bail = kExplodeBailCount; // first reason (none when == count)
+            };
+            std::unordered_map<uint32_t, Candidate> candidates;
+            const auto noteBail = [&candidates](uint32_t variable, std::size_t reason) {
+                Candidate &candidate = candidates[variable];
+                if (candidate.bail == kExplodeBailCount)
+                {
+                    candidate.bail = reason;
+                }
+            };
+            const auto isWideBv = [&state](VariableId variable) {
+                const Type &type = state.variableTypes[variable.value];
+                return type.kind == TypeKind::BitVector && type.bitWidth > 64;
+            };
+            // Host-visible values (difftest ports, declared labels) never
+            // leave the pool.
+            for (const PortBinding &port : model.interface.ports)
+            {
+                if (port.input.valid())
+                {
+                    noteBail(port.input.value, kExplodeBailHostVisible);
+                }
+                if (port.output.valid())
+                {
+                    noteBail(port.output.value, kExplodeBailHostVisible);
+                }
+                if (port.outputEnable.valid())
+                {
+                    noteBail(port.outputEnable.value, kExplodeBailHostVisible);
+                }
+            }
+            for (const VariableLabel &declared : model.interface.declaredVariables)
+            {
+                noteBail(declared.variable.value, kExplodeBailHostVisible);
+            }
+            for (uint32_t blockIndex = 0; blockIndex < state.blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                const EmitState::ScalarWatchPlan *scalarPlan =
+                    state.blockScalarWatchPlans[blockIndex]
+                        ? &*state.blockScalarWatchPlans[blockIndex]
+                        : nullptr;
+                for (std::size_t position = 0;
+                     position < model.program.blockSize(block);
+                     ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    const Opcode opcode = program.opcode(instruction);
+                    const auto operands = program.operands(instruction);
+                    const auto results = program.results(instruction);
+                    const bool planCaptured =
+                        (instruction.value < state.instructionWindowAction.size() &&
+                         state.instructionWindowAction[instruction.value] >= 0) ||
+                        (instruction.value < state.instructionDynBlendAction.size() &&
+                         state.instructionDynBlendAction[instruction.value] >= 0);
+                    if (planCaptured)
+                    {
+                        for (const VariableId operand : operands)
+                        {
+                            if (isWideBv(operand))
+                            {
+                                noteBail(operand.value, kExplodeBailPlanCaptured);
+                            }
+                        }
+                        for (const VariableId result : results)
+                        {
+                            if (isWideBv(result))
+                            {
+                                noteBail(result.value, kExplodeBailPlanCaptured);
+                            }
+                        }
+                        continue;
+                    }
+                    for (const VariableId result : results)
+                    {
+                        if (isWideBv(result))
+                        {
+                            noteBail(result.value, kExplodeBailResultDefined);
+                        }
+                    }
+                    const StateWriteLayout layout = stateWriteLayout(opcode);
+                    for (std::size_t index = 0; index < operands.size(); ++index)
+                    {
+                        const VariableId operand = operands[index];
+                        if (!isWideBv(operand))
+                        {
+                            continue;
+                        }
+                        switch (opcode)
+                        {
+                            case Opcode::SliceStatic:
+                            {
+                                const uint32_t width =
+                                    state.variableTypes[results.front().value].bitWidth;
+                                if (width > 64)
+                                {
+                                    noteBail(operand.value, kExplodeBailWideSlice);
+                                    break;
+                                }
+                                if (width == state.variableTypes[operand.value].bitWidth)
+                                {
+                                    noteBail(operand.value, kExplodeBailNonSliceRead);
+                                    break;
+                                }
+                                const auto attributes =
+                                    program.sliceStaticAttributes(instruction);
+                                Candidate &candidate = candidates[operand.value];
+                                candidate.gcd = std::gcd(candidate.gcd,
+                                                         static_cast<uint64_t>(width));
+                                candidate.gcd =
+                                    std::gcd(candidate.gcd, attributes->lsb);
+                                candidate.sliceSites += 1;
+                                break;
+                            }
+                            case Opcode::SliceArray:
+                                if (index == 0)
+                                {
+                                    const uint32_t width =
+                                        state.variableTypes[results.front().value]
+                                            .bitWidth;
+                                    if (width > 64)
+                                    {
+                                        noteBail(operand.value, kExplodeBailWideSlice);
+                                        break;
+                                    }
+                                    if (isWideBv(operands[1]))
+                                    {
+                                        // Element-indexed reads need a
+                                        // narrow (scalar) index.
+                                        noteBail(operand.value, kExplodeBailDynamicSlice);
+                                        break;
+                                    }
+                                    Candidate &candidate = candidates[operand.value];
+                                    candidate.gcd =
+                                        std::gcd(candidate.gcd,
+                                                 static_cast<uint64_t>(width));
+                                    candidate.arraySliceWidths.push_back(width);
+                                    candidate.sliceSites += 1;
+                                }
+                                else
+                                {
+                                    // The state as a slice index is a
+                                    // whole-width read.
+                                    noteBail(operand.value, kExplodeBailNonSliceRead);
+                                }
+                                break;
+                            case Opcode::SliceDynamic:
+                                if (index == 0 &&
+                                    state.variableTypes[results.front().value]
+                                            .bitWidth <= 64 &&
+                                    !isWideBv(operands[1]))
+                                {
+                                    // Dynamic-offset reads of one element
+                                    // width emit the two-element blend
+                                    // form (exact for any alignment).
+                                    const uint32_t width =
+                                        state.variableTypes[results.front().value]
+                                            .bitWidth;
+                                    Candidate &candidate = candidates[operand.value];
+                                    candidate.gcd =
+                                        std::gcd(candidate.gcd,
+                                                 static_cast<uint64_t>(width));
+                                    candidate.dynamicSliceWidths.push_back(width);
+                                    candidate.sliceSites += 1;
+                                }
+                                else
+                                {
+                                    noteBail(operand.value, kExplodeBailDynamicSlice);
+                                }
+                                break;
+                            case Opcode::RegisterWriteDynLane:
+                                noteBail(operand.value, kExplodeBailDynamicWrite);
+                                break;
+                            case Opcode::RegisterWrite:
+                            case Opcode::RegisterWriteCond:
+                            case Opcode::RegisterWriteMask:
+                            case Opcode::RegisterWriteCondMask:
+                            case Opcode::LatchWrite:
+                            case Opcode::LatchWriteCond:
+                            case Opcode::LatchWriteMask:
+                            case Opcode::LatchWriteCondMask:
+                                if (layout.isStateWrite && !layout.memory &&
+                                    static_cast<std::size_t>(index) == layout.targetIndex)
+                                {
+                                    Candidate &candidate = candidates[operand.value];
+                                    candidate.writeSites.emplace_back(
+                                        operands[layout.dataIndex],
+                                        layout.hasMask
+                                            ? operands[layout.hasCond ? 1 : 0]
+                                            : VariableId::invalid());
+                                }
+                                else
+                                {
+                                    // The state as write data/mask is a
+                                    // whole-width read of it.
+                                    noteBail(operand.value, kExplodeBailNonSliceRead);
+                                }
+                                break;
+                            case Opcode::ChangedAny:
+                                if (index == 0 && scalarPlan != nullptr &&
+                                    scalarPlan->detectorRaise.count(
+                                        static_cast<uint32_t>(position)) != 0)
+                                {
+                                    // ST00013: the write sites carry the
+                                    // change detection; nothing wide is
+                                    // emitted for this detector.
+                                    break;
+                                }
+                                noteBail(operand.value, kExplodeBailChangedDetector);
+                                break;
+                            case Opcode::ChangedPos:
+                            case Opcode::ChangedNeg:
+                                noteBail(operand.value, kExplodeBailChangedDetector);
+                                break;
+                            default:
+                                noteBail(operand.value, kExplodeBailNonSliceRead);
+                                break;
+                        }
+                    }
+                }
+            }
+            // Init eligibility: random(-seeded) init shares the
+            // initRandomState chain, whose statement order is frozen.
+            for (auto &[variableValue, candidate] : candidates)
+            {
+                if (candidate.bail != kExplodeBailCount)
+                {
+                    continue;
+                }
+                const VariableRecord &record =
+                    program.variable(VariableId{variableValue});
+                const InitDescriptor &init = program.init(record.init);
+                if (init.kind != InitKind::Actions)
+                {
+                    continue;
+                }
+                for (const InitAction &action : program.initActions(record.init))
+                {
+                    if (action.kind != InitActionKind::Set ||
+                        action.expression.kind != InitExprKind::Literal)
+                    {
+                        candidate.bail = kExplodeBailRandomInit;
+                        break;
+                    }
+                }
+            }
+            // Decision pass: only states with at least one slice read site
+            // are candidates (nothing to scalarize otherwise).
+            std::vector<uint32_t> exploded;
+            state.explodedElementWidth.assign(variableCount, 0);
+            for (auto &[variableValue, candidate] : candidates)
+            {
+                if (candidate.sliceSites == 0)
+                {
+                    continue;
+                }
+                if (candidate.bail != kExplodeBailCount)
+                {
+                    ++state.explodeBails[candidate.bail];
+                    continue;
+                }
+                const uint32_t width = state.variableTypes[variableValue].bitWidth;
+                const uint64_t elemWidth = candidate.gcd;
+                if (elemWidth == 0 || elemWidth > 64 ||
+                    width % elemWidth != 0 || width / elemWidth < 2)
+                {
+                    ++state.explodeBails[kExplodeBailSliceWidth];
+                    continue;
+                }
+                bool bailed = false;
+                for (const uint32_t arrayWidth : candidate.arraySliceWidths)
+                {
+                    if (arrayWidth != elemWidth)
+                    {
+                        ++state.explodeBails[kExplodeBailArraySliceWidth];
+                        bailed = true;
+                        break;
+                    }
+                }
+                if (bailed)
+                {
+                    continue;
+                }
+                for (const uint32_t dynamicWidth : candidate.dynamicSliceWidths)
+                {
+                    if (dynamicWidth != elemWidth)
+                    {
+                        ++state.explodeBails[kExplodeBailDynamicSlice];
+                        bailed = true;
+                        break;
+                    }
+                }
+                if (bailed)
+                {
+                    continue;
+                }
+                for (const auto &[data, mask] : candidate.writeSites)
+                {
+                    (void)data;
+                    if (!mask.valid())
+                    {
+                        continue;
+                    }
+                    const std::size_t words =
+                        (static_cast<std::size_t>(width) + 63U) / 64U;
+                    std::optional<std::vector<uint64_t>> maskWords =
+                        constantWordsVector(state, mask, words);
+                    if (!maskWords)
+                    {
+                        ++state.explodeBails[kExplodeBailNonconstantMask];
+                        bailed = true;
+                        break;
+                    }
+                    uint32_t touched = 0;
+                    uint64_t lastElem = std::numeric_limits<uint64_t>::max();
+                    for (std::size_t word = 0; word < words; ++word)
+                    {
+                        uint64_t value = (*maskWords)[word];
+                        if (word + 1U == words && width % 64U != 0)
+                        {
+                            value &= (UINT64_C(1) << (width % 64U)) - UINT64_C(1);
+                        }
+                        while (value != 0)
+                        {
+                            const uint32_t bit =
+                                static_cast<uint32_t>(std::countr_zero(value));
+                            value &= value - UINT64_C(1);
+                            const uint64_t elem = (word * 64U + bit) / elemWidth;
+                            if (elem != lastElem)
+                            {
+                                ++touched;
+                                lastElem = elem;
+                            }
+                        }
+                    }
+                    if (touched > kExplodeMaskElementLimit)
+                    {
+                        ++state.explodeBails[kExplodeBailMaskElements];
+                        bailed = true;
+                        break;
+                    }
+                }
+                if (bailed)
+                {
+                    continue;
+                }
+                state.explodedElementWidth[variableValue] =
+                    static_cast<uint32_t>(elemWidth);
+                exploded.push_back(variableValue);
+                ++state.explodedStateCount;
+                state.explodedElementTotal += width / elemWidth;
+            }
+            // Cross-state write-data compatibility: a write whose data is
+            // itself exploded needs matching element widths (element loads
+            // replace the word extract).
+            for (const uint32_t variableValue : exploded)
+            {
+                Candidate &candidate = candidates.at(variableValue);
+                const uint32_t elemWidth = state.explodedElementWidth[variableValue];
+                for (const auto &[data, mask] : candidate.writeSites)
+                {
+                    (void)mask;
+                    if (isExplodedState(state, data) &&
+                        state.explodedElementWidth[data.value] != elemWidth)
+                    {
+                        state.explodedElementWidth[variableValue] = 0;
+                        state.explodedElementTotal -=
+                            state.variableTypes[variableValue].bitWidth / elemWidth;
+                        --state.explodedStateCount;
+                        ++state.explodeBails[kExplodeBailWriteData];
+                        break;
+                    }
+                }
+            }
+            // Exploded states release their pool reservation; compact the
+            // remaining wide offsets so wideValues_ shrinks accordingly.
+            if (state.explodedStateCount != 0)
+            {
+                uint64_t wideWords = 0;
+                for (uint32_t index = 0; index < variableCount; ++index)
+                {
+                    const Type &type = state.variableTypes[index];
+                    if ((type.kind != TypeKind::BitVector || type.bitWidth <= 64) &&
+                        type.kind != TypeKind::Array)
+                    {
+                        continue;
+                    }
+                    EmitState::Storage &storage = state.variableStorage[index];
+                    const uint64_t elements =
+                        type.kind == TypeKind::Array ? type.elementCount : 1U;
+                    if (state.explodedElementWidth[index] != 0)
+                    {
+                        state.explodedReclaimedWords += storage.wordCount * elements;
+                        storage.offset = std::numeric_limits<uint64_t>::max();
+                        continue;
+                    }
+                    storage.offset = wideWords;
+                    wideWords += static_cast<uint64_t>(storage.wordCount) * elements;
+                }
+                state.wideWords = wideWords;
+            }
+        }
+
         void classifyLocalValueStorage(const ExecutableModel &model, EmitState &state)
         {
             const std::size_t variableCount = state.program.variableCount();
@@ -6911,6 +7738,10 @@ namespace wolvrix::lib::grhsim::am
         const auto branchyMuxAttribute = options.attributes.find("branchyMux");
         state.branchyMux = branchyMuxAttribute != options.attributes.end() &&
                            branchyMuxAttribute->second == "true";
+        // NO0017 §5: wide-state scalar explode (default off).
+        const auto wideStateExplodeAttribute = options.attributes.find("wideStateExplode");
+        state.wideStateExplode = wideStateExplodeAttribute != options.attributes.end() &&
+                                 wideStateExplodeAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -7425,6 +8256,11 @@ namespace wolvrix::lib::grhsim::am
         // NO0014 dynamic bit-field functional-update cone collapse
         // (intRat/vecRat/vlRat-style multi-port table updates).
         planDynBlendCones(model, state);
+        // NO0017 §5 wide-state scalar explode: planned after the windowed/
+        // dynblend plans (plan capture is a guard) and after ST00013 (the
+        // fused-detector check); compacts the pool offsets of the exploded
+        // states out of wideValues_.
+        planWideStateExplode(model, state);
         // NO0016 narrow-value storage classes: planned last because the
         // classification reads the windowed/dynblend plans.
         classifyLocalValueStorage(model, state);
@@ -7489,6 +8325,40 @@ namespace wolvrix::lib::grhsim::am
                                  " windowed_bailed_chains=" +
                                  std::to_string(state.windowedBailedChains),
                              std::string(kContext));
+        }
+
+        if (state.wideStateExplode &&
+            statsAttribute != options.attributes.end() && statsAttribute->second == "true")
+        {
+            static const std::array<std::string_view, kExplodeBailCount> bailNames = {
+                "host_visible", "random_init", "result_defined", "plan_captured",
+                "non_slice_read", "dynamic_slice", "wide_slice", "slice_width",
+                "array_slice_width", "changed_detector", "dynamic_write",
+                "nonconstant_mask", "mask_elements", "write_data",
+            };
+            std::string message =
+                "AM C++ emitter wide-state explode stats: exploded_states=" +
+                std::to_string(state.explodedStateCount) +
+                " exploded_elements=" + std::to_string(state.explodedElementTotal) +
+                " reclaimed_wide_words=" + std::to_string(state.explodedReclaimedWords) +
+                " guard_bails[";
+            bool first = true;
+            for (std::size_t index = 0; index < kExplodeBailCount; ++index)
+            {
+                if (state.explodeBails[index] == 0)
+                {
+                    continue;
+                }
+                if (!first)
+                {
+                    message += ",";
+                }
+                first = false;
+                message += std::string(bailNames[index]) + "=" +
+                           std::to_string(state.explodeBails[index]);
+            }
+            message += "]";
+            diagnostics.info(std::move(message), std::string(kContext));
         }
 
         const std::size_t blockSourceCount =
@@ -7774,8 +8644,21 @@ namespace wolvrix::lib::grhsim::am
             }
             header << memberDeclarations.str();
         }
-        header << "    std::array<std::uint64_t, kChangedResultCount> changedResults_{};\n"
-               << "    std::array<std::uint64_t, " << state.wideWords << "> wideValues_{};\n"
+        header << "    std::array<std::uint64_t, kChangedResultCount> changedResults_{};\n";
+        // NO0017 §5: exploded wide states — one per-element scalar array
+        // member per state (element width K), out of the wideValues_ pool.
+        for (uint32_t index = 0; index < state.explodedElementWidth.size(); ++index)
+        {
+            const uint32_t elemWidth = state.explodedElementWidth[index];
+            if (elemWidth == 0)
+            {
+                continue;
+            }
+            header << "    std::array<" << explodedElemCppType(elemWidth) << ", "
+                   << (state.variableTypes[index].bitWidth / elemWidth) << "> "
+                   << explodedMemberName(VariableId{index}) << "{};\n";
+        }
+        header << "    std::array<std::uint64_t, " << state.wideWords << "> wideValues_{};\n"
                << "    std::array<std::uint64_t, " << state.realValues << "> realValues_{};\n"
                << "    std::array<std::string, " << state.stringValues << "> stringValues_{};\n"
                << "    std::array<std::uint64_t, kActivityWordCount> activeWords_{};\n"
@@ -8862,8 +9745,18 @@ namespace
         runtime << "    changedResults_.fill(0); wideValues_.fill(0); realValues_.fill(0);\n"
                << "    for (std::string &value : stringValues_) value.clear();\n"
                << "    activeWords_.fill(0); backwardFired_ = false;\n"
-               << "    dirtyChangedBits_.fill(0); dirtyChangedResults_.clear(); onceCompleted_.fill(false);\n"
-               << "    firstEval_ = true; roundCounter_ = 0; finalized_ = false;\n"
+               << "    dirtyChangedBits_.fill(0); dirtyChangedResults_.clear(); onceCompleted_.fill(false);\n";
+        // NO0017 §5: re-zero the exploded element arrays on (re-)init, same
+        // contract as the pool fill above; literal init stores follow below.
+        for (uint32_t index = 0; index < state.explodedElementWidth.size(); ++index)
+        {
+            if (state.explodedElementWidth[index] == 0)
+            {
+                continue;
+            }
+            runtime << "    " << explodedMemberName(VariableId{index}) << ".fill(0);\n";
+        }
+        runtime << "    firstEval_ = true; roundCounter_ = 0; finalized_ = false;\n"
                << "    finishRequested_ = false; stopRequested_ = false; fatalRequested_ = false; systemExitCode_ = 0;\n"
                << "    std::uint64_t initRandomState = randomSeed_;\n";
         const auto emitSetInitialization = [&](VariableId variable,
@@ -8904,6 +9797,44 @@ namespace
                 if (expression.kind == InitExprKind::Literal)
                 {
                     literal = program.literal(expression.literal);
+                }
+                if (isExplodedState(state, variable))
+                {
+                    // NO0017 §5: exploded states take literal init only
+                    // (random init keeps the pool path by the planner).
+                    // Per-element stores in ascending order so the compiler
+                    // can fold constant runs (fill(0) above covers zeros).
+                    const uint32_t elemWidth = state.explodedElementWidth[variable.value];
+                    const uint64_t elemCount = type.bitWidth / elemWidth;
+                    for (uint64_t elem = 0; elem < elemCount; ++elem)
+                    {
+                        const uint64_t lo = elem * elemWidth;
+                        const uint64_t wordIndex = lo / 64U;
+                        const uint32_t shift = static_cast<uint32_t>(lo % 64U);
+                        uint64_t value =
+                            literal && wordIndex < literal->words.size()
+                                ? literal->words[wordIndex] >> shift
+                                : 0;
+                        if (shift != 0 && shift + elemWidth > 64U)
+                        {
+                            const uint64_t next =
+                                literal && wordIndex + 1U < literal->words.size()
+                                    ? literal->words[wordIndex + 1U]
+                                    : 0;
+                            value |= next << (64U - shift);
+                        }
+                        value &= elemWidth >= 64
+                                     ? UINT64_MAX
+                                     : (UINT64_C(1) << elemWidth) - UINT64_C(1);
+                        if (value == 0)
+                        {
+                            continue;
+                        }
+                        runtime << "    " << explodedMemberName(variable) << "[" << elem
+                                << "] = (UINT64_C(" << value << ")) & "
+                                << maskExpr(elemWidth) << ";\n";
+                    }
+                    return;
                 }
                 for (uint32_t word = 0; word < storage.wordCount; ++word)
                 {
@@ -10023,6 +10954,11 @@ namespace
         result.dynBlendRemapped = state.dynBlendRemapped;
         result.dynBlendMaterialized = state.dynBlendMaterialized;
         result.dynBlendBailed = state.dynBlendBailed;
+        result.wideStateExploded = state.explodedStateCount;
+        result.wideStateExplodedElements = state.explodedElementTotal;
+        result.wideStateExplodeBailed =
+            std::accumulate(state.explodeBails.begin(), state.explodeBails.end(),
+                            uint64_t{0});
         result.artifacts.reserve(stagedArtifacts.size());
         for (const StagedArtifact &artifact : stagedArtifacts)
         {
