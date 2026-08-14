@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -871,6 +872,222 @@ namespace
         if (std::system(runCommand.c_str()) != 0)
         {
             return fail("generated memory AM model disagreed with the Interpreter");
+        }
+        return 0;
+    }
+
+    // stateLayout=affinity (block-affinity state clustering): the memory
+    // fixture emitted with the affinity layout must declare exactly the same
+    // members in a permuted but deterministic order, keep the wideValues_
+    // pool size, keep init()'s memset anchored at the first declared member,
+    // reject invalid attribute values, and behave identically at runtime.
+    int testAffinityStateLayout(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        MemoryEmitterFixture fixture = makeMemoryEmitterFixture();
+
+        GrhSimAmCppEmitter emitter;
+        wolvrix::lib::diag::Diagnostics invalidDiagnostics;
+        const GrhSimAmCppResult invalidResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "invalid",
+                .modelName = "AffinityInvalidTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"stateLayout", "row-major"}},
+            },
+            invalidDiagnostics);
+        if (invalidResult.success || !invalidDiagnostics.hasError() ||
+            !hasDiagnosticContaining(invalidDiagnostics, "stateLayout"))
+        {
+            return fail("AM C++ emitter accepted an invalid stateLayout attribute");
+        }
+
+        wolvrix::lib::diag::Diagnostics idDiagnostics;
+        const GrhSimAmCppResult idResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "id",
+                .modelName = "AffinityTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            idDiagnostics);
+        wolvrix::lib::diag::Diagnostics affinityDiagnostics;
+        const GrhSimAmCppResult affinityResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "affinity",
+                .modelName = "AffinityTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"stateLayout", "affinity"}},
+            },
+            affinityDiagnostics);
+        wolvrix::lib::diag::Diagnostics repeatDiagnostics;
+        const GrhSimAmCppResult repeatResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "affinity-repeat",
+                .modelName = "AffinityTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"stateLayout", "affinity"}},
+            },
+            repeatDiagnostics);
+        if (!idResult.success || idDiagnostics.hasError() ||
+            !affinityResult.success || affinityDiagnostics.hasError() ||
+            !repeatResult.success || repeatDiagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the state-layout models");
+        }
+
+        // The v<K> member declaration order as emitted in the header.
+        const auto memberOrder = [](const std::string &text) {
+            std::vector<uint32_t> order;
+            const std::string marker = "    std::uint64_t v";
+            std::size_t cursor = 0;
+            while ((cursor = text.find(marker, cursor)) != std::string::npos)
+            {
+                const char *begin = text.data() + cursor + marker.size();
+                uint32_t id = 0;
+                const auto [end, error] =
+                    std::from_chars(begin, text.data() + text.size(), id);
+                if (error == std::errc{} && end != begin && *end == ';')
+                {
+                    order.push_back(id);
+                }
+                ++cursor;
+            }
+            return order;
+        };
+        const std::optional<std::string> idHeader =
+            readTextFile(outputDirectory / "id" / "grhsim_AffinityTop.hpp");
+        const std::optional<std::string> affinityHeader =
+            readTextFile(outputDirectory / "affinity" / "grhsim_AffinityTop.hpp");
+        const std::optional<std::string> affinityRuntime = readTextFile(
+            outputDirectory / "affinity" / "grhsim_AffinityTop_runtime.cpp");
+        if (!idHeader || !affinityHeader || !affinityRuntime)
+        {
+            return fail("state-layout models did not emit their header/runtime sources");
+        }
+        const std::vector<uint32_t> idOrder = memberOrder(*idHeader);
+        const std::vector<uint32_t> affinityOrder = memberOrder(*affinityHeader);
+        std::vector<uint32_t> sortedIdOrder = idOrder;
+        std::vector<uint32_t> sortedAffinityOrder = affinityOrder;
+        std::sort(sortedIdOrder.begin(), sortedIdOrder.end());
+        std::sort(sortedAffinityOrder.begin(), sortedAffinityOrder.end());
+        if (idOrder.empty() || sortedIdOrder != sortedAffinityOrder)
+        {
+            return fail("affinity state layout must declare exactly the id-layout members");
+        }
+        if (idOrder == affinityOrder)
+        {
+            return fail("affinity state layout did not cluster the memory fixture members");
+        }
+        // The wide pool keeps the same total size; only the entry offsets move.
+        const auto widePoolLine = [](const std::string &text) {
+            const std::size_t anchor = text.find("> wideValues_");
+            if (anchor == std::string::npos)
+            {
+                return std::string{};
+            }
+            const std::size_t begin = text.rfind('\n', anchor) + 1;
+            const std::size_t end = text.find('\n', anchor);
+            return text.substr(begin, end - begin);
+        };
+        if (widePoolLine(*idHeader).empty() ||
+            widePoolLine(*idHeader) != widePoolLine(*affinityHeader))
+        {
+            return fail("affinity state layout changed the wideValues_ pool size");
+        }
+        // init() zeroes the contiguous member region starting at the first
+        // declared member, whatever the layout order is.
+        const std::string expectedMemset =
+            "std::memset(&v" + std::to_string(affinityOrder.front()) + ", 0, sizeof(v" +
+            std::to_string(affinityOrder.front()) + ") * " +
+            std::to_string(affinityOrder.size()) + "U);";
+        if (affinityRuntime->find(expectedMemset) == std::string::npos)
+        {
+            return fail("affinity state layout broke the init() member-region memset");
+        }
+        // The layout sort key is fully deterministic: re-emitting the same
+        // model must reproduce every artifact byte-for-byte.
+        if (affinityResult.artifacts.size() != repeatResult.artifacts.size())
+        {
+            return fail("affinity state layout emitted an unstable artifact manifest");
+        }
+        for (const std::string &artifact : affinityResult.artifacts)
+        {
+            const std::filesystem::path filename = std::filesystem::path(artifact).filename();
+            const std::optional<std::string> first =
+                readTextFile(outputDirectory / "affinity" / filename);
+            const std::optional<std::string> second =
+                readTextFile(outputDirectory / "affinity-repeat" / filename);
+            if (!first || !second || *first != *second)
+            {
+                return fail("affinity state layout emission is not deterministic");
+            }
+        }
+
+        // The permuted layout must not change model behavior: replay the
+        // memory transaction oracle against the affinity-emitted model.
+        const std::array<MemoryTransaction, 6> transactions = {
+            MemoryTransaction{1, 0, 0, 0x00, 0x00, 0x44332211, 0x11, 1},
+            MemoryTransaction{0, 0, 2, 0x00, 0x00, 0x44332211, 0x33, 0},
+            MemoryTransaction{0, 1, 1, 0x0f, 0xab, 0x44332211, 0x2b, 1},
+            MemoryTransaction{0, 1, 1, 0x00, 0xcd, 0x44332211, 0x2b, 0},
+            MemoryTransaction{0, 1, 4, 0xff, 0x5a, 0x44332211, 0x00, 0},
+            MemoryTransaction{0, 0, 1, 0xff, 0x5a, 0x44332211, 0x2b, 0},
+        };
+        const std::filesystem::path affinityDirectory = outputDirectory / "affinity";
+        const std::filesystem::path harnessPath = affinityDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << "#include \"grhsim_AffinityTop.hpp\"\n"
+                   "#include <cstdint>\n\n"
+                   "int main()\n"
+                   "{\n"
+                   "    GrhSIM_AffinityTop model;\n"
+                   "    model.init();\n";
+        int returnCode = 1;
+        for (const MemoryTransaction &transaction : transactions)
+        {
+            harness << "    model.fill_enable = " << transaction.fillEnable << ";\n"
+                    << "    model.write_enable = " << transaction.writeEnable << ";\n"
+                    << "    model.address = " << transaction.address << ";\n"
+                    << "    model.write_mask = " << transaction.writeMask << ";\n"
+                    << "    model.write_data = " << transaction.writeData << ";\n"
+                    << "    model.fill_data = UINT32_C(" << transaction.fillData << ");\n"
+                    << "    model.eval();\n"
+                    << "    if (static_cast<std::uint64_t>(model.read_data) != UINT64_C("
+                    << transaction.expectedRead << ")) return " << returnCode++ << ";\n"
+                    << "    if (static_cast<std::uint64_t>(model.memory_changed) != UINT64_C("
+                    << transaction.expectedChanged << ")) return " << returnCode++ << ";\n";
+        }
+        harness << "    return 0;\n}\n";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the affinity memory model harness");
+        }
+        const std::string buildCommand =
+            "make -C '" + affinityDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated affinity memory AM model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = affinityDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + affinityDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (affinityDirectory / "libgrhsim_AffinityTop.a").string() + "' -o '" +
+            harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated affinity memory AM model harness failed to compile");
+        }
+        const std::string affinityRunCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(affinityRunCommand.c_str()) != 0)
+        {
+            return fail("generated affinity memory AM model disagreed with the oracle");
         }
         return 0;
     }
@@ -4088,6 +4305,13 @@ int main()
     if (const int result = testMemoryOperations(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-memory");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testAffinityStateLayout(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-affinity-layout");
         result != 0)
     {
         return result;

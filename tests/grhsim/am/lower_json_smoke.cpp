@@ -141,7 +141,7 @@ int main(int argc, char **argv)
                      "[--dp-coarsen-atom-budget <count>] [--dp-coarsen-instr-budget <count>] [--disable-coarsening] "
                      "[--tree-atom-fold-max-instr <count>] "
                      "[--runtime-profile] [--full-evaluation] [--changed-trace] "
-                     "[--branchy-mux] [--no-trace-comments] "
+                     "[--branchy-mux] [--state-layout <id|affinity>] [--no-trace-comments] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -179,6 +179,7 @@ int main(int argc, char **argv)
     bool changedTrace = false;
     bool branchyMux = false;
     bool traceComments = true;
+    std::optional<std::string> stateLayout;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
     {
@@ -419,6 +420,16 @@ int main(int argc, char **argv)
         else if (argument == "--branchy-mux")
         {
             branchyMux = true;
+        }
+        else if (argument == "--state-layout" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            if (text != "id" && text != "affinity")
+            {
+                std::cerr << "invalid --state-layout value: " << text << '\n';
+                return 2;
+            }
+            stateLayout = std::string(text);
         }
         else if (argument == "--no-trace-comments")
         {
@@ -789,6 +800,10 @@ int main(int argc, char **argv)
                 if (branchyMux)
                 {
                     emitOptions.attributes.emplace("branchyMux", "true");
+                }
+                if (stateLayout)
+                {
+                    emitOptions.attributes.emplace("stateLayout", *stateLayout);
                 }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,
