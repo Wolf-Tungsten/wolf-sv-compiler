@@ -258,6 +258,36 @@ namespace wolvrix::lib::grhsim::am
             mutable std::vector<uint32_t> localValueIndices;
             mutable uint32_t activeLocalityBlock = std::numeric_limits<uint32_t>::max();
             mutable std::vector<uint32_t> activeLocalityDeclarations;
+            // NO0016 narrow-value storage classes: every localized value is
+            // emitted with a C type sized to its bit width (class 0=uint8_t,
+            // 1=uint16_t, 2=uint32_t, 3=uint64_t) instead of a uniform
+            // uint64_t slot, shrinking chunked-Block shared arrays ~8x for
+            // 1-bit-dominated networks. localValueClasses is per variable;
+            // values whose emission can take the slot's address (word-level
+            // helpers on wide instructions, windowed/dynblend plans, array or
+            // host-visible ops) are pinned to class 3 by
+            // classifyLocalValueStorage. Per-class indices (not flat) are
+            // stored in localValueIndices; activeLocalityDeclClasses parallels
+            // activeLocalityDeclarations.
+            std::vector<uint8_t> localValueClasses;
+            mutable std::vector<uint8_t> activeLocalityDeclClasses;
+            mutable std::array<uint32_t, 4> activeLocalityClassCounts{};
+            // NO0016 Stage B chunk-internal scalarization: a localized value
+            // of an oversized (chunked) Block whose reads all stay inside its
+            // defining chunk is emitted as a chunk-function-local typed
+            // scalar (register candidate) instead of a shared parent-scope
+            // array slot — the microbenchmarked 13x gap between array
+            // round-trips and registers. Only cross-chunk values keep array
+            // slots. chunkScalarIndex != kInvalidChunkScalar marks an
+            // internal value and holds its dense per-(chunk, class) index;
+            // blockChunkScalarCounts[block][chunk][class] gives the
+            // declaration counts. Values pinned to class 3 (address-taken)
+            // and operands/results of mux-fusion-covered instructions are
+            // never internalized (their reads are emitted at the run head /
+            // plan tail positions, not at their instruction position).
+            std::vector<uint32_t> chunkScalarIndex;
+            std::vector<std::vector<std::array<uint32_t, 4>>> blockChunkScalarCounts;
+            uint64_t chunkLocalScalarCount = 0;
             // Oversized-Block chunking (blockChunkInstructions): while an
             // oversized Block's instruction stream is emitted as
             // block_<id>_chunk_<k>() member functions, this holds the chunked
@@ -507,11 +537,20 @@ namespace wolvrix::lib::grhsim::am
             uint64_t dynBlendRemapped = 0;
             uint64_t dynBlendMaterialized = 0;
             uint64_t dynBlendBailed = 0;
+            // NO0016: values pinned to the uint64_t storage class by
+            // classifyLocalValueStorage (address-taken or non-scalar).
+            uint64_t narrowLocalPinned = 0;
+            // NO0018 escape hatches (env-set, see classifyLocalValueStorage):
+            // keep the pre-NO0018 outlined slice_words / masked-write helper
+            // emission instead of the inline forms.
+            bool disableWideSliceInline = false;
+            bool disableMaskedWriteUnroll = false;
         };
 
         constexpr uint8_t kEscapeGlobal = 1U << 0U;
         constexpr uint8_t kEscapeCrossBlockUse = 1U << 1U;
         constexpr uint8_t kEscapeEarlyUse = 1U << 2U;
+        constexpr uint32_t kInvalidChunkScalar = std::numeric_limits<uint32_t>::max();
         constexpr uint32_t kInvalidLocalityBlock = std::numeric_limits<uint32_t>::max();
         constexpr uint32_t kInvalidChangedResultIndex =
             std::numeric_limits<uint32_t>::max();
@@ -543,16 +582,42 @@ namespace wolvrix::lib::grhsim::am
                    state.activeChunkedBlock == state.activeLocalityBlock;
         }
 
+        // NO0016 storage-class name infix: class 3 keeps the legacy
+        // local_<k>/localblk_<id>[k] spelling (so the all-class-3 escape
+        // hatch reproduces the pre-NO0016 output byte for byte), narrower
+        // classes carry the width in the name.
+        std::string localClassInfix(uint8_t storageClass)
+        {
+            switch (storageClass)
+            {
+                case 0: return "8";
+                case 1: return "16";
+                case 2: return "32";
+                default: return "";
+            }
+        }
+
         std::string valueExpr(const EmitState &state, VariableId variable)
         {
             if (isLocalValue(state, variable))
             {
+                const std::string infix =
+                    localClassInfix(state.localValueClasses[variable.value]);
                 if (chunkedBlockNaming(state))
                 {
-                    return "localblk_" + std::to_string(state.activeChunkedBlock) + "[" +
+                    // NO0016 Stage B: chunk-internal values name the
+                    // chunk-function-local scalar, not a shared array slot.
+                    if (state.chunkScalarIndex[variable.value] != kInvalidChunkScalar)
+                    {
+                        return "local" + infix + "_" +
+                               std::to_string(state.chunkScalarIndex[variable.value]);
+                    }
+                    return "localblk" + infix + "_" +
+                           std::to_string(state.activeChunkedBlock) + "[" +
                            std::to_string(state.localValueIndices[variable.value]) + "]";
                 }
-                return "local_" + std::to_string(state.localValueIndices[variable.value]);
+                return "local" + infix + "_" +
+                       std::to_string(state.localValueIndices[variable.value]);
             }
             const uint32_t denseIndex = state.changedResultDenseIndex[variable.value];
             if (denseIndex != kInvalidChangedResultIndex)
@@ -607,6 +672,8 @@ namespace wolvrix::lib::grhsim::am
         {
             state.activeLocalityBlock = block;
             state.activeLocalityDeclarations.clear();
+            state.activeLocalityDeclClasses.clear();
+            state.activeLocalityClassCounts.fill(0);
             for (const uint32_t variable : state.blockDefinedVariables[block])
             {
                 if (state.variableEscapeFlags[variable] != 0)
@@ -614,10 +681,20 @@ namespace wolvrix::lib::grhsim::am
                     continue;
                 }
                 state.localValueStamps[variable] = block + 1;
+                // NO0016 Stage B: a chunk-internal scalar is declared inside
+                // its home chunk function; it gets no shared array slot.
+                if (state.chunkScalarIndex[variable] != kInvalidChunkScalar)
+                {
+                    continue;
+                }
+                // NO0016: per-class indices (the class's own dense ordinal),
+                // not the flat declaration order.
+                const uint8_t storageClass = state.localValueClasses[variable];
                 state.localValueIndices[variable] =
-                    static_cast<uint32_t>(state.activeLocalityDeclarations.size());
+                    state.activeLocalityClassCounts[storageClass]++;
                 state.activeLocalityDeclarations.push_back(
                     state.localValueIndices[variable]);
+                state.activeLocalityDeclClasses.push_back(storageClass);
             }
         }
 
@@ -625,6 +702,19 @@ namespace wolvrix::lib::grhsim::am
         {
             state.activeLocalityBlock = kInvalidLocalityBlock;
             state.activeLocalityDeclarations.clear();
+            state.activeLocalityDeclClasses.clear();
+            state.activeLocalityClassCounts.fill(0);
+        }
+
+        const char *localClassCppType(uint8_t storageClass)
+        {
+            switch (storageClass)
+            {
+                case 0: return "std::uint8_t";
+                case 1: return "std::uint16_t";
+                case 2: return "std::uint32_t";
+                default: return "std::uint64_t";
+            }
         }
 
         std::string localValueDeclarations(const EmitState &state)
@@ -633,18 +723,35 @@ namespace wolvrix::lib::grhsim::am
             {
                 return {};
             }
-            std::string code = "std::uint64_t ";
-            bool first = true;
-            for (const uint32_t index : state.activeLocalityDeclarations)
+            // NO0016: one declaration per storage class, names carry the
+            // class infix (local8_<k>, ..., class 3 stays local_<k>).
+            std::string code;
+            for (uint8_t storageClass = 0; storageClass < 4; ++storageClass)
             {
-                if (!first)
+                if (state.activeLocalityClassCounts[storageClass] == 0)
                 {
-                    code += ", ";
+                    continue;
                 }
-                first = false;
-                code += "local_" + std::to_string(index);
+                code += localClassCppType(storageClass);
+                code += " ";
+                const std::string infix = localClassInfix(storageClass);
+                bool first = true;
+                for (std::size_t i = 0; i < state.activeLocalityDeclarations.size(); ++i)
+                {
+                    if (state.activeLocalityDeclClasses[i] != storageClass)
+                    {
+                        continue;
+                    }
+                    if (!first)
+                    {
+                        code += ", ";
+                    }
+                    first = false;
+                    code += "local" + infix + "_" +
+                            std::to_string(state.activeLocalityDeclarations[i]);
+                }
+                code += ";\n";
             }
-            code += ";\n";
             return code;
         }
 
@@ -804,6 +911,22 @@ namespace wolvrix::lib::grhsim::am
                        : "&" + valueExpr(state, variable);
         }
 
+        // NO0018: assign a <=64-bit slice of a wide word-array value as an
+        // inline expression. extract_word is header-constexpr, so a constant
+        // start folds to 1-2 loads and the result needs no addressable slot
+        // (unpinning in classifyLocalValueStorage mirrors this).
+        std::string wideSliceAssign(const EmitState &state,
+                                    VariableId result,
+                                    const std::string &sourceWords,
+                                    uint32_t sourceWidth,
+                                    const std::string &startExpr)
+        {
+            const uint32_t width = variableType(state, result).bitWidth;
+            return valueExpr(state, result) + " = (extract_word(" + sourceWords + ", " +
+                   std::to_string(sourceWidth) + ", " + startExpr + ")) & " +
+                   maskExpr(width) + ";\n";
+        }
+
         // The word value of a constant-initialized narrow bit-vector
         // variable, when it is one: lets a state-write mask fold to an
         // immediate instead of reading a state slot.
@@ -901,6 +1024,117 @@ namespace wolvrix::lib::grhsim::am
             return "assign_words(" + wideDataExpr(state, target) + ", " +
                    std::to_string(targetType.bitWidth) + ", " + wideDataExpr(state, source) +
                    ", " + std::to_string(sourceType.bitWidth) + ", " + sign + ");\n";
+        }
+
+        // NO0018 W3: the constant word values of a constant-initialized
+        // bit-vector variable, zero-padded to `words`.
+        std::optional<std::vector<uint64_t>> constantWordsVector(const EmitState &state,
+                                                                 VariableId variable,
+                                                                 std::size_t words)
+        {
+            const VariableRecord &record = state.program.variable(variable);
+            if (!record.init.valid() || record.init.value >= state.program.initCount())
+            {
+                return std::nullopt;
+            }
+            const InitDescriptor &init = state.program.init(record.init);
+            if (init.kind != InitKind::Constant)
+            {
+                return std::nullopt;
+            }
+            const LiteralView literal = state.program.literal(LiteralId{init.payload});
+            const Type &literalType = state.program.type(literal.type);
+            if (literalType.kind != TypeKind::BitVector)
+            {
+                return std::nullopt;
+            }
+            std::vector<uint64_t> out(words, 0);
+            for (std::size_t word = 0; word < words && word < literal.words.size(); ++word)
+            {
+                out[word] = literal.words[word];
+            }
+            return out;
+        }
+
+        // NO0018 W3: masked wide write emission. A constant mask touching few
+        // words unrolls to per-word RMW inline (the masked_write_words helper
+        // loops over every word of the target width; e.g. 32 words for a
+        // 2-bit counter update on a 2048-bit state). `flagExpr` empty selects
+        // the plain (non-detect) form; otherwise the per-word change is
+        // accumulated into it. Falls back to the helper call otherwise.
+        std::string emitMaskedWriteWords(const EmitState &state,
+                                         const std::string &targetWords,
+                                         const std::string &dataWords,
+                                         VariableId mask,
+                                         uint32_t width,
+                                         const std::string &flagExpr,
+                                         const std::string &constName)
+        {
+            const std::size_t words = (static_cast<std::size_t>(width) + 63U) / 64U;
+            if (!state.disableMaskedWriteUnroll)
+            {
+                if (std::optional<std::vector<uint64_t>> maskWords =
+                        constantWordsVector(state, mask, words))
+                {
+                    std::vector<std::pair<std::size_t, uint64_t>> touched;
+                    for (std::size_t word = 0; word < words; ++word)
+                    {
+                        uint64_t value = (*maskWords)[word];
+                        const uint32_t bits =
+                            word + 1U == words ? width - static_cast<uint32_t>(word * 64U) : 64U;
+                        if (bits < 64U)
+                        {
+                            value &= (UINT64_C(1) << bits) - UINT64_C(1);
+                        }
+                        if (value != 0)
+                        {
+                            touched.emplace_back(word, value);
+                        }
+                    }
+                    if (touched.size() <= 16)
+                    {
+                        std::string code;
+                        for (const auto &[word, value] : touched)
+                        {
+                            const std::string target =
+                                "(" + targetWords + ")[" + std::to_string(word) + "]";
+                            const std::string maskLit = wordMaskLiteral(value);
+                            const std::string next =
+                                "((" + target + " & ~" + maskLit + ") | ((" + dataWords + ")[" +
+                                std::to_string(word) + "] & " + maskLit + "))";
+                            if (flagExpr.empty())
+                            {
+                                code += target + " = " + next + ";\n";
+                            }
+                            else
+                            {
+                                code += "{ const std::uint64_t wnext = " + next + "; " + flagExpr +
+                                        " |= (wnext != " + target + "); " + target +
+                                        " = wnext; }\n";
+                            }
+                        }
+                        return code;
+                    }
+                }
+            }
+            std::string maskWords;
+            std::string prefix;
+            if (std::optional<std::string> decl = constantWordsDecl(state, mask, constName))
+            {
+                prefix = *decl + "\n";
+                maskWords = constName;
+            }
+            else
+            {
+                maskWords = wordDataExpr(state, mask);
+            }
+            const std::string writeArgs = targetWords + ", " + dataWords + ", " + maskWords +
+                                          ", " + std::to_string(width) + ")";
+            if (flagExpr.empty())
+            {
+                return prefix + "masked_write_words(" + writeArgs + ";\n";
+            }
+            return prefix + flagExpr + " |= masked_write_words_detect(" + writeArgs + ";\n";
         }
 
         std::string dpiIntegralCppType(const Type &type)
@@ -1565,6 +1799,11 @@ namespace wolvrix::lib::grhsim::am
             // planner proved the read happens before any overwriting step).
             const Type &resultType = variableType(state, results.front());
             const auto attributes = state.program.sliceStaticAttributes(instruction);
+            if (resultType.bitWidth <= 64 && !state.disableWideSliceInline)
+            {
+                return wideSliceAssign(state, results.front(), chainTarget, plan.width,
+                                       "UINT64_C(" + std::to_string(attributes->lsb) + ")");
+            }
             return "slice_words(" + wordDataExpr(state, results.front()) + ", " +
                    std::to_string(resultType.bitWidth) + ", " + chainTarget + ", " +
                    std::to_string(plan.width) + ", UINT64_C(" +
@@ -1597,12 +1836,26 @@ namespace wolvrix::lib::grhsim::am
                 if (state.program.opcode(instruction) == Opcode::SliceStatic)
                 {
                     const auto attributes = state.program.sliceStaticAttributes(instruction);
+                    if (resultType.bitWidth <= 64 && !state.disableWideSliceInline)
+                    {
+                        return wideSliceAssign(state, results.front(), accumulator,
+                                               plan.width,
+                                               "UINT64_C(" + std::to_string(attributes->lsb) + ")");
+                    }
                     return "slice_words(" + wordDataExpr(state, results.front()) + ", " +
                            std::to_string(resultType.bitWidth) + ", " + accumulator +
                            ", " + std::to_string(plan.width) + ", UINT64_C(" +
                            std::to_string(attributes->lsb) + "));\n";
                 }
                 const Type &indexType = variableType(state, operands[1]);
+                if (resultType.bitWidth <= 64 && indexType.kind == TypeKind::BitVector &&
+                    indexType.bitWidth <= 64 && !state.disableWideSliceInline)
+                {
+                    // Narrow index == index_words with zero high words;
+                    // extract_word covers the out-of-range (>= width) case.
+                    return wideSliceAssign(state, results.front(), accumulator,
+                                           plan.width, valueExpr(state, operands[1]));
+                }
                 return "slice_dynamic_words(" + wordDataExpr(state, results.front()) +
                        ", " + std::to_string(resultType.bitWidth) + ", " + accumulator +
                        ", " + std::to_string(plan.width) + ", " +
@@ -1854,6 +2107,13 @@ namespace wolvrix::lib::grhsim::am
                     const Type &resultType = variableType(state, results.front());
                     const Type &sourceType = variableType(state, operands.front());
                     const auto attributes = state.program.sliceStaticAttributes(instruction);
+                    if (resultType.bitWidth <= 64 && !state.disableWideSliceInline)
+                    {
+                        return wideSliceAssign(state, results.front(),
+                                               wordDataExpr(state, operands.front()),
+                                               sourceType.bitWidth,
+                                               "UINT64_C(" + std::to_string(attributes->lsb) + ")");
+                    }
                     return "slice_words(" + wordDataExpr(state, results.front()) + ", " +
                            std::to_string(resultType.bitWidth) + ", " +
                            wordDataExpr(state, operands.front()) + ", " +
@@ -1866,6 +2126,24 @@ namespace wolvrix::lib::grhsim::am
                     const Type &resultType = variableType(state, results.front());
                     const Type &sourceType = variableType(state, operands[0]);
                     const Type &indexType = variableType(state, operands[1]);
+                    if (resultType.bitWidth <= 64 && indexType.kind == TypeKind::BitVector &&
+                        indexType.bitWidth <= 64 && !state.disableWideSliceInline)
+                    {
+                        // Narrow index == index_words with zero high words.
+                        std::string start = valueExpr(state, operands[1]);
+                        if (opcode == Opcode::SliceArray)
+                        {
+                            // element == count maps to sourceWidth (-> 0).
+                            const uint64_t count =
+                                sourceType.bitWidth / resultType.bitWidth;
+                            start = "(" + start + " >= " + std::to_string(count) +
+                                    " ? " + std::to_string(sourceType.bitWidth) + " : " +
+                                    start + " * " + std::to_string(resultType.bitWidth) + ")";
+                        }
+                        return wideSliceAssign(state, results.front(),
+                                               wordDataExpr(state, operands[0]),
+                                               sourceType.bitWidth, start);
+                    }
                     const std::string helper =
                         opcode == Opcode::SliceDynamic ? "slice_dynamic_words" : "slice_array_words";
                     return helper + "(" + wordDataExpr(state, results.front()) + ", " +
@@ -2288,33 +2566,16 @@ namespace wolvrix::lib::grhsim::am
                 {
                     const VariableId mask =
                         operands[wideWriteLayout.hasCond ? 1 : 0];
-                    const std::string constName =
-                        "write_mask_" + std::to_string(instruction.value);
-                    std::string maskWords;
-                    if (std::optional<std::string> decl =
-                            constantWordsDecl(state, mask, constName))
-                    {
-                        body = *decl + "\n";
-                        maskWords = constName;
-                    }
-                    else
-                    {
-                        maskWords = wideDataExpr(state, mask);
-                    }
-                    const std::string writeArgs =
-                        wideDataExpr(state, target) + ", " + wideDataExpr(state, data) +
-                        ", " + maskWords + ", " + std::to_string(width) + ")";
+                    std::string flag;
                     if (isRegisterWriteOpcode(opcode) && state.scalarWriteRaise >= 0)
                     {
                         // ST00013: report a real change for the raise flag.
-                        body += scalarWatchFlagExpr(
-                                    state, static_cast<uint32_t>(state.scalarWriteRaise)) +
-                                " |= masked_write_words_detect(" + writeArgs + ";\n";
+                        flag = scalarWatchFlagExpr(
+                            state, static_cast<uint32_t>(state.scalarWriteRaise));
                     }
-                    else
-                    {
-                        body += "masked_write_words(" + writeArgs + ";\n";
-                    }
+                    body += emitMaskedWriteWords(state, wideDataExpr(state, target),
+                                                 wideDataExpr(state, data), mask, width, flag,
+                                                 "write_mask_" + std::to_string(instruction.value));
                 }
                 else if (isRegisterWriteOpcode(opcode) && state.scalarWriteRaise >= 0)
                 {
@@ -2713,34 +2974,18 @@ namespace wolvrix::lib::grhsim::am
                     if (layout.hasMask)
                     {
                         const VariableId mask = operands[addrIndex + 1];
-                        const std::string constName = "write_mask_" + suffix;
-                        std::string maskWords;
-                        if (std::optional<std::string> decl =
-                                constantWordsDecl(state, mask, constName))
-                        {
-                            body = *decl + " ";
-                            maskWords = constName;
-                        }
-                        else
-                        {
-                            maskWords = wordDataExpr(state, mask);
-                        }
-                        const std::string writeArgs =
-                            row + ", " + wordDataExpr(state, data) + ", " + maskWords +
-                            ", " + std::to_string(memoryType.bitWidth) + ")";
+                        std::string flag;
                         if (state.arrayWriteAccum >= 0)
                         {
                             // ST00011: fuse reader-activation change detection
                             // into the element write (exact: only a real element
                             // change raises the flag).
-                            body += arrayWatchAccumExpr(
-                                        state, static_cast<uint32_t>(state.arrayWriteAccum)) +
-                                    " |= masked_write_words_detect(" + writeArgs + ";";
+                            flag = arrayWatchAccumExpr(
+                                state, static_cast<uint32_t>(state.arrayWriteAccum));
                         }
-                        else
-                        {
-                            body += "masked_write_words(" + writeArgs + ";";
-                        }
+                        body += emitMaskedWriteWords(state, row, wordDataExpr(state, data), mask,
+                                                     memoryType.bitWidth, flag,
+                                                     "write_mask_" + suffix);
                     }
                     else
                     {
@@ -2985,18 +3230,32 @@ namespace wolvrix::lib::grhsim::am
         }
 
         // Oversized-Block chunking: a chunked Block's local values live in
-        // one parent-scope array (uninitialized, exactly like the inline
-        // per-value locals) shared with the chunk functions through a pointer
-        // parameter. Requires beginLocalityBlock + activeChunkedBlock.
+        // parent-scope arrays (uninitialized, exactly like the inline
+        // per-value locals) shared with the chunk functions through pointer
+        // parameters. NO0016: one array per non-empty storage class
+        // (localblk8_<id>[...], ...; class 3 keeps the legacy localblk_<id>
+        // spelling). Requires beginLocalityBlock + activeChunkedBlock.
         std::string chunkedLocalValueDeclarations(const EmitState &state)
         {
             if (state.activeLocalityDeclarations.empty())
             {
                 return {};
             }
-            return "std::uint64_t localblk_" +
-                   std::to_string(state.activeChunkedBlock) + "[" +
-                   std::to_string(state.activeLocalityDeclarations.size()) + "];\n";
+            std::string code;
+            for (uint8_t storageClass = 0; storageClass < 4; ++storageClass)
+            {
+                const uint32_t count = state.activeLocalityClassCounts[storageClass];
+                if (count == 0)
+                {
+                    continue;
+                }
+                code += localClassCppType(storageClass);
+                code += " localblk";
+                code += localClassInfix(storageClass);
+                code += "_" + std::to_string(state.activeChunkedBlock) + "[" +
+                        std::to_string(count) + "];\n";
+            }
+            return code;
         }
 
         // Chunked-form watch flags: same reset-at-Block-entry semantics as
@@ -3767,7 +4026,8 @@ namespace wolvrix::lib::grhsim::am
         // (every Block except the entry Block).
         struct BlockChunkParams
         {
-            bool locals = false;
+            // NO0016: one shared array per non-empty local storage class.
+            std::array<bool, 4> locals{};
             bool scalarWatch = false;
             bool arrayWatch = false;
             bool detectorGroups = false;
@@ -3779,7 +4039,11 @@ namespace wolvrix::lib::grhsim::am
         {
             BlockChunkParams params;
             beginLocalityBlock(state, static_cast<uint32_t>(blockIndex));
-            params.locals = !state.activeLocalityDeclarations.empty();
+            for (uint8_t storageClass = 0; storageClass < 4; ++storageClass)
+            {
+                params.locals[storageClass] =
+                    state.activeLocalityClassCounts[storageClass] != 0;
+            }
             endLocalityBlock(state);
             const EmitState::ScalarWatchPlan *scalarPlan =
                 scalarWatchPlanFor(state, blockIndex);
@@ -3815,7 +4079,19 @@ namespace wolvrix::lib::grhsim::am
             // queries quadratic on the oversized Blocks (measured: -O3 did
             // not finish a 62k-line TU in 40 minutes; the parent-scope
             // arrays never alias member storage, so restrict is valid).
-            if (params.locals)
+            if (params.locals[0])
+            {
+                append("std::uint8_t *__restrict__ localblk8" + suffix);
+            }
+            if (params.locals[1])
+            {
+                append("std::uint16_t *__restrict__ localblk16" + suffix);
+            }
+            if (params.locals[2])
+            {
+                append("std::uint32_t *__restrict__ localblk32" + suffix);
+            }
+            if (params.locals[3])
             {
                 append("std::uint64_t *__restrict__ localblk" + suffix);
             }
@@ -3852,7 +4128,19 @@ namespace wolvrix::lib::grhsim::am
                 }
                 list += argument;
             };
-            if (params.locals)
+            if (params.locals[0])
+            {
+                append("localblk8" + suffix);
+            }
+            if (params.locals[1])
+            {
+                append("localblk16" + suffix);
+            }
+            if (params.locals[2])
+            {
+                append("localblk32" + suffix);
+            }
+            if (params.locals[3])
             {
                 append("localblk" + suffix);
             }
@@ -5663,6 +5951,326 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
+        // NO0016 narrow-value storage classification: picks the C storage
+        // class (0=uint8_t, 1=uint16_t, 2=uint32_t, 3=uint64_t) of every
+        // localizable block value. A value may narrow only when no emission
+        // path can take its slot's address or otherwise need a uint64_t
+        // slot:
+        //  - any instruction with a non-scalar (>64-bit or non-BitVector)
+        //    operand/result routes to the word-level helpers
+        //    (emitNonScalarInstruction / wide-assign path), which address
+        //    narrow participants as uint64_t*;
+        //  - NO0013 windowed / NO0014 dynblend planned instructions emit
+        //    word-pointer helper calls (insert/replace/slice/blend); the
+        //    dynblend cone's named fields (base/idx/ones/elem/cond/result)
+        //    are addressed from the cone tail's emission even when they are
+        //    not the tail instruction's own operands, so they are pinned
+        //    from the plans directly;
+        //  - memory/array/system/host opcodes leave the scalar switch
+        //    entirely (their local-relevant values already escape; pinned
+        //    regardless as belt and braces).
+        // Remaining values are scalar-expression-only (valueExpr/resize_value
+        // by value), where a narrower unsigned slot is semantics-preserving:
+        // producers mask results to the value width (resultAssign) and every
+        // expression read masks through resize_value. A missed address-taken
+        // case fails the C++ compile (uint8_t* vs uint64_t*), never silently
+        // miscompiles. Escape hatch: WOLVRIX_GRHSIM_AM_DISABLE_NARROW_LOCALS
+        // pins every value to class 3, reproducing pre-NO0016 output.
+        void classifyLocalValueStorage(const ExecutableModel &model, EmitState &state)
+        {
+            const std::size_t variableCount = state.program.variableCount();
+            state.localValueClasses.assign(variableCount, 3);
+            state.narrowLocalPinned = 0;
+            state.disableWideSliceInline =
+                std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_WIDE_SLICE_INLINE") != nullptr;
+            state.disableMaskedWriteUnroll =
+                std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_MASKED_WRITE_UNROLL") != nullptr;
+            if (std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_NARROW_LOCALS") != nullptr)
+            {
+                return;
+            }
+            std::vector<uint8_t> pinWide(variableCount, 0);
+            const auto pinAll = [&](std::span<const VariableId> variables) {
+                for (const VariableId variable : variables)
+                {
+                    pinWide[variable.value] = 1;
+                }
+            };
+            const auto isNonScalar = [&](VariableId variable) {
+                const Type &type = state.variableTypes[variable.value];
+                return type.kind != TypeKind::BitVector || type.bitWidth > 64;
+            };
+            for (uint32_t blockIndex = 0; blockIndex < state.blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                for (std::size_t position = 0;
+                     position < model.program.blockSize(block); ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    const Opcode opcode = state.program.opcode(instruction);
+                    const auto operands = state.program.operands(instruction);
+                    const auto results = state.program.results(instruction);
+                    bool pin = opcode == Opcode::MemoryRead ||
+                               opcode == Opcode::MemoryReadAll ||
+                               opcode == Opcode::MemoryWrite ||
+                               opcode == Opcode::MemoryWriteCond ||
+                               opcode == Opcode::MemoryWriteMask ||
+                               opcode == Opcode::MemoryWriteCondMask ||
+                               opcode == Opcode::MemoryFill ||
+                               opcode == Opcode::MemoryWriteLanes ||
+                               opcode == Opcode::SystemFunction ||
+                               opcode == Opcode::SystemTask ||
+                               opcode == Opcode::DpiCall ||
+                               opcode == Opcode::ArrayMux ||
+                               opcode == Opcode::ArrayReduceOr ||
+                               opcode == Opcode::ArrayReduceAnd ||
+                               opcode == Opcode::ArrayReduceXor ||
+                               opcode == Opcode::ArrayBroadcast ||
+                               opcode == Opcode::ArrayOnehot ||
+                               opcode == Opcode::ArrayReduceLanesOr ||
+                               opcode == Opcode::ArrayReduceLanesAnd ||
+                               opcode == Opcode::ArrayReduceLanesXor;
+                    // NO0018: slice instructions emitted inline
+                    // (wideSliceAssign) touch no address: the wide source
+                    // stays class 3 by width, the narrow index and the
+                    // <=64-bit results are plain by-value scalars. The same
+                    // predicate gates the emission paths, so storage class
+                    // and emission stay consistent.
+                    const auto scalarSliceInline = [&] {
+                        if (state.disableWideSliceInline)
+                        {
+                            return false;
+                        }
+                        if (opcode != Opcode::SliceStatic &&
+                            opcode != Opcode::SliceDynamic &&
+                            opcode != Opcode::SliceArray)
+                        {
+                            return false;
+                        }
+                        if (std::any_of(results.begin(), results.end(), isNonScalar))
+                        {
+                            return false;
+                        }
+                        if (opcode != Opcode::SliceStatic && isNonScalar(operands[1]))
+                        {
+                            return false;
+                        }
+                        return true;
+                    };
+                    const bool sliceInline = scalarSliceInline();
+                    if (!pin && instruction.value < state.instructionWindowAction.size() &&
+                        state.instructionWindowAction[instruction.value] >= 0 &&
+                        !(sliceInline && state.instructionWindowAction[instruction.value] ==
+                                             kWindowActionRemapSlice))
+                    {
+                        pin = true;
+                    }
+                    if (!pin && instruction.value < state.instructionDynBlendAction.size() &&
+                        state.instructionDynBlendAction[instruction.value] >= 0 &&
+                        !(sliceInline && state.instructionDynBlendAction[instruction.value] ==
+                                             kDynBlendRemapSlice))
+                    {
+                        pin = true;
+                    }
+                    if (!pin && !sliceInline)
+                    {
+                        pin = std::any_of(operands.begin(), operands.end(), isNonScalar) ||
+                              std::any_of(results.begin(), results.end(), isNonScalar);
+                    }
+                    if (pin)
+                    {
+                        pinAll(operands);
+                        pinAll(results);
+                    }
+                }
+            }
+            // Dynblend cone named fields are addressed from the tail's
+            // emission (blend_window_dyn_words/assign_words) even when not
+            // operands of a pinned instruction.
+            for (const EmitState::DynBlendPlan &plan : state.dynBlendPlans)
+            {
+                pinWide[plan.finalVar.value] = 1;
+                for (const EmitState::DynBlendPlan::Cone &cone : plan.cones)
+                {
+                    pinWide[cone.base.value] = 1;
+                    pinWide[cone.idx.value] = 1;
+                    pinWide[cone.ones.value] = 1;
+                    pinWide[cone.elem.value] = 1;
+                    pinWide[cone.result.value] = 1;
+                    if (cone.cond.valid())
+                    {
+                        pinWide[cone.cond.value] = 1;
+                    }
+                }
+            }
+            for (const EmitState::WindowChainPlan &plan : state.windowChainPlans)
+            {
+                pinWide[plan.finalVar.value] = 1;
+            }
+            for (std::size_t variable = 0; variable < variableCount; ++variable)
+            {
+                if (pinWide[variable] != 0)
+                {
+                    state.narrowLocalPinned += 1;
+                    continue;
+                }
+                const Type &type = state.variableTypes[variable];
+                if (type.kind != TypeKind::BitVector || type.bitWidth > 64)
+                {
+                    continue;
+                }
+                if (type.bitWidth <= 8)
+                {
+                    state.localValueClasses[variable] = 0;
+                }
+                else if (type.bitWidth <= 16)
+                {
+                    state.localValueClasses[variable] = 1;
+                }
+                else if (type.bitWidth <= 32)
+                {
+                    state.localValueClasses[variable] = 2;
+                }
+            }
+        }
+
+        // NO0016 Stage B chunk-internal scalarization planning: for every
+        // oversized (chunked) Block, decide which localized values are read
+        // only inside their defining chunk. Those become chunk-function-local
+        // typed scalars (register candidates); values read across chunk
+        // boundaries keep the shared parent-scope arrays. A value is never
+        // internalized when its reads are not anchored at its own instruction
+        // position: class-3 (address-taken, see classifyLocalValueStorage),
+        // mux-fusion-covered instructions' operands/results (emitted at the
+        // run head position), and never-read values (a scalar declaration
+        // would trip -Wunused-variable, unlike an array slot). Misclassifying
+        // an internal value fails the C++ compile (undeclared identifier in
+        // the foreign chunk), never silently. Escape hatch:
+        // WOLVRIX_GRHSIM_AM_DISABLE_CHUNK_LOCALS keeps everything shared.
+        void planChunkLocalScalars(const ExecutableModel &model, EmitState &state,
+                                   std::size_t chunkInstructions)
+        {
+            const std::size_t variableCount = state.program.variableCount();
+            state.chunkScalarIndex.assign(variableCount, kInvalidChunkScalar);
+            state.blockChunkScalarCounts.assign(state.blockCount, {});
+            state.chunkLocalScalarCount = 0;
+            if (std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_NARROW_LOCALS") != nullptr ||
+                std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_CHUNK_LOCALS") != nullptr)
+            {
+                return;
+            }
+            // Scratch use-analysis arrays, reset per Block via a touched list.
+            std::vector<uint32_t> firstUseChunk(variableCount, kInvalidChunkScalar);
+            std::vector<uint8_t> useConflict(variableCount, 0);
+            std::vector<uint32_t> touched;
+            for (uint32_t blockIndex = 0; blockIndex < state.blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                const std::size_t blockSize = model.program.blockSize(block);
+                const std::vector<std::pair<std::size_t, std::size_t>> ranges =
+                    blockChunkRanges(blockSize, chunkInstructions,
+                                     state.blockCommitGate[blockIndex].headCount);
+                if (ranges.empty())
+                {
+                    continue;
+                }
+                const auto chunkOf = [&](std::size_t position) {
+                    for (std::size_t chunk = 0; chunk < ranges.size(); ++chunk)
+                    {
+                        if (position < ranges[chunk].second)
+                        {
+                            return static_cast<uint32_t>(chunk);
+                        }
+                    }
+                    return static_cast<uint32_t>(ranges.size() - 1);
+                };
+                touched.clear();
+                for (std::size_t position = 0; position < blockSize; ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    // Mux-fusion-covered instructions are emitted fused at
+                    // the run head position: their operand reads (and result
+                    // writes) are not anchored here, so those values must
+                    // stay in the shared arrays.
+                    const bool muxCovered =
+                        instruction.value < state.instructionMuxRun.size() &&
+                        state.instructionMuxRun[instruction.value] >= 0;
+                    const auto markTouched = [&](VariableId variable) {
+                        if (firstUseChunk[variable.value] == kInvalidChunkScalar &&
+                            useConflict[variable.value] == 0)
+                        {
+                            touched.push_back(variable.value);
+                        }
+                    };
+                    if (muxCovered)
+                    {
+                        for (const VariableId operand :
+                             state.program.operands(instruction))
+                        {
+                            markTouched(operand);
+                            useConflict[operand.value] = 1;
+                        }
+                        for (const VariableId result :
+                             state.program.results(instruction))
+                        {
+                            markTouched(result);
+                            useConflict[result.value] = 1;
+                        }
+                        continue;
+                    }
+                    for (const VariableId operand :
+                         state.program.operands(instruction))
+                    {
+                        if (state.variableDefBlock[operand.value] != blockIndex ||
+                            state.variableEscapeFlags[operand.value] != 0)
+                        {
+                            continue;
+                        }
+                        markTouched(operand);
+                        if (useConflict[operand.value] != 0)
+                        {
+                            continue;
+                        }
+                        const uint32_t useChunk = chunkOf(position);
+                        if (firstUseChunk[operand.value] == kInvalidChunkScalar)
+                        {
+                            firstUseChunk[operand.value] = useChunk;
+                        }
+                        else if (firstUseChunk[operand.value] != useChunk)
+                        {
+                            useConflict[operand.value] = 1;
+                        }
+                    }
+                }
+                std::vector<std::array<uint32_t, 4>> counts(ranges.size());
+                for (const uint32_t variable : touched)
+                {
+                    const uint32_t firstUse = firstUseChunk[variable];
+                    const uint8_t conflict = useConflict[variable];
+                    firstUseChunk[variable] = kInvalidChunkScalar;
+                    useConflict[variable] = 0;
+                    if (conflict != 0 || firstUse == kInvalidChunkScalar ||
+                        state.localValueClasses[variable] >= 3)
+                    {
+                        continue;
+                    }
+                    const uint32_t defChunk =
+                        chunkOf(state.variableDefPosition[variable]);
+                    if (firstUse != defChunk)
+                    {
+                        continue;
+                    }
+                    const uint8_t storageClass = state.localValueClasses[variable];
+                    state.chunkScalarIndex[variable] =
+                        counts[defChunk][storageClass]++;
+                    state.chunkLocalScalarCount += 1;
+                }
+                state.blockChunkScalarCounts[blockIndex] = std::move(counts);
+            }
+        }
+
         // NO0013 F1/F2: plan windowed emission for lane-build concat chains
         // (F1) and standalone wide concats (F2). See EmitState's
         // WindowChainPlan comment for the semantics. Planning is purely an
@@ -6817,10 +7425,17 @@ namespace wolvrix::lib::grhsim::am
         // NO0014 dynamic bit-field functional-update cone collapse
         // (intRat/vecRat/vlRat-style multi-port table updates).
         planDynBlendCones(model, state);
+        // NO0016 narrow-value storage classes: planned last because the
+        // classification reads the windowed/dynblend plans.
+        classifyLocalValueStorage(model, state);
+        // NO0016 Stage B chunk-internal scalarization: reads the storage
+        // classes and the mux-fusion coverage.
+        planChunkLocalScalars(model, state, *blockChunkInstructions);
 
         if (statsAttribute != options.attributes.end() && statsAttribute->second == "true")
         {
             uint64_t localValues = 0;
+            uint64_t narrowClassCounts[4] = {0, 0, 0, 0};
             for (const std::vector<uint32_t> &defined : state.blockDefinedVariables)
             {
                 for (const uint32_t variable : defined)
@@ -6828,12 +7443,25 @@ namespace wolvrix::lib::grhsim::am
                     if (state.variableEscapeFlags[variable] == 0)
                     {
                         ++localValues;
+                        narrowClassCounts[state.localValueClasses[variable]] += 1;
                     }
                 }
             }
             diagnostics.info("AM C++ emitter locality stats: local_values=" +
                                  std::to_string(localValues) + " escaped_values=" +
                                  std::to_string(variableCount - localValues) +
+                                 " narrow_local8=" +
+                                 std::to_string(narrowClassCounts[0]) +
+                                 " narrow_local16=" +
+                                 std::to_string(narrowClassCounts[1]) +
+                                 " narrow_local32=" +
+                                 std::to_string(narrowClassCounts[2]) +
+                                 " narrow_local64=" +
+                                 std::to_string(narrowClassCounts[3]) +
+                                 " narrow_local_pinned=" +
+                                 std::to_string(state.narrowLocalPinned) +
+                                 " chunk_local_scalars=" +
+                                 std::to_string(state.chunkLocalScalarCount) +
                                  " folded_detectors=" +
                                  std::to_string(state.detectorFoldedCount) +
                                  " detector_groups=" +
@@ -7023,7 +7651,7 @@ namespace wolvrix::lib::grhsim::am
         header << "    static constexpr std::uint64_t bit_mask(std::uint32_t width) {\n"
                << "        return width >= 64 ? UINT64_MAX : ((UINT64_C(1) << width) - 1);\n"
                << "    }\n"
-               << "    static std::size_t word_count(std::uint32_t width);\n"
+               << "    static constexpr std::size_t word_count(std::uint32_t width) { return (static_cast<std::size_t>(width) + 63U) / 64U; }\n"
                << "    static bool any_words(const std::uint64_t *value, std::uint32_t width);\n"
                << "    static bool equal_words(const std::uint64_t *lhs, const std::uint64_t *rhs, std::uint32_t width);\n"
                << "    static void assign_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, bool signExtend);\n"
@@ -7042,7 +7670,15 @@ namespace wolvrix::lib::grhsim::am
                << "    static int compare_words(const std::uint64_t *lhs, std::uint32_t lhsWidth, const std::uint64_t *rhs, std::uint32_t rhsWidth, bool isSigned);\n"
                << "    static bool reduce_words(const std::uint64_t *source, std::uint32_t width, std::uint32_t operation);\n"
                << "    static std::size_t index_words(const std::uint64_t *source, std::uint32_t width, std::size_t limit);\n"
-               << "    static std::uint64_t extract_word(const std::uint64_t *source, std::uint32_t width, std::uint64_t start);\n"
+               << "    static constexpr std::uint64_t extract_word(const std::uint64_t *source, std::uint32_t width, std::uint64_t start) {\n"
+               << "        if (start >= width) return 0;\n"
+               << "        const std::size_t sourceWord = static_cast<std::size_t>(start / 64U);\n"
+               << "        const std::uint32_t shift = static_cast<std::uint32_t>(start % 64U);\n"
+               << "        std::uint64_t value = source[sourceWord] >> shift;\n"
+               << "        if (shift != 0 && sourceWord + 1U < word_count(width)) value |= source[sourceWord + 1U] << (64U - shift);\n"
+               << "        const std::uint64_t remaining = static_cast<std::uint64_t>(width) - start;\n"
+               << "        return value & bit_mask(remaining >= 64U ? 64U : static_cast<std::uint32_t>(remaining));\n"
+               << "    }\n"
                << "    static void insert_words(std::uint64_t *target, std::uint32_t targetWidth, std::uint64_t targetLsb, const std::uint64_t *source, std::uint32_t sourceWidth);\n"
                << "    static void insert_replace_words(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *row, std::uint32_t rowWidth, std::uint64_t targetLsb, const std::uint64_t *source, std::uint32_t sourceWidth);\n"
                << "    static void replace_window_words(std::uint64_t *target, std::uint32_t targetWidth, std::uint64_t targetLsb, const std::uint64_t *source, std::uint32_t sourceWidth);\n"
@@ -7670,8 +8306,6 @@ namespace
                 << "#include \"" << prefix << "_support.hpp\"\n\n";
         runtime << className << "::" << className << "() = default;\n"
                << className << "::~" << className << "() { finalize(); }\n\n"
-               << "std::size_t " << className
-               << "::word_count(std::uint32_t width) { return (static_cast<std::size_t>(width) + 63U) / 64U; }\n"
                << "bool " << className
                << "::any_words(const std::uint64_t *value, std::uint32_t width) {\n"
                << "    const std::size_t words = word_count(width);\n"
@@ -7909,16 +8543,6 @@ namespace
                << "    const std::size_t words = word_count(width);\n"
                << "    for (std::size_t index = 1; index < words; ++index) if (source[index] != 0) return limit;\n"
                << "    return source[0] >= limit ? limit : static_cast<std::size_t>(source[0]);\n"
-               << "}\n"
-               << "std::uint64_t " << className
-               << "::extract_word(const std::uint64_t *source, std::uint32_t width, std::uint64_t start) {\n"
-               << "    if (start >= width) return 0;\n"
-               << "    const std::size_t sourceWord = static_cast<std::size_t>(start / 64U);\n"
-               << "    const std::uint32_t shift = static_cast<std::uint32_t>(start % 64U);\n"
-               << "    std::uint64_t value = source[sourceWord] >> shift;\n"
-               << "    if (shift != 0 && sourceWord + 1U < word_count(width)) value |= source[sourceWord + 1U] << (64U - shift);\n"
-               << "    const std::uint64_t remaining = static_cast<std::uint64_t>(width) - start;\n"
-               << "    return value & bit_mask(static_cast<std::uint32_t>(std::min<std::uint64_t>(remaining, 64U)));\n"
                << "}\n"
                << "void " << className
                << "::insert_words(std::uint64_t *target, std::uint32_t targetWidth, std::uint64_t targetLsb, const std::uint64_t *source, std::uint32_t sourceWidth) {\n"
@@ -9071,6 +9695,36 @@ namespace
                             chunkDefs << "    "
                                       << blockTraceBanner(
                                              model, static_cast<uint32_t>(blockIndex));
+                        }
+                        // NO0016 Stage B: declare this chunk's internal
+                        // scalars (one group per non-empty storage class).
+                        if (blockIndex < state.blockChunkScalarCounts.size() &&
+                            chunk < state.blockChunkScalarCounts[blockIndex].size())
+                        {
+                            const auto &chunkCounts =
+                                state.blockChunkScalarCounts[blockIndex][chunk];
+                            for (uint8_t storageClass = 0; storageClass < 4;
+                                 ++storageClass)
+                            {
+                                const uint32_t count = chunkCounts[storageClass];
+                                if (count == 0)
+                                {
+                                    continue;
+                                }
+                                chunkDefs << "    " << localClassCppType(storageClass)
+                                          << " ";
+                                const std::string infix =
+                                    localClassInfix(storageClass);
+                                for (uint32_t index = 0; index < count; ++index)
+                                {
+                                    if (index != 0)
+                                    {
+                                        chunkDefs << ", ";
+                                    }
+                                    chunkDefs << "local" << infix << "_" << index;
+                                }
+                                chunkDefs << ";\n";
+                            }
                         }
                         const auto [firstPosition, endPosition] = chunkRanges[chunk];
                         for (std::size_t index = firstPosition;

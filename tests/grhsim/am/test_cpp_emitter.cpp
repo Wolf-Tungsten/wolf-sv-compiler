@@ -2904,7 +2904,8 @@ int main()
     // reg.write.c / mem.write.c / mem.write.cm in one commit Block: the cond
     // variants must emit an `if (cond)` gate around the write, the no-mask
     // mem variant a plain whole-element assign_words, and the constant-mask
-    // variant a stack-local immediate mask array for masked_write_words.
+    // variant a single-word read-modify-write inline (NO0018 unrolls constant
+    // masks touching few words instead of calling masked_write_words).
     ExecutableModel makeCondGateEmitterModel()
     {
         LinearProgramBuilder linear;
@@ -3042,8 +3043,8 @@ int main()
                                        " = v" + std::to_string(data.value) + " & ";
         if (blocksText->find(gatedStore) == std::string::npos ||
             countOccurrences(*blocksText, "assign_words(") != 1 ||
-            countOccurrences(*blocksText, "masked_write_words(") != 1 ||
-            blocksText->find("write_mask_") == std::string::npos ||
+            countOccurrences(*blocksText, "masked_write_words(") != 0 ||
+            blocksText->find("& ~UINT64_C(0xf0)") == std::string::npos ||
             blocksText->find("UINT64_C(0xf0)") == std::string::npos)
         {
             return fail("AM C++ emitter did not emit the cond-gated write forms");
