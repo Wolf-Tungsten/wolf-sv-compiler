@@ -9221,18 +9221,75 @@ namespace
                               rhsLiteral.words.begin()) &&
                    lhsLiteral.bytes == rhsLiteral.bytes;
         };
+        // The wide-pool init stores are emitted in ascending storage.offset
+        // order, decoupled from the state layout. Under stateLayout=id the
+        // offsets already ascend with VariableId, so the stable sort below
+        // is a no-op and the output stays byte-identical to the unsorted
+        // emission; under stateLayout=affinity the layout-permuted store
+        // stream would otherwise defeat clang's memset/vectorization idiom
+        // recognition on the million-line init body (the XiangShan-scale
+        // single runtime TU then takes >31min and gets killed). Only
+        // literal wide-BitVector set bursts are buffered: random init
+        // (seeded or not) consumes the chained split_mix64 state, so any
+        // non-literal emission — and any non-wide-pool emission, to keep
+        // the id-layout output order exact — closes the current segment and
+        // is emitted in place. Distinct variables own disjoint word ranges
+        // and each burst writes every word of its variable exactly once, so
+        // reordering whole bursts inside one segment is semantics-neutral.
+        struct PendingWideInit
+        {
+            uint64_t offset = 0;
+            VariableId variable;
+            InitExpr expression;
+            std::size_t actionIndex = 0;
+        };
+        std::vector<PendingWideInit> pendingWideInits;
+        const auto flushPendingWideInits = [&]() {
+            if (pendingWideInits.empty())
+            {
+                return;
+            }
+            std::stable_sort(pendingWideInits.begin(), pendingWideInits.end(),
+                             [](const PendingWideInit &lhs, const PendingWideInit &rhs) {
+                                 return lhs.offset < rhs.offset;
+                             });
+            for (const PendingWideInit &pending : pendingWideInits)
+            {
+                emitSetInitialization(pending.variable, pending.expression,
+                                      pending.actionIndex);
+            }
+            pendingWideInits.clear();
+        };
+        const auto emitOrderedSetInitialization = [&](VariableId variable,
+                                                      const InitExpr &expression,
+                                                      std::size_t actionIndex) {
+            const Type &type = variableType(state, variable);
+            if (expression.kind == InitExprKind::Literal &&
+                type.kind == TypeKind::BitVector && type.bitWidth > 64)
+            {
+                pendingWideInits.push_back(PendingWideInit{
+                    .offset = variableStorage(state, variable).offset,
+                    .variable = variable,
+                    .expression = expression,
+                    .actionIndex = actionIndex,
+                });
+                return;
+            }
+            flushPendingWideInits();
+            emitSetInitialization(variable, expression, actionIndex);
+        };
         for (uint32_t index = 0; index < program.variableCount(); ++index)
         {
             const VariableId variable{index};
             const InitDescriptor &init = program.init(program.variable(variable).init);
             if (init.kind == InitKind::Constant)
             {
-                emitSetInitialization(variable,
-                                      InitExpr{
-                                          .kind = InitExprKind::Literal,
-                                          .literal = LiteralId{init.payload},
-                                      },
-                                      0);
+                emitOrderedSetInitialization(variable,
+                                             InitExpr{
+                                                 .kind = InitExprKind::Literal,
+                                                 .literal = LiteralId{init.payload},
+                                             },
+                                             0);
             }
             else if (init.kind == InitKind::Actions)
             {
@@ -9260,16 +9317,19 @@ namespace
                             mergedAction.count += next.count;
                             ++nextActionIndex;
                         }
+                        flushPendingWideInits();
                         emitFillInitialization(variable, mergedAction, actionIndex);
                     }
                     else
                     {
-                        emitSetInitialization(variable, action.expression, actionIndex);
+                        emitOrderedSetInitialization(variable, action.expression,
+                                                     actionIndex);
                     }
                     actionIndex = nextActionIndex;
                 }
             }
         }
+        flushPendingWideInits();
         runtime << "}\n\nbool " << className
                 << "::is_commit_block(std::size_t block) {\n"
                 << "    return kCommitBlockBegin != 0 && block >= kCommitBlockBegin && block < kCommitBlockEnd;\n"

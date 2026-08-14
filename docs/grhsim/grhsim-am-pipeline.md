@@ -326,6 +326,10 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   状态排在尾部按升序 VariableId；排序键完全确定，输出可复现。应用于成员声明
   顺序与宽值词池 offset 分配两处；`changedResults_` 密集下标不动。不变式保持：
   成员区连续（init() 单条 memset 语义不变）、宽池 offset 从 0 连续、总尺寸不变。
+  另一不变式与布局解耦：init() 的宽池 store 恒按 storage.offset 升序发射
+  （random-init 段边界处截断重排，段内稳定排序；`id` 布局下本就是升序，
+  输出逐字节不变），保证 clang 对初始化 store 流的 memset/向量化 idiom
+  识别不受布局置换影响。
   动机：成员/offset 的发现次序（升序 VariableId）与运行期访问模式无关，是主要
   gather 病灶；按块亲和性聚簇让同一块访问的状态相邻，改善热块工作集的
   页/cache 局部性。
