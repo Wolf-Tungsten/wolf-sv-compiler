@@ -3546,6 +3546,133 @@ int main()
         return 0;
     }
 
+    // resize-elision emission: with the "resizeElision" attribute on, a
+    // same-width unsigned resize_value of a stored scalar operand is an
+    // identity mask under the write-side width discipline, so the operand
+    // reference is emitted directly. Same model and semantics as
+    // testMuxRunFusion: every narrow site here is 8-bit -> 8-bit, so no
+    // resize_value may remain, while the wide arms keep their assign_words
+    // form untouched.
+    int testResizeElision(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        ExecutableModel model = makeMuxRunEmitterModel();
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "ResizeElideTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"resizeElision", "true"}},
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the resize-elision model");
+        }
+        const std::optional<std::string> blocksText =
+            readTextFile(outputDirectory / "grhsim_ResizeElideTop_blocks_0.cpp");
+        if (!blocksText)
+        {
+            return fail("AM C++ emitter produced no resize-elision blocks source");
+        }
+        const ProgramView program = model.program.view();
+        const auto findPort = [&](std::string_view name) {
+            for (const PortBinding &port : model.interface.ports)
+            {
+                if (program.string(port.name) == name)
+                {
+                    return port.direction == PortDirection::Input ? port.input : port.output;
+                }
+            }
+            return VariableId::invalid();
+        };
+        const VariableId a = findPort("a");
+        const VariableId c = findPort("c");
+        const VariableId d = findPort("d");
+        const VariableId r2 = findPort("r2");
+        if (!a.valid() || !c.valid() || !d.valid() || !r2.valid())
+        {
+            return fail("resize-elision model lost its interface bindings");
+        }
+        // Same-width unsigned sites are elided everywhere: the fused arm
+        // assigns the plain member reference, the cone keeps its bare '&',
+        // and no resize_value survives in the block source. The wide mux
+        // arms still route through assign_words.
+        const std::string elidedArm = "v" + std::to_string(r2.value) + " = (v" +
+                                      std::to_string(c.value) + ") & ";
+        const std::string elidedCone =
+            "(v" + std::to_string(a.value) + " & v" + std::to_string(d.value) + ")";
+        if (countOccurrences(*blocksText, "resize_value(") != 0 ||
+            blocksText->find(elidedArm) == std::string::npos ||
+            blocksText->find(elidedCone) == std::string::npos ||
+            countOccurrences(*blocksText, "assign_words(") < 4)
+        {
+            return fail("AM C++ emitter did not elide the same-width unsigned resize glue");
+        }
+
+        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << R"CPP(#include "grhsim_ResizeElideTop.hpp"
+int main()
+{
+    GrhSIM_ResizeElideTop model;
+    model.init();
+    model.sel = 0;
+    model.sel2 = 0;
+    model.a = 0x11;
+    model.b = 0x22;
+    model.c = 0x33;
+    model.d = 0x44;
+    model.wide_a = {UINT64_C(0xaaaabbbbccccdddd), UINT64_C(0x12)};
+    model.wide_b = {UINT64_C(0x1111222233334444), UINT64_C(0x56)};
+    model.eval();
+    if (model.r1 != 0x22 || model.r2 != 0x22 || model.r3 != 0x44 || model.mo != 0x22)
+        return 1;
+    if (model.w2[0] != UINT64_C(0xaaaabbbbccccdddd) || model.w2[1] != UINT64_C(0x12))
+        return 2;
+    model.sel = 1;
+    model.sel2 = 1;
+    model.eval();
+    if (model.r1 != 0x00 || model.r2 != 0x33 || model.r3 != 0x11 || model.mo != 0x11)
+        return 3;
+    if (model.w2[0] != UINT64_C(0x1111222233334444) || model.w2[1] != UINT64_C(0x56))
+        return 4;
+    return 0;
+}
+)CPP";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the resize-elision model harness");
+        }
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated resize-elision model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (outputDirectory / "libgrhsim_ResizeElideTop.a").string() + "' -o '" +
+            harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated resize-elision model harness failed to compile");
+        }
+        const std::string runCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(runCommand.c_str()) != 0)
+        {
+            return fail("generated resize-elision model violated the scalar mux semantics");
+        }
+        return 0;
+    }
+
     // NO0008 production-form fusion: same-select muxes lowered into an
     // AmGraph, scheduled through graphToProgram (split -> tree-atom fold ->
     // partition -> materialize), then emitted. The pinned outputs keep each
@@ -4144,6 +4271,13 @@ int main()
     if (const int result = testBranchyMux(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-branchy-mux");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testResizeElision(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-resize-elision");
         result != 0)
     {
         return result;

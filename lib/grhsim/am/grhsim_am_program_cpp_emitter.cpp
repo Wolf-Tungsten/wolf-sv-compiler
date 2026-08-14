@@ -217,6 +217,12 @@ namespace wolvrix::lib::grhsim::am
             // bodies into many small basic blocks so the C++ backend never
             // faces one giant straight-line region (emit-cost NO0001 B2).
             bool branchyMux = false;
+            // Compile-time resize-elision switch (attribute "resizeElision",
+            // default off). When true a same-width unsigned resize_value of a
+            // stored scalar operand emits the plain operand reference: the
+            // write-side discipline already truncates every stored scalar to
+            // its declared width, so the runtime AND is an identity mask.
+            bool resizeElision = false;
             // NO0006 trace comments (GrhSimAmCppOptions::traceComments,
             // default on): per-block banner and per-atom provenance comment
             // lines in the block sources. Comment-only.
@@ -897,6 +903,16 @@ namespace wolvrix::lib::grhsim::am
                                 Signedness signedness)
         {
             const Type &source = variableType(state, variable);
+            // resizeElision: resize_value(x, N, false, N) is an identity AND
+            // under the write-side masking discipline, and valueExpr always
+            // names stored scalar state (block local / changedResults_ slot /
+            // v<K> member) that every producer writes already truncated to
+            // the declared width, so the reference alone is exact.
+            if (state.resizeElision && signedness == Signedness::Unsigned &&
+                source.bitWidth == width)
+            {
+                return valueExpr(state, variable);
+            }
             return "resize_value(" + valueExpr(state, variable) + ", " +
                    std::to_string(source.bitWidth) + ", " +
                    (signedness == Signedness::Signed ? "true" : "false") + ", " +
@@ -6911,6 +6927,9 @@ namespace wolvrix::lib::grhsim::am
         const auto branchyMuxAttribute = options.attributes.find("branchyMux");
         state.branchyMux = branchyMuxAttribute != options.attributes.end() &&
                            branchyMuxAttribute->second == "true";
+        const auto resizeElisionAttribute = options.attributes.find("resizeElision");
+        state.resizeElision = resizeElisionAttribute != options.attributes.end() &&
+                              resizeElisionAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());

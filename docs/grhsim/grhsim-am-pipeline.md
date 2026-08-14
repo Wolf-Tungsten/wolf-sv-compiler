@@ -317,6 +317,19 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   `EMU_AM_TRACE_BEGIN_EVAL`/`EMU_AM_TRACE_END_EVAL` 限定。注意其数据源是
   跨块 changed-results 的 mark 列表，不含已被 detector-group folding 合并的
   检测器，不能作为全量变更源。
+- `resizeElision`（`--resize-elision`，默认 off）：同宽无符号 `resize_value`
+  胶消除。开启后 `resizedExpr` 对 `sourceWidth == targetWidth && !signExtend`
+  的操作数直接发存储引用（跳过 `resize_value(x, N, false, N)`，其语义仅为
+  `x & mask(N)`），覆盖全部调用点（二元操作数、窄 `assign`、比较、Mux 两臂、
+  mux-run 融合臂）；有符号同宽与异宽站点保留原样。安全性来自写侧掩码不变量：
+  每个已存储窄标量（块内局部 `local*_N`、跨块 `changedResults_[k]`、持久成员
+  `v<K>`）的所有写入点都按声明宽截断——`resultAssign`/`assignVariableStatement`/
+  Mux 臂/wideSliceAssign 显式 `& mask(bitWidth)`，mem.read 窄结果、reg.write 窄
+  路径、DPI integral commit、init（常量/随机）同样掩码，`changedResults_` 只存
+  0/1 事件标志；外部输入端口在 `eval()` 入口以 `v<K> = uint64(port) & mask`
+  截断，TB 写入的高位垃圾不会进入模型；`valueExpr` 只会产生上述三种存储引用，
+  无表达式形式，故同宽 resize 恒为 identity。`sourceWidth == targetWidth == 64`
+  被同一规则自然覆盖（掩码恒等，无需特判）。off 时输出与既往逐字节一致。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
