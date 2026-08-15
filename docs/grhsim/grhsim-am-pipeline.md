@@ -317,6 +317,9 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   `EMU_AM_TRACE_BEGIN_EVAL`/`EMU_AM_TRACE_END_EVAL` 限定。注意其数据源是
   跨块 changed-results 的 mark 列表，不含已被 detector-group folding 合并的
   检测器，不能作为全量变更源。
+- `guardEventGating`（`--guard-event-gating`）：识别「纯 fatal 守卫」
+  compute 块并对其块体发射事件门（门 = 块内 fatal 读取的 changedResults_
+  槽的 OR），门关闭时整块跳过；机制/合格条件/语义论证见 §3.2.9。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
@@ -1031,6 +1034,51 @@ CLI `grhsim-am-lower-json --wide-state-explode`。`collectStats` 下向
 diagnostics 打 `wide-state explode stats`（炸开状态数/元素总数/回收词数/
 守卫 bail 分类计数），`GrhSimAmCppResult.wideStateExploded*` 供 CLI JSON
 输出。
+
+### 3.2.9 纯 fatal 守卫块事件门控（`guardEventGating`，2026-08-15）
+
+**默认 off；off 时 emit 与基线逐字节一致。** 动机：断言守卫密集设计的
+compute 块（典型：xiangshan 的断言块，7,001 atoms / 27,448 instrs）整块由
+「合成 1-bit 判定值 + `if (!firstEval_ && fire && (changedResults_[k] != 0))`
+fatal」原子构成。fatal 的事件槽是时钟 posedge 的跨块 changed result，但
+该块在时钟双边沿都被激活——negedge 半数的触发里全部 fatal 条件必假，
+整块重估是纯浪费（实测该块约占 Host 8%）。
+
+机制：emit 时规划（`planGuardEventGates`，仅 compute 块）识别**纯守卫块**，
+在其扫描包裹处（byteFlags 位测试通过、活动位清除之后）把整块块体（全部
+chunk 调用）包进 `if (<门表达式>)`，门 = 块内全部 fatal 指令事件槽
+（changedResults_ 槽变量）boolExpr 的 `||`。活动位快照/清除时序不变；
+无 act.f/act.b 尾部的块跳过块体不改变任何调度行为。
+
+合格条件（全部满足，宁少勿错）：
+
+- 含 ≥1 条可门控 fatal：`system.task "fatal"`，Normal schedule（不写
+  onceCompleted_ 槽）、Immediate event mode（不锁存 pendingHostEvents_）、
+  ≥1 个事件操作数，且事件操作数全是跨块 changed result；
+- 其余每条指令无副作用：opcodeTraits 为 Pure，或 MemoryRead/MemoryReadAll
+  状态读（无状态写、无 act.f/act.b、无 changed.* 检测器、无 DPI 调用）；
+  与 fatal 同约束（Normal/Immediate/事件槽全覆盖）的事件门控
+  `fwrite`/`finish` 系统任务也允许——它们的宿主副作用同样只在事件槽
+  非零时触发，门可覆盖（xiangshan 断言块里 769 个 $display/$fwrite 原子
+  与 fatal 共用同一 changedResults_ 槽）；
+- 块写入的每个值（指令 results）：块内唯一定义、无跨块读取、无先于定义
+  的同块读取（逃逸分析 defBlock/crossBlockUse/earlyUse 判定），且不是
+  状态目标（状态写目标/检测器 watched/mem 读目标）、接口端口/声明变量或
+  init() 赋值的槽。
+
+语义论证（逐情形）：门关闭 ⇒ 块内每条 guard 任务（fatal/fwrite/finish）
+的 `fire && (events)` 必假（events 全为 0），与 `firstEval_` 无关，故块
+全部可观测副作用（fatal/finish 终止标志、fwrite 输出）都不可能触发；
+其余指令无副作用，写入的值无块外消费者、无跨轮同块早用，跳过整块不可
+观测。门开放时块体逐指令原样执行，与基线一致；多 round 下每次激活都
+重估门（槽在 eval 开始清零、round 内由检测器重写），与该次激活时 guard
+任务自身会读到的值完全相同，因此逐次激活等价；firstEval_ 基线同步轮门
+同样只读当前槽值，不改变首轮行为。
+
+开关与统计：emitter 属性 `guardEventGating`（`GrhSimAmCppOptions.attributes`），
+CLI `grhsim-am-lower-json --guard-event-gating`。开启时 emit 向 stderr 打
+`[guard-event-gating] gated=<块数> atoms=<总数> instrs=<总数>` 汇总行，并逐
+合格块打一行 `[guard-event-gating] block=<id> atoms=<n> instrs=<n>`。
 
 ### 3.3 临时 scheduling facts
 

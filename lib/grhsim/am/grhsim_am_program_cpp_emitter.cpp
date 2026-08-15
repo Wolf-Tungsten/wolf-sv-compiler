@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -415,6 +416,30 @@ namespace wolvrix::lib::grhsim::am
             };
             std::vector<CommitGate> blockCommitGate;
             uint64_t commitGateBlockCount = 0;
+            // Guard-event gating (GrhSimAmCppOptions attribute
+            // "guardEventGating", default off): a pure guard Block is a
+            // compute Block whose only observable effects are event-gated
+            // host tasks (fatal/fwrite/finish with fire conditions of the
+            // form `fire && (changedResults_ slot OR)`, fatal additionally
+            // `!firstEval_`-masked); every other instruction is side-effect
+            // free and every Block-written value stays Block-local. The
+            // scan then wraps the whole Block body in the OR of the guard
+            // tasks' changedResults_ slots: with the gate closed no guard
+            // task can fire and nothing else is observable, so the Block
+            // body is skipped outright (e.g. xiangshan's assertion Block on
+            // the clock negedge). Eligibility is planned by
+            // planGuardEventGates; an empty expression means no gate.
+            struct GuardGate
+            {
+                std::string expression;
+                uint64_t atoms = 0;
+                uint64_t instructions = 0;
+            };
+            bool guardEventGating = false;
+            std::vector<GuardGate> blockGuardGate;
+            uint64_t guardGatedBlockCount = 0;
+            uint64_t guardGatedAtoms = 0;
+            uint64_t guardGatedInstructions = 0;
             // ST00013 scalar write-point detection fusion (P5): a commit Block
             // tail changed.any on a BitVector state target costs one compare
             // plus one old-baseline store per round even when nothing was
@@ -4731,6 +4756,17 @@ namespace wolvrix::lib::grhsim::am
             }
             uint64_t byteCount = static_cast<uint64_t>(
                 scanBlockTestPrologue(blockIndex, state.runtimeProfile).size());
+            const std::string &guardGate = state.blockGuardGate[blockIndex].expression;
+            if (!guardGate.empty() &&
+                (!addByteCount(byteCount,
+                               static_cast<uint64_t>(16 + 4 + guardGate.size() + 4)) ||
+                 !addByteCount(byteCount, static_cast<uint64_t>(16 + 2))))
+            {
+                diagnostics.error("AM C++ emitter source size overflow: block=" +
+                                      std::to_string(blockIndex),
+                                  std::string(kContext));
+                return std::nullopt;
+            }
             if (!addByteCount(byteCount, *bodyBytes) ||
                 !addByteCount(byteCount,
                               scanBlockTestEpilogue(blockIndex, state.runtimeProfile).size()))
@@ -5678,6 +5714,210 @@ namespace wolvrix::lib::grhsim::am
                 {
                     state.blockScalarWatchPlans[blockIndex] = std::move(plan);
                 }
+            }
+        }
+
+        // Guard-event gating (attribute "guardEventGating", default off):
+        // finds pure guard compute Blocks and plans their scan-site event
+        // gate (EmitState::blockGuardGate). A Block qualifies when
+        //   - it holds at least one gateable fatal: a system.task "fatal"
+        //     with Normal schedule (no onceCompleted_ slot write),
+        //     Immediate event mode (no pendingHostEvents_ latch) and at
+        //     least one event operand, every event operand being a
+        //     cross-block changed result (a changedResults_[] slot);
+        //   - every other instruction is side-effect free: a Pure opcode
+        //     per opcodeTraits, or a MemoryRead/MemoryReadAll state read
+        //     (no state writes, no act.f/act.b, no changed detectors, no
+        //     DPI calls); event-gated "fwrite"/"finish" system tasks under
+        //     the same constraints as the fatal are also allowed — their
+        //     host effect fires only when one of their event slots is set,
+        //     which the gate covers;
+        //   - every value the Block writes (instruction results) is defined
+        //     exactly once inside the Block, is never read by another Block
+        //     or before its own definition, and is no state target,
+        //     interface port/declared variable, or init()-assigned slot.
+        // The gate expression is the OR of the guard tasks' event slot
+        // boolExprs: gate closed implies every guard task's
+        // `fire && (events)` condition is false, so no observable effect of
+        // the Block can trigger and skipping the whole body is
+        // unobservable.
+        void planGuardEventGates(const ExecutableModel &model, EmitState &state)
+        {
+            state.blockGuardGate.clear();
+            state.blockGuardGate.resize(state.blockCount);
+            state.guardGatedBlockCount = 0;
+            state.guardGatedAtoms = 0;
+            state.guardGatedInstructions = 0;
+            if (!state.guardEventGating || model.commitBlockBegin == 0)
+            {
+                return;
+            }
+            const std::size_t variableCount = state.variableTypes.size();
+            // Values a gate-safe Block may not define: state targets (any
+            // state-write target or detector-watched / memory-read state
+            // operand), interface ports and declared variables, and
+            // init()-assigned slots.
+            std::vector<bool> stateOrInterface(variableCount, false);
+            for (uint32_t blockIndex = 0; blockIndex < state.blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                for (std::size_t position = 0; position < model.program.blockSize(block);
+                     ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    const OpcodeTraits traits =
+                        opcodeTraits(state.program.opcode(instruction));
+                    const auto operands = state.program.operands(instruction);
+                    if (traits.stateTargetOperand != OpcodeTraits::kNoTargetOperand &&
+                        traits.stateTargetOperand < operands.size())
+                    {
+                        stateOrInterface[operands[traits.stateTargetOperand].value] = true;
+                    }
+                }
+            }
+            for (const PortBinding &port : model.interface.ports)
+            {
+                if (port.input.valid())
+                {
+                    stateOrInterface[port.input.value] = true;
+                }
+                if (port.output.valid())
+                {
+                    stateOrInterface[port.output.value] = true;
+                }
+                if (port.outputEnable.valid())
+                {
+                    stateOrInterface[port.outputEnable.value] = true;
+                }
+            }
+            for (const VariableLabel &declared : model.interface.declaredVariables)
+            {
+                stateOrInterface[declared.variable.value] = true;
+            }
+            for (uint32_t index = 0; index < variableCount; ++index)
+            {
+                const InitKind kind =
+                    state.program.init(state.program.variable(VariableId{index}).init).kind;
+                if (kind == InitKind::Constant || kind == InitKind::Actions)
+                {
+                    stateOrInterface[index] = true;
+                }
+            }
+
+            // Block 0 is the entry Block and never goes through the scan
+            // wrapper, so only [1, commitBlockBegin) can be gated.
+            for (uint32_t blockIndex = 1; blockIndex < model.commitBlockBegin; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                const std::size_t blockSize = model.program.blockSize(block);
+                if (blockSize == 0)
+                {
+                    continue;
+                }
+                bool eligible = true;
+                bool sawFatal = false;
+                std::vector<uint32_t> gateVariables;
+                std::unordered_set<uint32_t> gateVariableSet;
+                for (std::size_t position = 0; position < blockSize && eligible; ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    const Opcode opcode = state.program.opcode(instruction);
+                    const auto operands = state.program.operands(instruction);
+                    const auto results = state.program.results(instruction);
+                    const OpcodeEffect effect = opcodeTraits(opcode).effect;
+                    const bool sideEffectFree =
+                        effect == OpcodeEffect::Pure || opcode == Opcode::MemoryRead ||
+                        opcode == Opcode::MemoryReadAll;
+                    if (!sideEffectFree)
+                    {
+                        if (opcode != Opcode::SystemTask)
+                        {
+                            eligible = false;
+                            break;
+                        }
+                        const auto attributes =
+                            state.program.systemTaskAttributes(instruction);
+                        // Gateable guard task: an event-gated host task
+                        // (fatal/fwrite/finish are the only system.task
+                        // bindings this emitter supports) whose firing
+                        // requires one of its changedResults_ event slots —
+                        // so closing the slot OR silences it. Normal
+                        // schedule + Immediate mode exclude the
+                        // onceCompleted_ / pendingHostEvents_ slot writes,
+                        // which would be effects the gate cannot cover.
+                        if (!attributes || attributes->schedule != CallSchedule::Normal ||
+                            attributes->eventMode != HostEventMode::Immediate ||
+                            attributes->eventCount == 0 || operands.empty() ||
+                            attributes->eventCount > operands.size() - 1U)
+                        {
+                            eligible = false;
+                            break;
+                        }
+                        const std::string_view taskName =
+                            state.program.string(attributes->name);
+                        const bool fatalTask = taskName == "fatal";
+                        if (!fatalTask && taskName != "fwrite" && taskName != "finish")
+                        {
+                            eligible = false;
+                            break;
+                        }
+                        const std::size_t eventBegin =
+                            operands.size() - attributes->eventCount;
+                        for (std::size_t index = eventBegin; index < operands.size(); ++index)
+                        {
+                            const uint32_t variable = operands[index].value;
+                            if (!state.crossBlockChangedResults[variable])
+                            {
+                                eligible = false;
+                                break;
+                            }
+                            if (gateVariableSet.insert(variable).second)
+                            {
+                                gateVariables.push_back(variable);
+                            }
+                        }
+                        if (!eligible)
+                        {
+                            break;
+                        }
+                        sawFatal = sawFatal || fatalTask;
+                    }
+                    for (const VariableId result : results)
+                    {
+                        const uint32_t variable = result.value;
+                        if (state.variableDefBlock[variable] != blockIndex ||
+                            (state.variableEscapeFlags[variable] &
+                             (kEscapeCrossBlockUse | kEscapeEarlyUse)) != 0 ||
+                            stateOrInterface[variable])
+                        {
+                            eligible = false;
+                            break;
+                        }
+                    }
+                }
+                if (!eligible || !sawFatal || gateVariables.empty())
+                {
+                    continue;
+                }
+                std::string gate;
+                for (const uint32_t variable : gateVariables)
+                {
+                    if (!gate.empty())
+                    {
+                        gate += " || ";
+                    }
+                    gate += boolExpr(state, VariableId{variable});
+                }
+                EmitState::GuardGate plan;
+                plan.expression = std::move(gate);
+                plan.atoms = model.program.blockAtomCount(block);
+                plan.instructions = blockSize;
+                state.guardGatedAtoms += plan.atoms;
+                state.guardGatedInstructions += plan.instructions;
+                state.blockGuardGate[blockIndex] = std::move(plan);
+                ++state.guardGatedBlockCount;
             }
         }
 
@@ -7742,6 +7982,10 @@ namespace wolvrix::lib::grhsim::am
         const auto wideStateExplodeAttribute = options.attributes.find("wideStateExplode");
         state.wideStateExplode = wideStateExplodeAttribute != options.attributes.end() &&
                                  wideStateExplodeAttribute->second == "true";
+        // Guard-event gating of pure fatal-guard compute Blocks (default off).
+        const auto guardEventGatingAttribute = options.attributes.find("guardEventGating");
+        state.guardEventGating = guardEventGatingAttribute != options.attributes.end() &&
+                                 guardEventGatingAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -8247,6 +8491,28 @@ namespace wolvrix::lib::grhsim::am
         // RegisterWrite sites. Planned after ST00010 (emission consults its
         // group assignments).
         planScalarWatchGroups(model, state);
+        // Guard-event gating (attribute "guardEventGating", default off):
+        // pure fatal-guard compute Blocks get a scan-site event gate over
+        // their fatal instructions' changedResults_ slots. Reads the escape
+        // analysis (def block, cross-block use, crossBlockChangedResults).
+        planGuardEventGates(model, state);
+        if (state.guardEventGating)
+        {
+            std::cerr << "[guard-event-gating] gated=" << state.guardGatedBlockCount
+                      << " atoms=" << state.guardGatedAtoms
+                      << " instrs=" << state.guardGatedInstructions << '\n';
+            for (uint32_t blockIndex = 0; blockIndex < state.blockCount; ++blockIndex)
+            {
+                const EmitState::GuardGate &gate = state.blockGuardGate[blockIndex];
+                if (gate.expression.empty())
+                {
+                    continue;
+                }
+                std::cerr << "[guard-event-gating] block=" << blockIndex
+                          << " atoms=" << gate.atoms << " instrs=" << gate.instructions
+                          << '\n';
+            }
+        }
         // NO0008 block-level same-select mux fusion: adjacent mux-rooted
         // atoms sharing one select emit one fused if/else per run.
         planMuxFusionRuns(model, state);
@@ -10819,10 +11085,28 @@ namespace
                             }
                             blockSource << scanBlockTestPrologue(
                                 blockIndex, state.runtimeProfile);
-                            if (!writeBlockBodyOrChunks(blockIndex, "                "))
+                            // Guard-event gating: the gate wraps the whole
+                            // Block body (all chunk calls) after the byte
+                            // snapshot/clear, so the activity bookkeeping is
+                            // unchanged and a closed gate skips the body.
+                            const std::string &guardGate =
+                                state.blockGuardGate[blockIndex].expression;
+                            if (!guardGate.empty())
+                            {
+                                blockSource << "                if (" << guardGate
+                                            << ") {\n";
+                            }
+                            if (!writeBlockBodyOrChunks(blockIndex,
+                                                        guardGate.empty()
+                                                            ? "                "
+                                                            : "                    "))
                             {
                                 blocksGenerated = false;
                                 break;
+                            }
+                            if (!guardGate.empty())
+                            {
+                                blockSource << "                }\n";
                             }
                             blockSource << scanBlockTestEpilogue(
                                 blockIndex, state.runtimeProfile);
