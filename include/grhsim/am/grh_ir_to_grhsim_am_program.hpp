@@ -220,6 +220,14 @@ namespace wolvrix::lib::grhsim::am
         uint64_t dynBlendRemapped = 0;
         uint64_t dynBlendMaterialized = 0;
         uint64_t dynBlendBailed = 0;
+        // Init-zero elision (attribute "initZeroElision", default off):
+        // literal-0 init() stores skipped at emission because the init()
+        // prologue already covers them (member memset / wideValues_.fill(0) /
+        // realValues_.fill(0)); counts are skipped stores — narrow member
+        // stores, wide BitVector zero-word stores, real stores.
+        uint64_t initZeroElisionNarrow = 0;
+        uint64_t initZeroElisionWide = 0;
+        uint64_t initZeroElisionReal = 0;
     };
 
     // The pipeline currency is the AmGraph: lowering builds the graph

@@ -317,6 +317,23 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   `EMU_AM_TRACE_BEGIN_EVAL`/`EMU_AM_TRACE_END_EVAL` 限定。注意其数据源是
   跨块 changed-results 的 mark 列表，不含已被 detector-group folding 合并的
   检测器，不能作为全量变更源。
+- `initZeroElision`（`--init-zero-elision`，默认关）：发射期消除 init() 里
+  字面量 0 的死 init store，压缩生成代码体量（xiangshan SimTop 上 init() 的
+  逐变量 store 98%+ 是字面量 0），不改任何运行时语义。规则与语义论证：
+  init() prologue 已做全覆盖清零——窄标量成员区一条 memset、
+  `wideValues_.fill(0)`、`realValues_.fill(0)`，因此对「唯一 init action 且
+  为字面量 0」的 store，其写出的 0 被 prologue 覆盖，按构造是死 store：
+  >64bit BitVector 逐 word 消除（payload==0 的 word store 直接跳过，
+  `fill(0)` 逐槽覆盖且 `0 & mask == 0`；非零 word 照常发射、变量内 word
+  顺序不变）；≤64bit 标量仅当确有 memset 区成员时消除（判定与头文件成员
+  声明处同源：BitVector ≤64bit、非 cross-block changed result、非 ST00009
+  块内本地化、非 ST00010 折叠 detector event，否则保留——它可能没有成员
+  存储，消除会丢初始化）；realValues_ 字面量 0 同样可消。保守边界：只对
+  变量的唯一 init action 做消除，多 action 变量一律全保留（不分析
+  last-writer 顺序；实践中语义校验器 sawSet 规则已拒绝同变量多 Set，
+  该守卫为兜底）；String、Fill action、任何 random/seeded init 一律不动。
+  消除的 store 数（分窄/宽 word/real）经 diagnostics 与结果 JSON
+  （`init_zero_elision_narrow/wide/real`）报告。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
