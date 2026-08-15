@@ -258,10 +258,10 @@ namespace wolvrix::lib::grhsim::am
             bool commitStationGating = false;
             struct CommitStationGatingGroup
             {
-                // Sorted producer compute-Block ids; slot seenBase + i tracks
-                // producers[i].
+                // Sorted producer compute-Block ids shared by the group's
+                // stations. Seen slots are per run, not per group (see
+                // planCommitStationGating).
                 std::vector<uint32_t> producers;
-                uint32_t seenBase = 0;
             };
             struct CommitStationGatingPlan
             {
@@ -5990,7 +5990,7 @@ namespace wolvrix::lib::grhsim::am
                     if (inserted)
                     {
                         plan.groups.push_back(
-                            EmitState::CommitStationGatingGroup{producers, 0});
+                            EmitState::CommitStationGatingGroup{producers});
                     }
                     plan.groupByPosition.emplace(position, groupIt->second);
                 }
@@ -6004,13 +6004,10 @@ namespace wolvrix::lib::grhsim::am
                     continue;
                 }
 
-                // Seen slots: one per (group, producer) pair, dense across
-                // the whole model.
-                for (EmitState::CommitStationGatingGroup &group : plan.groups)
+                // Producer Blocks referenced by this Block's groups get a
+                // generation stamp at their scan entry.
+                for (const EmitState::CommitStationGatingGroup &group : plan.groups)
                 {
-                    group.seenBase = state.csgSeenSlotCount;
-                    state.csgSeenSlotCount +=
-                        static_cast<uint32_t>(group.producers.size());
                     for (const uint32_t producer : group.producers)
                     {
                         state.csgProducerBlock[producer] = 1;
@@ -6022,10 +6019,22 @@ namespace wolvrix::lib::grhsim::am
 
                 // Runs: maximal same-group station subsequences that never
                 // cross a chunk boundary (chunk functions brace-scope the
-                // wrap). Chunked Blocks follow the emission-time chunk
-                // ranges (forced boundary at the commit gate head).
-                std::unordered_map<uint32_t, uint32_t> runOpen;
-                std::unordered_map<uint32_t, uint32_t> runClose;
+                // wrap). Seen slots are allocated per (run, producer), not
+                // per (group, producer): a run is the atomic execute-or-skip
+                // unit, so its slots must track the producer generation its
+                // own stations last committed with. Per-group slots would
+                // let one run's sync skip a later run of the same group
+                // (chunk split or interleaved instructions) whose stations
+                // never compared against the new inputs — losing real writes
+                // already at the first eval.
+                struct GatingRun
+                {
+                    uint32_t openPosition = 0;
+                    uint32_t closePosition = 0;
+                    uint32_t group = 0;
+                    uint32_t seenBase = 0;
+                };
+                std::vector<GatingRun> runs;
                 const std::size_t gateBoundary =
                     state.blockCommitGate[blockIndex].headCount;
                 std::vector<std::pair<std::size_t, std::size_t>> ranges;
@@ -6041,7 +6050,6 @@ namespace wolvrix::lib::grhsim::am
                 for (const auto &[rangeFirst, rangeEnd] : ranges)
                 {
                     int32_t openGroup = -1;
-                    uint32_t lastStation = 0;
                     for (std::size_t position = rangeFirst; position < rangeEnd;
                          ++position)
                     {
@@ -6049,35 +6057,37 @@ namespace wolvrix::lib::grhsim::am
                             plan.groupByPosition.find(static_cast<uint32_t>(position));
                         if (station == plan.groupByPosition.end())
                         {
-                            if (openGroup >= 0)
-                            {
-                                runClose.emplace(lastStation,
-                                                 static_cast<uint32_t>(openGroup));
-                                openGroup = -1;
-                            }
+                            openGroup = -1;
                             continue;
                         }
                         const uint32_t group = station->second;
                         if (openGroup != static_cast<int32_t>(group))
                         {
-                            if (openGroup >= 0)
-                            {
-                                runClose.emplace(lastStation,
-                                                 static_cast<uint32_t>(openGroup));
-                            }
-                            runOpen.emplace(static_cast<uint32_t>(position), group);
+                            runs.push_back(GatingRun{static_cast<uint32_t>(position),
+                                                     static_cast<uint32_t>(position),
+                                                     group, 0});
                             openGroup = static_cast<int32_t>(group);
                         }
-                        lastStation = static_cast<uint32_t>(position);
-                    }
-                    if (openGroup >= 0)
-                    {
-                        runClose.emplace(lastStation, static_cast<uint32_t>(openGroup));
+                        runs.back().closePosition = static_cast<uint32_t>(position);
                     }
                 }
-                const auto checkText = [&](uint32_t groupId) {
+                // Seen slots: one per (run, producer) pair, dense across the
+                // whole model.
+                std::unordered_map<uint32_t, uint32_t> runByOpen;
+                std::unordered_map<uint32_t, uint32_t> runByClose;
+                for (uint32_t index = 0; index < runs.size(); ++index)
+                {
+                    GatingRun &run = runs[index];
+                    run.seenBase = state.csgSeenSlotCount;
+                    state.csgSeenSlotCount += static_cast<uint32_t>(
+                        plan.groups[run.group].producers.size());
+                    runByOpen.emplace(run.openPosition, index);
+                    runByClose.emplace(run.closePosition, index);
+                }
+                const auto checkText = [&](uint32_t runIndex) {
+                    const GatingRun &run = runs[runIndex];
                     const EmitState::CommitStationGatingGroup &group =
-                        plan.groups[groupId];
+                        plan.groups[run.group];
                     std::string text;
                     for (std::size_t index = 0; index < group.producers.size(); ++index)
                     {
@@ -6087,18 +6097,19 @@ namespace wolvrix::lib::grhsim::am
                         }
                         text += "csgProdTick_[" + std::to_string(group.producers[index]) +
                                 "] != csgSeenTick_[" +
-                                std::to_string(group.seenBase + index) + "]";
+                                std::to_string(run.seenBase + index) + "]";
                     }
                     return text;
                 };
-                const auto syncText = [&](uint32_t groupId) {
+                const auto syncText = [&](uint32_t runIndex) {
+                    const GatingRun &run = runs[runIndex];
                     const EmitState::CommitStationGatingGroup &group =
-                        plan.groups[groupId];
+                        plan.groups[run.group];
                     std::string text;
                     for (std::size_t index = 0; index < group.producers.size(); ++index)
                     {
                         text += "csgSeenTick_[" +
-                                std::to_string(group.seenBase + index) +
+                                std::to_string(run.seenBase + index) +
                                 "] = csgProdTick_[" +
                                 std::to_string(group.producers[index]) + "]; ";
                     }
@@ -6110,13 +6121,13 @@ namespace wolvrix::lib::grhsim::am
                         model.program.blockInstruction(block, position);
                     std::string prefix;
                     std::string suffix;
-                    const auto open = runOpen.find(position);
-                    if (open != runOpen.end())
+                    const auto open = runByOpen.find(position);
+                    if (open != runByOpen.end())
                     {
                         prefix = "if (" + checkText(open->second) + ") {\n";
                     }
-                    const auto close = runClose.find(position);
-                    if (close != runClose.end())
+                    const auto close = runByClose.find(position);
+                    if (close != runByClose.end())
                     {
                         suffix = syncText(close->second) + "}\n";
                     }

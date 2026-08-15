@@ -1073,7 +1073,10 @@ eval 打开全部 commit 块的门，~157K 个 ST00013 融合写站每 posedge e
   >64 时整块放弃门控（保守，计入 `bailed_blocks`）。
 - **运行时**：模型持有 `csgTick_`（eval round 循环每 round 开头自增）、
   `csgProdTick_[块id]`（被引用为生产者的 compute 块在 byteFlags 测试通过、
-  块体入口处盖朝代戳）、`csgSeenTick_[槽]`（每组每生产者一个槽）。commit
+  块体入口处盖朝代戳）、`csgSeenTick_[槽]`（**每 run 每生产者一个槽**：run =
+  chunk 内同组连续写站子序列，是原子执行/跳过单元；按组分配会让先执行 run 的
+  seen 同步跳过同组未比较过的后续 run，在 chunk 切分处首次 eval 即丢写，故按
+  run 分配）。commit
   块内每组写站包一层
   `if (csgProdTick_[P1] != csgSeenTick_[s1] || ...) { <该组写站>; csgSeenTick_[s] = csgProdTick_[P]; ... }`；
   组按 chunk 内连续写站子序列划分（不跨 chunk 边界）。首次 eval 全部块触发
