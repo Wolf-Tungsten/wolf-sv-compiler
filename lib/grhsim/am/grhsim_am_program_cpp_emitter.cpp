@@ -205,6 +205,17 @@ namespace wolvrix::lib::grhsim::am
             // bodies still perform their activation bookkeeping, so the mode
             // measures exactly the value of activity filtering itself.
             bool fullEvaluation = false;
+            // Compile-time branchless-activation switch (attribute
+            // "branchlessActivation", default off). When true every
+            // conditional activation merge (act.f/act.b and folded
+            // detector-group merges) drops its data-dependent branch: the
+            // condition is sign-extended into an all-ones/all-zero mask and
+            // every target activity word is OR-ed unconditionally. Trades
+            // always-on stores to activeWords_ for the removal of ~455K
+            // static / ~4.8G dynamic activation branches (NO0017 block-level
+            // profile). Disabled under runtimeProfile so profile counters
+            // keep their conditional accounting.
+            bool branchlessActivation = false;
             // Compile-time changed-trace switch (attribute "changedTrace",
             // default off). When true the model can stream per-(eval, round)
             // changed-variable records to the file named by
@@ -846,7 +857,9 @@ namespace wolvrix::lib::grhsim::am
         // (allowBranchlessRelay): OR-ing the sign-extended flag keeps the merge
         // in registers, the legacy deferred-group idiom. Global mask writes
         // stay conditional so a quiet group does not dirty the shared activity
-        // words.
+        // words. With branchlessActivation every merge goes branchless: the
+        // condition is sign-extended once into an all-ones/all-zero word mask
+        // and each target word is OR-ed unconditionally.
         std::string emitActivationMerge(const EmitState &state, bool forward,
                                         uint8_t relayMask,
                                         const std::map<uint32_t, uint64_t> &masks,
@@ -854,6 +867,28 @@ namespace wolvrix::lib::grhsim::am
                                         const std::string &condition,
                                         bool allowBranchlessRelay)
         {
+            if (state.branchlessActivation && !state.runtimeProfile)
+            {
+                std::string code =
+                    "{\nconst std::uint64_t actMask = 0ULL - static_cast<std::uint64_t>(" +
+                    condition + ");\n";
+                if (relayMask != 0)
+                {
+                    code += "byteFlags |= static_cast<std::uint8_t>(actMask & " +
+                            byteMaskLiteral(relayMask) + ");\n";
+                }
+                for (const auto &[word, mask] : masks)
+                {
+                    code += "activeWords_[" + std::to_string(word) +
+                            "] |= " + wordMaskLiteral(mask) + " & actMask;\n";
+                }
+                if (!forward)
+                {
+                    code += "backwardFired_ = backwardFired_ || (actMask != 0);\n";
+                }
+                code += "}\n";
+                return code;
+            }
             if (allowBranchlessRelay && forward && relayMask != 0 && masks.empty() &&
                 !state.runtimeProfile)
             {
@@ -6921,6 +6956,11 @@ namespace wolvrix::lib::grhsim::am
         const auto fullEvaluationAttribute = options.attributes.find("fullEvaluation");
         state.fullEvaluation = fullEvaluationAttribute != options.attributes.end() &&
                                fullEvaluationAttribute->second == "true";
+        const auto branchlessActivationAttribute =
+            options.attributes.find("branchlessActivation");
+        state.branchlessActivation =
+            branchlessActivationAttribute != options.attributes.end() &&
+            branchlessActivationAttribute->second == "true";
         const auto changedTraceAttribute = options.attributes.find("changedTrace");
         state.changedTrace = changedTraceAttribute != options.attributes.end() &&
                              changedTraceAttribute->second == "true";

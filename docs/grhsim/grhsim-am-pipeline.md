@@ -311,6 +311,13 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
 - `fullEvaluation`（`--full-evaluation` / `XS_WOLF_GRHSIM_AM_FULL_EVALUATION=1`）：
   扫描/commit 的 byte chunk 以 ownedMask 代替活动位快照，所有块无条件执行；
   块体的激活簿记保留，用于测量活动过滤本身的价值（NO0017 oracle）。
+- `branchlessActivation`（`--branchless-activation`，默认 off）：条件激活合并
+  （act.f/act.b 与折叠 detector-group 合并共用 `emitActivationMerge`）去分支化——
+  条件一次求值后符号扩展成全 1/全 0 字掩码，各目标活动字无条件
+  `activeWords_[w] |= mask & actMask`，act.b 的 `backwardFired_` 改逻辑或累积。
+  以恒写活动字为代价消除静态 ~455K 站点 / 动态 ~4.8G 次的数据相关分支
+  （NO0017 块级 profile）；`runtimeProfile` 开启时自动回退分支形式以保持
+  激活计数口径。off 时输出与既往逐字节一致。
 - `changedTrace`（`--changed-trace` / `XS_WOLF_GRHSIM_AM_CHANGED_TRACE=1`）：
   运行期设置 `EMU_AM_CHANGED_TRACE=<path>` 后，按 (eval, round) 流式写出
   二进制 changed 变量记录（3×uint64 头 + count×uint32 id），窗口由

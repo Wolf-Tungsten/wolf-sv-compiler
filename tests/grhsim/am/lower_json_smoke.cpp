@@ -141,7 +141,7 @@ int main(int argc, char **argv)
                      "[--dp-coarsen-atom-budget <count>] [--dp-coarsen-instr-budget <count>] [--disable-coarsening] "
                      "[--tree-atom-fold-max-instr <count>] "
                      "[--runtime-profile] [--full-evaluation] [--changed-trace] "
-                     "[--branchy-mux] [--resize-elision] [--no-trace-comments] "
+                     "[--branchy-mux] [--resize-elision] [--branchless-activation] [--no-trace-comments] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -179,6 +179,7 @@ int main(int argc, char **argv)
     bool changedTrace = false;
     bool branchyMux = false;
     bool resizeElision = false;
+    bool branchlessActivation = false;
     bool traceComments = true;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
@@ -424,6 +425,10 @@ int main(int argc, char **argv)
         else if (argument == "--resize-elision")
         {
             resizeElision = true;
+        }
+        else if (argument == "--branchless-activation")
+        {
+            branchlessActivation = true;
         }
         else if (argument == "--no-trace-comments")
         {
@@ -798,6 +803,10 @@ int main(int argc, char **argv)
                 if (resizeElision)
                 {
                     emitOptions.attributes.emplace("resizeElision", "true");
+                }
+                if (branchlessActivation)
+                {
+                    emitOptions.attributes.emplace("branchlessActivation", "true");
                 }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,
