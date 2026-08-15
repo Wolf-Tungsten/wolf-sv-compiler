@@ -142,7 +142,7 @@ int main(int argc, char **argv)
                      "[--tree-atom-fold-max-instr <count>] "
                      "[--runtime-profile] [--full-evaluation] [--changed-trace] "
                      "[--branchy-mux] [--no-trace-comments] [--wide-state-explode] "
-                     "[--commit-station-stats] "
+                     "[--commit-station-stats] [--commit-station-gating] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -182,6 +182,7 @@ int main(int argc, char **argv)
     bool traceComments = true;
     bool wideStateExplode = false;
     bool commitStationStats = false;
+    bool commitStationGating = false;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
     {
@@ -430,6 +431,10 @@ int main(int argc, char **argv)
         else if (argument == "--commit-station-stats")
         {
             commitStationStats = true;
+        }
+        else if (argument == "--commit-station-gating")
+        {
+            commitStationGating = true;
         }
         else if (argument == "--no-trace-comments")
         {
@@ -812,6 +817,10 @@ int main(int argc, char **argv)
                 {
                     emitOptions.attributes.emplace("commitStationStats", "true");
                 }
+                if (commitStationGating)
+                {
+                    emitOptions.attributes.emplace("commitStationGating", "true");
+                }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,
                     emitOptions,
@@ -834,6 +843,19 @@ int main(int argc, char **argv)
                     for (const diag::Diagnostic &message : diagnostics.messages())
                     {
                         if (message.message.find("wide-state explode stats") !=
+                            std::string::npos)
+                        {
+                            std::cerr << message.message << '\n';
+                        }
+                    }
+                }
+                if (commitStationGating)
+                {
+                    // Same forwarding as above: surface the gating coverage
+                    // report emitted as a diagnostics info message.
+                    for (const diag::Diagnostic &message : diagnostics.messages())
+                    {
+                        if (message.message.find("[commit-station-gating]") !=
                             std::string::npos)
                         {
                             std::cerr << message.message << '\n';

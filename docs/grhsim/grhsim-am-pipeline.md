@@ -1049,6 +1049,52 @@ helper 内部，不计入。
 开关：emitter 属性 `commitStationStats`，CLI
 `grhsim-am-lower-json --commit-station-stats`。
 
+### 3.2.10 commit 写站生产者朝代门控（`commitStationGating`，2026-08-15）
+
+**默认 off；off 时 emit 与基线逐字节一致。** 动机同 §3.2.9：时钟 posedge 每
+eval 打开全部 commit 块的门，~157K 个 ST00013 融合写站每 posedge eval 都付
+一次 compare，而绝大多数 compare 的输入自上次提交以来未变（空转）。本开关把
+空转 compare 整组跳过。
+
+机制（emit 时规划 + 运行时朝代计数）：
+
+- **var→生产者块映射**：遍历全部块的全部指令的 results，记录每个变量的
+  生产者 compute 块集合。
+- **合格写站**：commit 块的 ST00013 融合写站，读取变量 = data 操作数、cond
+  （`RegisterWriteCond*` 的 operands[0]）、非常量 mask；`RegisterWriteMask`
+  的 nextValue 读 target 自身是幂等的（命中后 `cur&mask == data&mask`，
+  未命中本来就不写），不计入。合格条件：所有读取变量都有非空生产者集合、
+  生产者全部是 compute 块（不含 entry 块 B0 与任何 commit 块）、读取变量
+  自身不是任何状态写的 target；target 寄存器跨全部块只有一个状态写指令
+  且非 host-visible。变量无生产者（接口输入、状态初值）、有 entry/commit
+  块生产者、生产者定义块数溢出（>2）、target 多写者或 host-visible → 不
+  合格。
+- **分组**：合格写站按排序后的生产者块 id 集合分组。单个 commit 块组数
+  >64 时整块放弃门控（保守，计入 `bailed_blocks`）。
+- **运行时**：模型持有 `csgTick_`（eval round 循环每 round 开头自增）、
+  `csgProdTick_[块id]`（被引用为生产者的 compute 块在 byteFlags 测试通过、
+  块体入口处盖朝代戳）、`csgSeenTick_[槽]`（每组每生产者一个槽）。commit
+  块内每组写站包一层
+  `if (csgProdTick_[P1] != csgSeenTick_[s1] || ...) { <该组写站>; csgSeenTick_[s] = csgProdTick_[P]; ... }`；
+  组按 chunk 内连续写站子序列划分（不跨 chunk 边界）。首次 eval 全部块触发
+  （initial activate-all），`csgTick_` 从 0 开始、round 前自增保证首个 round
+  tick≥1，零初始化的 prodTick/seen 不会误判；`init()` 重置三者。
+
+语义论证：生产者 compute 块自某组写站上次执行以来未触发 ⇒ 该组写站的全部
+读取变量保持上次执行时的值 ⇒  masked mix 与上次相同 ⇒ 与 target 的 compare
+幂等失败（上次命中后 `cur == mix`，上次未命中则 `cur` 未变且 `mix` 未变），
+整组跳过不改变任何可观察行为。target 单写者 + 读取变量非状态写 target 保
+证「target/输入不会被门控外的路径改动」。seen 槽只在组实际执行后同步，门
+关闭（块未触发/gate 未开）时不同步，因此生产者触发而写站未运行的情形会在
+下次运行时保守地重新 compare。
+
+emit 时报告：`[commit-station-gating] blocks=<门控块数>/<commit块总数>
+stations=<门控写站数>/<写站总数> groups=<组数> bailed_blocks=<n>`（diagnostics
+info，CLI 在 emit 成功路径转发到 stderr）。
+
+开关：emitter 属性 `commitStationGating`，CLI
+`grhsim-am-lower-json --commit-station-gating`。
+
 ### 3.3 临时 scheduling facts
 
 以下内容只属于 scheduler workspace，不进入 ScheduledProgram 或 session 的长期公共契约：

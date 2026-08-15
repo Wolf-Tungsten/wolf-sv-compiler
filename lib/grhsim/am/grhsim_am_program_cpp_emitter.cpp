@@ -245,6 +245,44 @@ namespace wolvrix::lib::grhsim::am
             // and finalize() prints the aggregate compare/hit/idle line to
             // stderr. Offline instrumentation only: no behavior change.
             bool commitStationStats = false;
+            // Compile-time commit-station gating switch (attribute
+            // "commitStationGating", default off). When true, eligible
+            // ST00013 fused write stations (all inputs produced by compute
+            // Blocks, single-writer target) are grouped by their producer
+            // Block set and wrapped in a generation check: a group runs only
+            // when one of its producer Blocks fired since the group last
+            // committed (csgProdTick_[P] != csgSeenTick_[slot]); otherwise
+            // every compare in the group would fail idempotently, so the
+            // whole group is skipped. See docs/grhsim/grhsim-am-pipeline.md
+            // for the semantic argument and the conservative bail rules.
+            bool commitStationGating = false;
+            struct CommitStationGatingGroup
+            {
+                // Sorted producer compute-Block ids; slot seenBase + i tracks
+                // producers[i].
+                std::vector<uint32_t> producers;
+                uint32_t seenBase = 0;
+            };
+            struct CommitStationGatingPlan
+            {
+                std::vector<CommitStationGatingGroup> groups;
+                // Block instruction position -> group id (gated stations).
+                std::unordered_map<uint32_t, uint32_t> groupByPosition;
+            };
+            std::vector<std::optional<CommitStationGatingPlan>> blockCommitStationGating;
+            // Compute Block id -> referenced as a producer by at least one
+            // gated group (its scan test stamps csgProdTick_ on entry).
+            std::vector<uint8_t> csgProducerBlock;
+            // InstructionId value -> (run-open check, run-close seen-sync)
+            // wrap text emitted around the station's own code. Runs are
+            // maximal same-group station subsequences inside one chunk.
+            std::unordered_map<uint32_t, std::pair<std::string, std::string>> csgStationWrap;
+            uint32_t csgSeenSlotCount = 0;
+            uint64_t csgGatedBlockCount = 0;
+            uint64_t csgGatedStationCount = 0;
+            uint64_t csgGroupCount = 0;
+            uint64_t csgStationTotal = 0;
+            uint64_t csgBailedBlockCount = 0;
             // NO0006 trace comments (GrhSimAmCppOptions::traceComments,
             // default on): per-block banner and per-atom provenance comment
             // lines in the block sources. Comment-only.
@@ -3852,7 +3890,27 @@ namespace wolvrix::lib::grhsim::am
                 {
                     return std::nullopt;
                 }
-                code += *emitted;
+                if (state.commitStationGating)
+                {
+                    // commitStationGating: a gated write-station run wraps the
+                    // station's own code (never the detector-group merges
+                    // appended below) in its producer-generation check.
+                    const auto wrap = state.csgStationWrap.find(instruction.value);
+                    if (wrap != state.csgStationWrap.end())
+                    {
+                        code += wrap->second.first;
+                        code += *emitted;
+                        code += wrap->second.second;
+                    }
+                    else
+                    {
+                        code += *emitted;
+                    }
+                }
+                else
+                {
+                    code += *emitted;
+                }
             }
             if (plan != nullptr)
             {
@@ -4324,7 +4382,8 @@ namespace wolvrix::lib::grhsim::am
             "    }\n";
 
         std::string scanBlockTestPrologue(std::size_t blockIndex,
-                                          bool runtimeProfile)
+                                          bool runtimeProfile,
+                                          bool csgProducerMark)
         {
             std::string text =
                 "            if ((byteFlags & " +
@@ -4340,6 +4399,13 @@ namespace wolvrix::lib::grhsim::am
                 text += "                if (runtimeProfileEnabled_) { profilePerBlockExecs_[" +
                         std::to_string(blockIndex) +
                         "] += 1; ++profileBlockExecs_; profileBlockT0 = wolvrixAmRdtsc(); }\n";
+            }
+            if (csgProducerMark)
+            {
+                // commitStationGating: stamp this producer Block's firing
+                // generation at its execution entry (byteFlags test passed).
+                text += "                csgProdTick_[" + std::to_string(blockIndex) +
+                        "] = csgTick_;\n";
             }
             return text;
         }
@@ -4743,7 +4809,10 @@ namespace wolvrix::lib::grhsim::am
                 return static_cast<uint64_t>(0);
             }
             uint64_t byteCount = static_cast<uint64_t>(
-                scanBlockTestPrologue(blockIndex, state.runtimeProfile).size());
+                scanBlockTestPrologue(blockIndex, state.runtimeProfile,
+                                      state.commitStationGating &&
+                                          state.csgProducerBlock[blockIndex])
+                    .size());
             if (!addByteCount(byteCount, *bodyBytes) ||
                 !addByteCount(byteCount,
                               scanBlockTestEpilogue(blockIndex, state.runtimeProfile).size()))
@@ -5691,6 +5760,374 @@ namespace wolvrix::lib::grhsim::am
                 {
                     state.blockScalarWatchPlans[blockIndex] = std::move(plan);
                 }
+            }
+        }
+
+        // Commit-station gating (attribute "commitStationGating", default
+        // off): group each commit Block's eligible ST00013 fused write
+        // stations by their producer compute-Block set and wrap every
+        // maximal same-group station run (inside one chunk) in a generation
+        // check — the group runs only when one of its producer Blocks fired
+        // since the group last committed. A station is eligible when every
+        // read variable (data, cond, non-constant mask; the target read of a
+        // masked write is idempotent and excluded) has a non-empty producer
+        // set made purely of compute Blocks (1..commitBlockBegin-1, so the
+        // entry Block never qualifies), no read variable is itself a
+        // state-write target anywhere, and the station's target is written
+        // by exactly one state-write instruction across all Blocks and is
+        // not host-visible. A commit Block with more than 64 groups keeps
+        // all of its stations ungated (conservative bail, counted).
+        void planCommitStationGating(const ExecutableModel &model, EmitState &state,
+                                     std::size_t blockChunkInstructions)
+        {
+            constexpr uint32_t kMaxGroupsPerBlock = 64;
+            state.blockCommitStationGating.clear();
+            state.blockCommitStationGating.resize(state.blockCount);
+            state.csgProducerBlock.assign(state.blockCount, uint8_t{0});
+            state.csgStationWrap.clear();
+            state.csgSeenSlotCount = 0;
+            state.csgGatedBlockCount = 0;
+            state.csgGatedStationCount = 0;
+            state.csgGroupCount = 0;
+            state.csgStationTotal = 0;
+            state.csgBailedBlockCount = 0;
+            if (!state.commitStationGating || model.commitBlockBegin == 0)
+            {
+                return;
+            }
+            constexpr uint32_t kNoBlock = std::numeric_limits<uint32_t>::max();
+            const uint32_t variableCount = state.program.variableCount();
+
+            // Host-visible variables (ports + declared labels): the host may
+            // poke them between evals, so a station writing such a target is
+            // never gated (a skipped compare would leave the poke in place
+            // where the ungated form would overwrite it).
+            std::vector<uint8_t> hostVisible(variableCount, 0);
+            for (const PortBinding &port : model.interface.ports)
+            {
+                if (port.input.valid())
+                {
+                    hostVisible[port.input.value] = 1;
+                }
+                if (port.output.valid())
+                {
+                    hostVisible[port.output.value] = 1;
+                }
+                if (port.outputEnable.valid())
+                {
+                    hostVisible[port.outputEnable.value] = 1;
+                }
+            }
+            for (const VariableLabel &declared : model.interface.declaredVariables)
+            {
+                hostVisible[declared.variable.value] = 1;
+            }
+
+            // Producer Blocks per variable: the first two distinct Blocks
+            // holding a defining instruction's results (a third distinct one
+            // flags overflow and bails conservatively). Also count non-memory
+            // state writes per target variable across all Blocks.
+            std::vector<uint32_t> producerA(variableCount, kNoBlock);
+            std::vector<uint32_t> producerB(variableCount, kNoBlock);
+            std::vector<uint8_t> producerOverflow(variableCount, 0);
+            std::vector<uint32_t> stateWriteCount(variableCount, 0);
+            for (uint32_t blockIndex = 0; blockIndex < state.blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                const std::size_t blockSize = model.program.blockSize(block);
+                for (std::size_t position = 0; position < blockSize; ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    for (const VariableId result : state.program.results(instruction))
+                    {
+                        uint32_t &first = producerA[result.value];
+                        if (first == kNoBlock)
+                        {
+                            first = blockIndex;
+                        }
+                        else if (first != blockIndex)
+                        {
+                            uint32_t &second = producerB[result.value];
+                            if (second == kNoBlock)
+                            {
+                                second = blockIndex;
+                            }
+                            else if (second != blockIndex)
+                            {
+                                producerOverflow[result.value] = 1;
+                            }
+                        }
+                    }
+                    const StateWriteLayout layout =
+                        stateWriteLayout(state.program.opcode(instruction));
+                    if (layout.isStateWrite && !layout.memory)
+                    {
+                        uint32_t &count =
+                            stateWriteCount[state.program.operands(instruction)[layout.targetIndex]
+                                                .value];
+                        if (count < 2)
+                        {
+                            ++count;
+                        }
+                    }
+                }
+            }
+
+            // Producer Blocks of one read variable: empty when the variable
+            // fails the eligibility rules (no producers, entry/commit
+            // producers, overflow, or itself a state-write target).
+            const auto producerBlocksOf = [&](VariableId variable,
+                                              std::vector<uint32_t> &blocks) {
+                if (stateWriteCount[variable.value] != 0 ||
+                    producerOverflow[variable.value] != 0)
+                {
+                    return;
+                }
+                const uint32_t first = producerA[variable.value];
+                if (first == kNoBlock)
+                {
+                    return;
+                }
+                if (first == 0 || first >= model.commitBlockBegin)
+                {
+                    return;
+                }
+                blocks.push_back(first);
+                const uint32_t second = producerB[variable.value];
+                if (second != kNoBlock)
+                {
+                    if (second == 0 || second >= model.commitBlockBegin)
+                    {
+                        blocks.clear();
+                        return;
+                    }
+                    blocks.push_back(second);
+                }
+            };
+
+            const uint32_t commitBlockEnd =
+                model.commitBlockEnd != 0 ? model.commitBlockEnd : state.blockCount;
+            for (uint32_t blockIndex = model.commitBlockBegin;
+                 blockIndex < commitBlockEnd; ++blockIndex)
+            {
+                const auto &scalarPlan = state.blockScalarWatchPlans[blockIndex];
+                if (!scalarPlan.has_value())
+                {
+                    continue;
+                }
+                const BlockId block{blockIndex};
+                const std::size_t blockSize = model.program.blockSize(block);
+                // Deterministic group numbering: stations in position order.
+                std::vector<uint32_t> stationPositions;
+                stationPositions.reserve(scalarPlan->writeRaise.size());
+                for (const auto &entry : scalarPlan->writeRaise)
+                {
+                    stationPositions.push_back(entry.first);
+                }
+                std::sort(stationPositions.begin(), stationPositions.end());
+
+                EmitState::CommitStationGatingPlan plan;
+                std::map<std::vector<uint32_t>, uint32_t> groupByProducers;
+                for (const uint32_t position : stationPositions)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    const Opcode opcode = state.program.opcode(instruction);
+                    if (!isRegisterWriteOpcode(opcode))
+                    {
+                        continue;
+                    }
+                    ++state.csgStationTotal;
+                    const auto operands = state.program.operands(instruction);
+                    const StateWriteLayout layout = stateWriteLayout(opcode);
+                    const VariableId target = operands[layout.targetIndex];
+                    if (stateWriteCount[target.value] > 1 ||
+                        hostVisible[target.value] != 0)
+                    {
+                        continue;
+                    }
+                    std::vector<uint32_t> producers;
+                    bool eligible = true;
+                    const auto collect = [&](VariableId variable) {
+                        if (!eligible)
+                        {
+                            return;
+                        }
+                        std::vector<uint32_t> blocks;
+                        producerBlocksOf(variable, blocks);
+                        if (blocks.empty())
+                        {
+                            eligible = false;
+                            return;
+                        }
+                        producers.insert(producers.end(), blocks.begin(), blocks.end());
+                    };
+                    collect(operands[layout.dataIndex]);
+                    if (layout.hasCond)
+                    {
+                        collect(operands[0]);
+                    }
+                    if (layout.hasMask)
+                    {
+                        const VariableId mask = operands[layout.hasCond ? 1 : 0];
+                        if (!scalarConstantWord(state, mask))
+                        {
+                            collect(mask);
+                        }
+                    }
+                    if (!eligible)
+                    {
+                        continue;
+                    }
+                    std::sort(producers.begin(), producers.end());
+                    producers.erase(std::unique(producers.begin(), producers.end()),
+                                    producers.end());
+                    const uint32_t groupId =
+                        static_cast<uint32_t>(plan.groups.size());
+                    const auto [groupIt, inserted] =
+                        groupByProducers.try_emplace(producers, groupId);
+                    if (inserted)
+                    {
+                        plan.groups.push_back(
+                            EmitState::CommitStationGatingGroup{producers, 0});
+                    }
+                    plan.groupByPosition.emplace(position, groupIt->second);
+                }
+                if (plan.groupByPosition.empty())
+                {
+                    continue;
+                }
+                if (plan.groups.size() > kMaxGroupsPerBlock)
+                {
+                    ++state.csgBailedBlockCount;
+                    continue;
+                }
+
+                // Seen slots: one per (group, producer) pair, dense across
+                // the whole model.
+                for (EmitState::CommitStationGatingGroup &group : plan.groups)
+                {
+                    group.seenBase = state.csgSeenSlotCount;
+                    state.csgSeenSlotCount +=
+                        static_cast<uint32_t>(group.producers.size());
+                    for (const uint32_t producer : group.producers)
+                    {
+                        state.csgProducerBlock[producer] = 1;
+                    }
+                }
+                ++state.csgGatedBlockCount;
+                state.csgGatedStationCount += plan.groupByPosition.size();
+                state.csgGroupCount += plan.groups.size();
+
+                // Runs: maximal same-group station subsequences that never
+                // cross a chunk boundary (chunk functions brace-scope the
+                // wrap). Chunked Blocks follow the emission-time chunk
+                // ranges (forced boundary at the commit gate head).
+                std::unordered_map<uint32_t, uint32_t> runOpen;
+                std::unordered_map<uint32_t, uint32_t> runClose;
+                const std::size_t gateBoundary =
+                    state.blockCommitGate[blockIndex].headCount;
+                std::vector<std::pair<std::size_t, std::size_t>> ranges;
+                if (blockSize > blockChunkInstructions)
+                {
+                    ranges = blockChunkRanges(blockSize, blockChunkInstructions,
+                                              gateBoundary);
+                }
+                else
+                {
+                    ranges.emplace_back(std::size_t{0}, blockSize);
+                }
+                for (const auto &[rangeFirst, rangeEnd] : ranges)
+                {
+                    int32_t openGroup = -1;
+                    uint32_t lastStation = 0;
+                    for (std::size_t position = rangeFirst; position < rangeEnd;
+                         ++position)
+                    {
+                        const auto station =
+                            plan.groupByPosition.find(static_cast<uint32_t>(position));
+                        if (station == plan.groupByPosition.end())
+                        {
+                            if (openGroup >= 0)
+                            {
+                                runClose.emplace(lastStation,
+                                                 static_cast<uint32_t>(openGroup));
+                                openGroup = -1;
+                            }
+                            continue;
+                        }
+                        const uint32_t group = station->second;
+                        if (openGroup != static_cast<int32_t>(group))
+                        {
+                            if (openGroup >= 0)
+                            {
+                                runClose.emplace(lastStation,
+                                                 static_cast<uint32_t>(openGroup));
+                            }
+                            runOpen.emplace(static_cast<uint32_t>(position), group);
+                            openGroup = static_cast<int32_t>(group);
+                        }
+                        lastStation = static_cast<uint32_t>(position);
+                    }
+                    if (openGroup >= 0)
+                    {
+                        runClose.emplace(lastStation, static_cast<uint32_t>(openGroup));
+                    }
+                }
+                const auto checkText = [&](uint32_t groupId) {
+                    const EmitState::CommitStationGatingGroup &group =
+                        plan.groups[groupId];
+                    std::string text;
+                    for (std::size_t index = 0; index < group.producers.size(); ++index)
+                    {
+                        if (!text.empty())
+                        {
+                            text += " || ";
+                        }
+                        text += "csgProdTick_[" + std::to_string(group.producers[index]) +
+                                "] != csgSeenTick_[" +
+                                std::to_string(group.seenBase + index) + "]";
+                    }
+                    return text;
+                };
+                const auto syncText = [&](uint32_t groupId) {
+                    const EmitState::CommitStationGatingGroup &group =
+                        plan.groups[groupId];
+                    std::string text;
+                    for (std::size_t index = 0; index < group.producers.size(); ++index)
+                    {
+                        text += "csgSeenTick_[" +
+                                std::to_string(group.seenBase + index) +
+                                "] = csgProdTick_[" +
+                                std::to_string(group.producers[index]) + "]; ";
+                    }
+                    return text;
+                };
+                for (const auto &[position, group] : plan.groupByPosition)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    std::string prefix;
+                    std::string suffix;
+                    const auto open = runOpen.find(position);
+                    if (open != runOpen.end())
+                    {
+                        prefix = "if (" + checkText(open->second) + ") {\n";
+                    }
+                    const auto close = runClose.find(position);
+                    if (close != runClose.end())
+                    {
+                        suffix = syncText(close->second) + "}\n";
+                    }
+                    if (!prefix.empty() || !suffix.empty())
+                    {
+                        state.csgStationWrap.emplace(
+                            instruction.value,
+                            std::make_pair(std::move(prefix), std::move(suffix)));
+                    }
+                }
+                state.blockCommitStationGating[blockIndex] = std::move(plan);
             }
         }
 
@@ -7760,6 +8197,11 @@ namespace wolvrix::lib::grhsim::am
             options.attributes.find("commitStationStats");
         state.commitStationStats = commitStationStatsAttribute != options.attributes.end() &&
                                    commitStationStatsAttribute->second == "true";
+        // Commit-station producer-generation gating (default off).
+        const auto commitStationGatingAttribute =
+            options.attributes.find("commitStationGating");
+        state.commitStationGating = commitStationGatingAttribute != options.attributes.end() &&
+                                    commitStationGatingAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -8265,6 +8707,26 @@ namespace wolvrix::lib::grhsim::am
         // RegisterWrite sites. Planned after ST00010 (emission consults its
         // group assignments).
         planScalarWatchGroups(model, state);
+        // Commit-station gating: producer-generation checks around eligible
+        // ST00013 write-station groups (default off; off leaves every plan
+        // empty and the emission byte-identical). Planned right after
+        // ST00013 (it consumes the fused write-site positions and the commit
+        // gate head boundaries).
+        planCommitStationGating(model, state, *blockChunkInstructions);
+        if (state.commitStationGating)
+        {
+            diagnostics.info(
+                "[commit-station-gating] blocks=" +
+                    std::to_string(state.csgGatedBlockCount) + "/" +
+                    std::to_string((model.commitBlockEnd != 0 ? model.commitBlockEnd
+                                                              : state.blockCount) -
+                                   model.commitBlockBegin) +
+                    " stations=" + std::to_string(state.csgGatedStationCount) + "/" +
+                    std::to_string(state.csgStationTotal) +
+                    " groups=" + std::to_string(state.csgGroupCount) +
+                    " bailed_blocks=" + std::to_string(state.csgBailedBlockCount),
+                std::string(kContext));
+        }
         // NO0008 block-level same-select mux fusion: adjacent mux-rooted
         // atoms sharing one select emit one fused if/else per run.
         planMuxFusionRuns(model, state);
@@ -8693,6 +9155,13 @@ namespace wolvrix::lib::grhsim::am
         {
             header << "    std::uint64_t csgStatsCompares_ = 0;\n"
                    << "    std::uint64_t csgStatsHits_ = 0;\n";
+        }
+        if (state.commitStationGating)
+        {
+            header << "    std::uint64_t csgTick_ = 0;\n"
+                   << "    std::array<std::uint64_t, kBlockCount> csgProdTick_{};\n"
+                   << "    std::array<std::uint64_t, " << state.csgSeenSlotCount
+                   << "> csgSeenTick_{};\n";
         }
         if (state.runtimeProfile)
         {
@@ -9769,6 +10238,13 @@ namespace
                << "    for (std::string &value : stringValues_) value.clear();\n"
                << "    activeWords_.fill(0); backwardFired_ = false;\n"
                << "    dirtyChangedBits_.fill(0); dirtyChangedResults_.clear(); onceCompleted_.fill(false);\n";
+        if (state.commitStationGating)
+        {
+            // Re-init reproduces the construction state of the gating
+            // bookkeeping (first eval re-activates every Block, so the next
+            // round re-stamps every producer generation anyway).
+            runtime << "    csgProdTick_.fill(0); csgSeenTick_.fill(0); csgTick_ = 0;\n";
+        }
         // NO0017 §5: re-zero the exploded element arrays on (re-)init, same
         // contract as the pool fill above; literal init stores follow below.
         for (uint32_t index = 0; index < state.explodedElementWidth.size(); ++index)
@@ -10152,6 +10628,7 @@ namespace
                 << "    }\n"
                 << "    while (true) {\n"
                 << "        backwardFired_ = false;\n"
+                << (state.commitStationGating ? "        ++csgTick_;\n" : "")
                 << (state.runtimeProfile
                         ? "        const auto profileComputeStart = runtimeProfileEnabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};\n"
                         : "");
@@ -10848,7 +11325,9 @@ namespace
                                 continue;
                             }
                             blockSource << scanBlockTestPrologue(
-                                blockIndex, state.runtimeProfile);
+                                blockIndex, state.runtimeProfile,
+                                state.commitStationGating &&
+                                    state.csgProducerBlock[blockIndex]);
                             if (!writeBlockBodyOrChunks(blockIndex, "                "))
                             {
                                 blocksGenerated = false;
