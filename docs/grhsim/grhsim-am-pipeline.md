@@ -1032,6 +1032,23 @@ diagnostics 打 `wide-state explode stats`（炸开状态数/元素总数/回收
 守卫 bail 分类计数），`GrhSimAmCppResult.wideStateExploded*` 供 CLI JSON
 输出。
 
+### 3.2.9 commit 写站空闲率离线插桩（`commitStationStats`，2026-08-15）
+
+**默认 off；off 时 emit 与基线逐字节一致。** 动机：时钟 posedge 每 eval 打开
+全部 commit 块的门，所有 ST00013 融合写站每 posedge eval 都执行一次
+`wrNext != target` compare；若写站的 data/cond/mask 输入的生产者 compute 块自
+上次提交以来未触发，输入仍等于上次提交进状态的值，compare 必然失败（空转）。
+本开关只做测量，不改变任何行为：emit 时给每个 ST00013 标量融合写站的
+compare 包一层计数——模型类新增成员 `csgStatsCompares_` / `csgStatsHits_`，
+写站代码在 compare 前 `++csgStatsCompares_`、命中分支内 `++csgStatsHits_`；
+`finalize()`（模型析构也会调用）向 stderr 打一行
+`[commit-station-stats] compares=<N> hits=<M> idle=<1-M/N>`，供离线算写站
+空闲率。只插桩标量 compare 形态（`wrNext != target`）；宽写站的 detect 在
+helper 内部，不计入。
+
+开关：emitter 属性 `commitStationStats`，CLI
+`grhsim-am-lower-json --commit-station-stats`。
+
 ### 3.3 临时 scheduling facts
 
 以下内容只属于 scheduler workspace，不进入 ScheduledProgram 或 session 的长期公共契约：

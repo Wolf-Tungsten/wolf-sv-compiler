@@ -239,6 +239,12 @@ namespace wolvrix::lib::grhsim::am
             // bodies into many small basic blocks so the C++ backend never
             // faces one giant straight-line region (emit-cost NO0001 B2).
             bool branchyMux = false;
+            // Compile-time commit-station stats switch (attribute
+            // "commitStationStats", default off). When true every ST00013
+            // fused scalar write station counts its compare and its hits,
+            // and finalize() prints the aggregate compare/hit/idle line to
+            // stderr. Offline instrumentation only: no behavior change.
+            bool commitStationStats = false;
             // NO0006 trace comments (GrhSimAmCppOptions::traceComments,
             // default on): per-block banner and per-atom provenance comment
             // lines in the block sources. Comment-only.
@@ -3268,10 +3274,17 @@ namespace wolvrix::lib::grhsim::am
                         // ST00013: compare at the write point and store only
                         // on a real change (the legacy write-point detection
                         // idiom); the tail detector reads the raise flag.
+                        // commitStationStats: count the compare and its hits
+                        // (offline idle-rate instrumentation).
                         const std::string next =
                             "wrNext_" + std::to_string(instruction.value);
-                        body = "{ const auto " + next + " = " + nextValue + ";\nif (" + next +
-                               " != " + valueExpr(state, target) + ") { " +
+                        const std::string statsCompare =
+                            state.commitStationStats ? "++csgStatsCompares_; " : "";
+                        const std::string statsHit =
+                            state.commitStationStats ? "++csgStatsHits_; " : "";
+                        body = "{ const auto " + next + " = " + nextValue + ";\n" +
+                               statsCompare + "if (" + next +
+                               " != " + valueExpr(state, target) + ") { " + statsHit +
                                valueExpr(state, target) + " = " + next + "; " +
                                scalarWatchFlagExpr(
                                    state, static_cast<uint32_t>(state.scalarWriteRaise)) +
@@ -7742,6 +7755,11 @@ namespace wolvrix::lib::grhsim::am
         const auto wideStateExplodeAttribute = options.attributes.find("wideStateExplode");
         state.wideStateExplode = wideStateExplodeAttribute != options.attributes.end() &&
                                  wideStateExplodeAttribute->second == "true";
+        // Commit-station stats offline instrumentation (default off).
+        const auto commitStationStatsAttribute =
+            options.attributes.find("commitStationStats");
+        state.commitStationStats = commitStationStatsAttribute != options.attributes.end() &&
+                                   commitStationStatsAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -8391,7 +8409,7 @@ namespace wolvrix::lib::grhsim::am
         std::ostringstream header;
         header << "#pragma once\n"
                << "#include <array>\n#include <chrono>\n#include <cstddef>\n#include <cstdint>\n#include <cstring>\n#include <string>\n#include <vector>\n\n";
-        if (state.runtimeProfile || state.changedTrace)
+        if (state.runtimeProfile || state.changedTrace || state.commitStationStats)
         {
             header << "#include <cstdio>\n#include <cstdlib>\n\n";
         }
@@ -8671,6 +8689,11 @@ namespace wolvrix::lib::grhsim::am
                << "> pendingHostEvents_{};\n"
                << "    bool firstEval_ = true;\n"
                << "    std::uint64_t randomSeed_ = 0;\n";
+        if (state.commitStationStats)
+        {
+            header << "    std::uint64_t csgStatsCompares_ = 0;\n"
+                   << "    std::uint64_t csgStatsHits_ = 0;\n";
+        }
         if (state.runtimeProfile)
         {
             header << "    bool runtimeProfileEnabled_ = false;\n"
@@ -10065,6 +10088,13 @@ namespace
                 return result;
             }
             writeIndentedLines(runtime, *code, "    ");
+        }
+        if (state.commitStationStats)
+        {
+            runtime << "    std::fprintf(stderr, \"[commit-station-stats] compares=%llu hits=%llu idle=%.6f\\n\", "
+                       "static_cast<unsigned long long>(csgStatsCompares_), "
+                       "static_cast<unsigned long long>(csgStatsHits_), "
+                       "csgStatsCompares_ == 0 ? 0.0 : 1.0 - static_cast<double>(csgStatsHits_) / static_cast<double>(csgStatsCompares_));\n";
         }
         runtime << "    std::cout.flush();\n"
                 << "    std::cerr.flush();\n"
