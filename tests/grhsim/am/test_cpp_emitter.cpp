@@ -3673,6 +3673,292 @@ int main()
         return 0;
     }
 
+    // Init-zero elision (attribute "initZeroElision", default off): with the
+    // switch on, a variable's sole literal-0 init store is skipped at
+    // emission because the init() prologue already covers it (member memset
+    // for narrow member values, wideValues_.fill(0) per slot for >64-bit
+    // BitVectors — so a mixed literal like {0, 7, 0} keeps only its non-zero
+    // word store, realValues_.fill(0) for reals). Non-zero literals, random
+    // inits and strings must survive, and the default mode must keep all
+    // stores.
+    // (The multi-action conservatism is unreachable here on purpose: the
+    // semantic validator rejects more than one Set action per variable —
+    // the sawSet rule in grhsim_am_program_validate.cpp — so multi-action
+    // scalar inits never reach the emitter; the guard stays as a belt and
+    // braces at the call site.)
+    int testInitZeroElision(const std::filesystem::path &outputDirectory)
+    {
+        LinearProgramBuilder linear;
+        const TypeId u8Type = linear.addType(Type::bitVector(8));
+        const TypeId u130Type = linear.addType(Type::bitVector(130));
+        const TypeId realType = linear.addType(Type::real());
+        const TypeId stringType = linear.addType(Type::string());
+
+        const std::array<uint64_t, 1> zeroWord = {0};
+        const std::array<uint64_t, 1> oneWord = {1};
+        const std::array<uint64_t, 1> fiveWord = {5};
+        const std::array<uint64_t, 1> piBits = {UINT64_C(0x400921fb54442d18)};
+        const std::array<uint64_t, 3> wideZeroWords = {0, 0, 0};
+        const std::array<uint64_t, 3> wideSparseWords = {0, 7, 0};
+        const LiteralId zeroLiteral8 = linear.addBitLiteral(u8Type, zeroWord);
+        const LiteralId oneLiteral8 = linear.addBitLiteral(u8Type, oneWord);
+        const LiteralId fiveLiteral8 = linear.addBitLiteral(u8Type, fiveWord);
+        const LiteralId wideZeroLiteral =
+            linear.addBitLiteral(u130Type, wideZeroWords);
+        const LiteralId wideSparseLiteral =
+            linear.addBitLiteral(u130Type, wideSparseWords);
+        const LiteralId realZeroLiteral = linear.addBitLiteral(realType, zeroWord);
+        const LiteralId realPiLiteral = linear.addBitLiteral(realType, piBits);
+        const LiteralId stringLiteral = linear.addStringLiteral(stringType, "hi");
+
+        const VariableId narrowZeroConst =
+            linear.addVariable(u8Type, linear.addConstantInit(zeroLiteral8));
+        const VariableId narrowOneConst =
+            linear.addVariable(u8Type, linear.addConstantInit(oneLiteral8));
+        const InitAction zeroSetAction{
+            .kind = InitActionKind::Set,
+            .expression = InitExpr{
+                .kind = InitExprKind::Literal,
+                .literal = zeroLiteral8,
+            },
+        };
+        const VariableId narrowZeroSet = linear.addVariable(
+            u8Type,
+            linear.addActionsInit(std::span<const InitAction>(&zeroSetAction, 1)));
+        const InitAction fiveSetAction{
+            .kind = InitActionKind::Set,
+            .expression = InitExpr{
+                .kind = InitExprKind::Literal,
+                .literal = fiveLiteral8,
+            },
+        };
+        const VariableId narrowFiveSet = linear.addVariable(
+            u8Type,
+            linear.addActionsInit(std::span<const InitAction>(&fiveSetAction, 1)));
+        const InitAction randomAction{
+            .kind = InitActionKind::Set,
+            .expression = InitExpr{
+                .kind = InitExprKind::Random,
+            },
+        };
+        const VariableId narrowRandom = linear.addVariable(
+            u8Type,
+            linear.addActionsInit(std::span<const InitAction>(&randomAction, 1)));
+        const VariableId wideZeroConst =
+            linear.addVariable(u130Type, linear.addConstantInit(wideZeroLiteral));
+        const VariableId wideSparseConst =
+            linear.addVariable(u130Type, linear.addConstantInit(wideSparseLiteral));
+        const VariableId realZero =
+            linear.addVariable(realType, linear.addConstantInit(realZeroLiteral));
+        const VariableId realPi =
+            linear.addVariable(realType, linear.addConstantInit(realPiLiteral));
+        const VariableId stringInit =
+            linear.addVariable(stringType, linear.addConstantInit(stringLiteral));
+        const VariableId assignOut = linear.addVariable(u8Type, linear.zeroInit());
+        const std::array<VariableId, 1> assignResults = {assignOut};
+        const std::array<VariableId, 1> assignOperands = {narrowOneConst};
+        const InstructionId assign =
+            linear.addInstruction(Opcode::Assign, assignResults, assignOperands);
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        scheduled.addBlock(std::vector<InstructionId>{assign});
+        ExecutableModel model{
+            .program = scheduled.finish(),
+            .interface = ProgramInterface{},
+            .commitBlockBegin = 0,
+            .commitBlockEnd = 0,
+        };
+
+        // Wide/real/string storage offsets are assigned in ascending
+        // VariableId order; replicate that layout to name the exact stores.
+        const ProgramView program = model.program.view();
+        const auto storageOffset = [&](VariableId variable) {
+            uint64_t wideOffset = 0;
+            uint64_t realOffset = 0;
+            uint64_t stringOffset = 0;
+            for (uint32_t index = 0; index < variable.value; ++index)
+            {
+                const Type &type =
+                    program.type(program.variable(VariableId{index}).type);
+                if ((type.kind == TypeKind::BitVector && type.bitWidth > 64) ||
+                    type.kind == TypeKind::Array)
+                {
+                    const uint64_t words =
+                        (static_cast<uint64_t>(type.bitWidth) + 63U) / 64U;
+                    wideOffset +=
+                        words * (type.kind == TypeKind::Array ? type.elementCount : 1U);
+                }
+                else if (type.kind == TypeKind::Real)
+                {
+                    ++realOffset;
+                }
+                else if (type.kind == TypeKind::String)
+                {
+                    ++stringOffset;
+                }
+            }
+            const Type &type = program.type(program.variable(variable).type);
+            if (type.kind == TypeKind::Real)
+            {
+                return realOffset;
+            }
+            if (type.kind == TypeKind::String)
+            {
+                return stringOffset;
+            }
+            return wideOffset;
+        };
+
+        const auto emitModel = [&](bool elide,
+                                   const std::filesystem::path &directory,
+                                   GrhSimAmCppResult &result) {
+            std::filesystem::remove_all(directory);
+            wolvrix::lib::diag::Diagnostics diagnostics;
+            GrhSimAmCppEmitter emitter;
+            GrhSimAmCppOptions options{
+                .outputDirectory = directory,
+                .modelName = "InitZeroTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            };
+            if (elide)
+            {
+                options.attributes.emplace("initZeroElision", "true");
+            }
+            result = emitter.emit(model, options, diagnostics);
+            if (!result.success || diagnostics.hasError())
+            {
+                return false;
+            }
+            return true;
+        };
+
+        GrhSimAmCppResult offResult;
+        if (!emitModel(false, outputDirectory / "off", offResult))
+        {
+            return fail("AM C++ emitter failed to generate the init-zero baseline model");
+        }
+        GrhSimAmCppResult onResult;
+        if (!emitModel(true, outputDirectory / "on", onResult))
+        {
+            return fail("AM C++ emitter failed to generate the init-zero elision model");
+        }
+        const std::optional<std::string> offRuntime =
+            readTextFile(outputDirectory / "off" / "grhsim_InitZeroTop_runtime.cpp");
+        const std::optional<std::string> onRuntime =
+            readTextFile(outputDirectory / "on" / "grhsim_InitZeroTop_runtime.cpp");
+        if (!offRuntime || !onRuntime)
+        {
+            return fail("AM C++ emitter produced no init-zero runtime source");
+        }
+        const auto initBody = [](const std::string &runtimeText) {
+            const std::size_t begin = runtimeText.find("::init() {");
+            if (begin == std::string::npos)
+            {
+                return std::string{};
+            }
+            const std::size_t end = runtimeText.find("\n}\n", begin);
+            if (end == std::string::npos)
+            {
+                return std::string{};
+            }
+            return runtimeText.substr(begin, end - begin);
+        };
+        const std::string offInit = initBody(*offRuntime);
+        const std::string onInit = initBody(*onRuntime);
+        if (offInit.empty() || onInit.empty())
+        {
+            return fail("AM C++ emitter runtime source lost its init() body");
+        }
+
+        const std::string mask8 = "((UINT64_C(1) << 8) - UINT64_C(1))";
+        const auto narrowStore = [&](VariableId variable, uint64_t value) {
+            return "    v" + std::to_string(variable.value) + " = (UINT64_C(" +
+                   std::to_string(value) + ")) & " + mask8 + ";";
+        };
+        const auto wideStore = [](uint64_t offset, uint64_t value,
+                                  std::string_view mask) {
+            return "    wideValues_[" + std::to_string(offset) + "] = (UINT64_C(" +
+                   std::to_string(value) + ")) & " + std::string(mask) + ";";
+        };
+        const uint64_t wideZeroOffset = storageOffset(wideZeroConst);
+        const uint64_t wideSparseOffset = storageOffset(wideSparseConst);
+        const uint64_t realZeroOffset = storageOffset(realZero);
+        const uint64_t realPiOffset = storageOffset(realPi);
+        const uint64_t stringOffset = storageOffset(stringInit);
+        const std::string tailMask = "((UINT64_C(1) << 2) - UINT64_C(1))";
+
+        // Baseline (switch off): every init store is emitted and the elision
+        // counters stay zero.
+        if (offResult.initZeroElisionNarrow != 0 ||
+            offResult.initZeroElisionWide != 0 || offResult.initZeroElisionReal != 0)
+        {
+            return fail("init-zero elision counted stores with the switch off");
+        }
+        if (countOccurrences(offInit, narrowStore(narrowZeroConst, 0)) != 1 ||
+            countOccurrences(offInit, narrowStore(narrowOneConst, 1)) != 1 ||
+            countOccurrences(offInit, narrowStore(narrowZeroSet, 0)) != 1 ||
+            countOccurrences(offInit, narrowStore(narrowFiveSet, 5)) != 1 ||
+            countOccurrences(offInit, "    v" + std::to_string(narrowRandom.value) +
+                                          " = (split_mix64(initRandomState)) & " +
+                                          mask8 + ";") != 1 ||
+            countOccurrences(offInit, wideStore(wideZeroOffset + 0, 0, "UINT64_MAX")) != 1 ||
+            countOccurrences(offInit, wideStore(wideZeroOffset + 1, 0, "UINT64_MAX")) != 1 ||
+            countOccurrences(offInit, wideStore(wideZeroOffset + 2, 0, tailMask)) != 1 ||
+            countOccurrences(offInit, wideStore(wideSparseOffset + 0, 0, "UINT64_MAX")) != 1 ||
+            countOccurrences(offInit, wideStore(wideSparseOffset + 1, 7, "UINT64_MAX")) != 1 ||
+            countOccurrences(offInit, wideStore(wideSparseOffset + 2, 0, tailMask)) != 1 ||
+            countOccurrences(offInit, "    realValues_[" +
+                                          std::to_string(realZeroOffset) +
+                                          "] = UINT64_C(0);") != 1 ||
+            countOccurrences(offInit, "    realValues_[" +
+                                          std::to_string(realPiOffset) +
+                                          "] = UINT64_C(4614256656552045848);") != 1 ||
+            countOccurrences(offInit, "    stringValues_[" +
+                                          std::to_string(stringOffset) +
+                                          "] = \"hi\";") != 1)
+        {
+            return fail("default emission dropped an init() store");
+        }
+
+        // Elision on: the sole-action literal-0 stores vanish (two narrow
+        // member stores, five wide zero-word stores — all three of the
+        // all-zero variable plus words 0/2 of the {0, 7, 0} sparse literal —
+        // one real store), while the non-zero action store, the random init,
+        // the sparse literal's non-zero word, the non-zero real and the
+        // string stay.
+        if (onResult.initZeroElisionNarrow != 2 ||
+            onResult.initZeroElisionWide != 5 || onResult.initZeroElisionReal != 1)
+        {
+            return fail("init-zero elision reported the wrong store counts");
+        }
+        if (countOccurrences(onInit, narrowStore(narrowZeroConst, 0)) != 0 ||
+            countOccurrences(onInit, narrowStore(narrowZeroSet, 0)) != 0 ||
+            countOccurrences(onInit, "v" + std::to_string(narrowZeroConst.value) + " =") != 0 ||
+            countOccurrences(onInit, "v" + std::to_string(narrowZeroSet.value) + " =") != 0 ||
+            countOccurrences(onInit, narrowStore(narrowOneConst, 1)) != 1 ||
+            countOccurrences(onInit, narrowStore(narrowFiveSet, 5)) != 1 ||
+            countOccurrences(onInit, "    v" + std::to_string(narrowRandom.value) +
+                                         " = (split_mix64(initRandomState)) & " +
+                                         mask8 + ";") != 1 ||
+            countOccurrences(onInit, "wideValues_[") != 1 ||
+            countOccurrences(onInit, wideStore(wideSparseOffset + 0, 0, "UINT64_MAX")) != 0 ||
+            countOccurrences(onInit, wideStore(wideSparseOffset + 1, 7, "UINT64_MAX")) != 1 ||
+            countOccurrences(onInit, wideStore(wideSparseOffset + 2, 0, tailMask)) != 0 ||
+            countOccurrences(onInit, "    realValues_[" +
+                                         std::to_string(realZeroOffset) +
+                                         "] = UINT64_C(0);") != 0 ||
+            countOccurrences(onInit, "    realValues_[" +
+                                         std::to_string(realPiOffset) +
+                                         "] = UINT64_C(4614256656552045848);") != 1 ||
+            countOccurrences(onInit, "    stringValues_[" +
+                                         std::to_string(stringOffset) +
+                                         "] = \"hi\";") != 1)
+        {
+            return fail("init-zero elision did not drop exactly the covered literal-0 stores");
+        }
+        return 0;
+    }
+
     // NO0008 production-form fusion: same-select muxes lowered into an
     // AmGraph, scheduled through graphToProgram (split -> tree-atom fold ->
     // partition -> materialize), then emitted. The pinned outputs keep each
@@ -4278,6 +4564,13 @@ int main()
     if (const int result = testResizeElision(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-resize-elision");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testInitZeroElision(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-init-zero-elision");
         result != 0)
     {
         return result;
