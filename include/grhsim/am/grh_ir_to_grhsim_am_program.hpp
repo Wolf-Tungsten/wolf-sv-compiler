@@ -119,6 +119,14 @@ namespace wolvrix::lib::grhsim::am
         // The WOLVRIX_GRHSIM_AM_NODE_ALIGNED env var (0|1) overrides this
         // option when set.
         GsimNodeAlignedMode gsimNodeAligned = GsimNodeAlignedMode::Auto;
+        // 实验开关（默认 off）：移除 EntryBlock（block 0）detector 组的
+        // preset 激活边中、目标 compute Block 同时被 commit Block act.b
+        // 反向激活的那些边——这类 Block 不再由钟/输入变化 preset 激活，
+        // 只能在 round-1 末尾由 commit act.b 于 round-2 触发。护栏：若某个
+        // watch 变量的全部 preset 目标都会被移除，则保留该组（输入不得
+        // 失去 EntryBlock watch）。eval() 首次求值的全块激活路径不受影响。
+        // off 时输出与既往逐字节一致。
+        bool skipPresetActivation = false;
     };
 
     // Resolves the effective node-aligned mode (NO0006): the

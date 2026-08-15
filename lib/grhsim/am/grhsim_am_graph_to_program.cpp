@@ -851,6 +851,10 @@ namespace wolvrix::lib::grhsim::am
         // reactivates the compute Blocks reading them (ActBackward). Edges
         // sharing one (commit Block, state target) pair collapse into a single
         // detector during materialization.
+        std::vector<char> commitReactivated;
+        if (options.skipPresetActivation) {
+            commitReactivated.assign(normalBlockCount + 1, 0);
+        }
         for (uint32_t block = commitBlockBegin; block < commitBlockEnd; ++block) {
             for (const uint32_t instruction : blockNodes[block]) {
                 const std::optional<VariableId> target =
@@ -864,6 +868,9 @@ namespace wolvrix::lib::grhsim::am
                     if (readerBlock == 0 || isCommitBlock(readerBlock)) {
                         continue;
                     }
+                    if (!commitReactivated.empty()) {
+                        commitReactivated[readerBlock] = 1;
+                    }
                     activationEdges.push_back(ActivationEdge{
                         .sourceBlock = block,
                         .variable = target->value,
@@ -871,6 +878,43 @@ namespace wolvrix::lib::grhsim::am
                     });
                 }
             }
+        }
+
+        // skipPresetActivation: a compute Block that a commit Block
+        // reactivates through act.b (marked above) is re-evaluated in the
+        // follow-up round on post-commit state, so its round-1 evaluation
+        // triggered by the EntryBlock preset (clock/input detector groups)
+        // is redundant. Drop exactly those preset edges; the initial eval
+        // activates every Block through a separate path and is unaffected.
+        // Guard: a source-0 watch variable must keep at least one target,
+        // otherwise its EntryBlock detector would vanish and the input
+        // would become unwatched (semantic validation requires every input
+        // read by a compute Block to be watched by the EntryBlock).
+        if (options.skipPresetActivation) {
+            std::unordered_map<uint32_t, std::pair<std::size_t, std::size_t>>
+                entryGroupCounts;  // variable -> (total targets, droppable targets)
+            for (const ActivationEdge &edge : activationEdges) {
+                if (edge.sourceBlock != 0) {
+                    continue;
+                }
+                auto &[total, droppable] = entryGroupCounts[edge.variable];
+                ++total;
+                if (commitReactivated[edge.targetBlock] != 0) {
+                    ++droppable;
+                }
+            }
+            activationEdges.erase(
+                std::remove_if(activationEdges.begin(), activationEdges.end(),
+                               [&](const ActivationEdge &edge) {
+                                   if (edge.sourceBlock != 0 ||
+                                       commitReactivated[edge.targetBlock] == 0) {
+                                       return false;
+                                   }
+                                   const auto &[total, droppable] =
+                                       entryGroupCounts[edge.variable];
+                                   return droppable < total;
+                               }),
+                activationEdges.end());
         }
 
         std::sort(activationEdges.begin(), activationEdges.end());

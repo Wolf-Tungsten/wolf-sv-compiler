@@ -141,7 +141,7 @@ int main(int argc, char **argv)
                      "[--dp-coarsen-atom-budget <count>] [--dp-coarsen-instr-budget <count>] [--disable-coarsening] "
                      "[--tree-atom-fold-max-instr <count>] "
                      "[--runtime-profile] [--full-evaluation] [--changed-trace] "
-                     "[--branchy-mux] [--resize-elision] [--no-trace-comments] "
+                     "[--branchy-mux] [--resize-elision] [--am-skip-preset-activation] [--no-trace-comments] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -179,6 +179,7 @@ int main(int argc, char **argv)
     bool changedTrace = false;
     bool branchyMux = false;
     bool resizeElision = false;
+    bool skipPresetActivation = false;
     bool traceComments = true;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
@@ -425,6 +426,10 @@ int main(int argc, char **argv)
         {
             resizeElision = true;
         }
+        else if (argument == "--am-skip-preset-activation")
+        {
+            skipPresetActivation = true;
+        }
         else if (argument == "--no-trace-comments")
         {
             traceComments = false;
@@ -651,6 +656,7 @@ int main(int argc, char **argv)
             .fanoutAbsorbBudgetMult = fanoutAbsorbBudgetMult,
             .fanoutAbsorbMaxConsumers = fanoutAbsorbMaxConsumers,
             .treeAtomFoldMaxInstr = treeAtomFoldMaxInstr,
+            .skipPresetActivation = skipPresetActivation,
         };
         const bool nodeAligned = gsimNodeAlignedScheduling(*amGraph, scheduleOptions);
         const bool skipAmOptimize = nodeAligned && !gsimNodeAlignedOptimizeForced();

@@ -330,6 +330,18 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   截断，TB 写入的高位垃圾不会进入模型；`valueExpr` 只会产生上述三种存储引用，
   无表达式形式，故同宽 resize 恒为 identity。`sourceWidth == targetWidth == 64`
   被同一规则自然覆盖（掩码恒等，无需特判）。off 时输出与既往逐字节一致。
+- `skipPresetActivation`（`--am-skip-preset-activation`，默认 off；调度阶段开关，
+  走 `ActivityScheduleOptions.skipPresetActivation`，不是 emitter attribute）：
+  在 materialize 阶段移除 EntryBlock（block 0）detector 组的 preset 激活边中、
+  目标 compute Block 至少有一条来自 commit Block 的 act.b 反向激活入边的那些边。
+  机制：这类 compute Block 在 round-1 末尾会被 commit Block 的 act.b 再激活并在
+  round-2 基于 commit 后的新状态重算，其 round-1 preset 求值的输出无人消费，属冗余；
+  开启后它们只能靠 commit act.b 触发。过滤发生在 activation edge 生成处
+  （graph→program 的 materialize），被整组清空的 detector 组不再物化；
+  护栏：若某个 watch 变量的全部 preset 目标都会被移除，则整组保留，
+  保证每个被 compute Block 读取的输入仍有 EntryBlock watch（语义校验
+  不变式）。eval() 首次求值激活全部 Block 的独立代码路径不受影响。
+  off 时输出与既往逐字节一致。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
