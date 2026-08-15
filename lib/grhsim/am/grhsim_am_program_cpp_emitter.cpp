@@ -223,6 +223,20 @@ namespace wolvrix::lib::grhsim::am
             // write-side discipline already truncates every stored scalar to
             // its declared width, so the runtime AND is an identity mask.
             bool resizeElision = false;
+            // Compile-time init-zero-elision switch (attribute
+            // "initZeroElision", default off). When true the init() emission
+            // skips literal-0 init stores that the init() prologue already
+            // covers: narrow member values (member memset), >64-bit
+            // BitVectors per word (wideValues_.fill(0)) and reals
+            // (realValues_.fill(0)). Only a variable's sole init action is
+            // eligible; multi-action variables keep every store (last-writer
+            // order is not analyzed). Pure generated-code-size optimization.
+            bool initZeroElision = false;
+            // Elided store counts: narrow member stores, wide BitVector
+            // zero-word stores, real stores.
+            uint64_t initZeroElisionNarrowCount = 0;
+            uint64_t initZeroElisionWideCount = 0;
+            uint64_t initZeroElisionRealCount = 0;
             // NO0006 trace comments (GrhSimAmCppOptions::traceComments,
             // default on): per-block banner and per-atom provenance comment
             // lines in the block sources. Comment-only.
@@ -601,6 +615,29 @@ namespace wolvrix::lib::grhsim::am
                 case 2: return "32";
                 default: return "";
             }
+        }
+
+        // True when variable gets a v<K> member in the contiguous region that
+        // init() zeroes with one memset: a persistent narrow value that is
+        // neither a dense changedResults_ slot, a block-localized (ST00009)
+        // value, nor a folded detector event (ST00010, whose zeroInit needs
+        // no explicit write). This is the exact membership condition of the
+        // header member-declaration loop; init-zero elision reuses it to
+        // prove a narrow literal-0 init store is memset-covered.
+        bool hasMemberStorage(const EmitState &state, VariableId variable)
+        {
+            const Type &type = state.variableTypes[variable.value];
+            if (type.kind != TypeKind::BitVector || type.bitWidth > 64 ||
+                state.crossBlockChangedResults[variable.value])
+            {
+                return false;
+            }
+            if (state.variableEscapeFlags[variable.value] == 0 &&
+                state.variableDefBlock[variable.value] != kInvalidLocalityBlock)
+            {
+                return false;
+            }
+            return state.foldedDetectorEvents[variable.value] == 0;
         }
 
         std::string valueExpr(const EmitState &state, VariableId variable)
@@ -6930,6 +6967,9 @@ namespace wolvrix::lib::grhsim::am
         const auto resizeElisionAttribute = options.attributes.find("resizeElision");
         state.resizeElision = resizeElisionAttribute != options.attributes.end() &&
                               resizeElisionAttribute->second == "true";
+        const auto initZeroElisionAttribute = options.attributes.find("initZeroElision");
+        state.initZeroElision = initZeroElisionAttribute != options.attributes.end() &&
+                                initZeroElisionAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -7766,21 +7806,10 @@ namespace wolvrix::lib::grhsim::am
             std::ostringstream memberDeclarations;
             for (uint32_t index = 0; index < variableCount; ++index)
             {
-                const Type &type = state.variableTypes[index];
-                if (type.kind != TypeKind::BitVector || type.bitWidth > 64 ||
-                    state.crossBlockChangedResults[index])
-                {
-                    continue;
-                }
-                if (state.variableEscapeFlags[index] == 0 &&
-                    state.variableDefBlock[index] != kInvalidLocalityBlock)
-                {
-                    continue;
-                }
-                // ST00010: a folded detector's event variable is never
-                // assigned or read (the group flag replaces it), and its
-                // zeroInit needs no explicit init write, so it gets no member.
-                if (state.foldedDetectorEvents[index])
+                // Membership condition lives in hasMemberStorage (ST00010
+                // folded detector events included); init-zero elision
+                // relies on the same predicate.
+                if (!hasMemberStorage(state, VariableId{index}))
                 {
                     continue;
                 }
@@ -8887,9 +8916,44 @@ namespace
                << "    std::uint64_t initRandomState = randomSeed_;\n";
         const auto emitSetInitialization = [&](VariableId variable,
                                                const InitExpr &expression,
-                                               std::size_t actionIndex) {
+                                               std::size_t actionIndex,
+                                               bool soleInitAction) {
             const Type &type = variableType(state, variable);
             const EmitState::Storage &storage = variableStorage(state, variable);
+            // Init-zero elision: a sole-action literal-0 store is dead — the
+            // init() prologue already zeroed its storage (member memset for
+            // narrow member values, wideValues_.fill(0) for >64-bit
+            // BitVectors, realValues_.fill(0) for reals). Narrow values
+            // without a member (block-localized or folded detector events)
+            // keep their store: they may have no storage for the prologue to
+            // cover. Wide BitVectors are elided per word inside the store
+            // loop below. Random/seeded and multi-action inits are never
+            // elided.
+            if (state.initZeroElision && soleInitAction &&
+                expression.kind == InitExprKind::Literal)
+            {
+                const LiteralView literal = program.literal(expression.literal);
+                if (type.kind == TypeKind::BitVector && type.bitWidth <= 64)
+                {
+                    const uint64_t word =
+                        literal.words.empty() ? 0 : literal.words.front();
+                    if (word == 0 && hasMemberStorage(state, variable))
+                    {
+                        ++state.initZeroElisionNarrowCount;
+                        return;
+                    }
+                }
+                else if (type.kind == TypeKind::Real)
+                {
+                    const uint64_t word =
+                        literal.words.empty() ? 0 : literal.words.front();
+                    if (word == 0)
+                    {
+                        ++state.initZeroElisionRealCount;
+                        return;
+                    }
+                }
+            }
             const bool seeded = expression.kind == InitExprKind::RandomSeeded;
             const std::string seedName = "seededInitState_" +
                                          std::to_string(variable.value) + "_" +
@@ -8931,6 +8995,15 @@ namespace
                     {
                         const uint64_t payload =
                             word < literal->words.size() ? literal->words[word] : 0;
+                        // Per-word init-zero elision: a zero word store is
+                        // dead on its own — wideValues_.fill(0) covers the
+                        // slot and (0 & mask) == 0. Non-zero words keep their
+                        // stores in order.
+                        if (state.initZeroElision && soleInitAction && payload == 0)
+                        {
+                            ++state.initZeroElisionWideCount;
+                            continue;
+                        }
                         value = "UINT64_C(" + std::to_string(payload) + ")";
                     }
                     else
@@ -9049,7 +9122,7 @@ namespace
                                           .kind = InitExprKind::Literal,
                                           .literal = LiteralId{init.payload},
                                       },
-                                      0);
+                                      0, /*soleInitAction=*/true);
             }
             else if (init.kind == InitKind::Actions)
             {
@@ -9081,11 +9154,21 @@ namespace
                     }
                     else
                     {
-                        emitSetInitialization(variable, action.expression, actionIndex);
+                        emitSetInitialization(variable, action.expression, actionIndex,
+                                              /*soleInitAction=*/actions.size() == 1);
                     }
                     actionIndex = nextActionIndex;
                 }
             }
+        }
+        if (state.initZeroElision)
+        {
+            diagnostics.info(
+                "AM C++ emitter init-zero elision eliminated init stores: narrow=" +
+                    std::to_string(state.initZeroElisionNarrowCount) +
+                    " wide=" + std::to_string(state.initZeroElisionWideCount) +
+                    " real=" + std::to_string(state.initZeroElisionRealCount),
+                std::string(kContext));
         }
         runtime << "}\n\nbool " << className
                 << "::is_commit_block(std::size_t block) {\n"
@@ -10042,6 +10125,9 @@ namespace
         result.dynBlendRemapped = state.dynBlendRemapped;
         result.dynBlendMaterialized = state.dynBlendMaterialized;
         result.dynBlendBailed = state.dynBlendBailed;
+        result.initZeroElisionNarrow = state.initZeroElisionNarrowCount;
+        result.initZeroElisionWide = state.initZeroElisionWideCount;
+        result.initZeroElisionReal = state.initZeroElisionRealCount;
         result.artifacts.reserve(stagedArtifacts.size());
         for (const StagedArtifact &artifact : stagedArtifacts)
         {
