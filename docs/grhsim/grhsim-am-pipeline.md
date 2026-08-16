@@ -337,6 +337,12 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   截断，TB 写入的高位垃圾不会进入模型；`valueExpr` 只会产生上述三种存储引用，
   无表达式形式，故同宽 resize 恒为 identity。`sourceWidth == targetWidth == 64`
   被同一规则自然覆盖（掩码恒等，无需特判）。off 时输出与既往逐字节一致。
+- `inlineScalarHelpers`（`--inline-scalar-helpers`，默认 off）：把窄标量的
+  `slice_value`、逻辑/算术移位和 `signed_value` 从 runtime TU 的外联定义改为
+  生成头文件内的 `constexpr` 定义，使各 Block TU 可做跨调用点常量传播与内联。
+  不改变 helper 语义；除法、取模以及宽值/数组 helper 仍保持 outlined，避免把
+  大循环复制进海量调用点。当前 CoreMark 模型静态覆盖 424,064 个 slice、
+  107,130 个逻辑移位及少量 signed/算术移位站点。off 时仍发原 runtime 定义。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成

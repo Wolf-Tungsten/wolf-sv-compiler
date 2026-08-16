@@ -3673,6 +3673,55 @@ int main()
         return 0;
     }
 
+    int testInlineScalarHelpers(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        ExecutableModel model = makeMuxRunEmitterModel();
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "InlineScalarTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"inlineScalarHelpers", "true"}},
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the inline-scalar model");
+        }
+        const std::optional<std::string> headerText =
+            readTextFile(outputDirectory / "grhsim_InlineScalarTop.hpp");
+        const std::optional<std::string> runtimeText =
+            readTextFile(outputDirectory / "grhsim_InlineScalarTop_runtime.cpp");
+        if (!headerText || !runtimeText)
+        {
+            return fail("AM C++ emitter produced incomplete inline-scalar artifacts");
+        }
+        if (headerText->find("static constexpr std::uint64_t slice_value(") ==
+                std::string::npos ||
+            headerText->find("static constexpr std::uint64_t shift_left(") ==
+                std::string::npos ||
+            headerText->find("static constexpr std::int64_t signed_value(") ==
+                std::string::npos ||
+            runtimeText->find("::slice_value(") != std::string::npos ||
+            runtimeText->find("::shift_left(") != std::string::npos ||
+            runtimeText->find("::signed_value(") != std::string::npos)
+        {
+            return fail("AM C++ emitter did not move the scalar helpers into the header");
+        }
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated inline-scalar model failed to compile");
+        }
+        return 0;
+    }
+
     // NO0008 production-form fusion: same-select muxes lowered into an
     // AmGraph, scheduled through graphToProgram (split -> tree-atom fold ->
     // partition -> materialize), then emitted. The pinned outputs keep each
@@ -4278,6 +4327,13 @@ int main()
     if (const int result = testResizeElision(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-resize-elision");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testInlineScalarHelpers(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-inline-scalar");
         result != 0)
     {
         return result;
