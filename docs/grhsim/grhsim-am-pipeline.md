@@ -320,6 +320,8 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
 - `guardEventGating`（`--guard-event-gating`）：识别「纯 fatal 守卫」
   compute 块并对其块体发射事件门（门 = 块内 fatal 读取的 changedResults_
   槽的 OR），门关闭时整块跳过；机制/合格条件/语义论证见 §3.2.9。
+- `commitInputGating`（`--commit-input-gating`）：在既有 commit 事件门内继续按
+  next 锥外部输入的真实变化门控状态写；机制/合格条件/语义论证见 §3.2.10。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
@@ -1079,6 +1081,40 @@ chunk 调用）包进 `if (<门表达式>)`，门 = 块内全部 fatal 指令事
 CLI `grhsim-am-lower-json --guard-event-gating`。开启时 emit 向 stderr 打
 `[guard-event-gating] gated=<块数> atoms=<总数> instrs=<总数>` 汇总行，并逐
 合格块打一行 `[guard-event-gating] block=<id> atoms=<n> instrs=<n>`。
+
+### 3.2.10 commit 输入脏传播门控（`commitInputGating`，2026-08-17）
+
+**默认 off；off 时不规划、不声明运行期状态，emit 与基线保持原路径。** 动机：
+commit 块虽已有事件门，但时钟事件到来时仍会重算 next 锥并执行大量幂等状态写。
+next 锥的外部叶子通常只在少量 compute 块执行或状态值真实改变时变化；把这些变化
+汇总成每个 commit 块一个 dirty byte，可在事件有效但输入稳定时跳过整个写后缀。
+
+机制：`planCommitInputGates` 从每个 commit 块的状态写固定操作数向后切片，沿块内
+定义继续追踪，得到块外叶子。可追踪状态叶复用 ST00013 写点 change detect，仅在
+真实写变时把依赖门的 `commitInputDirty_` 置位；由普通 compute 块定义的叶子在该
+生产块执行时置位。剩余不超过 64 个窄标量叶子用 `commitInputSnapshots_` 精确比较。
+最终门为 `event && (!valid || dirty || snapshot_changed)`；门开放后先刷新 snapshot、
+清 dirty，再原样执行 commit 写后缀。`init()` 清空 valid/dirty/snapshot 状态。
+
+合格条件（任一不满足即保留原 commit 事件门）：
+
+- 块已有可分离的 commit 事件头与非空写后缀，后缀含状态写且不含 HostRead/
+  HostEffect；MemoryFill、MemoryWriteLanes 等非固定写布局不参与；
+- 宽值或非 BitVector 外部叶子不参与；状态叶只有在其全部写点均可复用 ST00013
+  真实变化标志时走 dirty 传播，否则作为窄 snapshot 叶；
+- snapshot 叶不超过 64 个，且被跳过的后缀指令数至少为 snapshot 比较数的两倍，
+  避免门控成本超过被保护的工作。
+
+语义论证：首次执行由 `valid == 0` 强制开放并建立精确基线。此后任一生产 compute
+块执行都会先置 dirty；任一被追踪状态仅在写点检测到值真实改变时置 dirty；其余
+窄叶在门处逐值比较。因此门关闭时，后缀 next 锥的全部可变外部叶子均与上次执行
+相同，纯计算结果及状态写数据也相同，跳过只消除幂等写；门开放时原指令顺序不变。
+dirty 在后缀执行前清零，使执行期间的新变化留给下一次激活，不会丢事件。
+
+开关与统计：emitter 属性 `commitInputGating`（`GrhSimAmCppOptions.attributes`），
+CLI `grhsim-am-lower-json --commit-input-gating`。开启时 stderr 汇总 gated 块数、
+tracked state 叶、producer 块、dirty 边、snapshot、受保护指令和状态写数量，并按
+unsafe/snapshot/cost 三类汇总被拒块及写站数。
 
 ### 3.3 临时 scheduling facts
 

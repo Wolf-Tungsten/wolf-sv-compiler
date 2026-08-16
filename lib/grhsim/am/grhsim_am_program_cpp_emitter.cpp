@@ -11,11 +11,13 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -412,10 +414,28 @@ namespace wolvrix::lib::grhsim::am
             struct CommitGate
             {
                 std::string expression;
+                std::string preamble;
                 uint32_t headCount = 0;
             };
             std::vector<CommitGate> blockCommitGate;
             uint64_t commitGateBlockCount = 0;
+            // Commit-input gating (GrhSimAmCppOptions attribute
+            // "commitInputGating", default off): backward-slice each commit
+            // Block from its state writes. Trackable scalar state leaves
+            // propagate a dirty byte from their already-fused write-point
+            // comparisons; the small non-state remainder uses snapshots.
+            bool commitInputGating = false;
+            uint64_t commitInputSnapshotCount = 0;
+            uint64_t commitInputGateCount = 0;
+            uint64_t commitInputTrackedStateCount = 0;
+            uint64_t commitInputProducerBlockCount = 0;
+            uint64_t commitInputDirtyEdgeCount = 0;
+            uint64_t commitInputGatedInstructions = 0;
+            uint64_t commitInputGatedWrites = 0;
+            std::unordered_map<uint32_t, std::vector<uint32_t>>
+                commitInputDirtyGatesByInstruction;
+            std::unordered_map<uint32_t, std::vector<uint32_t>>
+                commitInputDirtyGatesByBlock;
             // Guard-event gating (GrhSimAmCppOptions attribute
             // "guardEventGating", default off): a pure guard Block is a
             // compute Block whose only observable effects are event-gated
@@ -709,6 +729,39 @@ namespace wolvrix::lib::grhsim::am
                        std::to_string(flag) + "]";
             }
             return "wrChg_" + std::to_string(flag);
+        }
+
+        std::string commitInputDirtyMarks(const EmitState &state,
+                                          InstructionId instruction)
+        {
+            const auto entry =
+                state.commitInputDirtyGatesByInstruction.find(instruction.value);
+            if (entry == state.commitInputDirtyGatesByInstruction.end())
+            {
+                return {};
+            }
+            std::string code;
+            for (const uint32_t gate : entry->second)
+            {
+                code += "commitInputDirty_[" + std::to_string(gate) + "] = 1; ";
+            }
+            return code;
+        }
+
+        std::string commitInputDirtyBlockMarks(const EmitState &state,
+                                               uint32_t block)
+        {
+            const auto entry = state.commitInputDirtyGatesByBlock.find(block);
+            if (entry == state.commitInputDirtyGatesByBlock.end())
+            {
+                return {};
+            }
+            std::string code;
+            for (const uint32_t gate : entry->second)
+            {
+                code += "commitInputDirty_[" + std::to_string(gate) + "] = 1;\n";
+            }
+            return code;
         }
 
         // Same for the ST00011 array write-point accumulator flags.
@@ -2963,27 +3016,26 @@ namespace wolvrix::lib::grhsim::am
                 const VariableId data = operands[wideWriteLayout.dataIndex];
                 const uint32_t width = variableType(state, target).bitWidth;
                 std::string body;
+                std::string flag;
+                if (isRegisterWriteOpcode(opcode) && state.scalarWriteRaise >= 0)
+                {
+                    flag = scalarWatchFlagExpr(
+                        state, static_cast<uint32_t>(state.scalarWriteRaise));
+                }
                 if (wideWriteLayout.hasMask)
                 {
                     const VariableId mask =
                         operands[wideWriteLayout.hasCond ? 1 : 0];
-                    std::string flag;
-                    if (isRegisterWriteOpcode(opcode) && state.scalarWriteRaise >= 0)
-                    {
-                        // ST00013: report a real change for the raise flag.
-                        flag = scalarWatchFlagExpr(
-                            state, static_cast<uint32_t>(state.scalarWriteRaise));
-                    }
+                    // ST00013: report a real change for the raise flag.
                     body += emitMaskedWriteWords(state, wideDataExpr(state, target),
                                                  wideDataExpr(state, data), mask, width, flag,
                                                  "write_mask_" + std::to_string(instruction.value));
                 }
-                else if (isRegisterWriteOpcode(opcode) && state.scalarWriteRaise >= 0)
+                else if (!flag.empty())
                 {
                     // ST00013: report a real change for the raise flag.
-                    body = scalarWatchFlagExpr(
-                               state, static_cast<uint32_t>(state.scalarWriteRaise)) +
-                           " |= assign_words_detect(" + wideDataExpr(state, target) +
+                    body = flag + " |= assign_words_detect(" +
+                           wideDataExpr(state, target) +
                            ", " + std::to_string(width) + ", " +
                            wideDataExpr(state, data) + ", " +
                            std::to_string(width) + ", false);\n";
@@ -2993,6 +3045,12 @@ namespace wolvrix::lib::grhsim::am
                     body = "assign_words(" + wideDataExpr(state, target) + ", " +
                            std::to_string(width) + ", " + wideDataExpr(state, data) +
                            ", " + std::to_string(width) + ", false);\n";
+                }
+                const std::string dirtyMarks =
+                    commitInputDirtyMarks(state, instruction);
+                if (!flag.empty() && !dirtyMarks.empty())
+                {
+                    body += "if (" + flag + ") { " + dirtyMarks + "}\n";
                 }
                 if (wideWriteLayout.hasCond)
                 {
@@ -3300,7 +3358,8 @@ namespace wolvrix::lib::grhsim::am
                                valueExpr(state, target) + " = " + next + "; " +
                                scalarWatchFlagExpr(
                                    state, static_cast<uint32_t>(state.scalarWriteRaise)) +
-                               " = true; } }\n";
+                               " = true; " + commitInputDirtyMarks(state, instruction) +
+                               "} }\n";
                     }
                     else
                     {
@@ -4664,6 +4723,18 @@ namespace wolvrix::lib::grhsim::am
                     return std::nullopt;
                 }
             }
+            const std::optional<uint64_t> dirtyMarkBytes = indentedLineByteCount(
+                commitInputDirtyBlockMarks(
+                    state, static_cast<uint32_t>(blockIndex)),
+                indentation);
+            if (!dirtyMarkBytes || !addByteCount(byteCount, *dirtyMarkBytes))
+            {
+                endLocalityBlock(state);
+                diagnostics.error("AM C++ emitter source size overflow: block=" +
+                                      std::to_string(blockIndex),
+                                  std::string(kContext));
+                return std::nullopt;
+            }
             const std::vector<AtomTraceBoundary> atomBoundaries =
                 state.traceComments ? blockAtomTraceBoundaries(model.program, block)
                                     : std::vector<AtomTraceBoundary>{};
@@ -4803,6 +4874,18 @@ namespace wolvrix::lib::grhsim::am
                                       std::to_string(blockIndex),
                                   std::string(kContext));
                 return std::nullopt;
+            }
+            if (!commitGate.preamble.empty())
+            {
+                const std::optional<uint64_t> preambleBytes =
+                    indentedLineByteCount(commitGate.preamble, "                    ");
+                if (!preambleBytes || !addByteCount(byteCount, *preambleBytes))
+                {
+                    diagnostics.error("AM C++ emitter source size overflow: block=" +
+                                          std::to_string(blockIndex),
+                                      std::string(kContext));
+                    return std::nullopt;
+                }
             }
             if (!addByteCount(byteCount, *bodyBytes) ||
                 !addByteCount(byteCount,
@@ -5572,9 +5655,317 @@ namespace wolvrix::lib::grhsim::am
                     continue;
                 }
                 state.blockCommitGate[blockIndex] =
-                    EmitState::CommitGate{std::move(gate), headCount};
+                    EmitState::CommitGate{std::move(gate), {}, headCount};
                 ++state.commitGateBlockCount;
             }
+        }
+
+        // Strengthens the existing commit event gate with exact input-dirty
+        // tracking. The leaf set is a backward slice from every state write
+        // through definitions in the gated body. A narrow state leaf is
+        // tracked without a value comparison when every one of its writers
+        // already has ST00013 write-point change detection: a real write sets
+        // the dependent gate's dirty byte. Remaining narrow leaves use exact
+        // snapshots. This turns large stable commit cones into one dirty-byte
+        // check without adding a second comparison at their write stations.
+        void planCommitInputGates(const ExecutableModel &model, EmitState &state)
+        {
+            state.commitInputSnapshotCount = 0;
+            state.commitInputGateCount = 0;
+            state.commitInputTrackedStateCount = 0;
+            state.commitInputProducerBlockCount = 0;
+            state.commitInputDirtyEdgeCount = 0;
+            state.commitInputGatedInstructions = 0;
+            state.commitInputGatedWrites = 0;
+            state.commitInputDirtyGatesByInstruction.clear();
+            state.commitInputDirtyGatesByBlock.clear();
+            if (!state.commitInputGating || model.commitBlockBegin == 0)
+            {
+                return;
+            }
+            uint64_t rejectedUnsafeBlocks = 0;
+            uint64_t rejectedUnsafeWrites = 0;
+            uint64_t rejectedSnapshotBlocks = 0;
+            uint64_t rejectedSnapshotWrites = 0;
+            uint64_t rejectedCostBlocks = 0;
+            uint64_t rejectedCostWrites = 0;
+
+            const std::size_t variableCount = state.program.variableCount();
+            std::vector<uint8_t> mutableOrExternal(variableCount, 0);
+            std::vector<uint8_t> stateTargetSeen(variableCount, 0);
+            std::vector<uint8_t> stateTargetTrackable(variableCount, 1);
+            std::unordered_map<uint32_t, std::vector<uint32_t>>
+                writeInstructionsByTarget;
+            for (uint32_t blockIndex = 0; blockIndex < state.blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                const EmitState::ScalarWatchPlan *scalarPlan =
+                    blockIndex < state.blockScalarWatchPlans.size() &&
+                            state.blockScalarWatchPlans[blockIndex]
+                        ? &*state.blockScalarWatchPlans[blockIndex]
+                        : nullptr;
+                for (std::size_t position = 0;
+                     position < model.program.blockSize(block); ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    const Opcode opcode = state.program.opcode(instruction);
+                    const OpcodeTraits traits = opcodeTraits(opcode);
+                    const auto operands = state.program.operands(instruction);
+                    if (traits.stateTargetOperand == OpcodeTraits::kNoTargetOperand ||
+                        traits.stateTargetOperand >= operands.size())
+                    {
+                        continue;
+                    }
+                    const uint32_t target = operands[traits.stateTargetOperand].value;
+                    mutableOrExternal[target] = 1;
+                    if (!isStateWriteOpcode(opcode))
+                    {
+                        continue;
+                    }
+                    stateTargetSeen[target] = 1;
+                    const Type &type = state.variableTypes[target];
+                    const bool fusedScalarWrite =
+                        type.kind == TypeKind::BitVector &&
+                        (type.bitWidth <= 64 || !state.wideStateExplode) &&
+                        isRegisterWriteOpcode(opcode) &&
+                        opcode != Opcode::RegisterWriteDynLane &&
+                        scalarPlan != nullptr &&
+                        scalarPlan->writeRaise.count(static_cast<uint32_t>(position)) != 0;
+                    if (!fusedScalarWrite)
+                    {
+                        stateTargetTrackable[target] = 0;
+                    }
+                    else
+                    {
+                        writeInstructionsByTarget[target].push_back(instruction.value);
+                    }
+                }
+            }
+            for (const PortBinding &port : model.interface.ports)
+            {
+                for (const VariableId variable :
+                     {port.input, port.output, port.outputEnable})
+                {
+                    if (variable.valid())
+                    {
+                        mutableOrExternal[variable.value] = 1;
+                    }
+                }
+            }
+            for (const VariableLabel &declared : model.interface.declaredVariables)
+            {
+                mutableOrExternal[declared.variable.value] = 1;
+            }
+
+            for (uint32_t blockIndex = model.commitBlockBegin;
+                 blockIndex < model.commitBlockEnd; ++blockIndex)
+            {
+                EmitState::CommitGate &gate = state.blockCommitGate[blockIndex];
+                const BlockId block{blockIndex};
+                const std::size_t blockSize = model.program.blockSize(block);
+                if (gate.headCount == 0 || gate.headCount >= blockSize)
+                {
+                    continue;
+                }
+
+                bool safe = true;
+                uint64_t writeCount = 0;
+                std::vector<uint32_t> writePositions;
+                for (std::size_t position = gate.headCount; position < blockSize; ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    const Opcode opcode = state.program.opcode(instruction);
+                    const OpcodeEffect effect = opcodeTraits(opcode).effect;
+                    if (effect == OpcodeEffect::HostRead ||
+                        effect == OpcodeEffect::HostEffect)
+                    {
+                        safe = false;
+                        break;
+                    }
+                    if (isStateWriteOpcode(opcode))
+                    {
+                        // MemoryFill / MemoryWriteLanes do not use the common
+                        // fixed-operand layout; keep their Blocks on the
+                        // baseline path rather than treating scheduler event
+                        // operands as cone inputs.
+                        if (!stateWriteLayout(opcode).isStateWrite)
+                        {
+                            safe = false;
+                            break;
+                        }
+                        writePositions.push_back(static_cast<uint32_t>(position));
+                        ++writeCount;
+                    }
+                }
+                if (!safe || writePositions.empty())
+                {
+                    continue;
+                }
+
+                std::set<uint32_t> leaves;
+                std::unordered_set<uint32_t> visitedDefinitions;
+                std::function<void(VariableId, uint32_t)> visit =
+                    [&](VariableId variable, uint32_t beforePosition) {
+                        const uint32_t definitionBlock =
+                            state.variableDefBlock[variable.value];
+                        const uint32_t definitionPosition =
+                            state.variableDefPosition[variable.value];
+                        if (definitionBlock == blockIndex &&
+                            definitionPosition >= gate.headCount &&
+                            definitionPosition < beforePosition)
+                        {
+                            if (!visitedDefinitions.insert(definitionPosition).second)
+                            {
+                                return;
+                            }
+                            const InstructionId definition =
+                                model.program.blockInstruction(block, definitionPosition);
+                            for (const VariableId operand :
+                                 state.program.operands(definition))
+                            {
+                                visit(operand, definitionPosition);
+                            }
+                            return;
+                        }
+
+                        const InitKind initKind = state.program.init(
+                            state.program.variable(variable).init).kind;
+                        const bool immutable = definitionBlock == kInvalidLocalityBlock &&
+                                               mutableOrExternal[variable.value] == 0 &&
+                                               (initKind == InitKind::Zero ||
+                                                initKind == InitKind::Constant);
+                        if (!immutable)
+                        {
+                            leaves.insert(variable.value);
+                        }
+                    };
+
+                for (const uint32_t position : writePositions)
+                {
+                    const InstructionId write =
+                        model.program.blockInstruction(block, position);
+                    const StateWriteLayout layout =
+                        stateWriteLayout(state.program.opcode(write));
+                    const auto operands = state.program.operands(write);
+                    for (uint32_t operandIndex = 0;
+                         operandIndex < layout.fixedCount; ++operandIndex)
+                    {
+                        visit(operands[operandIndex], position);
+                    }
+                }
+                if (leaves.empty())
+                {
+                    continue;
+                }
+                std::vector<uint32_t> trackedStateLeaves;
+                std::vector<uint32_t> snapshotLeaves;
+                std::set<uint32_t> producerBlocks;
+                for (const uint32_t variable : leaves)
+                {
+                    if (stateTargetSeen[variable] != 0 &&
+                        stateTargetTrackable[variable] != 0)
+                    {
+                        trackedStateLeaves.push_back(variable);
+                        continue;
+                    }
+                    const uint32_t definitionBlock =
+                        state.variableDefBlock[variable];
+                    if (stateTargetSeen[variable] == 0 &&
+                        definitionBlock != kInvalidLocalityBlock &&
+                        definitionBlock != 0 &&
+                        definitionBlock < model.commitBlockBegin)
+                    {
+                        producerBlocks.insert(definitionBlock);
+                        continue;
+                    }
+                    const Type &type = state.variableTypes[variable];
+                    if (type.kind != TypeKind::BitVector || type.bitWidth > 64)
+                    {
+                        safe = false;
+                        continue;
+                    }
+                    snapshotLeaves.push_back(variable);
+                }
+                const uint64_t workInstructions = blockSize - gate.headCount;
+                if (!safe || snapshotLeaves.size() > 64U ||
+                    workInstructions < snapshotLeaves.size() * 2U)
+                {
+                    if (!safe)
+                    {
+                        ++rejectedUnsafeBlocks;
+                        rejectedUnsafeWrites += writeCount;
+                    }
+                    else if (snapshotLeaves.size() > 64U)
+                    {
+                        ++rejectedSnapshotBlocks;
+                        rejectedSnapshotWrites += writeCount;
+                    }
+                    else
+                    {
+                        ++rejectedCostBlocks;
+                        rejectedCostWrites += writeCount;
+                    }
+                    continue;
+                }
+
+                const uint64_t validIndex = state.commitInputGateCount;
+                const uint64_t snapshotOffset = state.commitInputSnapshotCount;
+                std::string changed = "commitInputValid_[" +
+                                      std::to_string(validIndex) + "] == 0 || " +
+                                      "commitInputDirty_[" +
+                                      std::to_string(validIndex) + "] != 0";
+                std::string refresh = "commitInputValid_[" +
+                                      std::to_string(validIndex) + "] = 1;\n" +
+                                      "commitInputDirty_[" +
+                                      std::to_string(validIndex) + "] = 0;\n";
+                uint64_t inputIndex = 0;
+                for (const uint32_t variable : snapshotLeaves)
+                {
+                    const std::string value = valueExpr(state, VariableId{variable});
+                    const std::string snapshot = "commitInputSnapshots_[" +
+                                                 std::to_string(snapshotOffset + inputIndex) +
+                                                 "]";
+                    changed += " || " + snapshot + " != " + value;
+                    refresh += snapshot + " = " + value + ";\n";
+                    ++inputIndex;
+                }
+                gate.expression = "(" + gate.expression + ") && (" + changed + ")";
+                gate.preamble = std::move(refresh);
+                for (const uint32_t variable : trackedStateLeaves)
+                {
+                    const auto writers = writeInstructionsByTarget.find(variable);
+                    if (writers == writeInstructionsByTarget.end())
+                    {
+                        continue;
+                    }
+                    for (const uint32_t instruction : writers->second)
+                    {
+                        state.commitInputDirtyGatesByInstruction[instruction].push_back(
+                            static_cast<uint32_t>(validIndex));
+                        ++state.commitInputDirtyEdgeCount;
+                    }
+                }
+                for (const uint32_t producer : producerBlocks)
+                {
+                    state.commitInputDirtyGatesByBlock[producer].push_back(
+                        static_cast<uint32_t>(validIndex));
+                    ++state.commitInputDirtyEdgeCount;
+                }
+                state.commitInputSnapshotCount += snapshotLeaves.size();
+                state.commitInputTrackedStateCount += trackedStateLeaves.size();
+                state.commitInputProducerBlockCount += producerBlocks.size();
+                ++state.commitInputGateCount;
+                state.commitInputGatedInstructions += workInstructions;
+                state.commitInputGatedWrites += writeCount;
+            }
+            std::cerr << "[commit-input-gating-bails] unsafe="
+                      << rejectedUnsafeBlocks << '/' << rejectedUnsafeWrites
+                      << " snapshots=" << rejectedSnapshotBlocks << '/'
+                      << rejectedSnapshotWrites
+                      << " cost=" << rejectedCostBlocks << '/'
+                      << rejectedCostWrites << '\n';
         }
 
         // ST00013: plans the emit-time fusion of commit-Block tail changed.any
@@ -7986,6 +8377,11 @@ namespace wolvrix::lib::grhsim::am
         const auto guardEventGatingAttribute = options.attributes.find("guardEventGating");
         state.guardEventGating = guardEventGatingAttribute != options.attributes.end() &&
                                  guardEventGatingAttribute->second == "true";
+        const auto commitInputGatingAttribute =
+            options.attributes.find("commitInputGating");
+        state.commitInputGating =
+            commitInputGatingAttribute != options.attributes.end() &&
+            commitInputGatingAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -8491,6 +8887,20 @@ namespace wolvrix::lib::grhsim::am
         // RegisterWrite sites. Planned after ST00010 (emission consults its
         // group assignments).
         planScalarWatchGroups(model, state);
+        // Optional commit-internal cone gating reuses ST00013 real-change
+        // decisions to propagate exact state-input dirtiness.
+        planCommitInputGates(model, state);
+        if (state.commitInputGating)
+        {
+            std::cerr << "[commit-input-gating] gated="
+                      << state.commitInputGateCount
+                      << " tracked_state=" << state.commitInputTrackedStateCount
+                      << " producer_blocks=" << state.commitInputProducerBlockCount
+                      << " dirty_edges=" << state.commitInputDirtyEdgeCount
+                      << " snapshots=" << state.commitInputSnapshotCount
+                      << " instrs=" << state.commitInputGatedInstructions
+                      << " writes=" << state.commitInputGatedWrites << '\n';
+        }
         // Guard-event gating (attribute "guardEventGating", default off):
         // pure fatal-guard compute Blocks get a scan-site event gate over
         // their fatal instructions' changedResults_ slots. Reads the escape
@@ -8911,6 +9321,18 @@ namespace wolvrix::lib::grhsim::am
             header << memberDeclarations.str();
         }
         header << "    std::array<std::uint64_t, kChangedResultCount> changedResults_{};\n";
+        if (state.commitInputGating)
+        {
+            header << "    std::array<std::uint64_t, "
+                   << state.commitInputSnapshotCount
+                   << "> commitInputSnapshots_{};\n"
+                   << "    std::array<std::uint8_t, "
+                   << state.commitInputGateCount
+                   << "> commitInputValid_{};\n"
+                   << "    std::array<std::uint8_t, "
+                   << state.commitInputGateCount
+                   << "> commitInputDirty_{};\n";
+        }
         // NO0017 §5: exploded wide states — one per-element scalar array
         // member per state (element width K), out of the wideValues_ pool.
         for (uint32_t index = 0; index < state.explodedElementWidth.size(); ++index)
@@ -10012,6 +10434,11 @@ namespace
                << "    for (std::string &value : stringValues_) value.clear();\n"
                << "    activeWords_.fill(0); backwardFired_ = false;\n"
                << "    dirtyChangedBits_.fill(0); dirtyChangedResults_.clear(); onceCompleted_.fill(false);\n";
+        if (state.commitInputGating)
+        {
+            runtime << "    commitInputSnapshots_.fill(0); commitInputValid_.fill(0); "
+                       "commitInputDirty_.fill(0);\n";
+        }
         // NO0017 §5: re-zero the exploded element arrays on (re-)init, same
         // contract as the pool fill above; literal init stores follow below.
         for (uint32_t index = 0; index < state.explodedElementWidth.size(); ++index)
@@ -10746,6 +11173,11 @@ namespace
                                     << blockTraceBanner(
                                            model, static_cast<uint32_t>(blockIndex));
                     }
+                    writeIndentedLines(
+                        blockSource,
+                        commitInputDirtyBlockMarks(
+                            state, static_cast<uint32_t>(blockIndex)),
+                        indentation);
                     beginLocalityBlock(state, static_cast<uint32_t>(blockIndex));
                     writeIndentedLines(blockSource,
                                        localValueDeclarations(state),
@@ -10783,6 +11215,8 @@ namespace
                             // runs only when a gate detector fired.
                             blockSource << indentation << "if (" << gate->expression
                                         << ") {\n";
+                            writeIndentedLines(blockSource, gate->preamble,
+                                               gatedIndentation);
                         }
                         const InstructionId instruction =
                             model.program.blockInstruction(block, index);
@@ -10971,6 +11405,11 @@ namespace
                                     << blockTraceBanner(
                                            model, static_cast<uint32_t>(blockIndex));
                     }
+                    writeIndentedLines(
+                        blockSource,
+                        commitInputDirtyBlockMarks(
+                            state, static_cast<uint32_t>(blockIndex)),
+                        indentation);
                     writeIndentedLines(blockSource,
                                        chunkedLocalValueDeclarations(state),
                                        indentation);
@@ -10998,6 +11437,8 @@ namespace
                             // fired (the inline form wraps the instructions).
                             blockSource << indentation << "if (" << gate->expression
                                         << ") {\n";
+                            writeIndentedLines(blockSource, gate->preamble,
+                                               gatedIndentation);
                         }
                         blockSource << (chunk < ungatedChunks ? indentation
                                                               : gatedIndentation)

@@ -1866,7 +1866,9 @@ namespace
                 .outputDirectory = outputDirectory,
                 .modelName = "PackedActivityTop",
                 .maxOutputFileBytes = 1024 * 1024,
-                .attributes = {{"blocksPerSource", "17"}, {"runtimeProfile", "true"}},
+                .attributes = {{"blocksPerSource", "17"},
+                               {"runtimeProfile", "true"},
+                               {"commitInputGating", "true"}},
             },
             diagnostics);
         if (!emitResult.success || diagnostics.hasError())
@@ -2153,7 +2155,8 @@ namespace
         // its result forms the single gate wrapping the write and the tail
         // watch traffic.
         const std::string commitGate =
-            "if ((v" + std::to_string(fixture.commitForwardEvent.value) + " != 0)) {";
+            "(v" + std::to_string(fixture.commitForwardEvent.value) + " != 0)";
+        const std::string commitInputGate = "commitInputValid_[0] == 0";
         // ST00013: the commit Block's state detector is fused into the
         // RegisterWrite site (write-point compare, store and raise only on a
         // real change); its group accumulator reads the write-point flag
@@ -2161,6 +2164,14 @@ namespace
         const std::string commitAccumulate = "bool detGrp_0 = wrChg_0;";
         if (generatedSourceText.find(entryAccumulate) == std::string::npos ||
             generatedSourceText.find(commitGate) == std::string::npos ||
+            generatedSourceText.find(commitInputGate) == std::string::npos ||
+            headerText->find("commitInputSnapshots_") == std::string::npos ||
+            headerText->find("commitInputValid_") == std::string::npos ||
+            headerText->find("commitInputDirty_") == std::string::npos ||
+            countOccurrences(generatedSourceText,
+                             "commitInputDirty_[0] = 1;") < 2 ||
+            runtimeText->find("commitInputSnapshots_.fill(0); commitInputValid_.fill(0); commitInputDirty_.fill(0);") ==
+                std::string::npos ||
             generatedSourceText.find(commitAccumulate) == std::string::npos ||
             generatedSourceText.find("bool wrChg_0 = false;") == std::string::npos ||
             generatedSourceText.find("wrChg_0 = true;") == std::string::npos ||
