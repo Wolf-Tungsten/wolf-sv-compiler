@@ -237,6 +237,12 @@ namespace wolvrix::lib::grhsim::am
             uint64_t initZeroElisionNarrowCount = 0;
             uint64_t initZeroElisionWideCount = 0;
             uint64_t initZeroElisionRealCount = 0;
+            // Compile-time source-part activity guard (attribute
+            // "sourcePartActivityGuard", default off). Each static compute /
+            // commit source-part call first checks its exact Block range at
+            // 64-bit activity-word granularity, avoiding empty function calls
+            // and their byte-by-byte scans without changing activity updates.
+            bool sourcePartActivityGuard = false;
             // NO0006 trace comments (GrhSimAmCppOptions::traceComments,
             // default on): per-block banner and per-atom provenance comment
             // lines in the block sources. Comment-only.
@@ -6970,6 +6976,11 @@ namespace wolvrix::lib::grhsim::am
         const auto initZeroElisionAttribute = options.attributes.find("initZeroElision");
         state.initZeroElision = initZeroElisionAttribute != options.attributes.end() &&
                                 initZeroElisionAttribute->second == "true";
+        const auto sourcePartActivityGuardAttribute =
+            options.attributes.find("sourcePartActivityGuard");
+        state.sourcePartActivityGuard =
+            sourcePartActivityGuardAttribute != options.attributes.end() &&
+            sourcePartActivityGuardAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -7695,7 +7706,24 @@ namespace wolvrix::lib::grhsim::am
                   "    // Relies on little-endian byte order (the generated models target x86_64 hosts).\n"
                   "    [[nodiscard]] std::uint8_t &active_byte_ref(std::size_t byte) {\n"
                   "        return reinterpret_cast<std::uint8_t *>(activeWords_.data())[byte];\n"
-                  "    }\n"
+                  "    }\n";
+        if (state.sourcePartActivityGuard)
+        {
+            header << "    // Exact range probe used before a static source-part scan.\n"
+                      "    [[nodiscard]] bool has_active_blocks(std::size_t first, std::size_t end) const {\n"
+                      "        const std::size_t firstWord = first / 64U;\n"
+                      "        const std::size_t lastWord = (end - 1U) / 64U;\n"
+                      "        const std::uint64_t firstMask = UINT64_MAX << (first % 64U);\n"
+                      "        const std::uint64_t lastMask = UINT64_MAX >> (63U - ((end - 1U) % 64U));\n"
+                      "        if (firstWord == lastWord)\n"
+                      "            return (activeWords_[firstWord] & firstMask & lastMask) != 0;\n"
+                      "        if ((activeWords_[firstWord] & firstMask) != 0) return true;\n"
+                      "        for (std::size_t word = firstWord + 1U; word < lastWord; ++word)\n"
+                      "            if (activeWords_[word] != 0) return true;\n"
+                      "        return (activeWords_[lastWord] & lastMask) != 0;\n"
+                      "    }\n";
+        }
+        header
                << "    [[nodiscard]] static bool is_commit_block(std::size_t block);\n"
                << "    void set_changed_result(std::size_t variable, bool event) {\n"
                << "        changedResults_[variable] = event ? 1 : 0;\n"
@@ -9312,8 +9340,13 @@ namespace
                 {
                     continue;
                 }
-                runtime << "        "
-                        << scanSourceFunctionName(part.sourceIndex, part.partIndex)
+                runtime << "        ";
+                if (state.sourcePartActivityGuard)
+                {
+                    runtime << "if (has_active_blocks(" << scanLo << ", " << scanHi
+                            << ")) ";
+                }
+                runtime << scanSourceFunctionName(part.sourceIndex, part.partIndex)
                         << "();\n";
             }
         }
@@ -9339,8 +9372,13 @@ namespace
                 {
                     continue;
                 }
-                runtime << "        "
-                        << commitSourceFunctionName(part.sourceIndex, part.partIndex)
+                runtime << "        ";
+                if (state.sourcePartActivityGuard)
+                {
+                    runtime << "if (has_active_blocks(" << commitLo << ", " << commitHi
+                            << ")) ";
+                }
+                runtime << commitSourceFunctionName(part.sourceIndex, part.partIndex)
                         << "();\n";
             }
         }

@@ -347,6 +347,14 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   该守卫为兜底）；String、Fill action、任何 random/seeded init 一律不动。
   消除的 store 数（分窄/宽 word/real）经 diagnostics 与结果 JSON
   （`init_zero_elision_narrow/wide/real`）报告。
+- `sourcePartActivityGuard`（`--source-part-activity-guard`，默认关）：在每个
+  静态 `eval_scan_*` / `eval_commit_*` source-part 调用前，用其精确 Block
+  区间做一次 64-bit activity word 聚合检查；区间全静默时跳过函数调用及其
+  逐 activity byte 扫描。首尾 word 使用区间 mask，不能误读相邻 part 或跨
+  compute/commit 相位的活动位；前序 part 的同轮 `act.f` 在后序 guard 执行前
+  已写入 `activeWords_`，因此保留同轮前向传播；进入过的 part 仍由原 byte
+  snapshot/clear/relay 逻辑消费 activity，`act.b` 与收敛轮次语义不变。off 时
+  eval 调用序列与既往逐字节一致。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成

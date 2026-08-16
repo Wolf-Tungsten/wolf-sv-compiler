@@ -1990,6 +1990,8 @@ namespace
             headerText->find("void eval_commit_0();") != std::string::npos ||
             headerText->find("active_byte_ref(std::size_t byte)") ==
                 std::string::npos ||
+            headerText->find("has_active_blocks(std::size_t first") !=
+                std::string::npos ||
             headerText->find("void execute_block(") != std::string::npos ||
             headerText->find("nextActiveWords_") != std::string::npos ||
             headerText->find("activeSummary_") != std::string::npos ||
@@ -2287,6 +2289,99 @@ int main()
         if (std::system(runCommand.c_str()) != 0)
         {
             return fail("generated packed activity model violated activation semantics");
+        }
+
+        // Source-part activity guard: the optional exact-range probe wraps
+        // both compute and commit calls. The fixture crosses source-part and
+        // compute/commit boundaries in one round, so the generated harness is
+        // also a semantic check that preceding act.f writes are visible to a
+        // later guard and that act.b still drives another convergence round.
+        const std::filesystem::path guardedDirectory = outputDirectory / "guarded";
+        wolvrix::lib::diag::Diagnostics guardedDiagnostics;
+        const GrhSimAmCppResult guardedResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = guardedDirectory,
+                .modelName = "GuardedActivityTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {
+                    {"blocksPerSource", "17"},
+                    {"sourcePartActivityGuard", "true"},
+                },
+            },
+            guardedDiagnostics);
+        if (!guardedResult.success || guardedDiagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate guarded activity model");
+        }
+        const std::optional<std::string> guardedHeader =
+            readTextFile(guardedDirectory / "grhsim_GuardedActivityTop.hpp");
+        const std::optional<std::string> guardedRuntime =
+            readTextFile(guardedDirectory / "grhsim_GuardedActivityTop_runtime.cpp");
+        if (!guardedHeader || !guardedRuntime ||
+            guardedHeader->find("bool has_active_blocks(std::size_t first, std::size_t end) const") ==
+                std::string::npos ||
+            guardedRuntime->find(
+                "if (has_active_blocks(1, 17)) eval_scan_0();") ==
+                std::string::npos ||
+            guardedRuntime->find(
+                "if (has_active_blocks(119, 130)) eval_scan_7();") ==
+                std::string::npos ||
+            guardedRuntime->find(
+                "if (has_active_blocks(130, 131)) eval_commit_7();") ==
+                std::string::npos)
+        {
+            return fail("guarded activity model did not wrap exact source-part ranges");
+        }
+        const std::filesystem::path guardedHarnessPath = guardedDirectory / "harness.cpp";
+        std::ofstream guardedHarness(guardedHarnessPath);
+        guardedHarness << R"CPP(#include "grhsim_GuardedActivityTop.hpp"
+int main()
+{
+    GrhSIM_GuardedActivityTop model;
+    model.init();
+    model.activity_input = 0;
+    model.eval();
+    if (model.forward_output != 0 || model.backward_output != 0) return 1;
+    model.activity_input = 1;
+    model.eval();
+    if (model.forward_output != 1 || model.backward_output != 1) return 2;
+    model.eval();
+    if (model.forward_output != 1 || model.backward_output != 1) return 3;
+    model.activity_input = 0;
+    model.eval();
+    if (model.forward_output != 1 || model.backward_output != 1) return 4;
+    return 0;
+}
+)CPP";
+        guardedHarness.close();
+        if (!guardedHarness)
+        {
+            return fail("failed to write the guarded activity model harness");
+        }
+        const std::string guardedBuildCommand =
+            "make -C '" + guardedDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(guardedBuildCommand.c_str()) != 0)
+        {
+            return fail("generated guarded activity model failed to compile");
+        }
+        const std::filesystem::path guardedHarnessExecutable =
+            guardedDirectory / "harness";
+        const std::string guardedHarnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + guardedDirectory.string() + "' '" +
+            guardedHarnessPath.string() + "' '" +
+            (guardedDirectory / "libgrhsim_GuardedActivityTop.a").string() +
+            "' -o '" + guardedHarnessExecutable.string() + "'";
+        if (std::system(guardedHarnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated guarded activity model harness failed to compile");
+        }
+        const std::string guardedRunCommand =
+            "'" + guardedHarnessExecutable.string() + "'";
+        if (std::system(guardedRunCommand.c_str()) != 0)
+        {
+            return fail("generated guarded activity model violated activation semantics");
         }
         return 0;
     }
