@@ -324,6 +324,21 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   `EMU_AM_TRACE_BEGIN_EVAL`/`EMU_AM_TRACE_END_EVAL` 限定。注意其数据源是
   跨块 changed-results 的 mark 列表，不含已被 detector-group folding 合并的
   检测器，不能作为全量变更源。
+- `stateLayout`（`--state-layout <id|affinity>`，默认 `id`）：持久状态的静态
+  布局策略。`id` 为基线行为——`v<K>` 成员声明与 `wideValues_` 词池 offset 都按
+  升序 VariableId 分配，输出与未设置该属性时逐字节一致。`affinity` 先静态统计
+  每个变量被各 Block 指令引用（操作数 + 结果）的次数，取引用最多的 Block 为其
+  primary Block（并列取块号小者），再按 primary Block 分组布局：组按组内状态
+  总引用次数降序（热组靠前，并列取块号小者），组内按升序 VariableId，零引用
+  状态排在尾部按升序 VariableId；排序键完全确定，输出可复现。应用于成员声明
+  顺序与宽值词池 offset 分配两处；`changedResults_` 密集下标不动。不变式保持：
+  成员区连续（init() 单条 memset 语义不变）、宽池 offset 从 0 连续、总尺寸不变。
+  `init()` 额外把 literal-only 宽状态按最终 pool offset 发射，避免 affinity 置换后
+  百万级 store 失去单调性并触发 Clang 单函数优化爆炸；含随机初始化的变量保持原
+  VariableId 相对顺序，因此全局随机流的变量到值映射不变。
+  动机：成员/offset 的发现次序（升序 VariableId）与运行期访问模式无关，是主要
+  gather 病灶；按块亲和性聚簇让同一块访问的状态相邻，改善热块工作集的
+  页/cache 局部性。
 - `resizeElision`（`--resize-elision`，默认 off）：同宽无符号 `resize_value`
   胶消除。开启后 `resizedExpr` 对 `sourceWidth == targetWidth && !signExtend`
   的操作数直接发存储引用（跳过 `resize_value(x, N, false, N)`，其语义仅为
@@ -1180,6 +1195,10 @@ dirty list。
 静态排布与寄存器分配；块内局部值仍物化为 C++ 局部变量，不占成员）；跨块消费的
 `changed` 结果是唯一被运行时下标访问的值（dirty list 清零），单列密集数组
 `changedResults_[denseId]`；宽值（> 64 bit 与 Array）仍在 `wideValues_` 数组。
+状态布局默认一律按升序 VariableId（`stateLayout=id`，即 GRH 值发现次序）；
+`stateLayout=affinity` 改为按块静态访问亲和性聚簇（规则见文首 emitter 属性
+清单），成员声明顺序与宽池 offset 分配同步置换，成员区连续性与宽池从 0 连续
+分配均不变。
 生成的 Makefile 用 clang `-x c++-header` + 每 TU `-include-pch` 预编译模型头
 （成员声明达数百万行量级，PCH 是编译耗时摊销的关键），并用
 `ifeq ($(origin CXX),default)` 兜底 GNU make 内建的 g++ 默认值（g++ 不支持
