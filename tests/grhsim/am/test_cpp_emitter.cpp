@@ -3959,6 +3959,165 @@ int main()
         return 0;
     }
 
+    ExecutableModel makeWideStorageFirstTouchModel()
+    {
+        LinearProgramBuilder linear;
+        const TypeId wideType = linear.addType(Type::bitVector(65));
+        std::array<VariableId, 16> values{};
+        for (std::size_t index = 0; index < values.size(); ++index)
+        {
+            if (index % 4U == 1U)
+            {
+                const uint64_t group = index / 4U;
+                const std::array<uint64_t, 2> words = {
+                    UINT64_C(0x10) + group,
+                    group & 1U,
+                };
+                values[index] = linear.addVariable(
+                    wideType,
+                    linear.addConstantInit(linear.addBitLiteral(wideType, words)));
+            }
+            else
+            {
+                values[index] = linear.addVariable(wideType, linear.zeroInit());
+            }
+        }
+
+        std::array<InstructionId, 4> instructions{};
+        for (std::size_t index = 0; index < instructions.size(); ++index)
+        {
+            const std::array<VariableId, 1> results = {values[index * 4U + 3U]};
+            const std::array<VariableId, 1> operands = {values[index * 4U + 1U]};
+            instructions[index] = linear.addInstruction(Opcode::Assign, results, operands);
+        }
+
+        ProgramInterface interface;
+        for (std::size_t index = 0; index < instructions.size(); ++index)
+        {
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString("output_" + std::to_string(index)),
+                .direction = PortDirection::Output,
+                .output = values[index * 4U + 3U],
+            });
+        }
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        scheduled.addBlock(instructions);
+        return ExecutableModel{
+            .program = scheduled.finish(),
+            .interface = std::move(interface),
+        };
+    }
+
+    int testWideStorageFirstTouch(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        const std::filesystem::path idDirectory = outputDirectory / "id";
+        const std::filesystem::path firstTouchDirectory = outputDirectory / "first-touch";
+        ExecutableModel model = makeWideStorageFirstTouchModel();
+        const ValidationResult validation =
+            validate(model, ValidationOptions{.level = ValidationLevel::Semantic});
+        if (!validation.success())
+        {
+            return fail("wide-storage first-touch fixture failed validation: " +
+                        validation.errors.front());
+        }
+
+        GrhSimAmCppEmitter emitter;
+        wolvrix::lib::diag::Diagnostics idDiagnostics;
+        const GrhSimAmCppResult idResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = idDirectory,
+                .modelName = "WideStorageIdTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            idDiagnostics);
+        wolvrix::lib::diag::Diagnostics firstTouchDiagnostics;
+        const GrhSimAmCppResult firstTouchResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = firstTouchDirectory,
+                .modelName = "WideStorageFirstTouchTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"wideStorageFirstTouch", "true"}},
+            },
+            firstTouchDiagnostics);
+        if (!idResult.success || idDiagnostics.hasError() ||
+            !firstTouchResult.success || firstTouchDiagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate a wide-storage layout fixture");
+        }
+        if (firstTouchResult.wideStorageVariables != 16 ||
+            firstTouchResult.wideStorageTouchedVariables != 8 ||
+            firstTouchResult.wideStorageFirstTouchBlockFirstLines >=
+                firstTouchResult.wideStorageIdBlockFirstLines ||
+            firstTouchResult.wideStorageTouchedWords != 16 ||
+            firstTouchResult.wideStorageFirstTouchTouchedSpanWords != 16 ||
+            firstTouchResult.wideStorageIdTouchedSpanWords <= 16)
+        {
+            return fail("wide-storage first-touch static cache-line model did not improve");
+        }
+
+        const std::optional<std::string> idBlocks =
+            readTextFile(idDirectory / "grhsim_WideStorageIdTop_blocks_0.cpp");
+        const std::optional<std::string> firstTouchBlocks = readTextFile(
+            firstTouchDirectory / "grhsim_WideStorageFirstTouchTop_blocks_0.cpp");
+        if (!idBlocks || !firstTouchBlocks ||
+            idBlocks->find("assign_words(wideValues_.data() + 6, 65, "
+                           "wideValues_.data() + 2, 65, false);") == std::string::npos ||
+            firstTouchBlocks->find("assign_words(wideValues_.data() + 2, 65, "
+                                   "wideValues_.data() + 0, 65, false);") ==
+                std::string::npos)
+        {
+            return fail("wide-storage first-touch did not preserve default / reorder opt-in offsets");
+        }
+
+        const std::filesystem::path harnessPath = firstTouchDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << R"CPP(#include "grhsim_WideStorageFirstTouchTop.hpp"
+int main()
+{
+    GrhSIM_WideStorageFirstTouchTop model;
+    model.init();
+    model.eval();
+    if (model.output_0 != std::array<std::uint64_t, 2>{UINT64_C(0x10), 0}) return 1;
+    if (model.output_1 != std::array<std::uint64_t, 2>{UINT64_C(0x11), 1}) return 2;
+    if (model.output_2 != std::array<std::uint64_t, 2>{UINT64_C(0x12), 0}) return 3;
+    if (model.output_3 != std::array<std::uint64_t, 2>{UINT64_C(0x13), 1}) return 4;
+    return 0;
+}
+)CPP";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the wide-storage first-touch harness");
+        }
+        const std::string buildCommand =
+            "make -C '" + firstTouchDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated wide-storage first-touch model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = firstTouchDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + firstTouchDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (firstTouchDirectory / "libgrhsim_WideStorageFirstTouchTop.a").string() +
+            "' -o '" + harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated wide-storage first-touch harness failed to compile");
+        }
+        const std::string runCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(runCommand.c_str()) != 0)
+        {
+            return fail("wide-storage first-touch layout changed generated-model semantics");
+        }
+        return 0;
+    }
+
     // NO0008 production-form fusion: same-select muxes lowered into an
     // AmGraph, scheduled through graphToProgram (split -> tree-atom fold ->
     // partition -> materialize), then emitted. The pinned outputs keep each
@@ -4571,6 +4730,13 @@ int main()
     if (const int result = testInitZeroElision(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-init-zero-elision");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testWideStorageFirstTouch(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-wide-storage-first-touch");
         result != 0)
     {
         return result;

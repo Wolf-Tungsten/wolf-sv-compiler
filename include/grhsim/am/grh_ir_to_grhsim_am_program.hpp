@@ -228,6 +228,19 @@ namespace wolvrix::lib::grhsim::am
         uint64_t initZeroElisionNarrow = 0;
         uint64_t initZeroElisionWide = 0;
         uint64_t initZeroElisionReal = 0;
+        // Wide-storage first-touch layout (attribute
+        // "wideStorageFirstTouch", default off). The cache-line counters are
+        // static per-Block unique variable-start footprints, averaged across
+        // all eight possible 64-byte alignments of the uint64_t pool.
+        uint64_t wideStorageVariables = 0;
+        uint64_t wideStorageTouchedVariables = 0;
+        uint64_t wideStorageIdBlockFirstLines = 0;
+        uint64_t wideStorageFirstTouchBlockFirstLines = 0;
+        uint64_t wideStorageTouchedWords = 0;
+        uint64_t wideStorageIdTouchedSpanWords = 0;
+        uint64_t wideStorageFirstTouchTouchedSpanWords = 0;
+        uint64_t wideStorageIdTouchedPages = 0;
+        uint64_t wideStorageFirstTouchTouchedPages = 0;
     };
 
     // The pipeline currency is the AmGraph: lowering builds the graph

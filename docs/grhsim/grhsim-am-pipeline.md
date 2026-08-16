@@ -347,6 +347,16 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   该守卫为兜底）；String、Fill action、任何 random/seeded init 一律不动。
   消除的 store 数（分窄/宽 word/real）经 diagnostics 与结果 JSON
   （`init_zero_elision_narrow/wide/real`）报告。
+- `wideStorageFirstTouch`（`--wide-storage-first-touch`，默认关）：只重排
+  `wideValues_` 中宽 BitVector/Array 的连续槽，按 scheduled Block 顺序扫描，
+  每条指令先 operand 后 result，变量第一次出现即确定布局顺序；从未被 Block
+  引用的变量按 VariableId 追加。变量内部 word/element 顺序、窄值、real/string
+  池均不变。lower-json 同时报告 ID 布局与候选布局的静态
+  `wide_storage_*_block_first_lines`：每个 Block 去重后的宽变量首 cache-line
+  数，对 `wideValues_` 的 8 种 64-byte 基址余量取平均，用于正式评估前判断
+  布局是否有足够的空间局部性杠杆；`*_touched_span_words` 与
+  `*_touched_pages` 另报告所有 Block-touched 变量覆盖的地址跨度与 4 KiB page
+  并集。它们都是静态 footprint，不等同于动态 miss 数。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
