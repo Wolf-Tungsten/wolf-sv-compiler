@@ -355,6 +355,14 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   已写入 `activeWords_`，因此保留同轮前向传播；进入过的 part 仍由原 byte
   snapshot/clear/relay 逻辑消费 activity，`act.b` 与收敛轮次语义不变。off 时
   eval 调用序列与既往逐字节一致。
+- `sourceWordActivityGuard`（`--source-word-activity-guard`，默认关）：在每个
+  `eval_scan_*` / `eval_commit_*` source function 内，将同一 64-block
+  `activeWords_` word 所属的 byte chunks 包在一次精确 owned-bit mask 检查中；
+  活跃 part 内的空 word 因而无需逐 byte snapshot/clear。word guard 按静态升序
+  就地执行，所以前一 word 的 `act.f` 可在后一 word guard 前写入并被同轮观察；
+  已进入的 word 仍执行原 byte relay，同 word 前向传播不变；later-to-earlier 的
+  `act.b` 留在全局 activity word 并由下一轮消费。首尾 partial word 只检查本
+  source part 拥有的 bits，不读取相邻 part；`fullEvaluation` 模式旁路此 guard。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成

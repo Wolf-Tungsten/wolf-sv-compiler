@@ -142,7 +142,8 @@ int main(int argc, char **argv)
                      "[--tree-atom-fold-max-instr <count>] "
                      "[--runtime-profile] [--full-evaluation] [--changed-trace] "
                      "[--branchy-mux] [--resize-elision] [--init-zero-elision] "
-                     "[--source-part-activity-guard] [--no-trace-comments] "
+                     "[--source-part-activity-guard] [--source-word-activity-guard] "
+                     "[--no-trace-comments] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -182,6 +183,7 @@ int main(int argc, char **argv)
     bool resizeElision = false;
     bool initZeroElision = false;
     bool sourcePartActivityGuard = false;
+    bool sourceWordActivityGuard = false;
     bool traceComments = true;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
@@ -435,6 +437,10 @@ int main(int argc, char **argv)
         else if (argument == "--source-part-activity-guard")
         {
             sourcePartActivityGuard = true;
+        }
+        else if (argument == "--source-word-activity-guard")
+        {
+            sourceWordActivityGuard = true;
         }
         else if (argument == "--no-trace-comments")
         {
@@ -820,6 +826,10 @@ int main(int argc, char **argv)
                 if (sourcePartActivityGuard)
                 {
                     emitOptions.attributes.emplace("sourcePartActivityGuard", "true");
+                }
+                if (sourceWordActivityGuard)
+                {
+                    emitOptions.attributes.emplace("sourceWordActivityGuard", "true");
                 }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,

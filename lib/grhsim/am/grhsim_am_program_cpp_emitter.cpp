@@ -243,6 +243,12 @@ namespace wolvrix::lib::grhsim::am
             // 64-bit activity-word granularity, avoiding empty function calls
             // and their byte-by-byte scans without changing activity updates.
             bool sourcePartActivityGuard = false;
+            // Compile-time source-word activity guard (attribute
+            // "sourceWordActivityGuard", default off). Within each static
+            // source function, byte chunks sharing one 64-Block activity word
+            // are wrapped in one exact owned-bit probe. This skips empty words
+            // inside an active source part while preserving byte relay.
+            bool sourceWordActivityGuard = false;
             // NO0006 trace comments (GrhSimAmCppOptions::traceComments,
             // default on): per-block banner and per-atom provenance comment
             // lines in the block sources. Comment-only.
@@ -3806,6 +3812,35 @@ namespace wolvrix::lib::grhsim::am
             return chunks;
         }
 
+        // Consecutive byte chunks grouped by their backing 64-bit activity
+        // word. The aggregate mask contains only bits owned by this source
+        // part, including exact masks for partial first and last words.
+        struct ScanWordChunk
+        {
+            std::size_t wordIndex = 0;
+            uint64_t ownedMask = 0;
+            std::vector<ScanByteChunk> byteChunks;
+        };
+
+        std::vector<ScanWordChunk> scanWordChunks(std::size_t rangeLo,
+                                                  std::size_t rangeHi)
+        {
+            std::vector<ScanWordChunk> words;
+            for (const ScanByteChunk &byteChunk : scanByteChunks(rangeLo, rangeHi))
+            {
+                const std::size_t wordIndex = byteChunk.byteIndex / 8U;
+                if (words.empty() || words.back().wordIndex != wordIndex)
+                {
+                    words.push_back(ScanWordChunk{.wordIndex = wordIndex});
+                }
+                ScanWordChunk &word = words.back();
+                word.ownedMask |= static_cast<uint64_t>(byteChunk.ownedMask)
+                                  << ((byteChunk.byteIndex % 8U) * 8U);
+                word.byteChunks.push_back(byteChunk);
+            }
+            return words;
+        }
+
         std::string blockSourceIncludes(std::string_view prefix)
         {
             return "#include \"" + std::string(prefix) + ".hpp\"\n" +
@@ -3992,6 +4027,15 @@ namespace wolvrix::lib::grhsim::am
         constexpr std::string_view kScanByteChunkEpilogue =
             "        }\n"
             "    }\n";
+
+        std::string scanWordActivityGuardPrologue(std::size_t wordIndex,
+                                                  uint64_t ownedMask)
+        {
+            return "    if ((activeWords_[" + std::to_string(wordIndex) + "] & " +
+                   wordMaskLiteral(ownedMask) + ") != 0) {\n";
+        }
+
+        constexpr std::string_view kScanWordActivityGuardEpilogue = "    }\n";
 
         std::string scanBlockTestPrologue(std::size_t blockIndex,
                                           bool runtimeProfile)
@@ -4546,6 +4590,7 @@ namespace wolvrix::lib::grhsim::am
                 };
                 resetPartBytes();
                 std::size_t lastScanByte = std::numeric_limits<std::size_t>::max();
+                std::size_t lastScanWord = std::numeric_limits<std::size_t>::max();
                 const auto scanChunkOverhead = [&](std::size_t blockIndex,
                                                    uint64_t &pendingBytes) {
                     // First scan Block of an activity byte in this part:
@@ -4567,6 +4612,18 @@ namespace wolvrix::lib::grhsim::am
                             ownedMask = static_cast<uint8_t>(
                                 ownedMask | (1U << (block % 8U)));
                         }
+                    }
+                    const std::size_t scanWord = scanByte / 8U;
+                    if (state.sourceWordActivityGuard && !state.fullEvaluation &&
+                        scanWord != lastScanWord &&
+                        !addByteCount(
+                            pendingBytes,
+                            static_cast<uint64_t>(
+                                scanWordActivityGuardPrologue(scanWord, UINT64_MAX).size()) +
+                                static_cast<uint64_t>(
+                                    kScanWordActivityGuardEpilogue.size())))
+                    {
+                        return false;
                     }
                     return addByteCount(
                         pendingBytes,
@@ -4627,6 +4684,7 @@ namespace wolvrix::lib::grhsim::am
                         partHasBlock = false;
                         resetPartBytes();
                         lastScanByte = std::numeric_limits<std::size_t>::max();
+                        lastScanWord = std::numeric_limits<std::size_t>::max();
                         if (isScan)
                         {
                             pendingBytes = *blockBytes;
@@ -4643,6 +4701,7 @@ namespace wolvrix::lib::grhsim::am
                     if (isScan)
                     {
                         lastScanByte = scanByte;
+                        lastScanWord = scanByte / 8U;
                     }
                     if (!addByteCount(partBytes, pendingBytes))
                     {
@@ -6981,6 +7040,11 @@ namespace wolvrix::lib::grhsim::am
         state.sourcePartActivityGuard =
             sourcePartActivityGuardAttribute != options.attributes.end() &&
             sourcePartActivityGuardAttribute->second == "true";
+        const auto sourceWordActivityGuardAttribute =
+            options.attributes.find("sourceWordActivityGuard");
+        state.sourceWordActivityGuard =
+            sourceWordActivityGuardAttribute != options.attributes.end() &&
+            sourceWordActivityGuardAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -10009,40 +10073,58 @@ namespace
                     blockSource << scanSourcePrologue(className,
                                                       part.sourceIndex,
                                                       part.partIndex);
-                    for (const ScanByteChunk &chunk :
-                         scanByteChunks(scanLo, scanHi))
+                    for (const ScanWordChunk &wordChunk :
+                         scanWordChunks(scanLo, scanHi))
                     {
-                        blockSource << scanByteChunkPrologue(chunk.byteIndex,
-                                                             chunk.ownedMask,
-                                                             state.fullEvaluation);
-                        state.scanRelayByte =
-                            static_cast<int32_t>(chunk.byteIndex);
-                        state.scanRelayMask = chunk.ownedMask;
-                        for (std::size_t blockIndex = chunk.firstBlock;
-                             blockIndex < chunk.endBlock;
-                             ++blockIndex)
+                        const bool guardWord =
+                            state.sourceWordActivityGuard && !state.fullEvaluation;
+                        if (guardWord)
                         {
-                            if (scanBlockIsEmpty(blockIndex))
+                            blockSource << scanWordActivityGuardPrologue(
+                                wordChunk.wordIndex, wordChunk.ownedMask);
+                        }
+                        for (const ScanByteChunk &chunk : wordChunk.byteChunks)
+                        {
+                            blockSource << scanByteChunkPrologue(chunk.byteIndex,
+                                                                 chunk.ownedMask,
+                                                                 state.fullEvaluation);
+                            state.scanRelayByte =
+                                static_cast<int32_t>(chunk.byteIndex);
+                            state.scanRelayMask = chunk.ownedMask;
+                            for (std::size_t blockIndex = chunk.firstBlock;
+                                 blockIndex < chunk.endBlock;
+                                 ++blockIndex)
                             {
-                                continue;
+                                if (scanBlockIsEmpty(blockIndex))
+                                {
+                                    continue;
+                                }
+                                blockSource << scanBlockTestPrologue(
+                                    blockIndex, state.runtimeProfile);
+                                if (!writeBlockBodyOrChunks(blockIndex, "                "))
+                                {
+                                    blocksGenerated = false;
+                                    break;
+                                }
+                                blockSource << scanBlockTestEpilogue(
+                                    blockIndex, state.runtimeProfile);
                             }
-                            blockSource << scanBlockTestPrologue(
-                                blockIndex, state.runtimeProfile);
-                            if (!writeBlockBodyOrChunks(blockIndex, "                "))
+                            state.scanRelayByte = -1;
+                            state.scanRelayMask = 0;
+                            if (!blocksGenerated)
                             {
-                                blocksGenerated = false;
                                 break;
                             }
-                            blockSource << scanBlockTestEpilogue(
-                                blockIndex, state.runtimeProfile);
+                            blockSource << kScanByteChunkEpilogue;
                         }
-                        state.scanRelayByte = -1;
-                        state.scanRelayMask = 0;
                         if (!blocksGenerated)
                         {
                             break;
                         }
-                        blockSource << kScanByteChunkEpilogue;
+                        if (guardWord)
+                        {
+                            blockSource << kScanWordActivityGuardEpilogue;
+                        }
                     }
                     if (!blocksGenerated)
                     {
@@ -10066,40 +10148,59 @@ namespace
                     // Block runs only when a watched event source activated
                     // it; same-byte forward activations relay through
                     // byteFlags exactly like the compute scan.
-                    for (const ScanByteChunk &chunk :
-                         scanByteChunks(commitLo, commitHi))
+                    for (const ScanWordChunk &wordChunk :
+                         scanWordChunks(commitLo, commitHi))
                     {
-                        blockSource << scanByteChunkPrologue(chunk.byteIndex,
-                                                             chunk.ownedMask,
-                                                             state.fullEvaluation);
-                        state.scanRelayByte =
-                            static_cast<int32_t>(chunk.byteIndex);
-                        state.scanRelayMask = chunk.ownedMask;
-                        for (std::size_t blockIndex = chunk.firstBlock;
-                             blockIndex < chunk.endBlock;
-                             ++blockIndex)
+                        const bool guardWord =
+                            state.sourceWordActivityGuard && !state.fullEvaluation;
+                        if (guardWord)
                         {
-                            blockSource << commitBlockTestPrologue(
-                                blockIndex, state.runtimeProfile);
-                            const EmitState::CommitGate &commitGate =
-                                state.blockCommitGate[blockIndex];
-                            const EmitState::CommitGate *gate =
-                                commitGate.headCount != 0 ? &commitGate : nullptr;
-                            if (!writeBlockBodyOrChunks(blockIndex, "                ", gate))
+                            blockSource << scanWordActivityGuardPrologue(
+                                wordChunk.wordIndex, wordChunk.ownedMask);
+                        }
+                        for (const ScanByteChunk &chunk : wordChunk.byteChunks)
+                        {
+                            blockSource << scanByteChunkPrologue(chunk.byteIndex,
+                                                                 chunk.ownedMask,
+                                                                 state.fullEvaluation);
+                            state.scanRelayByte =
+                                static_cast<int32_t>(chunk.byteIndex);
+                            state.scanRelayMask = chunk.ownedMask;
+                            for (std::size_t blockIndex = chunk.firstBlock;
+                                 blockIndex < chunk.endBlock;
+                                 ++blockIndex)
                             {
-                                blocksGenerated = false;
+                                blockSource << commitBlockTestPrologue(
+                                    blockIndex, state.runtimeProfile);
+                                const EmitState::CommitGate &commitGate =
+                                    state.blockCommitGate[blockIndex];
+                                const EmitState::CommitGate *gate =
+                                    commitGate.headCount != 0 ? &commitGate : nullptr;
+                                if (!writeBlockBodyOrChunks(
+                                        blockIndex, "                ", gate))
+                                {
+                                    blocksGenerated = false;
+                                    break;
+                                }
+                                blockSource << scanBlockTestEpilogue(
+                                    blockIndex, state.runtimeProfile);
+                            }
+                            state.scanRelayByte = -1;
+                            state.scanRelayMask = 0;
+                            if (!blocksGenerated)
+                            {
                                 break;
                             }
-                            blockSource << scanBlockTestEpilogue(
-                                blockIndex, state.runtimeProfile);
+                            blockSource << kScanByteChunkEpilogue;
                         }
-                        state.scanRelayByte = -1;
-                        state.scanRelayMask = 0;
                         if (!blocksGenerated)
                         {
                             break;
                         }
-                        blockSource << kScanByteChunkEpilogue;
+                        if (guardWord)
+                        {
+                            blockSource << kScanWordActivityGuardEpilogue;
+                        }
                     }
                     if (!blocksGenerated)
                     {

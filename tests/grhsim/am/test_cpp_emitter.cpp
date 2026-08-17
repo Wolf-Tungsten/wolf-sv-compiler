@@ -1992,6 +1992,7 @@ namespace
                 std::string::npos ||
             headerText->find("has_active_blocks(std::size_t first") !=
                 std::string::npos ||
+            generatedSourceText.find("if ((activeWords_[") != std::string::npos ||
             headerText->find("void execute_block(") != std::string::npos ||
             headerText->find("nextActiveWords_") != std::string::npos ||
             headerText->find("activeSummary_") != std::string::npos ||
@@ -2291,11 +2292,12 @@ int main()
             return fail("generated packed activity model violated activation semantics");
         }
 
-        // Source-part activity guard: the optional exact-range probe wraps
-        // both compute and commit calls. The fixture crosses source-part and
-        // compute/commit boundaries in one round, so the generated harness is
-        // also a semantic check that preceding act.f writes are visible to a
-        // later guard and that act.b still drives another convergence round.
+        // Source-part and source-word activity guards: the optional exact-range
+        // probe wraps both compute and commit calls, while exact word masks
+        // wrap their owned byte chunks. The fixture crosses source-part, word,
+        // and compute/commit boundaries in one round, so the generated harness
+        // also checks that preceding act.f writes are visible to later guards,
+        // same-word byte relay survives, and act.b drives another round.
         const std::filesystem::path guardedDirectory = outputDirectory / "guarded";
         wolvrix::lib::diag::Diagnostics guardedDiagnostics;
         const GrhSimAmCppResult guardedResult = emitter.emit(
@@ -2307,6 +2309,7 @@ int main()
                 .attributes = {
                     {"blocksPerSource", "17"},
                     {"sourcePartActivityGuard", "true"},
+                    {"sourceWordActivityGuard", "true"},
                 },
             },
             guardedDiagnostics);
@@ -2318,7 +2321,11 @@ int main()
             readTextFile(guardedDirectory / "grhsim_GuardedActivityTop.hpp");
         const std::optional<std::string> guardedRuntime =
             readTextFile(guardedDirectory / "grhsim_GuardedActivityTop_runtime.cpp");
-        if (!guardedHeader || !guardedRuntime ||
+        const std::optional<std::string> guardedSource3 =
+            readTextFile(guardedDirectory / "grhsim_GuardedActivityTop_blocks_3.cpp");
+        const std::optional<std::string> guardedSource7 =
+            readTextFile(guardedDirectory / "grhsim_GuardedActivityTop_blocks_7.cpp");
+        if (!guardedHeader || !guardedRuntime || !guardedSource3 || !guardedSource7 ||
             guardedHeader->find("bool has_active_blocks(std::size_t first, std::size_t end) const") ==
                 std::string::npos ||
             guardedRuntime->find(
@@ -2329,9 +2336,24 @@ int main()
                 std::string::npos ||
             guardedRuntime->find(
                 "if (has_active_blocks(130, 131)) eval_commit_7();") ==
+                std::string::npos ||
+            guardedSource3->find(
+                "if ((activeWords_[0] & UINT64_C(0xfff8000000000000)) != 0) {") ==
+                std::string::npos ||
+            guardedSource3->find(
+                "if ((activeWords_[1] & UINT64_C(0xf)) != 0) {") ==
+                std::string::npos ||
+            guardedSource7->find(
+                "if ((activeWords_[1] & UINT64_C(0xff80000000000000)) != 0) {") ==
+                std::string::npos ||
+            guardedSource7->find(
+                "if ((activeWords_[2] & UINT64_C(0x3)) != 0) {") ==
+                std::string::npos ||
+            guardedSource7->find(
+                "if ((activeWords_[2] & UINT64_C(0x4)) != 0) {") ==
                 std::string::npos)
         {
-            return fail("guarded activity model did not wrap exact source-part ranges");
+            return fail("guarded activity model did not wrap exact part and word ranges");
         }
         const std::filesystem::path guardedHarnessPath = guardedDirectory / "harness.cpp";
         std::ofstream guardedHarness(guardedHarnessPath);
