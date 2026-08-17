@@ -240,6 +240,20 @@ namespace wolvrix::lib::grhsim::am
             // bodies into many small basic blocks so the C++ backend never
             // faces one giant straight-line region (emit-cost NO0001 B2).
             bool branchyMux = false;
+            // Compile-time init-zero-elision switch (attribute
+            // "initZeroElision", default off). When true the init() emission
+            // skips literal-0 init stores that the init() prologue already
+            // covers: narrow member values (member memset), >64-bit
+            // BitVectors per word (wideValues_.fill(0)) and reals
+            // (realValues_.fill(0)). Only a variable's sole init action is
+            // eligible; multi-action variables keep every store (last-writer
+            // order is not analyzed). Pure generated-code-size optimization.
+            bool initZeroElision = false;
+            // Elided store counts: narrow member stores, wide BitVector
+            // zero-word stores, real stores.
+            uint64_t initZeroElisionNarrowCount = 0;
+            uint64_t initZeroElisionWideCount = 0;
+            uint64_t initZeroElisionRealCount = 0;
             // NO0006 trace comments (GrhSimAmCppOptions::traceComments,
             // default on): per-block banner and per-atom provenance comment
             // lines in the block sources. Comment-only.
@@ -266,6 +280,15 @@ namespace wolvrix::lib::grhsim::am
             // memset from the first member instead.
             uint32_t firstMemberVariable = std::numeric_limits<uint32_t>::max();
             uint32_t memberValueCount = 0;
+            // State layout switch (GrhSimAmCppOptions attribute "stateLayout",
+            // default "id"). "id" keeps the baseline ascending-VariableId
+            // layout; "affinity" clusters persistent state by static
+            // block-reference affinity (planAffinityStateLayout): the v<K>
+            // member declaration order and the wideValues_ pool offset
+            // assignment both follow stateLayoutOrder. changedResults_ keeps
+            // its dense id order either way.
+            bool affinityStateLayout = false;
+            std::vector<uint32_t> stateLayoutOrder;
             std::unordered_map<uint32_t, DpiImportId> dpiImportBySymbol;
             std::vector<bool> referencedDpiImports;
             std::vector<InstructionId> finalSystemTasks;
@@ -662,6 +685,29 @@ namespace wolvrix::lib::grhsim::am
                 case 2: return "32";
                 default: return "";
             }
+        }
+
+        // True when variable gets a v<K> member in the contiguous region that
+        // init() zeroes with one memset: a persistent narrow value that is
+        // neither a dense changedResults_ slot, a block-localized (ST00009)
+        // value, nor a folded detector event (ST00010, whose zeroInit needs
+        // no explicit write). This is the exact membership condition of the
+        // header member-declaration loop; init-zero elision reuses it to
+        // prove a narrow literal-0 init store is memset-covered.
+        bool hasMemberStorage(const EmitState &state, VariableId variable)
+        {
+            const Type &type = state.variableTypes[variable.value];
+            if (type.kind != TypeKind::BitVector || type.bitWidth > 64 ||
+                state.crossBlockChangedResults[variable.value])
+            {
+                return false;
+            }
+            if (state.variableEscapeFlags[variable.value] == 0 &&
+                state.variableDefBlock[variable.value] != kInvalidLocalityBlock)
+            {
+                return false;
+            }
+            return state.foldedDetectorEvents[variable.value] == 0;
         }
 
         std::string valueExpr(const EmitState &state, VariableId variable)
@@ -5122,6 +5168,135 @@ namespace wolvrix::lib::grhsim::am
             return true;
         }
 
+        // stateLayout=affinity state clustering analysis. Only persistent
+        // state participates: wideValues_ pool entries (wide BitVector and
+        // Array) and v<K> member candidates — block-local values (ST00009),
+        // cross-block changed results (changedResults_ dense array),
+        // ST00010-folded detector events and the Real/String pools do not.
+        // For every participating state, statically counts how many times
+        // each Block's instructions reference it (operands + results) and
+        // picks the Block with the most references as its primary Block
+        // (ties keep the lower BlockId). The states are then laid out
+        // grouped by primary Block: groups sort by descending total state
+        // reference count (hot groups first, ties by lower BlockId), states
+        // sort by ascending VariableId inside a group, and unreferenced
+        // states form the ascending-id tail. The sort key is fully
+        // deterministic, so the emitted layout is reproducible. Called after
+        // the watch-group planning passes, which finalize the member
+        // candidacy filters this mirrors.
+        void planAffinityStateLayout(const ExecutableModel &model, EmitState &state)
+        {
+            const ProgramView program = model.program.view();
+            const uint32_t variableCount = static_cast<uint32_t>(program.variableCount());
+            const uint32_t blockCount = static_cast<uint32_t>(model.program.blockCount());
+            // Mirror the persistent-state candidacy of the member
+            // declaration burst plus the wideValues_ pool entries.
+            std::vector<bool> layoutState(variableCount, false);
+            for (uint32_t index = 0; index < variableCount; ++index)
+            {
+                const Type &type = state.variableTypes[index];
+                if ((type.kind == TypeKind::BitVector && type.bitWidth > 64) ||
+                    type.kind == TypeKind::Array)
+                {
+                    layoutState[index] = true;
+                    continue;
+                }
+                if (!hasMemberStorage(state, VariableId{index}))
+                {
+                    continue;
+                }
+                layoutState[index] = true;
+            }
+            std::vector<uint32_t> primaryBlock(variableCount, kInvalidLocalityBlock);
+            std::vector<uint64_t> bestBlockRefs(variableCount, 0);
+            std::vector<uint64_t> totalRefs(variableCount, 0);
+            std::vector<uint64_t> blockRefs(variableCount, 0);
+            std::vector<uint32_t> touched;
+            for (uint32_t blockIndex = 0; blockIndex < blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                touched.clear();
+                for (std::size_t position = 0; position < model.program.blockSize(block);
+                     ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    const auto countRefs = [&](std::span<const VariableId> variables) {
+                        for (const VariableId variable : variables)
+                        {
+                            if (!variable.valid() || !layoutState[variable.value])
+                            {
+                                continue;
+                            }
+                            if (blockRefs[variable.value] == 0)
+                            {
+                                touched.push_back(variable.value);
+                            }
+                            ++blockRefs[variable.value];
+                            ++totalRefs[variable.value];
+                        }
+                    };
+                    countRefs(program.operands(instruction));
+                    countRefs(program.results(instruction));
+                }
+                for (const uint32_t variable : touched)
+                {
+                    if (blockRefs[variable] > bestBlockRefs[variable])
+                    {
+                        bestBlockRefs[variable] = blockRefs[variable];
+                        primaryBlock[variable] = blockIndex;
+                    }
+                    blockRefs[variable] = 0;
+                }
+            }
+            // Group weight = total reference count of the states whose primary
+            // Block is the group; unreferenced states get no group and sort
+            // into the tail.
+            std::vector<uint64_t> groupWeight(blockCount, 0);
+            for (uint32_t variable = 0; variable < variableCount; ++variable)
+            {
+                if (primaryBlock[variable] != kInvalidLocalityBlock)
+                {
+                    groupWeight[primaryBlock[variable]] += totalRefs[variable];
+                }
+            }
+            std::vector<uint32_t> groupOrder(blockCount);
+            std::iota(groupOrder.begin(), groupOrder.end(), 0U);
+            std::stable_sort(groupOrder.begin(), groupOrder.end(),
+                             [&](uint32_t lhs, uint32_t rhs) {
+                                 return groupWeight[lhs] > groupWeight[rhs];
+                             });
+            std::vector<uint32_t> groupRank(blockCount, 0);
+            for (uint32_t rank = 0; rank < blockCount; ++rank)
+            {
+                groupRank[groupOrder[rank]] = rank;
+            }
+            state.stateLayoutOrder.clear();
+            state.stateLayoutOrder.reserve(variableCount);
+            for (uint32_t variable = 0; variable < variableCount; ++variable)
+            {
+                if (layoutState[variable])
+                {
+                    state.stateLayoutOrder.push_back(variable);
+                }
+            }
+            constexpr uint32_t kTailRank = std::numeric_limits<uint32_t>::max();
+            std::sort(state.stateLayoutOrder.begin(), state.stateLayoutOrder.end(),
+                      [&](uint32_t lhs, uint32_t rhs) {
+                          const uint32_t lhsRank = primaryBlock[lhs] != kInvalidLocalityBlock
+                                                       ? groupRank[primaryBlock[lhs]]
+                                                       : kTailRank;
+                          const uint32_t rhsRank = primaryBlock[rhs] != kInvalidLocalityBlock
+                                                       ? groupRank[primaryBlock[rhs]]
+                                                       : kTailRank;
+                          if (lhsRank != rhsRank)
+                          {
+                              return lhsRank < rhsRank;
+                          }
+                          return lhs < rhs;
+                      });
+        }
+
         // ST00010 detector-group folding analysis. For each Block, scans the
         // maximal runs of scheduler-materialized watch-group instructions
         // (changed.* detectors and act.f/act.b activations) and re-groups the
@@ -7019,13 +7194,12 @@ namespace wolvrix::lib::grhsim::am
             if (state.explodedStateCount != 0)
             {
                 uint64_t wideWords = 0;
-                for (uint32_t index = 0; index < variableCount; ++index)
-                {
+                const auto compactWideStorage = [&](uint32_t index) {
                     const Type &type = state.variableTypes[index];
                     if ((type.kind != TypeKind::BitVector || type.bitWidth <= 64) &&
                         type.kind != TypeKind::Array)
                     {
-                        continue;
+                        return;
                     }
                     EmitState::Storage &storage = state.variableStorage[index];
                     const uint64_t elements =
@@ -7034,10 +7208,24 @@ namespace wolvrix::lib::grhsim::am
                     {
                         state.explodedReclaimedWords += storage.wordCount * elements;
                         storage.offset = std::numeric_limits<uint64_t>::max();
-                        continue;
+                        return;
                     }
                     storage.offset = wideWords;
                     wideWords += static_cast<uint64_t>(storage.wordCount) * elements;
+                };
+                if (state.affinityStateLayout)
+                {
+                    for (const uint32_t index : state.stateLayoutOrder)
+                    {
+                        compactWideStorage(index);
+                    }
+                }
+                else
+                {
+                    for (uint32_t index = 0; index < variableCount; ++index)
+                    {
+                        compactWideStorage(index);
+                    }
                 }
                 state.wideWords = wideWords;
             }
@@ -7986,6 +8174,19 @@ namespace wolvrix::lib::grhsim::am
         const auto guardEventGatingAttribute = options.attributes.find("guardEventGating");
         state.guardEventGating = guardEventGatingAttribute != options.attributes.end() &&
                                  guardEventGatingAttribute->second == "true";
+        const auto initZeroElisionAttribute = options.attributes.find("initZeroElision");
+        state.initZeroElision = initZeroElisionAttribute != options.attributes.end() &&
+                                initZeroElisionAttribute->second == "true";
+        const auto stateLayoutAttribute = options.attributes.find("stateLayout");
+        if (stateLayoutAttribute != options.attributes.end() &&
+            stateLayoutAttribute->second != "id" && stateLayoutAttribute->second != "affinity")
+        {
+            diagnostics.error("AM C++ emitter stateLayout attribute must be \"id\" or \"affinity\"",
+                              std::string(kContext));
+            return result;
+        }
+        state.affinityStateLayout = stateLayoutAttribute != options.attributes.end() &&
+                                    stateLayoutAttribute->second == "affinity";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -8483,6 +8684,32 @@ namespace wolvrix::lib::grhsim::am
         // Planned after the escape analysis (it reads crossBlockChangedResults)
         // and before the measure/write passes.
         planArrayWatchGroups(model, state);
+        if (state.affinityStateLayout)
+        {
+            // stateLayout=affinity: cluster persistent state by static
+            // block-reference affinity. Runs after the escape analysis and
+            // detector-group folding, which finalize the member candidacy
+            // the analysis mirrors, and before every emission pass that
+            // consumes the member order or the wide-pool offsets.
+            planAffinityStateLayout(model, state);
+            // Re-assign the wideValues_ pool offsets in layout order. The
+            // pool stays a dense [0, wideWords) partition of the same
+            // entries — the total word count computed above is unchanged,
+            // only the entry order (and hence each entry's offset) moves.
+            uint64_t wideWords = 0;
+            for (const uint32_t index : state.stateLayoutOrder)
+            {
+                const Type &type = state.variableTypes[index];
+                if ((type.kind == TypeKind::BitVector && type.bitWidth > 64) ||
+                    type.kind == TypeKind::Array)
+                {
+                    EmitState::Storage &storage = state.variableStorage[index];
+                    storage.offset = wideWords;
+                    wideWords += static_cast<uint64_t>(storage.wordCount) *
+                                 (type.kind == TypeKind::Array ? type.elementCount : 1U);
+                }
+            }
+        }
         // ST00012 commit event batch gating: one event-union branch per
         // commit Block replaces per-statement event loads on quiet rounds.
         planCommitEventGates(model, state);
@@ -8872,34 +9099,26 @@ namespace wolvrix::lib::grhsim::am
         // defining block; cross-block changed results stay in the dense
         // changedResults_ array because they are written through a runtime
         // index (set_changed_result and the dirty-list clear). Members are
-        // Members are declared in ascending VariableId order without
-        // initializers: clang miscompiles the implicit default constructor
-        // once a class carries tens of thousands of {}-initialized members
-        // (only a small prefix is actually initialized), so init() zeroes
-        // the contiguous member region with a single memset instead. The
+        // declared without initializers: clang miscompiles the implicit
+        // default constructor once a class carries tens of thousands of
+        // {}-initialized members (only a small prefix is actually
+        // initialized), so init() zeroes the contiguous member region with a
+        // single memset instead. Members are declared in ascending VariableId
+        // order by default (stateLayout=id); stateLayout=affinity declares
+        // them in block-affinity layout order (planAffinityStateLayout) —
+        // the region stays contiguous either way, so the memset from the
+        // first declared member still spans exactly the member burst. The
         // declaration burst is built in memory to keep emission fast on
         // multi-million-value models.
         {
             std::ostringstream memberDeclarations;
-            for (uint32_t index = 0; index < variableCount; ++index)
-            {
-                const Type &type = state.variableTypes[index];
-                if (type.kind != TypeKind::BitVector || type.bitWidth > 64 ||
-                    state.crossBlockChangedResults[index])
+            const auto declareMember = [&](uint32_t index) {
+                // Membership condition lives in hasMemberStorage (ST00010
+                // folded detector events included); init-zero elision
+                // relies on the same predicate.
+                if (!hasMemberStorage(state, VariableId{index}))
                 {
-                    continue;
-                }
-                if (state.variableEscapeFlags[index] == 0 &&
-                    state.variableDefBlock[index] != kInvalidLocalityBlock)
-                {
-                    continue;
-                }
-                // ST00010: a folded detector's event variable is never
-                // assigned or read (the group flag replaces it), and its
-                // zeroInit needs no explicit init write, so it gets no member.
-                if (state.foldedDetectorEvents[index])
-                {
-                    continue;
+                    return;
                 }
                 if (state.memberValueCount == 0)
                 {
@@ -8907,6 +9126,20 @@ namespace wolvrix::lib::grhsim::am
                 }
                 ++state.memberValueCount;
                 memberDeclarations << "    std::uint64_t v" << index << ";\n";
+            };
+            if (state.affinityStateLayout)
+            {
+                for (const uint32_t index : state.stateLayoutOrder)
+                {
+                    declareMember(index);
+                }
+            }
+            else
+            {
+                for (uint32_t index = 0; index < variableCount; ++index)
+                {
+                    declareMember(index);
+                }
             }
             header << memberDeclarations.str();
         }
@@ -10027,9 +10260,44 @@ namespace
                << "    std::uint64_t initRandomState = randomSeed_;\n";
         const auto emitSetInitialization = [&](VariableId variable,
                                                const InitExpr &expression,
-                                               std::size_t actionIndex) {
+                                               std::size_t actionIndex,
+                                               bool soleInitAction) {
             const Type &type = variableType(state, variable);
             const EmitState::Storage &storage = variableStorage(state, variable);
+            // Init-zero elision: a sole-action literal-0 store is dead — the
+            // init() prologue already zeroed its storage (member memset for
+            // narrow member values, wideValues_.fill(0) for >64-bit
+            // BitVectors, realValues_.fill(0) for reals). Narrow values
+            // without a member (block-localized or folded detector events)
+            // keep their store: they may have no storage for the prologue to
+            // cover. Wide BitVectors are elided per word inside the store
+            // loop below. Random/seeded and multi-action inits are never
+            // elided.
+            if (state.initZeroElision && soleInitAction &&
+                expression.kind == InitExprKind::Literal)
+            {
+                const LiteralView literal = program.literal(expression.literal);
+                if (type.kind == TypeKind::BitVector && type.bitWidth <= 64)
+                {
+                    const uint64_t word =
+                        literal.words.empty() ? 0 : literal.words.front();
+                    if (word == 0 && hasMemberStorage(state, variable))
+                    {
+                        ++state.initZeroElisionNarrowCount;
+                        return;
+                    }
+                }
+                else if (type.kind == TypeKind::Real)
+                {
+                    const uint64_t word =
+                        literal.words.empty() ? 0 : literal.words.front();
+                    if (word == 0)
+                    {
+                        ++state.initZeroElisionRealCount;
+                        return;
+                    }
+                }
+            }
             const bool seeded = expression.kind == InitExprKind::RandomSeeded;
             const std::string seedName = "seededInitState_" +
                                          std::to_string(variable.value) + "_" +
@@ -10109,6 +10377,15 @@ namespace
                     {
                         const uint64_t payload =
                             word < literal->words.size() ? literal->words[word] : 0;
+                        // Per-word init-zero elision: a zero word store is
+                        // dead on its own — wideValues_.fill(0) covers the
+                        // slot and (0 & mask) == 0. Non-zero words keep their
+                        // stores in order.
+                        if (state.initZeroElision && soleInitAction && payload == 0)
+                        {
+                            ++state.initZeroElisionWideCount;
+                            continue;
+                        }
                         value = "UINT64_C(" + std::to_string(payload) + ")";
                     }
                     else
@@ -10216,7 +10493,50 @@ namespace
                               rhsLiteral.words.begin()) &&
                    lhsLiteral.bytes == rhsLiteral.bytes;
         };
-        for (uint32_t index = 0; index < program.variableCount(); ++index)
+        std::vector<uint32_t> initVariableOrder(program.variableCount());
+        std::iota(initVariableOrder.begin(), initVariableOrder.end(), 0U);
+        if (state.affinityStateLayout)
+        {
+            // Keep every literal-only wide initializer in physical pool order
+            // so clang sees long monotonic store runs even though affinity
+            // layout permutes VariableIds. Non-literal initializers retain
+            // their original relative order, preserving the global random
+            // stream's variable-to-value mapping.
+            std::vector<uint32_t> literalWide;
+            std::vector<uint32_t> remaining;
+            literalWide.reserve(initVariableOrder.size());
+            remaining.reserve(initVariableOrder.size());
+            for (const uint32_t index : initVariableOrder)
+            {
+                const Type &type = state.variableTypes[index];
+                const InitDescriptor &init =
+                    program.init(program.variable(VariableId{index}).init);
+                bool literalOnly = init.kind == InitKind::Constant;
+                if (init.kind == InitKind::Actions)
+                {
+                    const std::span<const InitAction> actions =
+                        program.initActions(program.variable(VariableId{index}).init);
+                    literalOnly = std::all_of(
+                        actions.begin(), actions.end(), [](const InitAction &action) {
+                            return action.expression.kind == InitExprKind::Literal;
+                        });
+                }
+                const bool wide =
+                    (type.kind == TypeKind::BitVector && type.bitWidth > 64) ||
+                    type.kind == TypeKind::Array;
+                (wide && literalOnly ? literalWide : remaining).push_back(index);
+            }
+            std::sort(literalWide.begin(), literalWide.end(), [&](uint32_t lhs, uint32_t rhs) {
+                const uint64_t lhsOffset = state.variableStorage[lhs].offset;
+                const uint64_t rhsOffset = state.variableStorage[rhs].offset;
+                return lhsOffset != rhsOffset ? lhsOffset < rhsOffset : lhs < rhs;
+            });
+            initVariableOrder.clear();
+            initVariableOrder.insert(initVariableOrder.end(),
+                                     literalWide.begin(), literalWide.end());
+            initVariableOrder.insert(initVariableOrder.end(), remaining.begin(), remaining.end());
+        }
+        for (const uint32_t index : initVariableOrder)
         {
             const VariableId variable{index};
             const InitDescriptor &init = program.init(program.variable(variable).init);
@@ -10227,7 +10547,7 @@ namespace
                                           .kind = InitExprKind::Literal,
                                           .literal = LiteralId{init.payload},
                                       },
-                                      0);
+                                      0, /*soleInitAction=*/true);
             }
             else if (init.kind == InitKind::Actions)
             {
@@ -10259,11 +10579,21 @@ namespace
                     }
                     else
                     {
-                        emitSetInitialization(variable, action.expression, actionIndex);
+                        emitSetInitialization(variable, action.expression, actionIndex,
+                                              /*soleInitAction=*/actions.size() == 1);
                     }
                     actionIndex = nextActionIndex;
                 }
             }
+        }
+        if (state.initZeroElision)
+        {
+            diagnostics.info(
+                "AM C++ emitter init-zero elision eliminated init stores: narrow=" +
+                    std::to_string(state.initZeroElisionNarrowCount) +
+                    " wide=" + std::to_string(state.initZeroElisionWideCount) +
+                    " real=" + std::to_string(state.initZeroElisionRealCount),
+                std::string(kContext));
         }
         runtime << "}\n\nbool " << className
                 << "::is_commit_block(std::size_t block) {\n"
@@ -11243,6 +11573,9 @@ namespace
         result.wideStateExplodeBailed =
             std::accumulate(state.explodeBails.begin(), state.explodeBails.end(),
                             uint64_t{0});
+        result.initZeroElisionNarrow = state.initZeroElisionNarrowCount;
+        result.initZeroElisionWide = state.initZeroElisionWideCount;
+        result.initZeroElisionReal = state.initZeroElisionRealCount;
         result.artifacts.reserve(stagedArtifacts.size());
         for (const StagedArtifact &artifact : stagedArtifacts)
         {

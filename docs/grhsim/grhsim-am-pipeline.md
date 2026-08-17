@@ -320,6 +320,38 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
 - `guardEventGating`（`--guard-event-gating`）：识别「纯 fatal 守卫」
   compute 块并对其块体发射事件门（门 = 块内 fatal 读取的 changedResults_
   槽的 OR），门关闭时整块跳过；机制/合格条件/语义论证见 §3.2.9。
+- `initZeroElision`（`--init-zero-elision`，默认关）：发射期消除 init() 里
+  字面量 0 的死 init store，压缩生成代码体量（xiangshan SimTop 上 init() 的
+  逐变量 store 98%+ 是字面量 0），不改任何运行时语义。规则与语义论证：
+  init() prologue 已做全覆盖清零——窄标量成员区一条 memset、
+  `wideValues_.fill(0)`、`realValues_.fill(0)`，因此对「唯一 init action 且
+  为字面量 0」的 store，其写出的 0 被 prologue 覆盖，按构造是死 store：
+  >64bit BitVector 逐 word 消除（payload==0 的 word store 直接跳过，
+  `fill(0)` 逐槽覆盖且 `0 & mask == 0`；非零 word 照常发射、变量内 word
+  顺序不变）；≤64bit 标量仅当确有 memset 区成员时消除（判定与头文件成员
+  声明处同源：BitVector ≤64bit、非 cross-block changed result、非 ST00009
+  块内本地化、非 ST00010 折叠 detector event，否则保留——它可能没有成员
+  存储，消除会丢初始化）；realValues_ 字面量 0 同样可消。保守边界：只对
+  变量的唯一 init action 做消除，多 action 变量一律全保留（不分析
+  last-writer 顺序；实践中语义校验器 sawSet 规则已拒绝同变量多 Set，
+  该守卫为兜底）；String、Fill action、任何 random/seeded init 一律不动。
+  消除的 store 数（分窄/宽 word/real）经 diagnostics 与结果 JSON
+  （`init_zero_elision_narrow/wide/real`）报告。
+- `stateLayout`（`--state-layout <id|affinity>`，默认 `id`）：持久状态的静态
+  布局策略。`id` 为基线行为——`v<K>` 成员声明与 `wideValues_` 词池 offset 都按
+  升序 VariableId 分配，输出与未设置该属性时逐字节一致。`affinity` 先静态统计
+  每个变量被各 Block 指令引用（操作数 + 结果）的次数，取引用最多的 Block 为其
+  primary Block（并列取块号小者），再按 primary Block 分组布局：组按组内状态
+  总引用次数降序（热组靠前，并列取块号小者），组内按升序 VariableId，零引用
+  状态排在尾部按升序 VariableId；排序键完全确定，输出可复现。应用于成员声明
+  顺序与宽值词池 offset 分配两处；`changedResults_` 密集下标不动。不变式保持：
+  成员区连续（init() 单条 memset 语义不变）、宽池 offset 从 0 连续、总尺寸不变。
+  `init()` 额外把 literal-only 宽状态按最终 pool offset 发射，避免 affinity 置换后
+  百万级 store 失去单调性并触发 Clang 单函数优化爆炸；含随机初始化的变量保持原
+  VariableId 相对顺序，因此全局随机流的变量到值映射不变。
+  动机：成员/offset 的发现次序（升序 VariableId）与运行期访问模式无关，是主要
+  gather 病灶；按块亲和性聚簇让同一块访问的状态相邻，改善热块工作集的
+  页/cache 局部性。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
@@ -1250,6 +1282,10 @@ dirty list。
 静态排布与寄存器分配；块内局部值仍物化为 C++ 局部变量，不占成员）；跨块消费的
 `changed` 结果是唯一被运行时下标访问的值（dirty list 清零），单列密集数组
 `changedResults_[denseId]`；宽值（> 64 bit 与 Array）仍在 `wideValues_` 数组。
+状态布局默认一律按升序 VariableId（`stateLayout=id`，即 GRH 值发现次序）；
+`stateLayout=affinity` 改为按块静态访问亲和性聚簇（规则见文首 emitter 属性
+清单），成员声明顺序与宽池 offset 分配同步置换，成员区连续性与宽池从 0 连续
+分配均不变。
 生成的 Makefile 用 clang `-x c++-header` + 每 TU `-include-pch` 预编译模型头
 （成员声明达数百万行量级，PCH 是编译耗时摊销的关键），并用
 `ifeq ($(origin CXX),default)` 兜底 GNU make 内建的 g++ 默认值（g++ 不支持

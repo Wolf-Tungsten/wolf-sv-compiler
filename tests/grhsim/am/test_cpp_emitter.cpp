@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -871,6 +872,254 @@ namespace
         if (std::system(runCommand.c_str()) != 0)
         {
             return fail("generated memory AM model disagreed with the Interpreter");
+        }
+        return 0;
+    }
+
+    // stateLayout=affinity with initZeroElision (the c2 combination): the
+    // memory fixture emitted with the affinity layout must declare exactly the same
+    // members in a permuted but deterministic order, keep the wideValues_
+    // pool size, keep init()'s memset anchored at the first declared member,
+    // reject invalid attribute values, and behave identically at runtime.
+    int testAffinityStateLayout(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        MemoryEmitterFixture fixture = makeMemoryEmitterFixture();
+
+        GrhSimAmCppEmitter emitter;
+        wolvrix::lib::diag::Diagnostics invalidDiagnostics;
+        const GrhSimAmCppResult invalidResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "invalid",
+                .modelName = "AffinityInvalidTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"stateLayout", "row-major"}},
+            },
+            invalidDiagnostics);
+        if (invalidResult.success || !invalidDiagnostics.hasError() ||
+            !hasDiagnosticContaining(invalidDiagnostics, "stateLayout"))
+        {
+            return fail("AM C++ emitter accepted an invalid stateLayout attribute");
+        }
+
+        wolvrix::lib::diag::Diagnostics idDiagnostics;
+        const GrhSimAmCppResult idResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "id",
+                .modelName = "AffinityTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            idDiagnostics);
+        wolvrix::lib::diag::Diagnostics affinityDiagnostics;
+        const GrhSimAmCppResult affinityResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "affinity",
+                .modelName = "AffinityTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"stateLayout", "affinity"},
+                               {"initZeroElision", "true"}},
+            },
+            affinityDiagnostics);
+        wolvrix::lib::diag::Diagnostics repeatDiagnostics;
+        const GrhSimAmCppResult repeatResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "affinity-repeat",
+                .modelName = "AffinityTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"stateLayout", "affinity"},
+                               {"initZeroElision", "true"}},
+            },
+            repeatDiagnostics);
+        if (!idResult.success || idDiagnostics.hasError() ||
+            !affinityResult.success || affinityDiagnostics.hasError() ||
+            !repeatResult.success || repeatDiagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the state-layout models");
+        }
+
+        // The v<K> member declaration order as emitted in the header.
+        const auto memberOrder = [](const std::string &text) {
+            std::vector<uint32_t> order;
+            const std::string marker = "    std::uint64_t v";
+            std::size_t cursor = 0;
+            while ((cursor = text.find(marker, cursor)) != std::string::npos)
+            {
+                const char *begin = text.data() + cursor + marker.size();
+                uint32_t id = 0;
+                const auto [end, error] =
+                    std::from_chars(begin, text.data() + text.size(), id);
+                if (error == std::errc{} && end != begin && *end == ';')
+                {
+                    order.push_back(id);
+                }
+                ++cursor;
+            }
+            return order;
+        };
+        const std::optional<std::string> idHeader =
+            readTextFile(outputDirectory / "id" / "grhsim_AffinityTop.hpp");
+        const std::optional<std::string> affinityHeader =
+            readTextFile(outputDirectory / "affinity" / "grhsim_AffinityTop.hpp");
+        const std::optional<std::string> affinityRuntime = readTextFile(
+            outputDirectory / "affinity" / "grhsim_AffinityTop_runtime.cpp");
+        if (!idHeader || !affinityHeader || !affinityRuntime)
+        {
+            return fail("state-layout models did not emit their header/runtime sources");
+        }
+        const std::vector<uint32_t> idOrder = memberOrder(*idHeader);
+        const std::vector<uint32_t> affinityOrder = memberOrder(*affinityHeader);
+        std::vector<uint32_t> sortedIdOrder = idOrder;
+        std::vector<uint32_t> sortedAffinityOrder = affinityOrder;
+        std::sort(sortedIdOrder.begin(), sortedIdOrder.end());
+        std::sort(sortedAffinityOrder.begin(), sortedAffinityOrder.end());
+        if (idOrder.empty() || sortedIdOrder != sortedAffinityOrder)
+        {
+            return fail("affinity state layout must declare exactly the id-layout members");
+        }
+        if (idOrder == affinityOrder)
+        {
+            return fail("affinity state layout did not cluster the memory fixture members");
+        }
+        // The wide pool keeps the same total size; only the entry offsets move.
+        const auto widePoolLine = [](const std::string &text) {
+            const std::size_t anchor = text.find("> wideValues_");
+            if (anchor == std::string::npos)
+            {
+                return std::string{};
+            }
+            const std::size_t begin = text.rfind('\n', anchor) + 1;
+            const std::size_t end = text.find('\n', anchor);
+            return text.substr(begin, end - begin);
+        };
+        if (widePoolLine(*idHeader).empty() ||
+            widePoolLine(*idHeader) != widePoolLine(*affinityHeader))
+        {
+            return fail("affinity state layout changed the wideValues_ pool size");
+        }
+        // init() zeroes the contiguous member region starting at the first
+        // declared member, whatever the layout order is.
+        const std::string expectedMemset =
+            "std::memset(&v" + std::to_string(affinityOrder.front()) + ", 0, sizeof(v" +
+            std::to_string(affinityOrder.front()) + ") * " +
+            std::to_string(affinityOrder.size()) + "U);";
+        if (affinityRuntime->find(expectedMemset) == std::string::npos)
+        {
+            return fail("affinity state layout broke the init() member-region memset");
+        }
+        const std::size_t initBegin = affinityRuntime->find("::init() {");
+        const std::size_t initEnd = affinityRuntime->find("::is_commit_block", initBegin);
+        if (initBegin == std::string::npos || initEnd == std::string::npos)
+        {
+            return fail("affinity state layout produced no bounded init() body");
+        }
+        std::size_t search = initBegin;
+        uint64_t previousOffset = 0;
+        bool sawWideStore = false;
+        while ((search = affinityRuntime->find("wideValues_[", search)) !=
+                   std::string::npos &&
+               search < initEnd)
+        {
+            const std::size_t numberBegin =
+                search + std::string_view("wideValues_[").size();
+            uint64_t offset = 0;
+            const char *begin = affinityRuntime->data() + numberBegin;
+            const char *end = affinityRuntime->data() + initEnd;
+            const auto [numberEnd, error] = std::from_chars(begin, end, offset);
+            if (error == std::errc{} && numberEnd < end && *numberEnd == ']')
+            {
+                if (sawWideStore && offset < previousOffset)
+                {
+                    return fail("affinity init() wide stores are not in physical offset order");
+                }
+                previousOffset = offset;
+                sawWideStore = true;
+            }
+            search = numberBegin;
+        }
+        // The layout sort key is fully deterministic: re-emitting the same
+        // model must reproduce every artifact byte-for-byte.
+        if (affinityResult.artifacts.size() != repeatResult.artifacts.size())
+        {
+            return fail("affinity state layout emitted an unstable artifact manifest");
+        }
+        for (const std::string &artifact : affinityResult.artifacts)
+        {
+            const std::filesystem::path filename = std::filesystem::path(artifact).filename();
+            const std::optional<std::string> first =
+                readTextFile(outputDirectory / "affinity" / filename);
+            const std::optional<std::string> second =
+                readTextFile(outputDirectory / "affinity-repeat" / filename);
+            if (!first || !second || *first != *second)
+            {
+                return fail("affinity state layout emission is not deterministic");
+            }
+        }
+
+        // The permuted layout must not change model behavior: replay the
+        // memory transaction oracle against the affinity-emitted model.
+        const std::array<MemoryTransaction, 6> transactions = {
+            MemoryTransaction{1, 0, 0, 0x00, 0x00, 0x44332211, 0x11, 1},
+            MemoryTransaction{0, 0, 2, 0x00, 0x00, 0x44332211, 0x33, 0},
+            MemoryTransaction{0, 1, 1, 0x0f, 0xab, 0x44332211, 0x2b, 1},
+            MemoryTransaction{0, 1, 1, 0x00, 0xcd, 0x44332211, 0x2b, 0},
+            MemoryTransaction{0, 1, 4, 0xff, 0x5a, 0x44332211, 0x00, 0},
+            MemoryTransaction{0, 0, 1, 0xff, 0x5a, 0x44332211, 0x2b, 0},
+        };
+        const std::filesystem::path affinityDirectory = outputDirectory / "affinity";
+        const std::filesystem::path harnessPath = affinityDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << "#include \"grhsim_AffinityTop.hpp\"\n"
+                   "#include <cstdint>\n\n"
+                   "int main()\n"
+                   "{\n"
+                   "    GrhSIM_AffinityTop model;\n"
+                   "    model.init();\n";
+        int returnCode = 1;
+        for (const MemoryTransaction &transaction : transactions)
+        {
+            harness << "    model.fill_enable = " << transaction.fillEnable << ";\n"
+                    << "    model.write_enable = " << transaction.writeEnable << ";\n"
+                    << "    model.address = " << transaction.address << ";\n"
+                    << "    model.write_mask = " << transaction.writeMask << ";\n"
+                    << "    model.write_data = " << transaction.writeData << ";\n"
+                    << "    model.fill_data = UINT32_C(" << transaction.fillData << ");\n"
+                    << "    model.eval();\n"
+                    << "    if (static_cast<std::uint64_t>(model.read_data) != UINT64_C("
+                    << transaction.expectedRead << ")) return " << returnCode++ << ";\n"
+                    << "    if (static_cast<std::uint64_t>(model.memory_changed) != UINT64_C("
+                    << transaction.expectedChanged << ")) return " << returnCode++ << ";\n";
+        }
+        harness << "    return 0;\n}\n";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the affinity memory model harness");
+        }
+        const std::string buildCommand =
+            "make -C '" + affinityDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated affinity memory AM model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = affinityDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + affinityDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (affinityDirectory / "libgrhsim_AffinityTop.a").string() + "' -o '" +
+            harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated affinity memory AM model harness failed to compile");
+        }
+        const std::string affinityRunCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(affinityRunCommand.c_str()) != 0)
+        {
+            return fail("generated affinity memory AM model disagreed with the oracle");
         }
         return 0;
     }
@@ -3546,6 +3795,292 @@ int main()
         return 0;
     }
 
+    // Init-zero elision (attribute "initZeroElision", default off): with the
+    // switch on, a variable's sole literal-0 init store is skipped at
+    // emission because the init() prologue already covers it (member memset
+    // for narrow member values, wideValues_.fill(0) per slot for >64-bit
+    // BitVectors — so a mixed literal like {0, 7, 0} keeps only its non-zero
+    // word store, realValues_.fill(0) for reals). Non-zero literals, random
+    // inits and strings must survive, and the default mode must keep all
+    // stores.
+    // (The multi-action conservatism is unreachable here on purpose: the
+    // semantic validator rejects more than one Set action per variable —
+    // the sawSet rule in grhsim_am_program_validate.cpp — so multi-action
+    // scalar inits never reach the emitter; the guard stays as a belt and
+    // braces at the call site.)
+    int testInitZeroElision(const std::filesystem::path &outputDirectory)
+    {
+        LinearProgramBuilder linear;
+        const TypeId u8Type = linear.addType(Type::bitVector(8));
+        const TypeId u130Type = linear.addType(Type::bitVector(130));
+        const TypeId realType = linear.addType(Type::real());
+        const TypeId stringType = linear.addType(Type::string());
+
+        const std::array<uint64_t, 1> zeroWord = {0};
+        const std::array<uint64_t, 1> oneWord = {1};
+        const std::array<uint64_t, 1> fiveWord = {5};
+        const std::array<uint64_t, 1> piBits = {UINT64_C(0x400921fb54442d18)};
+        const std::array<uint64_t, 3> wideZeroWords = {0, 0, 0};
+        const std::array<uint64_t, 3> wideSparseWords = {0, 7, 0};
+        const LiteralId zeroLiteral8 = linear.addBitLiteral(u8Type, zeroWord);
+        const LiteralId oneLiteral8 = linear.addBitLiteral(u8Type, oneWord);
+        const LiteralId fiveLiteral8 = linear.addBitLiteral(u8Type, fiveWord);
+        const LiteralId wideZeroLiteral =
+            linear.addBitLiteral(u130Type, wideZeroWords);
+        const LiteralId wideSparseLiteral =
+            linear.addBitLiteral(u130Type, wideSparseWords);
+        const LiteralId realZeroLiteral = linear.addBitLiteral(realType, zeroWord);
+        const LiteralId realPiLiteral = linear.addBitLiteral(realType, piBits);
+        const LiteralId stringLiteral = linear.addStringLiteral(stringType, "hi");
+
+        const VariableId narrowZeroConst =
+            linear.addVariable(u8Type, linear.addConstantInit(zeroLiteral8));
+        const VariableId narrowOneConst =
+            linear.addVariable(u8Type, linear.addConstantInit(oneLiteral8));
+        const InitAction zeroSetAction{
+            .kind = InitActionKind::Set,
+            .expression = InitExpr{
+                .kind = InitExprKind::Literal,
+                .literal = zeroLiteral8,
+            },
+        };
+        const VariableId narrowZeroSet = linear.addVariable(
+            u8Type,
+            linear.addActionsInit(std::span<const InitAction>(&zeroSetAction, 1)));
+        const InitAction fiveSetAction{
+            .kind = InitActionKind::Set,
+            .expression = InitExpr{
+                .kind = InitExprKind::Literal,
+                .literal = fiveLiteral8,
+            },
+        };
+        const VariableId narrowFiveSet = linear.addVariable(
+            u8Type,
+            linear.addActionsInit(std::span<const InitAction>(&fiveSetAction, 1)));
+        const InitAction randomAction{
+            .kind = InitActionKind::Set,
+            .expression = InitExpr{
+                .kind = InitExprKind::Random,
+            },
+        };
+        const VariableId narrowRandom = linear.addVariable(
+            u8Type,
+            linear.addActionsInit(std::span<const InitAction>(&randomAction, 1)));
+        const VariableId wideZeroConst =
+            linear.addVariable(u130Type, linear.addConstantInit(wideZeroLiteral));
+        const VariableId wideSparseConst =
+            linear.addVariable(u130Type, linear.addConstantInit(wideSparseLiteral));
+        const VariableId realZero =
+            linear.addVariable(realType, linear.addConstantInit(realZeroLiteral));
+        const VariableId realPi =
+            linear.addVariable(realType, linear.addConstantInit(realPiLiteral));
+        const VariableId stringInit =
+            linear.addVariable(stringType, linear.addConstantInit(stringLiteral));
+        const VariableId assignOut = linear.addVariable(u8Type, linear.zeroInit());
+        const std::array<VariableId, 1> assignResults = {assignOut};
+        const std::array<VariableId, 1> assignOperands = {narrowOneConst};
+        const InstructionId assign =
+            linear.addInstruction(Opcode::Assign, assignResults, assignOperands);
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        scheduled.addBlock(std::vector<InstructionId>{assign});
+        ExecutableModel model{
+            .program = scheduled.finish(),
+            .interface = ProgramInterface{},
+            .commitBlockBegin = 0,
+            .commitBlockEnd = 0,
+        };
+
+        // Wide/real/string storage offsets are assigned in ascending
+        // VariableId order; replicate that layout to name the exact stores.
+        const ProgramView program = model.program.view();
+        const auto storageOffset = [&](VariableId variable) {
+            uint64_t wideOffset = 0;
+            uint64_t realOffset = 0;
+            uint64_t stringOffset = 0;
+            for (uint32_t index = 0; index < variable.value; ++index)
+            {
+                const Type &type =
+                    program.type(program.variable(VariableId{index}).type);
+                if ((type.kind == TypeKind::BitVector && type.bitWidth > 64) ||
+                    type.kind == TypeKind::Array)
+                {
+                    const uint64_t words =
+                        (static_cast<uint64_t>(type.bitWidth) + 63U) / 64U;
+                    wideOffset +=
+                        words * (type.kind == TypeKind::Array ? type.elementCount : 1U);
+                }
+                else if (type.kind == TypeKind::Real)
+                {
+                    ++realOffset;
+                }
+                else if (type.kind == TypeKind::String)
+                {
+                    ++stringOffset;
+                }
+            }
+            const Type &type = program.type(program.variable(variable).type);
+            if (type.kind == TypeKind::Real)
+            {
+                return realOffset;
+            }
+            if (type.kind == TypeKind::String)
+            {
+                return stringOffset;
+            }
+            return wideOffset;
+        };
+
+        const auto emitModel = [&](bool elide,
+                                   const std::filesystem::path &directory,
+                                   GrhSimAmCppResult &result) {
+            std::filesystem::remove_all(directory);
+            wolvrix::lib::diag::Diagnostics diagnostics;
+            GrhSimAmCppEmitter emitter;
+            GrhSimAmCppOptions options{
+                .outputDirectory = directory,
+                .modelName = "InitZeroTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            };
+            if (elide)
+            {
+                options.attributes.emplace("initZeroElision", "true");
+            }
+            result = emitter.emit(model, options, diagnostics);
+            if (!result.success || diagnostics.hasError())
+            {
+                return false;
+            }
+            return true;
+        };
+
+        GrhSimAmCppResult offResult;
+        if (!emitModel(false, outputDirectory / "off", offResult))
+        {
+            return fail("AM C++ emitter failed to generate the init-zero baseline model");
+        }
+        GrhSimAmCppResult onResult;
+        if (!emitModel(true, outputDirectory / "on", onResult))
+        {
+            return fail("AM C++ emitter failed to generate the init-zero elision model");
+        }
+        const std::optional<std::string> offRuntime =
+            readTextFile(outputDirectory / "off" / "grhsim_InitZeroTop_runtime.cpp");
+        const std::optional<std::string> onRuntime =
+            readTextFile(outputDirectory / "on" / "grhsim_InitZeroTop_runtime.cpp");
+        if (!offRuntime || !onRuntime)
+        {
+            return fail("AM C++ emitter produced no init-zero runtime source");
+        }
+        const auto initBody = [](const std::string &runtimeText) {
+            const std::size_t begin = runtimeText.find("::init() {");
+            if (begin == std::string::npos)
+            {
+                return std::string{};
+            }
+            const std::size_t end = runtimeText.find("\n}\n", begin);
+            if (end == std::string::npos)
+            {
+                return std::string{};
+            }
+            return runtimeText.substr(begin, end - begin);
+        };
+        const std::string offInit = initBody(*offRuntime);
+        const std::string onInit = initBody(*onRuntime);
+        if (offInit.empty() || onInit.empty())
+        {
+            return fail("AM C++ emitter runtime source lost its init() body");
+        }
+
+        const std::string mask8 = "((UINT64_C(1) << 8) - UINT64_C(1))";
+        const auto narrowStore = [&](VariableId variable, uint64_t value) {
+            return "    v" + std::to_string(variable.value) + " = (UINT64_C(" +
+                   std::to_string(value) + ")) & " + mask8 + ";";
+        };
+        const auto wideStore = [](uint64_t offset, uint64_t value,
+                                  std::string_view mask) {
+            return "    wideValues_[" + std::to_string(offset) + "] = (UINT64_C(" +
+                   std::to_string(value) + ")) & " + std::string(mask) + ";";
+        };
+        const uint64_t wideZeroOffset = storageOffset(wideZeroConst);
+        const uint64_t wideSparseOffset = storageOffset(wideSparseConst);
+        const uint64_t realZeroOffset = storageOffset(realZero);
+        const uint64_t realPiOffset = storageOffset(realPi);
+        const uint64_t stringOffset = storageOffset(stringInit);
+        const std::string tailMask = "((UINT64_C(1) << 2) - UINT64_C(1))";
+
+        // Baseline (switch off): every init store is emitted and the elision
+        // counters stay zero.
+        if (offResult.initZeroElisionNarrow != 0 ||
+            offResult.initZeroElisionWide != 0 || offResult.initZeroElisionReal != 0)
+        {
+            return fail("init-zero elision counted stores with the switch off");
+        }
+        if (countOccurrences(offInit, narrowStore(narrowZeroConst, 0)) != 1 ||
+            countOccurrences(offInit, narrowStore(narrowOneConst, 1)) != 1 ||
+            countOccurrences(offInit, narrowStore(narrowZeroSet, 0)) != 1 ||
+            countOccurrences(offInit, narrowStore(narrowFiveSet, 5)) != 1 ||
+            countOccurrences(offInit, "    v" + std::to_string(narrowRandom.value) +
+                                          " = (split_mix64(initRandomState)) & " +
+                                          mask8 + ";") != 1 ||
+            countOccurrences(offInit, wideStore(wideZeroOffset + 0, 0, "UINT64_MAX")) != 1 ||
+            countOccurrences(offInit, wideStore(wideZeroOffset + 1, 0, "UINT64_MAX")) != 1 ||
+            countOccurrences(offInit, wideStore(wideZeroOffset + 2, 0, tailMask)) != 1 ||
+            countOccurrences(offInit, wideStore(wideSparseOffset + 0, 0, "UINT64_MAX")) != 1 ||
+            countOccurrences(offInit, wideStore(wideSparseOffset + 1, 7, "UINT64_MAX")) != 1 ||
+            countOccurrences(offInit, wideStore(wideSparseOffset + 2, 0, tailMask)) != 1 ||
+            countOccurrences(offInit, "    realValues_[" +
+                                          std::to_string(realZeroOffset) +
+                                          "] = UINT64_C(0);") != 1 ||
+            countOccurrences(offInit, "    realValues_[" +
+                                          std::to_string(realPiOffset) +
+                                          "] = UINT64_C(4614256656552045848);") != 1 ||
+            countOccurrences(offInit, "    stringValues_[" +
+                                          std::to_string(stringOffset) +
+                                          "] = \"hi\";") != 1)
+        {
+            return fail("default emission dropped an init() store");
+        }
+
+        // Elision on: the sole-action literal-0 stores vanish (two narrow
+        // member stores, five wide zero-word stores — all three of the
+        // all-zero variable plus words 0/2 of the {0, 7, 0} sparse literal —
+        // one real store), while the non-zero action store, the random init,
+        // the sparse literal's non-zero word, the non-zero real and the
+        // string stay.
+        if (onResult.initZeroElisionNarrow != 2 ||
+            onResult.initZeroElisionWide != 5 || onResult.initZeroElisionReal != 1)
+        {
+            return fail("init-zero elision reported the wrong store counts");
+        }
+        if (countOccurrences(onInit, narrowStore(narrowZeroConst, 0)) != 0 ||
+            countOccurrences(onInit, narrowStore(narrowZeroSet, 0)) != 0 ||
+            countOccurrences(onInit, "v" + std::to_string(narrowZeroConst.value) + " =") != 0 ||
+            countOccurrences(onInit, "v" + std::to_string(narrowZeroSet.value) + " =") != 0 ||
+            countOccurrences(onInit, narrowStore(narrowOneConst, 1)) != 1 ||
+            countOccurrences(onInit, narrowStore(narrowFiveSet, 5)) != 1 ||
+            countOccurrences(onInit, "    v" + std::to_string(narrowRandom.value) +
+                                         " = (split_mix64(initRandomState)) & " +
+                                         mask8 + ";") != 1 ||
+            countOccurrences(onInit, "wideValues_[") != 1 ||
+            countOccurrences(onInit, wideStore(wideSparseOffset + 0, 0, "UINT64_MAX")) != 0 ||
+            countOccurrences(onInit, wideStore(wideSparseOffset + 1, 7, "UINT64_MAX")) != 1 ||
+            countOccurrences(onInit, wideStore(wideSparseOffset + 2, 0, tailMask)) != 0 ||
+            countOccurrences(onInit, "    realValues_[" +
+                                         std::to_string(realZeroOffset) +
+                                         "] = UINT64_C(0);") != 0 ||
+            countOccurrences(onInit, "    realValues_[" +
+                                         std::to_string(realPiOffset) +
+                                         "] = UINT64_C(4614256656552045848);") != 1 ||
+            countOccurrences(onInit, "    stringValues_[" +
+                                         std::to_string(stringOffset) +
+                                         "] = \"hi\";") != 1)
+        {
+            return fail("init-zero elision did not drop exactly the covered literal-0 stores");
+        }
+        return 0;
+    }
+
     // NO0008 production-form fusion: same-select muxes lowered into an
     // AmGraph, scheduled through graphToProgram (split -> tree-atom fold ->
     // partition -> materialize), then emitted. The pinned outputs keep each
@@ -4539,6 +5074,13 @@ int main()
     {
         return result;
     }
+    if (const int result = testAffinityStateLayout(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-affinity-layout");
+        result != 0)
+    {
+        return result;
+    }
     if (const int result = testArrayOperations(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-array-ops");
@@ -4591,6 +5133,13 @@ int main()
     if (const int result = testBranchyMux(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-branchy-mux");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testInitZeroElision(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-init-zero-elision");
         result != 0)
     {
         return result;

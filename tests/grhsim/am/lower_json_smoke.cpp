@@ -141,8 +141,9 @@ int main(int argc, char **argv)
                      "[--dp-coarsen-atom-budget <count>] [--dp-coarsen-instr-budget <count>] [--disable-coarsening] "
                      "[--tree-atom-fold-max-instr <count>] "
                      "[--runtime-profile] [--full-evaluation] [--changed-trace] "
-                     "[--branchy-mux] [--no-trace-comments] [--wide-state-explode] "
-                     "[--guard-event-gating] "
+                     "[--branchy-mux] [--init-zero-elision] [--no-trace-comments] "
+                     "[--wide-state-explode] [--guard-event-gating] "
+                     "[--state-layout <id|affinity>] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -179,9 +180,11 @@ int main(int argc, char **argv)
     bool fullEvaluation = false;
     bool changedTrace = false;
     bool branchyMux = false;
+    bool initZeroElision = false;
     bool traceComments = true;
     bool wideStateExplode = false;
     bool guardEventGating = false;
+    std::optional<std::string> stateLayout;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
     {
@@ -430,6 +433,20 @@ int main(int argc, char **argv)
         else if (argument == "--guard-event-gating")
         {
             guardEventGating = true;
+        }
+        else if (argument == "--init-zero-elision")
+        {
+            initZeroElision = true;
+        }
+        else if (argument == "--state-layout" && index + 1 < argc)
+        {
+            const std::string_view text(argv[++index]);
+            if (text != "id" && text != "affinity")
+            {
+                std::cerr << "invalid --state-layout value: " << text << '\n';
+                return 2;
+            }
+            stateLayout = std::string(text);
         }
         else if (argument == "--no-trace-comments")
         {
@@ -720,6 +737,9 @@ int main(int argc, char **argv)
         uint64_t wideStateExploded = 0;
         uint64_t wideStateExplodedElements = 0;
         uint64_t wideStateExplodeBailed = 0;
+        uint64_t initZeroElisionNarrow = 0;
+        uint64_t initZeroElisionWide = 0;
+        uint64_t initZeroElisionReal = 0;
         if (runSchedule)
         {
             phaseStart = std::chrono::steady_clock::now();
@@ -812,6 +832,14 @@ int main(int argc, char **argv)
                 {
                     emitOptions.attributes.emplace("guardEventGating", "true");
                 }
+                if (initZeroElision)
+                {
+                    emitOptions.attributes.emplace("initZeroElision", "true");
+                }
+                if (stateLayout)
+                {
+                    emitOptions.attributes.emplace("stateLayout", *stateLayout);
+                }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,
                     emitOptions,
@@ -825,16 +853,18 @@ int main(int argc, char **argv)
                     printDiagnostics(diagnostics);
                     return 1;
                 }
-                if (wideStateExplode)
+                if (wideStateExplode || initZeroElision)
                 {
                     // The emit-success path does not flush diagnostics;
-                    // surface the explode guard-bail breakdown for
-                    // attribution (see the collectStats-gated info message
-                    // in the emitter).
+                    // surface the enabled feature's attribution summary.
                     for (const diag::Diagnostic &message : diagnostics.messages())
                     {
-                        if (message.message.find("wide-state explode stats") !=
-                            std::string::npos)
+                        if ((wideStateExplode &&
+                             message.message.find("wide-state explode stats") !=
+                                 std::string::npos) ||
+                            (initZeroElision &&
+                             message.message.find("init-zero elision") !=
+                                 std::string::npos))
                         {
                             std::cerr << message.message << '\n';
                         }
@@ -858,6 +888,9 @@ int main(int argc, char **argv)
                 wideStateExploded = emitResult.wideStateExploded;
                 wideStateExplodedElements = emitResult.wideStateExplodedElements;
                 wideStateExplodeBailed = emitResult.wideStateExplodeBailed;
+                initZeroElisionNarrow = emitResult.initZeroElisionNarrow;
+                initZeroElisionWide = emitResult.initZeroElisionWide;
+                initZeroElisionReal = emitResult.initZeroElisionReal;
             }
         }
         std::cout << "{\n"
@@ -904,6 +937,9 @@ int main(int argc, char **argv)
                   << "  \"wide_state_exploded\": " << wideStateExploded << ",\n"
                   << "  \"wide_state_exploded_elements\": " << wideStateExplodedElements << ",\n"
                   << "  \"wide_state_explode_bailed\": " << wideStateExplodeBailed << ",\n"
+                  << "  \"init_zero_elision_narrow\": " << initZeroElisionNarrow << ",\n"
+                  << "  \"init_zero_elision_wide\": " << initZeroElisionWide << ",\n"
+                  << "  \"init_zero_elision_real\": " << initZeroElisionReal << ",\n"
                   << "  \"current_rss_kib\": " << currentRssKiB() << ",\n"
                   << "  \"peak_rss_kib\": " << peakRssKiB() << '\n'
                   << "}\n";
