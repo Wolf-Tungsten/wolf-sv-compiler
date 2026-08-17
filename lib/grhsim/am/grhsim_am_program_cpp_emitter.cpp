@@ -243,6 +243,21 @@ namespace wolvrix::lib::grhsim::am
             // 64-bit activity-word granularity, avoiding empty function calls
             // and their byte-by-byte scans without changing activity updates.
             bool sourcePartActivityGuard = false;
+            // Compile-time wide-storage layout switch (attribute
+            // "wideStorageFirstTouch", default off). Wide BitVector / Array
+            // slots are packed by their first operand/result touch in
+            // scheduled Block order; untouched slots follow in VariableId
+            // order. The default keeps the historical VariableId layout.
+            bool wideStorageFirstTouch = false;
+            uint64_t wideStorageVariableCount = 0;
+            uint64_t wideStorageTouchedVariableCount = 0;
+            uint64_t wideStorageIdBlockFirstLines = 0;
+            uint64_t wideStorageFirstTouchBlockFirstLines = 0;
+            uint64_t wideStorageTouchedWords = 0;
+            uint64_t wideStorageIdTouchedSpanWords = 0;
+            uint64_t wideStorageFirstTouchTouchedSpanWords = 0;
+            uint64_t wideStorageIdTouchedPages = 0;
+            uint64_t wideStorageFirstTouchTouchedPages = 0;
             // NO0006 trace comments (GrhSimAmCppOptions::traceComments,
             // default on): per-block banner and per-atom provenance comment
             // lines in the block sources. Comment-only.
@@ -6981,6 +6996,11 @@ namespace wolvrix::lib::grhsim::am
         state.sourcePartActivityGuard =
             sourcePartActivityGuardAttribute != options.attributes.end() &&
             sourcePartActivityGuardAttribute->second == "true";
+        const auto wideStorageFirstTouchAttribute =
+            options.attributes.find("wideStorageFirstTouch");
+        state.wideStorageFirstTouch =
+            wideStorageFirstTouchAttribute != options.attributes.end() &&
+            wideStorageFirstTouchAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -7003,17 +7023,14 @@ namespace wolvrix::lib::grhsim::am
             {
                 const uint64_t words = (static_cast<uint64_t>(type.bitWidth) + 63U) / 64U;
                 const uint64_t elements = type.kind == TypeKind::Array ? type.elementCount : 1U;
-                if (words > std::numeric_limits<uint64_t>::max() / elements ||
-                    state.wideWords > std::numeric_limits<uint64_t>::max() - words * elements)
+                if (words > std::numeric_limits<uint64_t>::max() / elements)
                 {
                     diagnostics.error("AM C++ emitter wide storage size overflow: variable=" +
                                           std::to_string(index),
                                       std::string(kContext));
                     return result;
                 }
-                storage.offset = state.wideWords;
                 storage.wordCount = static_cast<uint32_t>(words);
-                state.wideWords += words * elements;
             }
             else if (type.kind == TypeKind::Real)
             {
@@ -7062,6 +7079,238 @@ namespace wolvrix::lib::grhsim::am
             }
             state.variableTypes.push_back(type);
         }
+
+        const auto isWideStorageVariable = [&](uint32_t index) {
+            const Type &type = state.variableTypes[index];
+            return (type.kind == TypeKind::BitVector && type.bitWidth > 64) ||
+                   type.kind == TypeKind::Array;
+        };
+        const auto wideStorageWords = [&](uint32_t index) {
+            const Type &type = state.variableTypes[index];
+            const uint64_t elements = type.kind == TypeKind::Array ? type.elementCount : 1U;
+            return static_cast<uint64_t>(state.variableStorage[index].wordCount) * elements;
+        };
+        std::vector<uint32_t> wideVariables;
+        wideVariables.reserve(program.variableCount() / 4U);
+        for (uint32_t index = 0; index < program.variableCount(); ++index)
+        {
+            if (isWideStorageVariable(index))
+            {
+                wideVariables.push_back(index);
+            }
+        }
+        state.wideStorageVariableCount = wideVariables.size();
+
+        std::vector<uint32_t> storageOrder;
+        std::vector<uint8_t> firstTouchSeen;
+        if (state.wideStorageFirstTouch)
+        {
+            storageOrder.reserve(wideVariables.size());
+            firstTouchSeen.assign(program.variableCount(), 0);
+            const auto addFirstTouch = [&](VariableId variable) {
+                if (variable.valid() && isWideStorageVariable(variable.value) &&
+                    firstTouchSeen[variable.value] == 0)
+                {
+                    firstTouchSeen[variable.value] = 1;
+                    storageOrder.push_back(variable.value);
+                }
+            };
+            for (uint32_t blockIndex = 0; blockIndex < model.program.blockCount(); ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                for (std::size_t position = 0; position < model.program.blockSize(block);
+                     ++position)
+                {
+                    const InstructionId instruction =
+                        model.program.blockInstruction(block, position);
+                    for (VariableId operand : program.operands(instruction))
+                    {
+                        addFirstTouch(operand);
+                    }
+                    for (VariableId resultVariable : program.results(instruction))
+                    {
+                        addFirstTouch(resultVariable);
+                    }
+                }
+            }
+            state.wideStorageTouchedVariableCount = storageOrder.size();
+            for (uint32_t index : wideVariables)
+            {
+                if (firstTouchSeen[index] == 0)
+                {
+                    storageOrder.push_back(index);
+                }
+            }
+        }
+        else
+        {
+            storageOrder = wideVariables;
+        }
+
+        const auto buildWideOffsets = [&](const std::vector<uint32_t> &order,
+                                          std::vector<uint64_t> &offsets,
+                                          uint64_t &totalWords) {
+            offsets.assign(program.variableCount(), 0);
+            totalWords = 0;
+            for (uint32_t index : order)
+            {
+                const uint64_t words = wideStorageWords(index);
+                if (totalWords > std::numeric_limits<uint64_t>::max() - words)
+                {
+                    return false;
+                }
+                offsets[index] = totalWords;
+                totalWords += words;
+            }
+            return true;
+        };
+
+        std::vector<uint64_t> selectedOffsets;
+        uint64_t selectedWideWords = 0;
+        if (!buildWideOffsets(storageOrder, selectedOffsets, selectedWideWords))
+        {
+            diagnostics.error("AM C++ emitter wide storage size overflow",
+                              std::string(kContext));
+            return result;
+        }
+
+        if (state.wideStorageFirstTouch)
+        {
+            std::vector<uint64_t> idOffsets;
+            uint64_t idWideWords = 0;
+            if (!buildWideOffsets(wideVariables, idOffsets, idWideWords) ||
+                idWideWords != selectedWideWords)
+            {
+                diagnostics.error("AM C++ emitter wide storage layout size mismatch",
+                                  std::string(kContext));
+                return result;
+            }
+            const auto blockFirstLineTouches = [&](const std::vector<uint64_t> &offsets) {
+                uint64_t alignmentSum = 0;
+                std::vector<uint32_t> stamps(program.variableCount(),
+                                             std::numeric_limits<uint32_t>::max());
+                std::vector<uint32_t> touched;
+                std::vector<uint64_t> lines;
+                for (uint32_t blockIndex = 0; blockIndex < model.program.blockCount();
+                     ++blockIndex)
+                {
+                    touched.clear();
+                    const auto addBlockTouch = [&](VariableId variable) {
+                        if (variable.valid() && isWideStorageVariable(variable.value) &&
+                            stamps[variable.value] != blockIndex)
+                        {
+                            stamps[variable.value] = blockIndex;
+                            touched.push_back(variable.value);
+                        }
+                    };
+                    const BlockId block{blockIndex};
+                    for (std::size_t position = 0;
+                         position < model.program.blockSize(block);
+                         ++position)
+                    {
+                        const InstructionId instruction =
+                            model.program.blockInstruction(block, position);
+                        for (VariableId operand : program.operands(instruction))
+                        {
+                            addBlockTouch(operand);
+                        }
+                        for (VariableId resultVariable : program.results(instruction))
+                        {
+                            addBlockTouch(resultVariable);
+                        }
+                    }
+                    lines.reserve(touched.size());
+                    for (uint64_t alignmentWords = 0; alignmentWords < 8; ++alignmentWords)
+                    {
+                        lines.clear();
+                        for (uint32_t variable : touched)
+                        {
+                            const uint64_t offset = offsets[variable];
+                            lines.push_back(offset / 8U +
+                                            ((offset % 8U + alignmentWords) / 8U));
+                        }
+                        std::sort(lines.begin(), lines.end());
+                        alignmentSum += static_cast<uint64_t>(
+                            std::unique(lines.begin(), lines.end()) - lines.begin());
+                    }
+                }
+                return (alignmentSum + 4U) / 8U;
+            };
+            state.wideStorageIdBlockFirstLines = blockFirstLineTouches(idOffsets);
+            state.wideStorageFirstTouchBlockFirstLines =
+                blockFirstLineTouches(selectedOffsets);
+
+            uint64_t idFirst = std::numeric_limits<uint64_t>::max();
+            uint64_t idEnd = 0;
+            for (uint32_t variable : wideVariables)
+            {
+                if (firstTouchSeen[variable] == 0)
+                {
+                    continue;
+                }
+                const uint64_t words = wideStorageWords(variable);
+                state.wideStorageTouchedWords += words;
+                idFirst = std::min(idFirst, idOffsets[variable]);
+                idEnd = std::max(idEnd, idOffsets[variable] + words);
+            }
+            if (state.wideStorageTouchedVariableCount != 0)
+            {
+                state.wideStorageIdTouchedSpanWords = idEnd - idFirst;
+                state.wideStorageFirstTouchTouchedSpanWords =
+                    state.wideStorageTouchedWords;
+            }
+
+            const auto touchedPages = [&](const std::vector<uint64_t> &offsets) {
+                constexpr uint64_t kPageWords = 4096U / sizeof(uint64_t);
+                std::vector<std::pair<uint64_t, uint64_t>> ranges;
+                ranges.reserve(state.wideStorageTouchedVariableCount);
+                for (uint32_t variable : wideVariables)
+                {
+                    if (firstTouchSeen[variable] == 0)
+                    {
+                        continue;
+                    }
+                    const uint64_t words = wideStorageWords(variable);
+                    ranges.emplace_back(offsets[variable] / kPageWords,
+                                        (offsets[variable] + words - 1U) / kPageWords);
+                }
+                std::sort(ranges.begin(), ranges.end());
+                uint64_t pageCount = 0;
+                uint64_t rangeFirst = 0;
+                uint64_t rangeLast = 0;
+                bool haveRange = false;
+                for (const auto &[first, last] : ranges)
+                {
+                    if (!haveRange || first > rangeLast + 1U)
+                    {
+                        if (haveRange)
+                        {
+                            pageCount += rangeLast - rangeFirst + 1U;
+                        }
+                        rangeFirst = first;
+                        rangeLast = last;
+                        haveRange = true;
+                    }
+                    else
+                    {
+                        rangeLast = std::max(rangeLast, last);
+                    }
+                }
+                if (haveRange)
+                {
+                    pageCount += rangeLast - rangeFirst + 1U;
+                }
+                return pageCount;
+            };
+            state.wideStorageIdTouchedPages = touchedPages(idOffsets);
+            state.wideStorageFirstTouchTouchedPages = touchedPages(selectedOffsets);
+        }
+
+        for (uint32_t index : wideVariables)
+        {
+            state.variableStorage[index].offset = selectedOffsets[index];
+        }
+        state.wideWords = selectedWideWords;
 
         state.referencedDpiImports.assign(program.dpiImportCount(), false);
         for (uint32_t index = 0; index < program.dpiImportCount(); ++index)
@@ -10166,6 +10415,18 @@ namespace
         result.initZeroElisionNarrow = state.initZeroElisionNarrowCount;
         result.initZeroElisionWide = state.initZeroElisionWideCount;
         result.initZeroElisionReal = state.initZeroElisionRealCount;
+        result.wideStorageVariables = state.wideStorageVariableCount;
+        result.wideStorageTouchedVariables = state.wideStorageTouchedVariableCount;
+        result.wideStorageIdBlockFirstLines = state.wideStorageIdBlockFirstLines;
+        result.wideStorageFirstTouchBlockFirstLines =
+            state.wideStorageFirstTouchBlockFirstLines;
+        result.wideStorageTouchedWords = state.wideStorageTouchedWords;
+        result.wideStorageIdTouchedSpanWords = state.wideStorageIdTouchedSpanWords;
+        result.wideStorageFirstTouchTouchedSpanWords =
+            state.wideStorageFirstTouchTouchedSpanWords;
+        result.wideStorageIdTouchedPages = state.wideStorageIdTouchedPages;
+        result.wideStorageFirstTouchTouchedPages =
+            state.wideStorageFirstTouchTouchedPages;
         result.artifacts.reserve(stagedArtifacts.size());
         for (const StagedArtifact &artifact : stagedArtifacts)
         {
