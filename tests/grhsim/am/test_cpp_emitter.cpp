@@ -3125,6 +3125,7 @@ int main()
         LinearProgramBuilder linear;
         const TypeId u1Type = linear.addType(Type::bitVector(1));
         const TypeId u8Type = linear.addType(Type::bitVector(8));
+        const TypeId s8Type = linear.addType(Type::bitVector(8, Signedness::Signed));
         const TypeId u72Type = linear.addType(Type::bitVector(72));
 
         ProgramInterface interface;
@@ -3168,6 +3169,15 @@ int main()
         const VariableId r3 = addOutput(u8Type, "r3");
         const VariableId w2 = addOutput(u72Type, "w2");
         const VariableId mo = addOutput(u8Type, "mo");
+        const VariableId signedLt = addOutput(u1Type, "signed_lt");
+        const std::array<uint64_t, 1> signedNegativeWords = {UINT64_C(0xf0)};
+        const std::array<uint64_t, 1> signedPositiveWords = {UINT64_C(0x08)};
+        const VariableId signedNegative = linear.addVariable(
+            s8Type,
+            linear.addConstantInit(linear.addBitLiteral(s8Type, signedNegativeWords)));
+        const VariableId signedPositive = linear.addVariable(
+            s8Type,
+            linear.addConstantInit(linear.addBitLiteral(s8Type, signedPositiveWords)));
         const VariableId tmp = linear.addVariable(u8Type, linear.undefInit());
         const VariableId w1 = linear.addVariable(u72Type, linear.undefInit());
         const VariableId cone = linear.addVariable(u8Type, linear.undefInit());
@@ -3180,6 +3190,8 @@ int main()
         const InstructionId wide1 = addInstruction(Opcode::Mux, {w1}, {sel, wideA, wideB});
         const InstructionId wide2 = addInstruction(Opcode::Mux, {w2}, {sel, wideB, wideA});
         const InstructionId other = addInstruction(Opcode::Mux, {mo}, {sel2, a, b});
+        const InstructionId signedCompare =
+            addInstruction(Opcode::Lt, {signedLt}, {signedNegative, signedPositive});
 
         const std::array<VariableId, 8> watched = {sel, sel2, a, b, c, d, wideA, wideB};
         ScheduledProgramBuilder scheduled(linear.finish());
@@ -3214,6 +3226,7 @@ int main()
         scheduled.appendBlockInstruction(wide1);
         scheduled.appendBlockInstruction(wide2);
         scheduled.appendBlockInstruction(other);
+        scheduled.appendBlockInstruction(signedCompare);
         scheduled.endBlock();
 
         return ExecutableModel{
@@ -3546,13 +3559,12 @@ int main()
         return 0;
     }
 
-    // resize-elision emission: with the "resizeElision" attribute on, a
-    // same-width unsigned resize_value of a stored scalar operand is an
-    // identity mask under the write-side width discipline, so the operand
-    // reference is emitted directly. Same model and semantics as
-    // testMuxRunFusion: every narrow site here is 8-bit -> 8-bit, so no
-    // resize_value may remain, while the wide arms keep their assign_words
-    // form untouched.
+    // Resize-elision emission: with the "resizeElision" attribute on, a
+    // same-width resize_value of a stored scalar operand is an identity
+    // mask under the write-side width discipline, regardless of signedness:
+    // sign extension only applies to a wider target. The model carries both
+    // unsigned muxes and an 8-bit signed constant comparison, so no narrow
+    // resize_value may remain while the wide arms keep assign_words intact.
     int testResizeElision(const std::filesystem::path &outputDirectory)
     {
         std::filesystem::remove_all(outputDirectory);
@@ -3593,14 +3605,16 @@ int main()
         const VariableId c = findPort("c");
         const VariableId d = findPort("d");
         const VariableId r2 = findPort("r2");
-        if (!a.valid() || !c.valid() || !d.valid() || !r2.valid())
+        const VariableId signedLt = findPort("signed_lt");
+        if (!a.valid() || !c.valid() || !d.valid() || !r2.valid() || !signedLt.valid())
         {
             return fail("resize-elision model lost its interface bindings");
         }
-        // Same-width unsigned sites are elided everywhere: the fused arm
-        // assigns the plain member reference, the cone keeps its bare '&',
-        // and no resize_value survives in the block source. The wide mux
-        // arms still route through assign_words.
+        // Same-width sites are elided everywhere: the fused arm assigns the
+        // plain member reference, the cone keeps its bare '&', the signed
+        // comparison uses raw constant members, and no resize_value survives
+        // in the block source. The wide mux arms still route through
+        // assign_words.
         const std::string elidedArm = "v" + std::to_string(r2.value) + " = (v" +
                                       std::to_string(c.value) + ") & ";
         const std::string elidedCone =
@@ -3610,7 +3624,7 @@ int main()
             blocksText->find(elidedCone) == std::string::npos ||
             countOccurrences(*blocksText, "assign_words(") < 4)
         {
-            return fail("AM C++ emitter did not elide the same-width unsigned resize glue");
+            return fail("AM C++ emitter did not elide the same-width resize glue");
         }
 
         const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
@@ -3629,14 +3643,16 @@ int main()
     model.wide_a = {UINT64_C(0xaaaabbbbccccdddd), UINT64_C(0x12)};
     model.wide_b = {UINT64_C(0x1111222233334444), UINT64_C(0x56)};
     model.eval();
-    if (model.r1 != 0x22 || model.r2 != 0x22 || model.r3 != 0x44 || model.mo != 0x22)
+    if (model.r1 != 0x22 || model.r2 != 0x22 || model.r3 != 0x44 || model.mo != 0x22 ||
+        model.signed_lt != 1)
         return 1;
     if (model.w2[0] != UINT64_C(0xaaaabbbbccccdddd) || model.w2[1] != UINT64_C(0x12))
         return 2;
     model.sel = 1;
     model.sel2 = 1;
     model.eval();
-    if (model.r1 != 0x00 || model.r2 != 0x33 || model.r3 != 0x11 || model.mo != 0x11)
+    if (model.r1 != 0x00 || model.r2 != 0x33 || model.r3 != 0x11 || model.mo != 0x11 ||
+        model.signed_lt != 1)
         return 3;
     if (model.w2[0] != UINT64_C(0x1111222233334444) || model.w2[1] != UINT64_C(0x56))
         return 4;

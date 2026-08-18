@@ -229,10 +229,10 @@ namespace wolvrix::lib::grhsim::am
             // faces one giant straight-line region (emit-cost NO0001 B2).
             bool branchyMux = false;
             // Compile-time resize-elision switch (attribute "resizeElision",
-            // default off). When true a same-width unsigned resize_value of a
-            // stored scalar operand emits the plain operand reference: the
-            // write-side discipline already truncates every stored scalar to
-            // its declared width, so the runtime AND is an identity mask.
+            // default off). When true a same-width resize_value of a stored
+            // scalar operand emits the plain operand reference: extension is
+            // irrelevant when the widths match, and the write-side discipline
+            // already truncates every stored scalar to its declared width.
             bool resizeElision = false;
             // Compile-time scalar-helper inlining switch (attribute
             // "inlineScalarHelpers", default off). When true the small scalar
@@ -944,13 +944,13 @@ namespace wolvrix::lib::grhsim::am
                                 Signedness signedness)
         {
             const Type &source = variableType(state, variable);
-            // resizeElision: resize_value(x, N, false, N) is an identity AND
-            // under the write-side masking discipline, and valueExpr always
-            // names stored scalar state (block local / changedResults_ slot /
-            // v<K> member) that every producer writes already truncated to
-            // the declared width, so the reference alone is exact.
-            if (state.resizeElision && signedness == Signedness::Unsigned &&
-                source.bitWidth == width)
+            // resizeElision: resize_value(x, N, signExtend, N) is an identity
+            // under the write-side masking discipline. Sign extension only
+            // applies when targetWidth exceeds sourceWidth, and valueExpr
+            // always names stored scalar state (block local / changedResults_
+            // slot / v<K> member) that every producer writes already
+            // truncated to the declared width.
+            if (state.resizeElision && source.bitWidth == width)
             {
                 return valueExpr(state, variable);
             }
