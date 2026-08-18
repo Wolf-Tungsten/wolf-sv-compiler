@@ -350,6 +350,11 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   helper 仍使用常量变量的真实存储，`init()` 与输入端口写入同样明确绕过字面量路径，
   因而不会生成 `&UINT64_C(...)` 或向字面量赋值。宽常量和其他 init kind 保持原样，
   off 时输出与既往一致。
+- `inlineScalarConstantStorageElision`（`--inline-scalar-constant-storage-elision`，默认
+  off）：与 `inlineScalarConstants` 同时开启时，进一步删除没有全局/提前读取、没有
+  地址需求且最多只跨 Block 按值读取的窄常量的 `v<K>` 成员和 `init()` store。状态写、
+  端口、host/DPI、memory/array helper 以及其他需地址的路径会被 escape/pin 分析排除；
+  读取仍由上项发射字面量，因此该开关不单独改变未满足安全条件的常量。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成

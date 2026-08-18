@@ -246,6 +246,11 @@ namespace wolvrix::lib::grhsim::am
             // masked literals at read sites. Address-taking and write sites
             // continue to use their backing storage.
             bool inlineScalarConstants = false;
+            // Compile-time scalar-constant storage-elision switch (attribute
+            // "inlineScalarConstantStorageElision", default off). When true,
+            // a safe immutable scalar constant has no backing v<K> member or
+            // init() store; reads continue through inlineScalarConstants.
+            bool inlineScalarConstantStorageElision = false;
             // NO0006 trace comments (GrhSimAmCppOptions::traceComments,
             // default on): per-block banner and per-atom provenance comment
             // lines in the block sources. Comment-only.
@@ -264,6 +269,10 @@ namespace wolvrix::lib::grhsim::am
             std::vector<bool> crossBlockChangedResults;
             std::vector<uint32_t> changedResultDenseIndex;
             uint32_t changedResultCount = 0;
+            // Scalar constants selected for literal-only storage. These are
+            // filled after escape/pointer-use analysis and consulted by both
+            // member declaration and init() emission.
+            std::vector<bool> inlineScalarConstantStorageElided;
             // First VariableId that gets a v<K> member and the total member
             // count, recorded while emitting the member declarations. Members
             // are declared without initializers (clang miscompiles the
@@ -6069,10 +6078,9 @@ namespace wolvrix::lib::grhsim::am
                 std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_WIDE_SLICE_INLINE") != nullptr;
             state.disableMaskedWriteUnroll =
                 std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_MASKED_WRITE_UNROLL") != nullptr;
-            if (std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_NARROW_LOCALS") != nullptr)
-            {
-                return;
-            }
+            state.inlineScalarConstantStorageElided.assign(variableCount, false);
+            const bool disableNarrowLocals =
+                std::getenv("WOLVRIX_GRHSIM_AM_DISABLE_NARROW_LOCALS") != nullptr;
             std::vector<uint8_t> pinWide(variableCount, 0);
             const auto pinAll = [&](std::span<const VariableId> variables) {
                 for (const VariableId variable : variables)
@@ -6194,9 +6202,32 @@ namespace wolvrix::lib::grhsim::am
             }
             for (std::size_t variable = 0; variable < variableCount; ++variable)
             {
+                // A literal-only constant is safe to remove only after every
+                // address-taking path has been pinned. The escape analysis
+                // deliberately leaves the init-only constant case clear;
+                // any state/host/port use still contributes kEscapeGlobal.
+                if (state.inlineScalarConstants &&
+                    state.inlineScalarConstantStorageElision && !disableNarrowLocals &&
+                    pinWide[variable] == 0)
+                {
+                    const uint8_t escapes = state.variableEscapeFlags[variable];
+                    if ((escapes == 0 || escapes == kEscapeCrossBlockUse) &&
+                        scalarConstantWord(
+                            state, VariableId{static_cast<uint32_t>(variable)}).has_value())
+                    {
+                        state.inlineScalarConstantStorageElided[variable] = true;
+                    }
+                }
                 if (pinWide[variable] != 0)
                 {
-                    state.narrowLocalPinned += 1;
+                    if (!disableNarrowLocals)
+                    {
+                        state.narrowLocalPinned += 1;
+                    }
+                    continue;
+                }
+                if (disableNarrowLocals)
+                {
                     continue;
                 }
                 const Type &type = state.variableTypes[variable];
@@ -7013,6 +7044,11 @@ namespace wolvrix::lib::grhsim::am
         state.inlineScalarConstants =
             inlineScalarConstantsAttribute != options.attributes.end() &&
             inlineScalarConstantsAttribute->second == "true";
+        const auto inlineScalarConstantStorageElisionAttribute =
+            options.attributes.find("inlineScalarConstantStorageElision");
+        state.inlineScalarConstantStorageElision =
+            inlineScalarConstantStorageElisionAttribute != options.attributes.end() &&
+            inlineScalarConstantStorageElisionAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -7474,7 +7510,10 @@ namespace wolvrix::lib::grhsim::am
                 continue;
             }
             const InitDescriptor &init = program.init(program.variable(VariableId{index}).init);
-            if (init.kind == InitKind::Constant || init.kind == InitKind::Actions)
+            if (init.kind == InitKind::Actions ||
+                (init.kind == InitKind::Constant &&
+                 !(state.inlineScalarConstants &&
+                   state.inlineScalarConstantStorageElision)))
             {
                 // init() assigns persistent storage slots by index.
                 state.variableEscapeFlags[index] |= kEscapeGlobal;
@@ -7880,6 +7919,11 @@ namespace wolvrix::lib::grhsim::am
                 const Type &type = state.variableTypes[index];
                 if (type.kind != TypeKind::BitVector || type.bitWidth > 64 ||
                     state.crossBlockChangedResults[index])
+                {
+                    continue;
+                }
+                if (index < state.inlineScalarConstantStorageElided.size() &&
+                    state.inlineScalarConstantStorageElided[index])
                 {
                     continue;
                 }
@@ -9161,6 +9205,11 @@ namespace
             const InitDescriptor &init = program.init(program.variable(variable).init);
             if (init.kind == InitKind::Constant)
             {
+                if (index < state.inlineScalarConstantStorageElided.size() &&
+                    state.inlineScalarConstantStorageElided[index])
+                {
+                    continue;
+                }
                 emitSetInitialization(variable,
                                       InitExpr{
                                           .kind = InitExprKind::Literal,

@@ -141,7 +141,7 @@ int main(int argc, char **argv)
                      "[--dp-coarsen-atom-budget <count>] [--dp-coarsen-instr-budget <count>] [--disable-coarsening] "
                      "[--tree-atom-fold-max-instr <count>] "
                      "[--runtime-profile] [--full-evaluation] [--changed-trace] "
-                     "[--branchy-mux] [--resize-elision] [--inline-scalar-helpers] [--inline-scalar-constants] [--branchless-activation] [--no-trace-comments] "
+                     "[--branchy-mux] [--resize-elision] [--inline-scalar-helpers] [--inline-scalar-constants] [--inline-scalar-constant-storage-elision] [--branchless-activation] [--no-trace-comments] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -181,6 +181,7 @@ int main(int argc, char **argv)
     bool resizeElision = false;
     bool inlineScalarHelpers = false;
     bool inlineScalarConstants = false;
+    bool inlineScalarConstantStorageElision = false;
     bool branchlessActivation = false;
     bool traceComments = true;
     AmOptimizeOptions amOptimize;
@@ -435,6 +436,10 @@ int main(int argc, char **argv)
         else if (argument == "--inline-scalar-constants")
         {
             inlineScalarConstants = true;
+        }
+        else if (argument == "--inline-scalar-constant-storage-elision")
+        {
+            inlineScalarConstantStorageElision = true;
         }
         else if (argument == "--branchless-activation")
         {
@@ -821,6 +826,10 @@ int main(int argc, char **argv)
                 if (inlineScalarConstants)
                 {
                     emitOptions.attributes.emplace("inlineScalarConstants", "true");
+                }
+                if (inlineScalarConstantStorageElision)
+                {
+                    emitOptions.attributes.emplace("inlineScalarConstantStorageElision", "true");
                 }
                 if (branchlessActivation)
                 {

@@ -3855,6 +3855,90 @@ int main()
         return 0;
     }
 
+    int testInlineScalarConstantStorageElision(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        ExecutableModel model = makeMuxRunEmitterModel();
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "InlineConstantStorageTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {
+                    {"inlineScalarConstants", "true"},
+                    {"inlineScalarConstantStorageElision", "true"},
+                },
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the constant-storage model");
+        }
+        const std::optional<std::string> headerText =
+            readTextFile(outputDirectory / "grhsim_InlineConstantStorageTop.hpp");
+        const std::optional<std::string> blocksText =
+            readTextFile(outputDirectory / "grhsim_InlineConstantStorageTop_blocks_0.cpp");
+        const std::optional<std::string> runtimeText =
+            readTextFile(outputDirectory / "grhsim_InlineConstantStorageTop_runtime.cpp");
+        if (!headerText || !blocksText || !runtimeText)
+        {
+            return fail("AM C++ emitter produced incomplete constant-storage artifacts");
+        }
+
+        const ProgramView program = model.program.view();
+        const auto findConstant = [&](uint64_t word) {
+            for (uint32_t index = 0; index < program.variableCount(); ++index)
+            {
+                const VariableId variable{index};
+                const VariableRecord &record = program.variable(variable);
+                const Type &type = program.type(record.type);
+                const InitDescriptor &init = program.init(record.init);
+                if (type.kind != TypeKind::BitVector || type.bitWidth != 8 ||
+                    type.signedness != Signedness::Unsigned || init.kind != InitKind::Constant)
+                {
+                    continue;
+                }
+                const LiteralView literal = program.literal(LiteralId{init.payload});
+                if (!literal.words.empty() && literal.words.front() == word)
+                {
+                    return variable;
+                }
+            }
+            return VariableId::invalid();
+        };
+        const VariableId highConstant = findConstant(UINT64_C(0xf0));
+        const VariableId lowConstant = findConstant(UINT64_C(0x08));
+        if (!highConstant.valid() || !lowConstant.valid())
+        {
+            return fail("constant-storage model lost its scalar constant fixture");
+        }
+        const std::string highDeclaration =
+            "std::uint64_t v" + std::to_string(highConstant.value) + ";";
+        const std::string lowDeclaration =
+            "std::uint64_t v" + std::to_string(lowConstant.value) + ";";
+        const std::string highStorage = "v" + std::to_string(highConstant.value);
+        const std::string lowStorage = "v" + std::to_string(lowConstant.value);
+        if (headerText->find(highDeclaration) != std::string::npos ||
+            headerText->find(lowDeclaration) != std::string::npos ||
+            runtimeText->find(highStorage + " = (") != std::string::npos ||
+            runtimeText->find(lowStorage + " = (") != std::string::npos ||
+            blocksText->find("UINT64_C(0xf0)") == std::string::npos ||
+            blocksText->find("UINT64_C(0x8)") == std::string::npos)
+        {
+            return fail("AM C++ emitter retained safe scalar constant storage");
+        }
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() + "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated constant-storage model failed to compile");
+        }
+        return 0;
+    }
+
     // NO0008 production-form fusion: same-select muxes lowered into an
     // AmGraph, scheduled through graphToProgram (split -> tree-atom fold ->
     // partition -> materialize), then emitted. The pinned outputs keep each
@@ -4474,6 +4558,13 @@ int main()
     if (const int result = testInlineScalarConstants(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-inline-constant");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testInlineScalarConstantStorageElision(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-inline-constant-storage");
         result != 0)
     {
         return result;
