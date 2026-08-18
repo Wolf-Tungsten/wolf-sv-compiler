@@ -143,7 +143,7 @@ int main(int argc, char **argv)
                      "[--runtime-profile] [--full-evaluation] [--changed-trace] "
                      "[--branchy-mux] [--resize-elision] [--init-zero-elision] "
                      "[--source-part-activity-guard] [--source-word-activity-guard] "
-                     "[--no-trace-comments] "
+                     "[--wide-storage-first-touch] [--no-trace-comments] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -184,6 +184,7 @@ int main(int argc, char **argv)
     bool initZeroElision = false;
     bool sourcePartActivityGuard = false;
     bool sourceWordActivityGuard = false;
+    bool wideStorageFirstTouch = false;
     bool traceComments = true;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
@@ -441,6 +442,10 @@ int main(int argc, char **argv)
         else if (argument == "--source-word-activity-guard")
         {
             sourceWordActivityGuard = true;
+        }
+        else if (argument == "--wide-storage-first-touch")
+        {
+            wideStorageFirstTouch = true;
         }
         else if (argument == "--no-trace-comments")
         {
@@ -731,6 +736,15 @@ int main(int argc, char **argv)
         uint64_t initZeroElisionNarrow = 0;
         uint64_t initZeroElisionWide = 0;
         uint64_t initZeroElisionReal = 0;
+        uint64_t wideStorageVariables = 0;
+        uint64_t wideStorageTouchedVariables = 0;
+        uint64_t wideStorageIdBlockFirstLines = 0;
+        uint64_t wideStorageFirstTouchBlockFirstLines = 0;
+        uint64_t wideStorageTouchedWords = 0;
+        uint64_t wideStorageIdTouchedSpanWords = 0;
+        uint64_t wideStorageFirstTouchTouchedSpanWords = 0;
+        uint64_t wideStorageIdTouchedPages = 0;
+        uint64_t wideStorageFirstTouchTouchedPages = 0;
         if (runSchedule)
         {
             phaseStart = std::chrono::steady_clock::now();
@@ -831,6 +845,10 @@ int main(int argc, char **argv)
                 {
                     emitOptions.attributes.emplace("sourceWordActivityGuard", "true");
                 }
+                if (wideStorageFirstTouch)
+                {
+                    emitOptions.attributes.emplace("wideStorageFirstTouch", "true");
+                }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,
                     emitOptions,
@@ -862,6 +880,18 @@ int main(int argc, char **argv)
                 initZeroElisionNarrow = emitResult.initZeroElisionNarrow;
                 initZeroElisionWide = emitResult.initZeroElisionWide;
                 initZeroElisionReal = emitResult.initZeroElisionReal;
+                wideStorageVariables = emitResult.wideStorageVariables;
+                wideStorageTouchedVariables = emitResult.wideStorageTouchedVariables;
+                wideStorageIdBlockFirstLines = emitResult.wideStorageIdBlockFirstLines;
+                wideStorageFirstTouchBlockFirstLines =
+                    emitResult.wideStorageFirstTouchBlockFirstLines;
+                wideStorageTouchedWords = emitResult.wideStorageTouchedWords;
+                wideStorageIdTouchedSpanWords = emitResult.wideStorageIdTouchedSpanWords;
+                wideStorageFirstTouchTouchedSpanWords =
+                    emitResult.wideStorageFirstTouchTouchedSpanWords;
+                wideStorageIdTouchedPages = emitResult.wideStorageIdTouchedPages;
+                wideStorageFirstTouchTouchedPages =
+                    emitResult.wideStorageFirstTouchTouchedPages;
                 printNewDiagnostics(diagnostics, diagnosticsCursor);
             }
         }
@@ -909,6 +939,22 @@ int main(int argc, char **argv)
                   << "  \"init_zero_elision_narrow\": " << initZeroElisionNarrow << ",\n"
                   << "  \"init_zero_elision_wide\": " << initZeroElisionWide << ",\n"
                   << "  \"init_zero_elision_real\": " << initZeroElisionReal << ",\n"
+                  << "  \"wide_storage_variables\": " << wideStorageVariables << ",\n"
+                  << "  \"wide_storage_touched_variables\": "
+                  << wideStorageTouchedVariables << ",\n"
+                  << "  \"wide_storage_id_block_first_lines\": "
+                  << wideStorageIdBlockFirstLines << ",\n"
+                  << "  \"wide_storage_first_touch_block_first_lines\": "
+                  << wideStorageFirstTouchBlockFirstLines << ",\n"
+                  << "  \"wide_storage_touched_words\": " << wideStorageTouchedWords << ",\n"
+                  << "  \"wide_storage_id_touched_span_words\": "
+                  << wideStorageIdTouchedSpanWords << ",\n"
+                  << "  \"wide_storage_first_touch_touched_span_words\": "
+                  << wideStorageFirstTouchTouchedSpanWords << ",\n"
+                  << "  \"wide_storage_id_touched_pages\": "
+                  << wideStorageIdTouchedPages << ",\n"
+                  << "  \"wide_storage_first_touch_touched_pages\": "
+                  << wideStorageFirstTouchTouchedPages << ",\n"
                   << "  \"current_rss_kib\": " << currentRssKiB() << ",\n"
                   << "  \"peak_rss_kib\": " << peakRssKiB() << '\n'
                   << "}\n";
