@@ -240,6 +240,12 @@ namespace wolvrix::lib::grhsim::am
             // every block TU can inline them. The stock out-of-line runtime
             // definitions are retained when disabled.
             bool inlineScalarHelpers = false;
+            // Compile-time scalar-constant inlining switch (attribute
+            // "inlineScalarConstants", default off). When true immutable
+            // constant-initialized bit-vectors up to 64 bits are emitted as
+            // masked literals at read sites. Address-taking and write sites
+            // continue to use their backing storage.
+            bool inlineScalarConstants = false;
             // NO0006 trace comments (GrhSimAmCppOptions::traceComments,
             // default on): per-block banner and per-atom provenance comment
             // lines in the block sources. Comment-only.
@@ -620,7 +626,10 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
-        std::string valueExpr(const EmitState &state, VariableId variable)
+        std::optional<uint64_t> scalarConstantWord(const EmitState &state,
+                                                   VariableId variable);
+
+        std::string storageValueExpr(const EmitState &state, VariableId variable)
         {
             if (isLocalValue(state, variable))
             {
@@ -648,6 +657,24 @@ namespace wolvrix::lib::grhsim::am
                 return "changedResults_[" + std::to_string(denseIndex) + "]";
             }
             return "v" + std::to_string(variable.value);
+        }
+
+        std::string valueExpr(const EmitState &state, VariableId variable)
+        {
+            if (state.inlineScalarConstants)
+            {
+                if (const std::optional<uint64_t> constant =
+                        scalarConstantWord(state, variable))
+                {
+                    const uint32_t width = state.variableTypes[variable.value].bitWidth;
+                    const uint64_t masked =
+                        width == 64
+                            ? *constant
+                            : *constant & ((uint64_t{1} << width) - uint64_t{1});
+                    return wordMaskLiteral(masked);
+                }
+            }
+            return storageValueExpr(state, variable);
         }
 
         std::string boolExpr(const EmitState &state, VariableId variable)
@@ -965,7 +992,7 @@ namespace wolvrix::lib::grhsim::am
             const Type &type = variableType(state, variable);
             return (isWideBitVector(state, variable) || type.kind == TypeKind::Array)
                        ? wideDataExpr(state, variable)
-                       : "&" + valueExpr(state, variable);
+                       : "&" + storageValueExpr(state, variable);
         }
 
         // NO0018: assign a <=64-bit slice of a wide word-array value as an
@@ -6981,6 +7008,11 @@ namespace wolvrix::lib::grhsim::am
         state.inlineScalarHelpers =
             inlineScalarHelpersAttribute != options.attributes.end() &&
             inlineScalarHelpersAttribute->second == "true";
+        const auto inlineScalarConstantsAttribute =
+            options.attributes.find("inlineScalarConstants");
+        state.inlineScalarConstants =
+            inlineScalarConstantsAttribute != options.attributes.end() &&
+            inlineScalarConstantsAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -8999,7 +9031,7 @@ namespace
                 {
                     value = "split_mix64(" + randomState + ")";
                 }
-                runtime << "    " << valueExpr(state, variable) << " = (" << value
+                runtime << "    " << storageValueExpr(state, variable) << " = (" << value
                         << ") & " << maskExpr(type.bitWidth) << ";\n";
             }
             else if (type.kind == TypeKind::BitVector)
@@ -9261,7 +9293,7 @@ namespace
             const Type &type = variableType(state, port.input);
             if (type.bitWidth <= 64)
             {
-                runtime << "    " << valueExpr(state, port.input)
+                runtime << "    " << storageValueExpr(state, port.input)
                         << " = static_cast<std::uint64_t>(" << sanitizeCppIdentifier(program.string(port.name))
                         << ") & " << maskExpr(type.bitWidth) << ";\n";
             }

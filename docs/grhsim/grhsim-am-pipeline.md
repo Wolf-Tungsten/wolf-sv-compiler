@@ -343,6 +343,13 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   不改变 helper 语义；除法、取模以及宽值/数组 helper 仍保持 outlined，避免把
   大循环复制进海量调用点。当前 CoreMark 模型静态覆盖 424,064 个 slice、
   107,130 个逻辑移位及少量 signed/算术移位站点。off 时仍发原 runtime 定义。
+- `inlineScalarConstants`（`--inline-scalar-constants`，默认 off）：把
+  `InitKind::Constant` 且宽度不超过 64 bit 的不可写 BitVector 在读取点直接发射为
+  按声明宽度掩码后的 `UINT64_C(...)` 字面量，让各 Block TU 可继续常量传播并消除
+  模型对象 load。AM validator 禁止 instruction 写常量变量；需要可寻址 word 数据的
+  helper 仍使用常量变量的真实存储，`init()` 与输入端口写入同样明确绕过字面量路径，
+  因而不会生成 `&UINT64_C(...)` 或向字面量赋值。宽常量和其他 init kind 保持原样，
+  off 时输出与既往一致。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成

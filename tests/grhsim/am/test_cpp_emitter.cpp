@@ -3168,6 +3168,15 @@ int main()
         const VariableId r3 = addOutput(u8Type, "r3");
         const VariableId w2 = addOutput(u72Type, "w2");
         const VariableId mo = addOutput(u8Type, "mo");
+        const VariableId constantLt = addOutput(u1Type, "constant_lt");
+        const std::array<uint64_t, 1> highConstantWords = {UINT64_C(0xf0)};
+        const std::array<uint64_t, 1> lowConstantWords = {UINT64_C(0x08)};
+        const VariableId highConstant = linear.addVariable(
+            u8Type,
+            linear.addConstantInit(linear.addBitLiteral(u8Type, highConstantWords)));
+        const VariableId lowConstant = linear.addVariable(
+            u8Type,
+            linear.addConstantInit(linear.addBitLiteral(u8Type, lowConstantWords)));
         const VariableId tmp = linear.addVariable(u8Type, linear.undefInit());
         const VariableId w1 = linear.addVariable(u72Type, linear.undefInit());
         const VariableId cone = linear.addVariable(u8Type, linear.undefInit());
@@ -3180,6 +3189,8 @@ int main()
         const InstructionId wide1 = addInstruction(Opcode::Mux, {w1}, {sel, wideA, wideB});
         const InstructionId wide2 = addInstruction(Opcode::Mux, {w2}, {sel, wideB, wideA});
         const InstructionId other = addInstruction(Opcode::Mux, {mo}, {sel2, a, b});
+        const InstructionId constantCompare =
+            addInstruction(Opcode::Lt, {constantLt}, {highConstant, lowConstant});
 
         const std::array<VariableId, 8> watched = {sel, sel2, a, b, c, d, wideA, wideB};
         ScheduledProgramBuilder scheduled(linear.finish());
@@ -3214,6 +3225,7 @@ int main()
         scheduled.appendBlockInstruction(wide1);
         scheduled.appendBlockInstruction(wide2);
         scheduled.appendBlockInstruction(other);
+        scheduled.appendBlockInstruction(constantCompare);
         scheduled.endBlock();
 
         return ExecutableModel{
@@ -3718,6 +3730,127 @@ int main()
         if (std::system(buildCommand.c_str()) != 0)
         {
             return fail("generated inline-scalar model failed to compile");
+        }
+        return 0;
+    }
+
+    int testInlineScalarConstants(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        ExecutableModel model = makeMuxRunEmitterModel();
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "InlineConstantTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"inlineScalarConstants", "true"}},
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the inline-constant model");
+        }
+        const std::optional<std::string> blocksText =
+            readTextFile(outputDirectory / "grhsim_InlineConstantTop_blocks_0.cpp");
+        const std::optional<std::string> runtimeText =
+            readTextFile(outputDirectory / "grhsim_InlineConstantTop_runtime.cpp");
+        if (!blocksText || !runtimeText)
+        {
+            return fail("AM C++ emitter produced incomplete inline-constant artifacts");
+        }
+
+        const ProgramView program = model.program.view();
+        const auto findPort = [&](std::string_view name) {
+            for (const PortBinding &port : model.interface.ports)
+            {
+                if (program.string(port.name) == name)
+                {
+                    return port.direction == PortDirection::Input ? port.input : port.output;
+                }
+            }
+            return VariableId::invalid();
+        };
+        const auto findConstant = [&](uint64_t word) {
+            for (uint32_t index = 0; index < program.variableCount(); ++index)
+            {
+                const VariableId variable{index};
+                const VariableRecord &record = program.variable(variable);
+                const Type &type = program.type(record.type);
+                const InitDescriptor &init = program.init(record.init);
+                if (type.kind != TypeKind::BitVector || type.bitWidth != 8 ||
+                    type.signedness != Signedness::Unsigned || init.kind != InitKind::Constant)
+                {
+                    continue;
+                }
+                const LiteralView literal = program.literal(LiteralId{init.payload});
+                if (!literal.words.empty() && literal.words.front() == word)
+                {
+                    return variable;
+                }
+            }
+            return VariableId::invalid();
+        };
+        const VariableId constantLt = findPort("constant_lt");
+        const VariableId highConstant = findConstant(UINT64_C(0xf0));
+        const VariableId lowConstant = findConstant(UINT64_C(0x08));
+        if (!constantLt.valid() || !highConstant.valid() || !lowConstant.valid())
+        {
+            return fail("inline-constant model lost its scalar constant fixture");
+        }
+
+        const std::string highStorage = "v" + std::to_string(highConstant.value);
+        const std::string lowStorage = "v" + std::to_string(lowConstant.value);
+        if (blocksText->find("UINT64_C(0xf0)") == std::string::npos ||
+            blocksText->find("UINT64_C(0x8)") == std::string::npos ||
+            blocksText->find(highStorage) != std::string::npos ||
+            blocksText->find(lowStorage) != std::string::npos ||
+            blocksText->find("&UINT64_C(") != std::string::npos ||
+            runtimeText->find(highStorage + " = (") == std::string::npos ||
+            runtimeText->find(lowStorage + " = (") == std::string::npos)
+        {
+            return fail("AM C++ emitter did not inline immutable scalar constant reads safely");
+        }
+
+        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << R"CPP(#include "grhsim_InlineConstantTop.hpp"
+int main()
+{
+    GrhSIM_InlineConstantTop model;
+    model.init();
+    model.eval();
+    return model.constant_lt == 0 ? 0 : 1;
+}
+)CPP";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the inline-constant model harness");
+        }
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated inline-constant model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (outputDirectory / "libgrhsim_InlineConstantTop.a").string() + "' -o '" +
+            harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated inline-constant model harness failed to compile");
+        }
+        const std::string runCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(runCommand.c_str()) != 0)
+        {
+            return fail("generated inline-constant model violated scalar constant semantics");
         }
         return 0;
     }
@@ -4334,6 +4467,13 @@ int main()
     if (const int result = testInlineScalarHelpers(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-inline-scalar");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testInlineScalarConstants(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-inline-constant");
         result != 0)
     {
         return result;
