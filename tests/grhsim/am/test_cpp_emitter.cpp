@@ -3734,6 +3734,52 @@ int main()
         return 0;
     }
 
+    int testInlineScalarDivModHelpers(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        ExecutableModel model = makeMuxRunEmitterModel();
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult emitResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "InlineScalarDivModTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {
+                    {"inlineScalarHelpers", "true"},
+                    {"inlineScalarDivModHelpers", "true"},
+                },
+            },
+            diagnostics);
+        if (!emitResult.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the inline div/mod model");
+        }
+        const std::optional<std::string> headerText =
+            readTextFile(outputDirectory / "grhsim_InlineScalarDivModTop.hpp");
+        const std::optional<std::string> runtimeText =
+            readTextFile(outputDirectory / "grhsim_InlineScalarDivModTop_runtime.cpp");
+        if (!headerText || !runtimeText ||
+            headerText->find("static inline std::uint64_t divide_value(") ==
+                std::string::npos ||
+            headerText->find("static inline std::uint64_t modulo_value(") ==
+                std::string::npos ||
+            runtimeText->find("::divide_value(") != std::string::npos ||
+            runtimeText->find("::modulo_value(") != std::string::npos)
+        {
+            return fail("AM C++ emitter did not move div/mod helpers into the header");
+        }
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated inline div/mod model failed to compile");
+        }
+        return 0;
+    }
+
     int testInlineScalarConstants(const std::filesystem::path &outputDirectory)
     {
         std::filesystem::remove_all(outputDirectory);
@@ -4467,6 +4513,13 @@ int main()
     if (const int result = testInlineScalarHelpers(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-inline-scalar");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testInlineScalarDivModHelpers(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-inline-scalar-divmod");
         result != 0)
     {
         return result;

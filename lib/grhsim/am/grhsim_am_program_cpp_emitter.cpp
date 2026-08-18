@@ -240,6 +240,12 @@ namespace wolvrix::lib::grhsim::am
             // every block TU can inline them. The stock out-of-line runtime
             // definitions are retained when disabled.
             bool inlineScalarHelpers = false;
+            // Compile-time scalar div/mod helper inlining switch (attribute
+            // "inlineScalarDivModHelpers", default off). The helpers stay
+            // separate from the small shift/slice group because division can
+            // expand substantially at every call site; enabling this switch
+            // lets each Block TU specialize the fixed width and signedness.
+            bool inlineScalarDivModHelpers = false;
             // Compile-time scalar-constant inlining switch (attribute
             // "inlineScalarConstants", default off). When true immutable
             // constant-initialized bit-vectors up to 64 bits are emitted as
@@ -7008,6 +7014,11 @@ namespace wolvrix::lib::grhsim::am
         state.inlineScalarHelpers =
             inlineScalarHelpersAttribute != options.attributes.end() &&
             inlineScalarHelpersAttribute->second == "true";
+        const auto inlineScalarDivModHelpersAttribute =
+            options.attributes.find("inlineScalarDivModHelpers");
+        state.inlineScalarDivModHelpers =
+            inlineScalarDivModHelpersAttribute != options.attributes.end() &&
+            inlineScalarDivModHelpersAttribute->second == "true";
         const auto inlineScalarConstantsAttribute =
             options.attributes.find("inlineScalarConstants");
         state.inlineScalarConstants =
@@ -7828,9 +7839,29 @@ namespace wolvrix::lib::grhsim::am
                    << "    static std::uint64_t shift_right(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool);\n"
                    << "    static std::uint64_t arithmetic_shift_right(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool isSigned);\n";
         }
-        header << "    static std::uint64_t divide_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned);\n"
-               << "    static std::uint64_t modulo_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned);\n"
-               << "    static constexpr std::uint64_t concat_value(std::uint64_t accumulated, std::uint32_t accumulatedWidth, std::uint64_t value, std::uint32_t valueWidth) {\n"
+        if (state.inlineScalarDivModHelpers)
+        {
+            header << "    static inline std::uint64_t divide_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned) {\n"
+                   << "        lhs &= bit_mask(width); rhs &= bit_mask(width); if (rhs == 0) return 0;\n"
+                   << "        if (!isSigned) return (lhs / rhs) & bit_mask(width);\n"
+                   << "        const std::int64_t a = signed_value(lhs, width), b = signed_value(rhs, width);\n"
+                   << "        if (width == 64 && a == std::numeric_limits<std::int64_t>::min() && b == -1) return lhs;\n"
+                   << "        return static_cast<std::uint64_t>(a / b) & bit_mask(width);\n"
+                   << "    }\n"
+                   << "    static inline std::uint64_t modulo_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned) {\n"
+                   << "        lhs &= bit_mask(width); rhs &= bit_mask(width); if (rhs == 0) return 0;\n"
+                   << "        if (!isSigned) return (lhs % rhs) & bit_mask(width);\n"
+                   << "        const std::int64_t a = signed_value(lhs, width), b = signed_value(rhs, width);\n"
+                   << "        if (width == 64 && a == std::numeric_limits<std::int64_t>::min() && b == -1) return 0;\n"
+                   << "        return static_cast<std::uint64_t>(a % b) & bit_mask(width);\n"
+                   << "    }\n";
+        }
+        else
+        {
+            header << "    static std::uint64_t divide_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned);\n"
+                   << "    static std::uint64_t modulo_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned);\n";
+        }
+        header << "    static constexpr std::uint64_t concat_value(std::uint64_t accumulated, std::uint32_t accumulatedWidth, std::uint64_t value, std::uint32_t valueWidth) {\n"
                << "        if (valueWidth >= 64) return value;\n"
                << "        return ((accumulated & bit_mask(accumulatedWidth)) << valueWidth) | (value & bit_mask(valueWidth));\n"
                << "    }\n";
@@ -8950,20 +8981,23 @@ namespace
                     << "    if (width < 64 && ((value >> (width - 1)) & 1U)) value |= ~bit_mask(width);\n"
                     << "    return static_cast<std::int64_t>(value);\n}\n";
         }
-        runtime << "std::uint64_t " << className
-               << "::divide_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned) {\n"
-               << "    lhs &= bit_mask(width); rhs &= bit_mask(width); if (rhs == 0) return 0;\n"
-               << "    if (!isSigned) return (lhs / rhs) & bit_mask(width);\n"
-               << "    const std::int64_t a = signed_value(lhs, width), b = signed_value(rhs, width);\n"
-               << "    if (width == 64 && a == std::numeric_limits<std::int64_t>::min() && b == -1) return lhs;\n"
-               << "    return static_cast<std::uint64_t>(a / b) & bit_mask(width);\n}\n"
-               << "std::uint64_t " << className
-               << "::modulo_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned) {\n"
-               << "    lhs &= bit_mask(width); rhs &= bit_mask(width); if (rhs == 0) return 0;\n"
-               << "    if (!isSigned) return (lhs % rhs) & bit_mask(width);\n"
-               << "    const std::int64_t a = signed_value(lhs, width), b = signed_value(rhs, width);\n"
-               << "    if (width == 64 && a == std::numeric_limits<std::int64_t>::min() && b == -1) return 0;\n"
-               << "    return static_cast<std::uint64_t>(a % b) & bit_mask(width);\n}\n";
+        if (!state.inlineScalarDivModHelpers)
+        {
+            runtime << "std::uint64_t " << className
+                   << "::divide_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned) {\n"
+                   << "    lhs &= bit_mask(width); rhs &= bit_mask(width); if (rhs == 0) return 0;\n"
+                   << "    if (!isSigned) return (lhs / rhs) & bit_mask(width);\n"
+                   << "    const std::int64_t a = signed_value(lhs, width), b = signed_value(rhs, width);\n"
+                   << "    if (width == 64 && a == std::numeric_limits<std::int64_t>::min() && b == -1) return lhs;\n"
+                   << "    return static_cast<std::uint64_t>(a / b) & bit_mask(width);\n}\n"
+                   << "std::uint64_t " << className
+                   << "::modulo_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned) {\n"
+                   << "    lhs &= bit_mask(width); rhs &= bit_mask(width); if (rhs == 0) return 0;\n"
+                   << "    if (!isSigned) return (lhs % rhs) & bit_mask(width);\n"
+                   << "    const std::int64_t a = signed_value(lhs, width), b = signed_value(rhs, width);\n"
+                   << "    if (width == 64 && a == std::numeric_limits<std::int64_t>::min() && b == -1) return 0;\n"
+                   << "    return static_cast<std::uint64_t>(a % b) & bit_mask(width);\n}\n";
+        }
         if (!state.inlineScalarHelpers)
         {
             runtime << "std::uint64_t " << className

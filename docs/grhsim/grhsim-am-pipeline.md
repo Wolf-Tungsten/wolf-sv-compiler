@@ -343,6 +343,11 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   不改变 helper 语义；除法、取模以及宽值/数组 helper 仍保持 outlined，避免把
   大循环复制进海量调用点。当前 CoreMark 模型静态覆盖 424,064 个 slice、
   107,130 个逻辑移位及少量 signed/算术移位站点。off 时仍发原 runtime 定义。
+- `inlineScalarDivModHelpers`（`--inline-scalar-divmod-helpers`，默认 off）：把
+  窄标量 `divide_value` / `modulo_value` 单独定义在生成头文件。每个 Block TU 因而
+  可按固定 width、signedness 与实参常量专门化除法路径；它与通用 scalar helper
+  开关分开，避免默认把较重的除法实现复制到所有调用点。除零、signed min/-1 边界
+  与结果掩码保持原 helper 语义，宽值/数组 div/mod 仍不支持。
 - `inlineScalarConstants`（`--inline-scalar-constants`，默认 off）：把
   `InitKind::Constant` 且宽度不超过 64 bit 的不可写 BitVector 在读取点直接发射为
   按声明宽度掩码后的 `UINT64_C(...)` 字面量，让各 Block TU 可继续常量传播并消除

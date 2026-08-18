@@ -141,7 +141,7 @@ int main(int argc, char **argv)
                      "[--dp-coarsen-atom-budget <count>] [--dp-coarsen-instr-budget <count>] [--disable-coarsening] "
                      "[--tree-atom-fold-max-instr <count>] "
                      "[--runtime-profile] [--full-evaluation] [--changed-trace] "
-                     "[--branchy-mux] [--resize-elision] [--inline-scalar-helpers] [--inline-scalar-constants] [--branchless-activation] [--no-trace-comments] "
+                     "[--branchy-mux] [--resize-elision] [--inline-scalar-helpers] [--inline-scalar-divmod-helpers] [--inline-scalar-constants] [--branchless-activation] [--no-trace-comments] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -180,6 +180,7 @@ int main(int argc, char **argv)
     bool branchyMux = false;
     bool resizeElision = false;
     bool inlineScalarHelpers = false;
+    bool inlineScalarDivModHelpers = false;
     bool inlineScalarConstants = false;
     bool branchlessActivation = false;
     bool traceComments = true;
@@ -431,6 +432,10 @@ int main(int argc, char **argv)
         else if (argument == "--inline-scalar-helpers")
         {
             inlineScalarHelpers = true;
+        }
+        else if (argument == "--inline-scalar-divmod-helpers")
+        {
+            inlineScalarDivModHelpers = true;
         }
         else if (argument == "--inline-scalar-constants")
         {
@@ -817,6 +822,10 @@ int main(int argc, char **argv)
                 if (inlineScalarHelpers)
                 {
                     emitOptions.attributes.emplace("inlineScalarHelpers", "true");
+                }
+                if (inlineScalarDivModHelpers)
+                {
+                    emitOptions.attributes.emplace("inlineScalarDivModHelpers", "true");
                 }
                 if (inlineScalarConstants)
                 {
