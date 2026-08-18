@@ -249,6 +249,13 @@ namespace wolvrix::lib::grhsim::am
             // are wrapped in one exact owned-bit probe. This skips empty words
             // inside an active source part while preserving byte relay.
             bool sourceWordActivityGuard = false;
+            // Compile-time source-word activity snapshot (attribute
+            // "sourceWordActivitySnapshot", default off). A scan word is
+            // loaded once into a local wordFlags value and its owned bits are
+            // cleared from activeWords_ once; byteFlags and same-word forward
+            // relays then consume that local snapshot. Full evaluation
+            // bypasses the mode.
+            bool sourceWordActivitySnapshot = false;
             // NO0006 trace comments (GrhSimAmCppOptions::traceComments,
             // default on): per-block banner and per-atom provenance comment
             // lines in the block sources. Comment-only.
@@ -337,6 +344,12 @@ namespace wolvrix::lib::grhsim::am
             // relay (entry/commit Blocks and any non-scan emission context).
             mutable int32_t scanRelayByte = -1;
             mutable uint8_t scanRelayMask = 0;
+            // Snapshot-mode relay context. The mask contains owned bits in
+            // the current word that have not reached their byte yet; forward
+            // activations may stay in local wordFlags while earlier bits fall
+            // back to the global activity bitmap.
+            mutable int32_t scanRelayWord = -1;
+            mutable uint64_t scanRelayWordMask = 0;
             // ST00010 detector-group folding: block-tail runs of
             // scheduler-materialized (changed.*, act.f/act.b) watch groups are
             // re-grouped at emit time by activation target signature. All
@@ -860,14 +873,17 @@ namespace wolvrix::lib::grhsim::am
                    valueExpr(state, watched) + " == 0)";
         }
 
-        // Splits an activation target list into the scan-local relay mask
-        // (same-byte forward targets owned by the current chunk) and the global
-        // per-word masks. Returns false on an out-of-range target.
+        // Splits an activation target list into scan-local relay masks (the
+        // current byte and, in snapshot mode, not-yet-scanned bits of the
+        // current word) and the global per-word masks. Returns false on an
+        // out-of-range target.
         bool splitActivationTargets(const EmitState &state, bool forward,
                                     std::span<const BlockId> targets, uint8_t &relayMask,
+                                    uint64_t &wordRelayMask,
                                     std::map<uint32_t, uint64_t> &masks, std::string &error)
         {
             relayMask = 0;
+            wordRelayMask = 0;
             masks.clear();
             for (const BlockId target : targets)
             {
@@ -884,6 +900,15 @@ namespace wolvrix::lib::grhsim::am
                     relayMask = static_cast<uint8_t>(relayMask | (1U << bit));
                     continue;
                 }
+                const uint32_t wordBit = target.value % 64U;
+                if (forward && state.sourceWordActivitySnapshot &&
+                    !state.fullEvaluation && state.scanRelayWord >= 0 &&
+                    target.value / 64U == static_cast<uint32_t>(state.scanRelayWord) &&
+                    ((state.scanRelayWordMask >> wordBit) & 1U) != 0)
+                {
+                    wordRelayMask |= UINT64_C(1) << wordBit;
+                    continue;
+                }
                 masks[target.value / 64U] |= UINT64_C(1) << (target.value % 64U);
             }
             return true;
@@ -898,12 +923,14 @@ namespace wolvrix::lib::grhsim::am
         // words.
         std::string emitActivationMerge(const EmitState &state, bool forward,
                                         uint8_t relayMask,
+                                        uint64_t wordRelayMask,
                                         const std::map<uint32_t, uint64_t> &masks,
                                         uint64_t originalTargetCount,
                                         const std::string &condition,
                                         bool allowBranchlessRelay)
         {
-            if (allowBranchlessRelay && forward && relayMask != 0 && masks.empty() &&
+            if (allowBranchlessRelay && forward && relayMask != 0 &&
+                wordRelayMask == 0 && masks.empty() &&
                 !state.runtimeProfile)
             {
                 return "byteFlags |= (std::uint8_t)((0U - (std::uint8_t)(" + condition +
@@ -913,6 +940,10 @@ namespace wolvrix::lib::grhsim::am
             if (relayMask != 0)
             {
                 code += "byteFlags |= " + byteMaskLiteral(relayMask) + ";\n";
+            }
+            if (wordRelayMask != 0)
+            {
+                code += "wordFlags |= " + wordMaskLiteral(wordRelayMask) + ";\n";
             }
             if (state.runtimeProfile && originalTargetCount != 0)
             {
@@ -3170,12 +3201,14 @@ namespace wolvrix::lib::grhsim::am
                     // ascending test sequence).
                     std::map<uint32_t, uint64_t> masks;
                     uint8_t relayMask = 0;
+                    uint64_t wordRelayMask = 0;
                     if (!splitActivationTargets(state, forward, attributes->targets,
-                                                relayMask, masks, error))
+                                                relayMask, wordRelayMask, masks, error))
                     {
                         return std::nullopt;
                     }
-                    return emitActivationMerge(state, forward, relayMask, masks,
+                    return emitActivationMerge(state, forward, relayMask, wordRelayMask,
+                                               masks,
                                                attributes->targets.size(),
                                                boolExpr(state, operands.front()),
                                                /*allowBranchlessRelay=*/false);
@@ -3428,12 +3461,14 @@ namespace wolvrix::lib::grhsim::am
             const EmitState::DetectorGroupPlan::Group &group = plan.groups[groupId];
             std::map<uint32_t, uint64_t> masks;
             uint8_t relayMask = 0;
+            uint64_t wordRelayMask = 0;
             if (!splitActivationTargets(state, group.forward, group.targets, relayMask,
-                                        masks, error))
+                                        wordRelayMask, masks, error))
             {
                 return std::nullopt;
             }
-            return emitActivationMerge(state, group.forward, relayMask, masks,
+            return emitActivationMerge(state, group.forward, relayMask, wordRelayMask,
+                                       masks,
                                        group.originalTargetCount,
                                        detectorGroupExpr(state, groupId),
                                        /*allowBranchlessRelay=*/true);
@@ -3991,21 +4026,30 @@ namespace wolvrix::lib::grhsim::am
 
         constexpr std::string_view kBlockSourceFunctionEpilogue = "}\n";
 
-        // One byte chunk of the static compute scan: snapshot the activity
-        // byte into a local, clear the owned bits from the global byte, then
-        // consume the snapshot with straight-line ascending bit tests (the
-        // legacy/GSIM batch idiom). Same-byte forward activations relay into
-        // the local byteFlags, so they are picked up later in the same pass.
+        // One byte chunk of the static compute scan. The legacy form loads and
+        // clears the byte through active_byte_ref; snapshot mode derives the
+        // byte from the enclosing wordFlags local. Same-byte forward
+        // activations relay into byteFlags; the fixed ascending byte order
+        // makes a per-byte clear of wordFlags unnecessary.
         // In full-evaluation mode the snapshot is forced to the owned mask, so
         // every owned block test passes unconditionally.
         std::string scanByteChunkPrologue(std::size_t byteIndex, uint8_t ownedMask,
-                                          bool fullEvaluation)
+                                          bool fullEvaluation, bool snapshotMode)
         {
             if (fullEvaluation)
             {
                 return "    {\n        std::uint8_t byteFlags = " +
                        byteMaskLiteral(ownedMask) +
                        ";\n        if (byteFlags != 0) {\n";
+            }
+            if (snapshotMode)
+            {
+                const std::size_t shift = (byteIndex % 8U) * 8U;
+                return "        {\n            std::uint8_t byteFlags = "
+                       "static_cast<std::uint8_t>(wordFlags >> " +
+                       std::to_string(shift) + ") & " +
+                       byteMaskLiteral(ownedMask) +
+                       ";\n            if (byteFlags != 0) {\n";
             }
             std::string text = "    {\n        std::uint8_t byteFlags = active_byte_ref(" +
                                std::to_string(byteIndex) + ")";
@@ -4024,9 +4068,11 @@ namespace wolvrix::lib::grhsim::am
             return text;
         }
 
-        constexpr std::string_view kScanByteChunkEpilogue =
-            "        }\n"
-            "    }\n";
+        std::string scanByteChunkEpilogue(bool snapshotMode)
+        {
+            return snapshotMode ? "            }\n        }\n"
+                                 : "        }\n    }\n";
+        }
 
         std::string scanWordActivityGuardPrologue(std::size_t wordIndex,
                                                   uint64_t ownedMask)
@@ -4035,7 +4081,21 @@ namespace wolvrix::lib::grhsim::am
                    wordMaskLiteral(ownedMask) + ") != 0) {\n";
         }
 
-        constexpr std::string_view kScanWordActivityGuardEpilogue = "    }\n";
+        std::string scanWordActivitySnapshotPrologue(std::size_t wordIndex,
+                                                     uint64_t ownedMask)
+        {
+            return "    {\n        std::uint64_t wordFlags = activeWords_[" +
+                   std::to_string(wordIndex) + "] & " +
+                   wordMaskLiteral(ownedMask) +
+                   ";\n        if (wordFlags != 0) {\n            activeWords_[" +
+                   std::to_string(wordIndex) + "] &= ~" +
+                   wordMaskLiteral(ownedMask) + ";\n";
+        }
+
+        std::string scanWordActivityEpilogue(bool snapshotMode)
+        {
+            return snapshotMode ? "        }\n    }\n" : "    }\n";
+        }
 
         std::string scanBlockTestPrologue(std::size_t blockIndex,
                                           bool runtimeProfile)
@@ -4135,6 +4195,7 @@ namespace wolvrix::lib::grhsim::am
             bool arrayWatch = false;
             bool detectorGroups = false;
             bool byteFlags = false;
+            bool wordFlags = false;
         };
 
         BlockChunkParams blockChunkParamsFor(const EmitState &state,
@@ -4159,6 +4220,9 @@ namespace wolvrix::lib::grhsim::am
             params.detectorGroups =
                 detectorPlan != nullptr && !detectorPlan->groups.empty();
             params.byteFlags = blockIndex != 0;
+            params.wordFlags = blockIndex != 0 &&
+                               state.sourceWordActivitySnapshot &&
+                               !state.fullEvaluation;
             return params;
         }
 
@@ -4214,6 +4278,10 @@ namespace wolvrix::lib::grhsim::am
             {
                 append("std::uint8_t &__restrict__ byteFlags");
             }
+            if (params.wordFlags)
+            {
+                append("std::uint64_t &__restrict__ wordFlags");
+            }
             return list;
         }
 
@@ -4262,6 +4330,10 @@ namespace wolvrix::lib::grhsim::am
             if (params.byteFlags)
             {
                 append("byteFlags");
+            }
+            if (params.wordFlags)
+            {
+                append("wordFlags");
             }
             return list;
         }
@@ -4444,10 +4516,19 @@ namespace wolvrix::lib::grhsim::am
             state.scanRelayByte = static_cast<int32_t>(blockIndex / 8U);
             state.scanRelayMask =
                 static_cast<uint8_t>(0xfeU << (blockIndex % 8U));
+            if (state.sourceWordActivitySnapshot && !state.fullEvaluation)
+            {
+                state.scanRelayWord = static_cast<int32_t>(blockIndex / 64U);
+                const uint32_t wordBit = blockIndex % 64U;
+                state.scanRelayWordMask =
+                    wordBit == 63U ? 0 : UINT64_MAX << (wordBit + 1U);
+            }
             const std::optional<uint64_t> bodyBytes =
                 measureBlockBody(model, state, blockIndex, "                ", diagnostics);
             state.scanRelayByte = -1;
             state.scanRelayMask = 0;
+            state.scanRelayWord = -1;
+            state.scanRelayWordMask = 0;
             if (!bodyBytes)
             {
                 return std::nullopt;
@@ -4614,14 +4695,21 @@ namespace wolvrix::lib::grhsim::am
                         }
                     }
                     const std::size_t scanWord = scanByte / 8U;
-                    if (state.sourceWordActivityGuard && !state.fullEvaluation &&
-                        scanWord != lastScanWord &&
+                    const bool snapshotWord =
+                        state.sourceWordActivitySnapshot && !state.fullEvaluation;
+                    const bool guardWord =
+                        state.sourceWordActivityGuard && !state.fullEvaluation && !snapshotWord;
+                    if ((snapshotWord || guardWord) && scanWord != lastScanWord &&
                         !addByteCount(
                             pendingBytes,
-                            static_cast<uint64_t>(
-                                scanWordActivityGuardPrologue(scanWord, UINT64_MAX).size()) +
+                            static_cast<uint64_t>((snapshotWord
+                                                       ? scanWordActivitySnapshotPrologue(
+                                                             scanWord, UINT64_MAX)
+                                                       : scanWordActivityGuardPrologue(
+                                                             scanWord, UINT64_MAX))
+                                                      .size()) +
                                 static_cast<uint64_t>(
-                                    kScanWordActivityGuardEpilogue.size())))
+                                    scanWordActivityEpilogue(snapshotWord).size())))
                     {
                         return false;
                     }
@@ -4629,9 +4717,10 @@ namespace wolvrix::lib::grhsim::am
                         pendingBytes,
                         static_cast<uint64_t>(
                             scanByteChunkPrologue(scanByte, ownedMask,
-                                                  state.fullEvaluation)
+                                                  state.fullEvaluation, snapshotWord)
                                 .size()) +
-                            static_cast<uint64_t>(kScanByteChunkEpilogue.size()));
+                            static_cast<uint64_t>(
+                                scanByteChunkEpilogue(snapshotWord).size()));
                 };
 
                 for (std::size_t blockIndex = firstBlock;
@@ -7045,6 +7134,11 @@ namespace wolvrix::lib::grhsim::am
         state.sourceWordActivityGuard =
             sourceWordActivityGuardAttribute != options.attributes.end() &&
             sourceWordActivityGuardAttribute->second == "true";
+        const auto sourceWordActivitySnapshotAttribute =
+            options.attributes.find("sourceWordActivitySnapshot");
+        state.sourceWordActivitySnapshot =
+            sourceWordActivitySnapshotAttribute != options.attributes.end() &&
+            sourceWordActivitySnapshotAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -10076,18 +10170,38 @@ namespace
                     for (const ScanWordChunk &wordChunk :
                          scanWordChunks(scanLo, scanHi))
                     {
+                        const bool snapshotWord =
+                            state.sourceWordActivitySnapshot && !state.fullEvaluation;
                         const bool guardWord =
-                            state.sourceWordActivityGuard && !state.fullEvaluation;
-                        if (guardWord)
+                            state.sourceWordActivityGuard && !state.fullEvaluation && !snapshotWord;
+                        if (snapshotWord)
+                        {
+                            blockSource << scanWordActivitySnapshotPrologue(
+                                wordChunk.wordIndex, wordChunk.ownedMask);
+                        }
+                        else if (guardWord)
                         {
                             blockSource << scanWordActivityGuardPrologue(
                                 wordChunk.wordIndex, wordChunk.ownedMask);
                         }
+                        state.scanRelayWord = snapshotWord
+                                                  ? static_cast<int32_t>(wordChunk.wordIndex)
+                                                  : -1;
+                        state.scanRelayWordMask = snapshotWord
+                                                      ? wordChunk.ownedMask
+                                                      : 0;
                         for (const ScanByteChunk &chunk : wordChunk.byteChunks)
                         {
+                            if (snapshotWord)
+                            {
+                                state.scanRelayWordMask &= ~(
+                                    static_cast<uint64_t>(chunk.ownedMask)
+                                    << ((chunk.byteIndex % 8U) * 8U));
+                            }
                             blockSource << scanByteChunkPrologue(chunk.byteIndex,
                                                                  chunk.ownedMask,
-                                                                 state.fullEvaluation);
+                                                                 state.fullEvaluation,
+                                                                 snapshotWord);
                             state.scanRelayByte =
                                 static_cast<int32_t>(chunk.byteIndex);
                             state.scanRelayMask = chunk.ownedMask;
@@ -10115,15 +10229,19 @@ namespace
                             {
                                 break;
                             }
-                            blockSource << kScanByteChunkEpilogue;
+                            blockSource << scanByteChunkEpilogue(snapshotWord);
                         }
+                        state.scanRelayByte = -1;
+                        state.scanRelayMask = 0;
+                        state.scanRelayWord = -1;
+                        state.scanRelayWordMask = 0;
                         if (!blocksGenerated)
                         {
                             break;
                         }
-                        if (guardWord)
+                        if (snapshotWord || guardWord)
                         {
-                            blockSource << kScanWordActivityGuardEpilogue;
+                            blockSource << scanWordActivityEpilogue(snapshotWord);
                         }
                     }
                     if (!blocksGenerated)
@@ -10151,18 +10269,38 @@ namespace
                     for (const ScanWordChunk &wordChunk :
                          scanWordChunks(commitLo, commitHi))
                     {
+                        const bool snapshotWord =
+                            state.sourceWordActivitySnapshot && !state.fullEvaluation;
                         const bool guardWord =
-                            state.sourceWordActivityGuard && !state.fullEvaluation;
-                        if (guardWord)
+                            state.sourceWordActivityGuard && !state.fullEvaluation && !snapshotWord;
+                        if (snapshotWord)
+                        {
+                            blockSource << scanWordActivitySnapshotPrologue(
+                                wordChunk.wordIndex, wordChunk.ownedMask);
+                        }
+                        else if (guardWord)
                         {
                             blockSource << scanWordActivityGuardPrologue(
                                 wordChunk.wordIndex, wordChunk.ownedMask);
                         }
+                        state.scanRelayWord = snapshotWord
+                                                  ? static_cast<int32_t>(wordChunk.wordIndex)
+                                                  : -1;
+                        state.scanRelayWordMask = snapshotWord
+                                                      ? wordChunk.ownedMask
+                                                      : 0;
                         for (const ScanByteChunk &chunk : wordChunk.byteChunks)
                         {
+                            if (snapshotWord)
+                            {
+                                state.scanRelayWordMask &= ~(
+                                    static_cast<uint64_t>(chunk.ownedMask)
+                                    << ((chunk.byteIndex % 8U) * 8U));
+                            }
                             blockSource << scanByteChunkPrologue(chunk.byteIndex,
                                                                  chunk.ownedMask,
-                                                                 state.fullEvaluation);
+                                                                 state.fullEvaluation,
+                                                                 snapshotWord);
                             state.scanRelayByte =
                                 static_cast<int32_t>(chunk.byteIndex);
                             state.scanRelayMask = chunk.ownedMask;
@@ -10191,15 +10329,19 @@ namespace
                             {
                                 break;
                             }
-                            blockSource << kScanByteChunkEpilogue;
+                            blockSource << scanByteChunkEpilogue(snapshotWord);
                         }
+                        state.scanRelayByte = -1;
+                        state.scanRelayMask = 0;
+                        state.scanRelayWord = -1;
+                        state.scanRelayWordMask = 0;
                         if (!blocksGenerated)
                         {
                             break;
                         }
-                        if (guardWord)
+                        if (snapshotWord || guardWord)
                         {
-                            blockSource << kScanWordActivityGuardEpilogue;
+                            blockSource << scanWordActivityEpilogue(snapshotWord);
                         }
                     }
                     if (!blocksGenerated)

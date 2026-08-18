@@ -2405,6 +2405,145 @@ int main()
         {
             return fail("generated guarded activity model violated activation semantics");
         }
+
+        // Source-word snapshot: consume each owned activity word with one
+        // global load/clear, then relay future bytes of that word through the
+        // local wordFlags value. blocksPerSource=80 keeps Block 64 and its
+        // targets 72/73 in one source so the fixture exercises the word-local
+        // relay, while the final source still has partial compute/commit words.
+        const std::filesystem::path snapshotDirectory = outputDirectory / "snapshot";
+        wolvrix::lib::diag::Diagnostics snapshotDiagnostics;
+        const GrhSimAmCppResult snapshotResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = snapshotDirectory,
+                .modelName = "SnapshotActivityTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {
+                    {"blocksPerSource", "80"},
+                    {"sourcePartActivityGuard", "true"},
+                    {"sourceWordActivityGuard", "true"},
+                    {"sourceWordActivitySnapshot", "true"},
+                },
+            },
+            snapshotDiagnostics);
+        if (!snapshotResult.success || snapshotDiagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate snapshot activity model");
+        }
+        const std::optional<std::string> snapshotHeader =
+            readTextFile(snapshotDirectory / "grhsim_SnapshotActivityTop.hpp");
+        const std::optional<std::string> snapshotRuntime =
+            readTextFile(snapshotDirectory / "grhsim_SnapshotActivityTop_runtime.cpp");
+        const std::optional<std::string> snapshotSource0 =
+            readTextFile(snapshotDirectory / "grhsim_SnapshotActivityTop_blocks_0.cpp");
+        const std::optional<std::string> snapshotSource1 =
+            readTextFile(snapshotDirectory / "grhsim_SnapshotActivityTop_blocks_1.cpp");
+        if (!snapshotHeader || !snapshotRuntime || !snapshotSource0 || !snapshotSource1 ||
+            snapshotHeader->find("bool has_active_blocks(std::size_t first, std::size_t end) const") ==
+                std::string::npos ||
+            snapshotRuntime->find(
+                "if (has_active_blocks(1, 80)) eval_scan_0();") ==
+                std::string::npos ||
+            snapshotSource0->find(
+                "std::uint64_t wordFlags = activeWords_[1] & UINT64_C(0xffff);") ==
+                std::string::npos ||
+            snapshotSource0->find(
+                "activeWords_[1] &= ~UINT64_C(0xffff);") ==
+                std::string::npos ||
+            snapshotSource0->find(
+                "std::uint8_t byteFlags = static_cast<std::uint8_t>(wordFlags >> 0) & UINT8_C(0xff);") ==
+                std::string::npos ||
+            snapshotSource0->find("wordFlags |= UINT64_C(0x300);") ==
+                std::string::npos ||
+            snapshotSource0->find("active_byte_ref(") != std::string::npos ||
+            snapshotSource1->find("activeWords_[2] &= ~UINT64_C(0x3);") ==
+                std::string::npos ||
+            snapshotSource1->find("activeWords_[2] &= ~UINT64_C(0x4);") ==
+                std::string::npos)
+        {
+            return fail("snapshot activity model did not preserve word-local relay ownership");
+        }
+        const std::filesystem::path snapshotHarnessPath = snapshotDirectory / "harness.cpp";
+        std::ofstream snapshotHarness(snapshotHarnessPath);
+        snapshotHarness << R"CPP(#include "grhsim_SnapshotActivityTop.hpp"
+int main()
+{
+    GrhSIM_SnapshotActivityTop model;
+    model.init();
+    model.activity_input = 0;
+    model.eval();
+    if (model.forward_output != 0 || model.backward_output != 0) return 1;
+    model.activity_input = 1;
+    model.eval();
+    if (model.forward_output != 1 || model.backward_output != 1) return 2;
+    model.eval();
+    if (model.forward_output != 1 || model.backward_output != 1) return 3;
+    model.activity_input = 0;
+    model.eval();
+    if (model.forward_output != 1 || model.backward_output != 1) return 4;
+    return 0;
+}
+)CPP";
+        snapshotHarness.close();
+        if (!snapshotHarness)
+        {
+            return fail("failed to write the snapshot activity model harness");
+        }
+        const std::string snapshotBuildCommand =
+            "make -C '" + snapshotDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(snapshotBuildCommand.c_str()) != 0)
+        {
+            return fail("generated snapshot activity model failed to compile");
+        }
+        const std::filesystem::path snapshotHarnessExecutable =
+            snapshotDirectory / "harness";
+        const std::string snapshotHarnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + snapshotDirectory.string() + "' '" +
+            snapshotHarnessPath.string() + "' '" +
+            (snapshotDirectory / "libgrhsim_SnapshotActivityTop.a").string() +
+            "' -o '" + snapshotHarnessExecutable.string() + "'";
+        if (std::system(snapshotHarnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated snapshot activity model harness failed to compile");
+        }
+        const std::string snapshotRunCommand = "'" + snapshotHarnessExecutable.string() + "'";
+        if (std::system(snapshotRunCommand.c_str()) != 0)
+        {
+            return fail("generated snapshot activity model violated activation semantics");
+        }
+
+        // fullEvaluation intentionally bypasses the snapshot path: every
+        // block test stays forced by its owned byte mask and no word-local
+        // state is introduced.
+        const std::filesystem::path fullSnapshotDirectory = snapshotDirectory / "full";
+        wolvrix::lib::diag::Diagnostics fullSnapshotDiagnostics;
+        const GrhSimAmCppResult fullSnapshotResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = fullSnapshotDirectory,
+                .modelName = "FullSnapshotActivityTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {
+                    {"blocksPerSource", "80"},
+                    {"fullEvaluation", "true"},
+                    {"sourceWordActivitySnapshot", "true"},
+                },
+            },
+            fullSnapshotDiagnostics);
+        if (!fullSnapshotResult.success || fullSnapshotDiagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate full-evaluation snapshot model");
+        }
+        const std::optional<std::string> fullSnapshotSource0 =
+            readTextFile(fullSnapshotDirectory / "grhsim_FullSnapshotActivityTop_blocks_0.cpp");
+        if (!fullSnapshotSource0 || fullSnapshotSource0->find("wordFlags") != std::string::npos ||
+            fullSnapshotSource0->find("std::uint8_t byteFlags = UINT8_C(0xfe);") ==
+                std::string::npos)
+        {
+            return fail("full evaluation did not bypass source-word snapshot emission");
+        }
         return 0;
     }
 
