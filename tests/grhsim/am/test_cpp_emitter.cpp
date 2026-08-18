@@ -1868,7 +1868,8 @@ namespace
                 .maxOutputFileBytes = 1024 * 1024,
                 .attributes = {{"blocksPerSource", "17"},
                                {"runtimeProfile", "true"},
-                               {"commitInputGating", "true"}},
+                               {"commitInputGating", "true"},
+                               {"commitInputSparseGating", "true"}},
             },
             diagnostics);
         if (!emitResult.success || diagnostics.hasError())

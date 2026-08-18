@@ -1116,6 +1116,18 @@ CLI `grhsim-am-lower-json --commit-input-gating`。开启时 stderr 汇总 gated
 tracked state 叶、producer 块、dirty 边、snapshot、受保护指令和状态写数量，并按
 unsafe/snapshot/cost 三类汇总被拒块及写站数。
 
+### 3.2.11 commit 输入稀疏成本筛选（`commitInputSparseGating`，2026-08-18）
+
+**默认 off；必须与 `commitInputGating` 同时开启。** 这是 commit 输入门控的
+成本筛选变体：对每个候选 commit gate 统计 backward slice 产生的 dirty propagation
+edge 数 `E`，以及可被 gate 跳过的尾部指令数 `W`。只有 `W >= 4 * E` 的 gate
+才启用 dirty/snapshot 门；其余块保留原有 commit event gate，不改变执行顺序、
+状态写或 activation 语义。筛选只减少低净收益 gate 的传播 store，不能近似删除
+任何状态写。
+
+CLI：`grhsim-am-lower-json --commit-input-gating --commit-input-sparse`。stderr
+额外报告被成本筛选拒绝的 block/write/dirty-edge 数，供正式评估归因。
+
 ### 3.3 临时 scheduling facts
 
 以下内容只属于 scheduler workspace，不进入 ScheduledProgram 或 session 的长期公共契约：

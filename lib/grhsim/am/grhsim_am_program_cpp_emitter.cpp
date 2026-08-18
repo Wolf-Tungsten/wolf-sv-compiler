@@ -425,6 +425,14 @@ namespace wolvrix::lib::grhsim::am
             // propagate a dirty byte from their already-fused write-point
             // comparisons; the small non-state remainder uses snapshots.
             bool commitInputGating = false;
+            // Cost-aware refinement of commit-input gating (default off):
+            // retain a gate only when its statically protected tail has at
+            // least four instructions per dirty propagation edge. Rejected
+            // blocks stay on the existing event-gate path.
+            bool commitInputSparseGating = false;
+            uint64_t commitInputSparseRejectedBlocks = 0;
+            uint64_t commitInputSparseRejectedWrites = 0;
+            uint64_t commitInputSparseRejectedEdges = 0;
             uint64_t commitInputSnapshotCount = 0;
             uint64_t commitInputGateCount = 0;
             uint64_t commitInputTrackedStateCount = 0;
@@ -5679,6 +5687,9 @@ namespace wolvrix::lib::grhsim::am
             state.commitInputGatedWrites = 0;
             state.commitInputDirtyGatesByInstruction.clear();
             state.commitInputDirtyGatesByBlock.clear();
+            state.commitInputSparseRejectedBlocks = 0;
+            state.commitInputSparseRejectedWrites = 0;
+            state.commitInputSparseRejectedEdges = 0;
             if (!state.commitInputGating || model.commitBlockBegin == 0)
             {
                 return;
@@ -5889,7 +5900,20 @@ namespace wolvrix::lib::grhsim::am
                     snapshotLeaves.push_back(variable);
                 }
                 const uint64_t workInstructions = blockSize - gate.headCount;
+                uint64_t estimatedDirtyEdges = producerBlocks.size();
+                for (const uint32_t variable : trackedStateLeaves)
+                {
+                    const auto writers = writeInstructionsByTarget.find(variable);
+                    if (writers != writeInstructionsByTarget.end())
+                    {
+                        estimatedDirtyEdges += writers->second.size();
+                    }
+                }
+                const bool sparseCostRejected =
+                    state.commitInputSparseGating && estimatedDirtyEdges != 0 &&
+                    workInstructions < estimatedDirtyEdges * UINT64_C(4);
                 if (!safe || snapshotLeaves.size() > 64U ||
+                    sparseCostRejected ||
                     workInstructions < snapshotLeaves.size() * 2U)
                 {
                     if (!safe)
@@ -5901,6 +5925,12 @@ namespace wolvrix::lib::grhsim::am
                     {
                         ++rejectedSnapshotBlocks;
                         rejectedSnapshotWrites += writeCount;
+                    }
+                    else if (sparseCostRejected)
+                    {
+                        ++state.commitInputSparseRejectedBlocks;
+                        state.commitInputSparseRejectedWrites += writeCount;
+                        state.commitInputSparseRejectedEdges += estimatedDirtyEdges;
                     }
                     else
                     {
@@ -5966,6 +5996,14 @@ namespace wolvrix::lib::grhsim::am
                       << rejectedSnapshotWrites
                       << " cost=" << rejectedCostBlocks << '/'
                       << rejectedCostWrites << '\n';
+            if (state.commitInputSparseGating)
+            {
+                std::cerr << "[commit-input-sparse] min_work_per_edge=4 rejected="
+                          << state.commitInputSparseRejectedBlocks << '/'
+                          << state.commitInputSparseRejectedWrites
+                          << " dirty_edges=" << state.commitInputSparseRejectedEdges
+                          << '\n';
+            }
         }
 
         // ST00013: plans the emit-time fusion of commit-Block tail changed.any
@@ -8382,6 +8420,11 @@ namespace wolvrix::lib::grhsim::am
         state.commitInputGating =
             commitInputGatingAttribute != options.attributes.end() &&
             commitInputGatingAttribute->second == "true";
+        const auto commitInputSparseGatingAttribute =
+            options.attributes.find("commitInputSparseGating");
+        state.commitInputSparseGating =
+            commitInputSparseGatingAttribute != options.attributes.end() &&
+            commitInputSparseGatingAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());

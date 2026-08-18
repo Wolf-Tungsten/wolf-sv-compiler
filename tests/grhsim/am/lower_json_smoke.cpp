@@ -142,7 +142,7 @@ int main(int argc, char **argv)
                      "[--tree-atom-fold-max-instr <count>] "
                      "[--runtime-profile] [--full-evaluation] [--changed-trace] "
                      "[--branchy-mux] [--no-trace-comments] [--wide-state-explode] "
-                     "[--guard-event-gating] [--commit-input-gating] "
+                     "[--guard-event-gating] [--commit-input-gating] [--commit-input-sparse] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -183,6 +183,7 @@ int main(int argc, char **argv)
     bool wideStateExplode = false;
     bool guardEventGating = false;
     bool commitInputGating = false;
+    bool commitInputSparseGating = false;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
     {
@@ -435,6 +436,11 @@ int main(int argc, char **argv)
         else if (argument == "--commit-input-gating")
         {
             commitInputGating = true;
+        }
+        else if (argument == "--commit-input-sparse")
+        {
+            commitInputGating = true;
+            commitInputSparseGating = true;
         }
         else if (argument == "--no-trace-comments")
         {
@@ -820,6 +826,10 @@ int main(int argc, char **argv)
                 if (commitInputGating)
                 {
                     emitOptions.attributes.emplace("commitInputGating", "true");
+                }
+                if (commitInputSparseGating)
+                {
+                    emitOptions.attributes.emplace("commitInputSparseGating", "true");
                 }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,
