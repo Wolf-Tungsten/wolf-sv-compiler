@@ -322,6 +322,9 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   槽的 OR），门关闭时整块跳过；机制/合格条件/语义论证见 §3.2.9。
 - `commitInputGating`（`--commit-input-gating`）：在既有 commit 事件门内继续按
   next 锥外部输入的真实变化门控状态写；机制/合格条件/语义论证见 §3.2.10。
+- `commitInputPackedDirty`（`--commit-input-packed-dirty`）：把 commit-input gate 的
+  dirty byte 改为 64 gate/word 的掩码，合并同一 producer 写向同一 word 的传播；机制
+  与语义论证见 §3.2.12。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
@@ -1127,6 +1130,27 @@ edge 数 `E`，以及可被 gate 跳过的尾部指令数 `W`。只有 `W >= 4 *
 
 CLI：`grhsim-am-lower-json --commit-input-gating --commit-input-sparse`。stderr
 额外报告被成本筛选拒绝的 block/write/dirty-edge 数，供正式评估归因。
+
+### 3.2.12 commit 输入 dirty 位图（`commitInputPackedDirty`，2026-08-19）
+
+**默认 off；开启时隐式开启 `commitInputGating`。** 每个 commit gate 原本有一个
+`std::uint8_t` dirty 槽，producer 的一条传播边会发射一次 `dirty[gate] = 1`。大模型中
+同一 producer 常向多个 gate 传播，逐边 byte store 会主导稳定路径的额外写流。
+
+该变体把 dirty 槽改为 `std::uint64_t` 位图：gate `g` 对应 word `g / 64` 的 bit
+`g % 64`。同一 instruction 或 producer block 的所有目标 gate 先按 word 合并，再发射
+一条常量掩码 `dirty[word] |= mask`；commit gate 读取自己的 bit，执行后只清自己的 bit。
+`valid` 和 snapshot 的契约不变。
+
+语义论证：每个原 dirty byte 仅表示“该 gate 自上次执行后至少收到一次传播”。位图的
+对应 bit 具有相同单调置位语义；不同 gate 占不同 bit，置位是 OR，清除只作用于当前
+gate 的 bit。因此 gate 的 `event && (!valid || dirty || snapshot_changed)` 判定、首次
+执行和跨 round 的累积/清除时序逐 gate 保持不变，只减少了多个同 word edge 的生成代码
+和运行时 store 数。
+
+CLI：`grhsim-am-lower-json --commit-input-packed-dirty`（也可显式带
+`--commit-input-gating`）。stderr 的 `dirty_storage` 表示生成的 dirty 元素数；开启
+本选项时它是 `ceil(gated / 64)` 个 word。
 
 ### 3.3 临时 scheduling facts
 

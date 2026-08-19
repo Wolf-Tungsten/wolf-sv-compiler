@@ -143,6 +143,7 @@ int main(int argc, char **argv)
                      "[--runtime-profile] [--full-evaluation] [--changed-trace] "
                      "[--branchy-mux] [--no-trace-comments] [--wide-state-explode] "
                      "[--guard-event-gating] [--commit-input-gating] [--commit-input-sparse] "
+                     "[--commit-input-packed-dirty] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -184,6 +185,7 @@ int main(int argc, char **argv)
     bool guardEventGating = false;
     bool commitInputGating = false;
     bool commitInputSparseGating = false;
+    bool commitInputPackedDirty = false;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
     {
@@ -441,6 +443,11 @@ int main(int argc, char **argv)
         {
             commitInputGating = true;
             commitInputSparseGating = true;
+        }
+        else if (argument == "--commit-input-packed-dirty")
+        {
+            commitInputGating = true;
+            commitInputPackedDirty = true;
         }
         else if (argument == "--no-trace-comments")
         {
@@ -830,6 +837,10 @@ int main(int argc, char **argv)
                 if (commitInputSparseGating)
                 {
                     emitOptions.attributes.emplace("commitInputSparseGating", "true");
+                }
+                if (commitInputPackedDirty)
+                {
+                    emitOptions.attributes.emplace("commitInputPackedDirty", "true");
                 }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,

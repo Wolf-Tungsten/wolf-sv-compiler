@@ -425,6 +425,9 @@ namespace wolvrix::lib::grhsim::am
             // propagate a dirty byte from their already-fused write-point
             // comparisons; the small non-state remainder uses snapshots.
             bool commitInputGating = false;
+            // Optional packed representation: 64 commit-gate dirty flags per
+            // word, with same-word producer edges combined into one OR mask.
+            bool commitInputPackedDirty = false;
             // Cost-aware refinement of commit-input gating (default off):
             // retain a gate only when its statically protected tail has at
             // least four instructions per dirty propagation edge. Rejected
@@ -438,6 +441,7 @@ namespace wolvrix::lib::grhsim::am
             uint64_t commitInputTrackedStateCount = 0;
             uint64_t commitInputProducerBlockCount = 0;
             uint64_t commitInputDirtyEdgeCount = 0;
+            uint64_t commitInputDirtyStorageCount = 0;
             uint64_t commitInputGatedInstructions = 0;
             uint64_t commitInputGatedWrites = 0;
             std::unordered_map<uint32_t, std::vector<uint32_t>>
@@ -739,6 +743,33 @@ namespace wolvrix::lib::grhsim::am
             return "wrChg_" + std::to_string(flag);
         }
 
+        std::string commitInputDirtyMarkList(const EmitState &state,
+                                             const std::vector<uint32_t> &gates,
+                                             std::string_view lineEnd)
+        {
+            std::string code;
+            if (state.commitInputPackedDirty)
+            {
+                std::map<uint32_t, uint64_t> masks;
+                for (const uint32_t gate : gates)
+                {
+                    masks[gate / 64U] |= UINT64_C(1) << (gate % 64U);
+                }
+                for (const auto &[word, mask] : masks)
+                {
+                    code += "commitInputDirty_[" + std::to_string(word) + "] |= " +
+                            wordMaskLiteral(mask) + ";" + std::string(lineEnd);
+                }
+                return code;
+            }
+            for (const uint32_t gate : gates)
+            {
+                code += "commitInputDirty_[" + std::to_string(gate) + "] = 1;" +
+                        std::string(lineEnd);
+            }
+            return code;
+        }
+
         std::string commitInputDirtyMarks(const EmitState &state,
                                           InstructionId instruction)
         {
@@ -748,12 +779,7 @@ namespace wolvrix::lib::grhsim::am
             {
                 return {};
             }
-            std::string code;
-            for (const uint32_t gate : entry->second)
-            {
-                code += "commitInputDirty_[" + std::to_string(gate) + "] = 1; ";
-            }
-            return code;
+            return commitInputDirtyMarkList(state, entry->second, " ");
         }
 
         std::string commitInputDirtyBlockMarks(const EmitState &state,
@@ -764,12 +790,29 @@ namespace wolvrix::lib::grhsim::am
             {
                 return {};
             }
-            std::string code;
-            for (const uint32_t gate : entry->second)
+            return commitInputDirtyMarkList(state, entry->second, "\n");
+        }
+
+        std::string commitInputDirtyTestExpr(const EmitState &state, uint64_t gate)
+        {
+            if (!state.commitInputPackedDirty)
             {
-                code += "commitInputDirty_[" + std::to_string(gate) + "] = 1;\n";
+                return "commitInputDirty_[" + std::to_string(gate) + "] != 0";
             }
-            return code;
+            const uint64_t mask = UINT64_C(1) << (gate % 64U);
+            return "(commitInputDirty_[" + std::to_string(gate / 64U) + "] & " +
+                   wordMaskLiteral(mask) + ") != 0";
+        }
+
+        std::string commitInputDirtyClearCode(const EmitState &state, uint64_t gate)
+        {
+            if (!state.commitInputPackedDirty)
+            {
+                return "commitInputDirty_[" + std::to_string(gate) + "] = 0;\n";
+            }
+            const uint64_t mask = UINT64_C(1) << (gate % 64U);
+            return "commitInputDirty_[" + std::to_string(gate / 64U) + "] &= ~" +
+                   wordMaskLiteral(mask) + ";\n";
         }
 
         // Same for the ST00011 array write-point accumulator flags.
@@ -5683,6 +5726,7 @@ namespace wolvrix::lib::grhsim::am
             state.commitInputTrackedStateCount = 0;
             state.commitInputProducerBlockCount = 0;
             state.commitInputDirtyEdgeCount = 0;
+            state.commitInputDirtyStorageCount = 0;
             state.commitInputGatedInstructions = 0;
             state.commitInputGatedWrites = 0;
             state.commitInputDirtyGatesByInstruction.clear();
@@ -5944,12 +5988,10 @@ namespace wolvrix::lib::grhsim::am
                 const uint64_t snapshotOffset = state.commitInputSnapshotCount;
                 std::string changed = "commitInputValid_[" +
                                       std::to_string(validIndex) + "] == 0 || " +
-                                      "commitInputDirty_[" +
-                                      std::to_string(validIndex) + "] != 0";
+                                      commitInputDirtyTestExpr(state, validIndex);
                 std::string refresh = "commitInputValid_[" +
                                       std::to_string(validIndex) + "] = 1;\n" +
-                                      "commitInputDirty_[" +
-                                      std::to_string(validIndex) + "] = 0;\n";
+                                      commitInputDirtyClearCode(state, validIndex);
                 uint64_t inputIndex = 0;
                 for (const uint32_t variable : snapshotLeaves)
                 {
@@ -5990,6 +6032,9 @@ namespace wolvrix::lib::grhsim::am
                 state.commitInputGatedInstructions += workInstructions;
                 state.commitInputGatedWrites += writeCount;
             }
+            state.commitInputDirtyStorageCount = state.commitInputPackedDirty
+                                                      ? (state.commitInputGateCount + 63U) / 64U
+                                                      : state.commitInputGateCount;
             std::cerr << "[commit-input-gating-bails] unsafe="
                       << rejectedUnsafeBlocks << '/' << rejectedUnsafeWrites
                       << " snapshots=" << rejectedSnapshotBlocks << '/'
@@ -8420,6 +8465,12 @@ namespace wolvrix::lib::grhsim::am
         state.commitInputGating =
             commitInputGatingAttribute != options.attributes.end() &&
             commitInputGatingAttribute->second == "true";
+        const auto commitInputPackedDirtyAttribute =
+            options.attributes.find("commitInputPackedDirty");
+        state.commitInputPackedDirty =
+            commitInputPackedDirtyAttribute != options.attributes.end() &&
+            commitInputPackedDirtyAttribute->second == "true";
+        state.commitInputGating = state.commitInputGating || state.commitInputPackedDirty;
         const auto commitInputSparseGatingAttribute =
             options.attributes.find("commitInputSparseGating");
         state.commitInputSparseGating =
@@ -8940,6 +8991,7 @@ namespace wolvrix::lib::grhsim::am
                       << " tracked_state=" << state.commitInputTrackedStateCount
                       << " producer_blocks=" << state.commitInputProducerBlockCount
                       << " dirty_edges=" << state.commitInputDirtyEdgeCount
+                      << " dirty_storage=" << state.commitInputDirtyStorageCount
                       << " snapshots=" << state.commitInputSnapshotCount
                       << " instrs=" << state.commitInputGatedInstructions
                       << " writes=" << state.commitInputGatedWrites << '\n';
@@ -9372,8 +9424,10 @@ namespace wolvrix::lib::grhsim::am
                    << "    std::array<std::uint8_t, "
                    << state.commitInputGateCount
                    << "> commitInputValid_{};\n"
-                   << "    std::array<std::uint8_t, "
-                   << state.commitInputGateCount
+                   << "    std::array<"
+                   << (state.commitInputPackedDirty ? "std::uint64_t" : "std::uint8_t")
+                   << ", "
+                   << state.commitInputDirtyStorageCount
                    << "> commitInputDirty_{};\n";
         }
         // NO0017 §5: exploded wide states — one per-element scalar array
