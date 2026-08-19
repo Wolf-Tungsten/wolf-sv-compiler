@@ -384,6 +384,15 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   top-word mask 在合法拼接区间内本就不置位越界位。`zero_words` 前导仅当所有
   操作数都是满字 store（每个 word 都被独占覆写）时消除；任何操作数回退到
   outlined 调用或 OR 形式时前导保留。off 时输出与既往逐字节一致。
+- `inlineScalarHelpers`（`--inline-scalar-helpers`，默认关）：5 个窄标量
+  helper——`signed_value` / `shift_left` / `shift_right` /
+  `arithmetic_shift_right` / `slice_value`——从「头文件纯声明 + runtime .cpp
+  类外定义」改为头文件内 `static constexpr` 定义（函数体逐字搬运，仅改写为
+  类内形态，`bit_mask` 本已是 constexpr）。动机是消除窄标量 slice / 移位 /
+  signed 比较调用点的跨 TU 调用边界，让 blocks 源里的调用点看到函数体，
+  暴露常量传播与内联机会；`divide_value` / `modulo_value` / `resized_word` /
+  `slice_array_value` 保持 outlined（后两者本身就会间接受益于头文件内
+  `slice_value` / `signed_value` 的定义可见性）。off 时输出与既往逐字节一致。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成

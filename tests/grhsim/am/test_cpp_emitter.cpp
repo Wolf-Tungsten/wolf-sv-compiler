@@ -4421,6 +4421,290 @@ int main()
         return 0;
     }
 
+    // inlineScalarHelpers fixture: one block of narrow shift / slice /
+    // signed-compare ops so the blocks source calls all five narrow scalar
+    // helpers (shift_left, shift_right, arithmetic_shift_right, slice_value,
+    // signed_value).
+    ExecutableModel makeInlineScalarHelpersModel()
+    {
+        LinearProgramBuilder linear;
+        const TypeId u1Type = linear.addType(Type::bitVector(1));
+        const TypeId u4Type = linear.addType(Type::bitVector(4));
+        const TypeId u8Type = linear.addType(Type::bitVector(8));
+        const TypeId s8Type =
+            linear.addType(Type::bitVector(8, Signedness::Signed));
+
+        const std::array<uint64_t, 1> a8Words = {UINT64_C(0xa5)};
+        const std::array<uint64_t, 1> amountWords = {UINT64_C(0x02)};
+        const std::array<uint64_t, 1> indexWords = {UINT64_C(0x03)};
+        const std::array<uint64_t, 1> negWords = {UINT64_C(0x80)};
+        const std::array<uint64_t, 1> posWords = {UINT64_C(0x05)};
+        const std::array<uint64_t, 1> negBWords = {UINT64_C(0xfe)};
+        const VariableId a8 = addBitConstant(linear, u8Type, a8Words);
+        const VariableId amount = addBitConstant(linear, u8Type, amountWords);
+        const VariableId dynIndex = addBitConstant(linear, u8Type, indexWords);
+        const VariableId neg8 = addBitConstant(linear, s8Type, negWords);
+        const VariableId posA = addBitConstant(linear, s8Type, posWords);
+        const VariableId negB = addBitConstant(linear, s8Type, negBWords);
+
+        const VariableId outShl = linear.addVariable(u8Type, linear.zeroInit());
+        const VariableId outLshr = linear.addVariable(u8Type, linear.zeroInit());
+        const VariableId outAshr = linear.addVariable(s8Type, linear.zeroInit());
+        const VariableId outSlice = linear.addVariable(u4Type, linear.zeroInit());
+        const VariableId outDslice = linear.addVariable(u4Type, linear.zeroInit());
+        const VariableId outSlt = linear.addVariable(u1Type, linear.zeroInit());
+        const auto addPure = [&](Opcode opcode, VariableId result,
+                                 std::initializer_list<VariableId> ops) {
+            const std::array<VariableId, 1> results = {result};
+            return linear.addInstruction(
+                opcode, results,
+                std::span<const VariableId>(ops.begin(), ops.size()));
+        };
+        const InstructionId staticSlice =
+            addPure(Opcode::SliceStatic, outSlice, {a8});
+        linear.setSliceStaticAttributes(staticSlice, 3);
+        const std::array<InstructionId, 6> instructions = {
+            addPure(Opcode::Shl, outShl, {a8, amount}),
+            addPure(Opcode::LogicalShr, outLshr, {a8, amount}),
+            addPure(Opcode::ArithmeticShr, outAshr, {neg8, amount}),
+            staticSlice,
+            addPure(Opcode::SliceDynamic, outDslice, {a8, dynIndex}),
+            addPure(Opcode::Lt, outSlt, {negB, posA}),
+        };
+
+        ProgramInterface interface;
+        for (const auto &[name, variable] :
+             {std::pair{"out_shl", outShl}, {"out_lshr", outLshr},
+              {"out_ashr", outAshr}, {"out_slice", outSlice},
+              {"out_dslice", outDslice}, {"out_slt", outSlt}})
+        {
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Output,
+                .output = variable,
+            });
+        }
+        ScheduledProgramBuilder scheduled(linear.finish());
+        scheduled.addBlock(instructions);
+        return ExecutableModel{
+            .program = scheduled.finish(),
+            .interface = std::move(interface),
+        };
+    }
+
+    int testInlineScalarHelpers(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        ExecutableModel model = makeInlineScalarHelpersModel();
+        const ValidationResult validation =
+            validate(model, ValidationOptions{.level = ValidationLevel::Semantic});
+        if (!validation.success())
+        {
+            return fail("inline-scalar-helpers fixture failed validation: " +
+                        validation.errors.front());
+        }
+        const auto emitModel = [&](const std::filesystem::path &directory,
+                                   std::string_view modelName, bool inlineHelpers,
+                                   bool explicitFalse) {
+            std::filesystem::remove_all(directory);
+            wolvrix::lib::diag::Diagnostics diagnostics;
+            GrhSimAmCppEmitter emitter;
+            GrhSimAmCppOptions options{
+                .outputDirectory = directory,
+                .modelName = std::string(modelName),
+                .maxOutputFileBytes = 1024 * 1024,
+            };
+            if (inlineHelpers)
+            {
+                options.attributes.emplace("inlineScalarHelpers", "true");
+            }
+            else if (explicitFalse)
+            {
+                options.attributes.emplace("inlineScalarHelpers", "false");
+            }
+            const GrhSimAmCppResult result =
+                emitter.emit(model, options, diagnostics);
+            return result.success && !diagnostics.hasError();
+        };
+        const std::filesystem::path stockDirectory = outputDirectory / "stock";
+        const std::filesystem::path offDirectory = outputDirectory / "off-false";
+        const std::filesystem::path onDirectory = outputDirectory / "on";
+        if (!emitModel(stockDirectory, "InlineScalarStockTop", false, false) ||
+            !emitModel(offDirectory, "InlineScalarStockTop", false, true) ||
+            !emitModel(onDirectory, "InlineScalarTop", true, false))
+        {
+            return fail("AM C++ emitter failed to generate the inline-scalar-helpers fixture");
+        }
+
+        // Switch off (attribute absent or explicitly "false") must produce
+        // byte-identical output.
+        std::size_t stockFileCount = 0;
+        for (const auto &entry :
+             std::filesystem::directory_iterator(stockDirectory))
+        {
+            if (!entry.is_regular_file())
+            {
+                continue;
+            }
+            ++stockFileCount;
+            const std::optional<std::string> stockText = readTextFile(entry.path());
+            const std::optional<std::string> offText =
+                readTextFile(offDirectory / entry.path().filename());
+            if (!stockText || !offText || *stockText != *offText)
+            {
+                return fail("inlineScalarHelpers=false changed the emitted bytes: " +
+                            entry.path().filename().string());
+            }
+        }
+        std::size_t offFileCount = 0;
+        for (const auto &entry : std::filesystem::directory_iterator(offDirectory))
+        {
+            if (entry.is_regular_file())
+            {
+                ++offFileCount;
+            }
+        }
+        if (stockFileCount == 0 || stockFileCount != offFileCount)
+        {
+            return fail("inlineScalarHelpers=false changed the emitted file set");
+        }
+
+        const std::optional<std::string> stockHeader =
+            readTextFile(stockDirectory / "grhsim_InlineScalarStockTop.hpp");
+        const std::optional<std::string> stockRuntime =
+            readTextFile(stockDirectory / "grhsim_InlineScalarStockTop_runtime.cpp");
+        const std::optional<std::string> onHeader =
+            readTextFile(onDirectory / "grhsim_InlineScalarTop.hpp");
+        const std::optional<std::string> onRuntime =
+            readTextFile(onDirectory / "grhsim_InlineScalarTop_runtime.cpp");
+        const std::optional<std::string> onBlocks =
+            readTextFile(onDirectory / "grhsim_InlineScalarTop_blocks_0.cpp");
+        if (!stockHeader || !stockRuntime || !onHeader || !onRuntime || !onBlocks)
+        {
+            return fail("AM C++ emitter produced no inline-scalar-helpers sources");
+        }
+        // Stock form: plain declarations in the header, out-of-class
+        // definitions in the runtime source.
+        if (countOccurrences(*stockHeader,
+                             "    static std::int64_t signed_value(std::uint64_t value, std::uint32_t width);\n") != 1 ||
+            countOccurrences(*stockHeader,
+                             "    static std::uint64_t slice_value(std::uint64_t value, std::uint64_t start, std::uint32_t width);\n") != 1 ||
+            countOccurrences(*stockHeader, "static constexpr std::uint64_t slice_value") != 0 ||
+            countOccurrences(*stockHeader, "static constexpr std::int64_t signed_value") != 0)
+        {
+            return fail("stock header lost its narrow scalar helper declarations");
+        }
+        if (countOccurrences(*stockRuntime, "::signed_value(std::uint64_t value") != 1 ||
+            countOccurrences(*stockRuntime, "::shift_left(std::uint64_t value") != 1 ||
+            countOccurrences(*stockRuntime, "::shift_right(std::uint64_t value") != 1 ||
+            countOccurrences(*stockRuntime, "::arithmetic_shift_right(std::uint64_t value") != 1 ||
+            countOccurrences(*stockRuntime, "::slice_value(std::uint64_t value") != 1)
+        {
+            return fail("stock runtime lost its narrow scalar helper definitions");
+        }
+        // Inline form: static constexpr definitions in the header, no
+        // out-of-class definitions in the runtime source, call sites in the
+        // blocks source unchanged.
+        if (countOccurrences(*onHeader, "static constexpr std::int64_t signed_value(std::uint64_t value, std::uint32_t width) {") != 1 ||
+            countOccurrences(*onHeader, "static constexpr std::uint64_t shift_left(std::uint64_t value") != 1 ||
+            countOccurrences(*onHeader, "static constexpr std::uint64_t shift_right(std::uint64_t value") != 1 ||
+            countOccurrences(*onHeader, "static constexpr std::uint64_t arithmetic_shift_right(std::uint64_t value") != 1 ||
+            countOccurrences(*onHeader, "static constexpr std::uint64_t slice_value(std::uint64_t value") != 1)
+        {
+            return fail("inline-scalar-helpers header lost its constexpr helper definitions");
+        }
+        if (countOccurrences(*onRuntime, "::signed_value(") != 0 ||
+            countOccurrences(*onRuntime, "::shift_left(") != 0 ||
+            countOccurrences(*onRuntime, "::shift_right(") != 0 ||
+            countOccurrences(*onRuntime, "::arithmetic_shift_right(") != 0 ||
+            countOccurrences(*onRuntime, "::slice_value(") != 0)
+        {
+            return fail("inline-scalar-helpers runtime kept an outlined helper definition");
+        }
+        // divide_value / modulo_value / slice_array_value stay outlined.
+        if (countOccurrences(*onRuntime, "::divide_value(") != 1 ||
+            countOccurrences(*onRuntime, "::modulo_value(") != 1 ||
+            countOccurrences(*onRuntime, "::slice_array_value(") != 1)
+        {
+            return fail("inline-scalar-helpers runtime lost an outlined helper");
+        }
+        if (countOccurrences(*onBlocks, "shift_left(") < 1 ||
+            countOccurrences(*onBlocks, "arithmetic_shift_right(") < 1 ||
+            countOccurrences(*onBlocks, "slice_value(") < 2 ||
+            countOccurrences(*onBlocks, "signed_value(") < 2)
+        {
+            return fail("inline-scalar-helpers blocks source lost its helper call sites");
+        }
+
+        // Semantics: both the stock and the inline model must produce the
+        // same outputs.
+        const auto harnessBody = [](std::string_view headerName,
+                                    std::string_view className) {
+            return std::string("#include \"") + std::string(headerName) +
+                   "\"\n#include <cstdint>\n"
+                   "int main()\n"
+                   "{\n"
+                   "    " +
+                   std::string(className) +
+                   " model;\n"
+                   "    model.init();\n"
+                   "    model.eval();\n"
+                   "    if (static_cast<std::uint64_t>(model.out_shl) != UINT64_C(0x94)) return 1;\n"
+                   "    if (static_cast<std::uint64_t>(model.out_lshr) != UINT64_C(0x29)) return 2;\n"
+                   "    if (static_cast<std::uint64_t>(model.out_ashr) != UINT64_C(0xe0)) return 3;\n"
+                   "    if (static_cast<std::uint64_t>(model.out_slice) != UINT64_C(0x4)) return 4;\n"
+                   "    if (static_cast<std::uint64_t>(model.out_dslice) != UINT64_C(0x4)) return 5;\n"
+                   "    if (static_cast<std::uint64_t>(model.out_slt) != UINT64_C(0x1)) return 6;\n"
+                   "    return 0;\n}\n";
+        };
+        const auto buildAndRun = [&](const std::filesystem::path &directory,
+                                     std::string_view modelName,
+                                     std::string_view failPrefix) {
+            const std::filesystem::path harnessPath = directory / "harness.cpp";
+            std::ofstream harness(harnessPath);
+            harness << harnessBody("grhsim_" + std::string(modelName) + ".hpp",
+                                   "GrhSIM_" + std::string(modelName));
+            harness.close();
+            if (!harness)
+            {
+                return fail(std::string(failPrefix) + ": failed to write the harness");
+            }
+            const std::string buildCommand =
+                "make -C '" + directory.string() +
+                "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+            if (std::system(buildCommand.c_str()) != 0)
+            {
+                return fail(std::string(failPrefix) +
+                            ": generated model failed to compile");
+            }
+            const std::filesystem::path harnessExecutable = directory / "harness";
+            const std::string harnessCompileCommand =
+                "clang++ -std=c++20 -O2 -I'" + directory.string() + "' '" +
+                harnessPath.string() + "' '" +
+                (directory / ("libgrhsim_" + std::string(modelName) + ".a")).string() +
+                "' -o '" + harnessExecutable.string() + "'";
+            if (std::system(harnessCompileCommand.c_str()) != 0)
+            {
+                return fail(std::string(failPrefix) +
+                            ": harness failed to compile");
+            }
+            const std::string runCommand = "'" + harnessExecutable.string() + "'";
+            if (std::system(runCommand.c_str()) != 0)
+            {
+                return fail(std::string(failPrefix) +
+                            ": generated-model semantics changed");
+            }
+            return 0;
+        };
+        if (const int result =
+                buildAndRun(stockDirectory, "InlineScalarStockTop", "stock");
+            result != 0)
+        {
+            return result;
+        }
+        return buildAndRun(onDirectory, "InlineScalarTop", "inline-scalar-helpers");
+    }
+
     // NO0008 production-form fusion: same-select muxes lowered into an
     // AmGraph, scheduled through graphToProgram (split -> tree-atom fold ->
     // partition -> materialize), then emitted. The pinned outputs keep each
@@ -5047,6 +5331,13 @@ int main()
     if (const int result = testConcatInsertInline(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-concat-insert-inline");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testInlineScalarHelpers(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-inline-scalar-helpers");
         result != 0)
     {
         return result;

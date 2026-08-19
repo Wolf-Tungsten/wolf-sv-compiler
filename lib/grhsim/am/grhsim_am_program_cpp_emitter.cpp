@@ -257,6 +257,15 @@ namespace wolvrix::lib::grhsim::am
             // zero_words preamble becomes dead once every operand stores full
             // aligned words directly.
             bool concatInsertInline = false;
+            // Compile-time narrow scalar helper inlining (attribute
+            // "inlineScalarHelpers", default off). signed_value / shift_left /
+            // shift_right / arithmetic_shift_right / slice_value are defined
+            // as static constexpr members in the generated header instead of
+            // outlined in the runtime source, removing the cross-TU call
+            // boundary and exposing constant propagation at narrow slice /
+            // shift / signed-compare sites. With the switch off the output is
+            // byte-identical to the stock form.
+            bool inlineScalarHelpers = false;
             // Compile-time wide-storage layout switch (attribute
             // "wideStorageFirstTouch", default off). Wide BitVector / Array
             // slots are packed by their first operand/result touch in
@@ -7245,6 +7254,11 @@ namespace wolvrix::lib::grhsim::am
         state.concatInsertInline =
             concatInsertInlineAttribute != options.attributes.end() &&
             concatInsertInlineAttribute->second == "true";
+        const auto inlineScalarHelpersAttribute =
+            options.attributes.find("inlineScalarHelpers");
+        state.inlineScalarHelpers =
+            inlineScalarHelpersAttribute != options.attributes.end() &&
+            inlineScalarHelpersAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -8280,18 +8294,58 @@ namespace wolvrix::lib::grhsim::am
                << "        value &= bit_mask(sourceWidth);\n"
                << "        if (signExtend && sourceWidth < targetWidth && ((value >> (sourceWidth - 1)) & 1U)) value |= ~bit_mask(sourceWidth);\n"
                << "        return value & bit_mask(targetWidth);\n"
-               << "    }\n"
-               << "    static std::int64_t signed_value(std::uint64_t value, std::uint32_t width);\n"
-               << "    static std::uint64_t divide_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned);\n"
-               << "    static std::uint64_t modulo_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned);\n"
-               << "    static std::uint64_t shift_left(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool);\n"
-               << "    static std::uint64_t shift_right(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool);\n"
-               << "    static std::uint64_t arithmetic_shift_right(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool isSigned);\n"
+               << "    }\n";
+        // inlineScalarHelpers: define the narrow scalar helpers as static
+        // constexpr members in the header so call sites in the blocks sources
+        // see the body (cross-TU boundary removed); off keeps the stock
+        // declaration + runtime definition split.
+        if (state.inlineScalarHelpers)
+        {
+            header << "    static constexpr std::int64_t signed_value(std::uint64_t value, std::uint32_t width) {\n"
+                   << "        value &= bit_mask(width);\n"
+                   << "        if (width < 64 && ((value >> (width - 1)) & 1U)) value |= ~bit_mask(width);\n"
+                   << "        return static_cast<std::int64_t>(value);\n"
+                   << "    }\n";
+        }
+        else
+        {
+            header << "    static std::int64_t signed_value(std::uint64_t value, std::uint32_t width);\n";
+        }
+        header << "    static std::uint64_t divide_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned);\n"
+               << "    static std::uint64_t modulo_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned);\n";
+        if (state.inlineScalarHelpers)
+        {
+            header << "    static constexpr std::uint64_t shift_left(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool) { return amount >= width ? 0 : (value << amount) & bit_mask(width); }\n"
+                   << "    static constexpr std::uint64_t shift_right(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool) { return amount >= width ? 0 : (value & bit_mask(width)) >> amount; }\n"
+                   << "    static constexpr std::uint64_t arithmetic_shift_right(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool isSigned) {\n"
+                   << "        if (!isSigned) return shift_right(value, amount, width, false);\n"
+                   << "        const bool negative = ((value >> (width - 1)) & 1U) != 0;\n"
+                   << "        if (amount >= width) return negative ? bit_mask(width) : 0;\n"
+                   << "        if (!negative || amount == 0) return shift_right(value, amount, width, false);\n"
+                   << "        const std::uint64_t fill = width == 64 ? (~UINT64_C(0) << (64 - amount)) : (bit_mask(static_cast<std::uint32_t>(amount)) << (width - amount));\n"
+                   << "        return (shift_right(value, amount, width, false) | fill) & bit_mask(width);\n"
+                   << "    }\n";
+        }
+        else
+        {
+            header << "    static std::uint64_t shift_left(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool);\n"
+                   << "    static std::uint64_t shift_right(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool);\n"
+                   << "    static std::uint64_t arithmetic_shift_right(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool isSigned);\n";
+        }
+        header
                << "    static constexpr std::uint64_t concat_value(std::uint64_t accumulated, std::uint32_t accumulatedWidth, std::uint64_t value, std::uint32_t valueWidth) {\n"
                << "        if (valueWidth >= 64) return value;\n"
                << "        return ((accumulated & bit_mask(accumulatedWidth)) << valueWidth) | (value & bit_mask(valueWidth));\n"
-               << "    }\n"
-               << "    static std::uint64_t slice_value(std::uint64_t value, std::uint64_t start, std::uint32_t width);\n"
+               << "    }\n";
+        if (state.inlineScalarHelpers)
+        {
+            header << "    static constexpr std::uint64_t slice_value(std::uint64_t value, std::uint64_t start, std::uint32_t width) { return start >= 64 ? 0 : (value >> start) & bit_mask(width); }\n";
+        }
+        else
+        {
+            header << "    static std::uint64_t slice_value(std::uint64_t value, std::uint64_t start, std::uint32_t width);\n";
+        }
+        header
                << "    static std::uint64_t slice_array_value(std::uint64_t value, std::uint64_t index, std::uint32_t width, std::uint32_t baseWidth);\n"
                << "    static constexpr std::size_t kBlockCount = " << blockCount << ";\n"
                << "    static constexpr std::size_t kCommitBlockBegin = "
@@ -9380,13 +9434,19 @@ namespace
                << "    std::uint64_t value = state;\n"
                << "    value = (value ^ (value >> 30U)) * UINT64_C(0xbf58476d1ce4e5b9);\n"
                << "    value = (value ^ (value >> 27U)) * UINT64_C(0x94d049bb133111eb);\n"
-               << "    return value ^ (value >> 31U);\n}\n"
-               << "std::int64_t " << className
-               << "::signed_value(std::uint64_t value, std::uint32_t width) {\n"
-               << "    value &= bit_mask(width);\n"
-               << "    if (width < 64 && ((value >> (width - 1)) & 1U)) value |= ~bit_mask(width);\n"
-               << "    return static_cast<std::int64_t>(value);\n}\n"
-               << "std::uint64_t " << className
+               << "    return value ^ (value >> 31U);\n}\n";
+        // inlineScalarHelpers: the five narrow scalar helpers live in the
+        // header as static constexpr members, so their out-of-class runtime
+        // definitions are skipped (off keeps the stock outlined form).
+        if (!state.inlineScalarHelpers)
+        {
+            runtime << "std::int64_t " << className
+                    << "::signed_value(std::uint64_t value, std::uint32_t width) {\n"
+                    << "    value &= bit_mask(width);\n"
+                    << "    if (width < 64 && ((value >> (width - 1)) & 1U)) value |= ~bit_mask(width);\n"
+                    << "    return static_cast<std::int64_t>(value);\n}\n";
+        }
+        runtime << "std::uint64_t " << className
                << "::divide_value(std::uint64_t lhs, std::uint64_t rhs, std::uint32_t width, bool isSigned) {\n"
                << "    lhs &= bit_mask(width); rhs &= bit_mask(width); if (rhs == 0) return 0;\n"
                << "    if (!isSigned) return (lhs / rhs) & bit_mask(width);\n"
@@ -9399,22 +9459,25 @@ namespace
                << "    if (!isSigned) return (lhs % rhs) & bit_mask(width);\n"
                << "    const std::int64_t a = signed_value(lhs, width), b = signed_value(rhs, width);\n"
                << "    if (width == 64 && a == std::numeric_limits<std::int64_t>::min() && b == -1) return 0;\n"
-               << "    return static_cast<std::uint64_t>(a % b) & bit_mask(width);\n}\n"
-               << "std::uint64_t " << className
-               << "::shift_left(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool) { return amount >= width ? 0 : (value << amount) & bit_mask(width); }\n"
-               << "std::uint64_t " << className
-               << "::shift_right(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool) { return amount >= width ? 0 : (value & bit_mask(width)) >> amount; }\n"
-               << "std::uint64_t " << className
-               << "::arithmetic_shift_right(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool isSigned) {\n"
-               << "    if (!isSigned) return shift_right(value, amount, width, false);\n"
-               << "    const bool negative = ((value >> (width - 1)) & 1U) != 0;\n"
-               << "    if (amount >= width) return negative ? bit_mask(width) : 0;\n"
-               << "    if (!negative || amount == 0) return shift_right(value, amount, width, false);\n"
-               << "    const std::uint64_t fill = width == 64 ? (~UINT64_C(0) << (64 - amount)) : (bit_mask(static_cast<std::uint32_t>(amount)) << (width - amount));\n"
-               << "    return (shift_right(value, amount, width, false) | fill) & bit_mask(width);\n}\n"
-               << "std::uint64_t " << className
-               << "::slice_value(std::uint64_t value, std::uint64_t start, std::uint32_t width) { return start >= 64 ? 0 : (value >> start) & bit_mask(width); }\n"
-               << "std::uint64_t " << className
+               << "    return static_cast<std::uint64_t>(a % b) & bit_mask(width);\n}\n";
+        if (!state.inlineScalarHelpers)
+        {
+            runtime << "std::uint64_t " << className
+                    << "::shift_left(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool) { return amount >= width ? 0 : (value << amount) & bit_mask(width); }\n"
+                    << "std::uint64_t " << className
+                    << "::shift_right(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool) { return amount >= width ? 0 : (value & bit_mask(width)) >> amount; }\n"
+                    << "std::uint64_t " << className
+                    << "::arithmetic_shift_right(std::uint64_t value, std::uint64_t amount, std::uint32_t width, bool isSigned) {\n"
+                    << "    if (!isSigned) return shift_right(value, amount, width, false);\n"
+                    << "    const bool negative = ((value >> (width - 1)) & 1U) != 0;\n"
+                    << "    if (amount >= width) return negative ? bit_mask(width) : 0;\n"
+                    << "    if (!negative || amount == 0) return shift_right(value, amount, width, false);\n"
+                    << "    const std::uint64_t fill = width == 64 ? (~UINT64_C(0) << (64 - amount)) : (bit_mask(static_cast<std::uint32_t>(amount)) << (width - amount));\n"
+                    << "    return (shift_right(value, amount, width, false) | fill) & bit_mask(width);\n}\n"
+                    << "std::uint64_t " << className
+                    << "::slice_value(std::uint64_t value, std::uint64_t start, std::uint32_t width) { return start >= 64 ? 0 : (value >> start) & bit_mask(width); }\n";
+        }
+        runtime << "std::uint64_t " << className
                << "::slice_array_value(std::uint64_t value, std::uint64_t index, std::uint32_t width, std::uint32_t baseWidth) {\n"
                << "    if (width == 0 || index >= (baseWidth + width - 1) / width) return 0;\n"
                << "    return slice_value(value, index * width, width);\n}\n\n"

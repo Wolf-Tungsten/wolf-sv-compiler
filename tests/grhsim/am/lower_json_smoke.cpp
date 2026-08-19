@@ -143,7 +143,7 @@ int main(int argc, char **argv)
                      "[--runtime-profile] [--full-evaluation] [--changed-trace] "
                      "[--branchy-mux] [--resize-elision] [--init-zero-elision] "
                      "[--source-part-activity-guard] [--source-word-activity-guard] "
-                     "[--wide-storage-first-touch] [--no-trace-comments] "
+                     "[--wide-storage-first-touch] [--inline-scalar-helpers] [--no-trace-comments] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -186,6 +186,7 @@ int main(int argc, char **argv)
     bool sourceWordActivityGuard = false;
     bool wideStorageFirstTouch = false;
     bool concatInsertInline = false;
+    bool inlineScalarHelpers = false;
     bool traceComments = true;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
@@ -451,6 +452,10 @@ int main(int argc, char **argv)
         else if (argument == "--concat-insert-inline")
         {
             concatInsertInline = true;
+        }
+        else if (argument == "--inline-scalar-helpers")
+        {
+            inlineScalarHelpers = true;
         }
         else if (argument == "--no-trace-comments")
         {
@@ -857,6 +862,10 @@ int main(int argc, char **argv)
                 if (concatInsertInline)
                 {
                     emitOptions.attributes.emplace("concatInsertInline", "true");
+                }
+                if (inlineScalarHelpers)
+                {
+                    emitOptions.attributes.emplace("inlineScalarHelpers", "true");
                 }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,
