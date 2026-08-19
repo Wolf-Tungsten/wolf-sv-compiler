@@ -322,6 +322,9 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   槽的 OR），门关闭时整块跳过；机制/合格条件/语义论证见 §3.2.9。
 - `commitInputGating`（`--commit-input-gating`）：在既有 commit 事件门内继续按
   next 锥外部输入的真实变化门控状态写；机制/合格条件/语义论证见 §3.2.10。
+- `commitInputProducerChangeGating`（`--commit-input-producer-change`，隐含开启
+  `--commit-input-gating`）：producer compute 块执行后比较其窄标量输出快照，只有
+  输出真实变化才向依赖 commit gate 传播 dirty；机制/回退条件见 §3.2.12。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
@@ -1127,6 +1130,23 @@ edge 数 `E`，以及可被 gate 跳过的尾部指令数 `W`。只有 `W >= 4 *
 
 CLI：`grhsim-am-lower-json --commit-input-gating --commit-input-sparse`。stderr
 额外报告被成本筛选拒绝的 block/write/dirty-edge 数，供正式评估归因。
+
+### 3.2.12 producer 输出变化门控（`commitInputProducerChangeGating`，2026-08-19）
+
+**默认 off；必须与 `commitInputGating` 同时开启。** 基础 commit 输入门控在
+producer compute 块执行时无条件置位依赖 gate 的 `commitInputDirty_`，即使该块本轮
+重新算出的输出与上次相同。该变体为每个合格 producer 的窄 BitVector 输出建立一个
+共享快照槽，在 producer 块体执行完成后比较并更新；仅当任一输出真实变化时才置位
+该块连接的 dirty gates。快照槽与 commit 输入 snapshot 共用数组，`init()` 仍统一清零。
+
+启用时，producer 叶必须是 64 位以内 BitVector；宽值、非标量值和其他不满足条件的
+commit gate 保留基础事件门路径。首次 commit 仍由 `commitInputValid_ == 0` 强制开放，
+所以 producer 输出初值为零也不会丢失首次状态写；之后快照只记录 producer 最近一次
+实际执行结果，多个 producer 执行间的 dirty 置位保持幂等。
+
+CLI：`grhsim-am-lower-json --commit-input-producer-change`（自动同时开启
+`--commit-input-gating`）。stderr 的 `[commit-input-gating]` 汇总行增加
+`producer_change=1`，便于区分该候选与基础门控。
 
 ### 3.3 临时 scheduling facts
 

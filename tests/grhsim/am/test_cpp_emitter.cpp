@@ -1868,7 +1868,8 @@ namespace
                 .maxOutputFileBytes = 1024 * 1024,
                 .attributes = {{"blocksPerSource", "17"},
                                {"runtimeProfile", "true"},
-                               {"commitInputGating", "true"}},
+                               {"commitInputGating", "true"},
+                               {"commitInputProducerChangeGating", "true"}},
             },
             diagnostics);
         if (!emitResult.success || diagnostics.hasError())
@@ -2183,6 +2184,16 @@ namespace
                                      ";") == std::string::npos)
         {
             return fail("generated activity runtime did not fold detector groups");
+        }
+        const std::string producerChanged =
+            "commitInputProducerChanged_" + std::to_string(64);
+        if (headerText->find("commitInputSnapshots_") == std::string::npos ||
+            generatedSourceText.find(producerChanged) == std::string::npos ||
+            generatedSourceText.find("commitInputSnapshots_[") == std::string::npos ||
+            generatedSourceText.find("if (" + producerChanged + ") {") ==
+                std::string::npos)
+        {
+            return fail("producer-change commit input gating was not emitted");
         }
         // Per-Block profile counters move into the dispatch form: scan Blocks
         // count at the top of their bit-test branch, the commit Block counts

@@ -425,6 +425,11 @@ namespace wolvrix::lib::grhsim::am
             // propagate a dirty byte from their already-fused write-point
             // comparisons; the small non-state remainder uses snapshots.
             bool commitInputGating = false;
+            // Producer-block refinement (GrhSimAmCppOptions attribute
+            // "commitInputProducerChangeGating", default off): compare
+            // narrow producer outputs after the block executes and propagate
+            // dirty only when an output really changed.
+            bool commitInputProducerChangeGating = false;
             // Cost-aware refinement of commit-input gating (default off):
             // retain a gate only when its statically protected tail has at
             // least four instructions per dirty propagation edge. Rejected
@@ -444,6 +449,13 @@ namespace wolvrix::lib::grhsim::am
                 commitInputDirtyGatesByInstruction;
             std::unordered_map<uint32_t, std::vector<uint32_t>>
                 commitInputDirtyGatesByBlock;
+            struct CommitInputProducerWatch
+            {
+                uint32_t variable = 0;
+                uint32_t snapshot = 0;
+            };
+            std::unordered_map<uint32_t, std::vector<CommitInputProducerWatch>>
+                commitInputProducerWatchesByBlock;
             // Guard-event gating (GrhSimAmCppOptions attribute
             // "guardEventGating", default off): a pure guard Block is a
             // compute Block whose only observable effects are event-gated
@@ -759,6 +771,10 @@ namespace wolvrix::lib::grhsim::am
         std::string commitInputDirtyBlockMarks(const EmitState &state,
                                                uint32_t block)
         {
+            if (state.commitInputProducerChangeGating)
+            {
+                return {};
+            }
             const auto entry = state.commitInputDirtyGatesByBlock.find(block);
             if (entry == state.commitInputDirtyGatesByBlock.end())
             {
@@ -769,6 +785,41 @@ namespace wolvrix::lib::grhsim::am
             {
                 code += "commitInputDirty_[" + std::to_string(gate) + "] = 1;\n";
             }
+            return code;
+        }
+
+        std::string commitInputProducerChangeMarks(const EmitState &state,
+                                                   uint32_t block)
+        {
+            if (!state.commitInputProducerChangeGating)
+            {
+                return {};
+            }
+            const auto watches = state.commitInputProducerWatchesByBlock.find(block);
+            const auto gates = state.commitInputDirtyGatesByBlock.find(block);
+            if (watches == state.commitInputProducerWatchesByBlock.end() ||
+                gates == state.commitInputDirtyGatesByBlock.end() ||
+                watches->second.empty() || gates->second.empty())
+            {
+                return {};
+            }
+            const std::string changed =
+                "commitInputProducerChanged_" + std::to_string(block);
+            std::string code = "bool " + changed + " = false;\n";
+            for (const EmitState::CommitInputProducerWatch &watch : watches->second)
+            {
+                const std::string snapshot =
+                    "commitInputSnapshots_[" + std::to_string(watch.snapshot) + "]";
+                const std::string value = valueExpr(state, VariableId{watch.variable});
+                code += "if (" + snapshot + " != " + value + ") { " + snapshot +
+                        " = " + value + "; " + changed + " = true; }\n";
+            }
+            code += "if (" + changed + ") {\n";
+            for (const uint32_t gate : gates->second)
+            {
+                code += "commitInputDirty_[" + std::to_string(gate) + "] = 1;\n";
+            }
+            code += "}\n";
             return code;
         }
 
@@ -5687,6 +5738,7 @@ namespace wolvrix::lib::grhsim::am
             state.commitInputGatedWrites = 0;
             state.commitInputDirtyGatesByInstruction.clear();
             state.commitInputDirtyGatesByBlock.clear();
+            state.commitInputProducerWatchesByBlock.clear();
             state.commitInputSparseRejectedBlocks = 0;
             state.commitInputSparseRejectedWrites = 0;
             state.commitInputSparseRejectedEdges = 0;
@@ -5700,6 +5752,7 @@ namespace wolvrix::lib::grhsim::am
             uint64_t rejectedSnapshotWrites = 0;
             uint64_t rejectedCostBlocks = 0;
             uint64_t rejectedCostWrites = 0;
+            std::map<uint32_t, std::set<uint32_t>> producerVariablesByBlock;
 
             const std::size_t variableCount = state.program.variableCount();
             std::vector<uint8_t> mutableOrExternal(variableCount, 0);
@@ -5888,6 +5941,15 @@ namespace wolvrix::lib::grhsim::am
                         definitionBlock != 0 &&
                         definitionBlock < model.commitBlockBegin)
                     {
+                        if (state.commitInputProducerChangeGating)
+                        {
+                            const Type &type = state.variableTypes[variable];
+                            if (type.kind != TypeKind::BitVector || type.bitWidth > 64)
+                            {
+                                safe = false;
+                                continue;
+                            }
+                        }
                         producerBlocks.insert(definitionBlock);
                         continue;
                     }
@@ -5940,6 +6002,22 @@ namespace wolvrix::lib::grhsim::am
                     continue;
                 }
 
+                if (state.commitInputProducerChangeGating)
+                {
+                    for (const uint32_t variable : leaves)
+                    {
+                        const uint32_t definitionBlock =
+                            state.variableDefBlock[variable];
+                        if (stateTargetSeen[variable] == 0 &&
+                            definitionBlock != kInvalidLocalityBlock &&
+                            definitionBlock != 0 &&
+                            definitionBlock < model.commitBlockBegin)
+                        {
+                            producerVariablesByBlock[definitionBlock].insert(variable);
+                        }
+                    }
+                }
+
                 const uint64_t validIndex = state.commitInputGateCount;
                 const uint64_t snapshotOffset = state.commitInputSnapshotCount;
                 std::string changed = "commitInputValid_[" +
@@ -5989,6 +6067,21 @@ namespace wolvrix::lib::grhsim::am
                 ++state.commitInputGateCount;
                 state.commitInputGatedInstructions += workInstructions;
                 state.commitInputGatedWrites += writeCount;
+            }
+            if (state.commitInputProducerChangeGating)
+            {
+                for (const auto &[producer, variables] : producerVariablesByBlock)
+                {
+                    auto &watches = state.commitInputProducerWatchesByBlock[producer];
+                    for (const uint32_t variable : variables)
+                    {
+                        watches.push_back(EmitState::CommitInputProducerWatch{
+                            .variable = variable,
+                            .snapshot = static_cast<uint32_t>(state.commitInputSnapshotCount),
+                        });
+                        ++state.commitInputSnapshotCount;
+                    }
+                }
             }
             std::cerr << "[commit-input-gating-bails] unsafe="
                       << rejectedUnsafeBlocks << '/' << rejectedUnsafeWrites
@@ -8420,6 +8513,12 @@ namespace wolvrix::lib::grhsim::am
         state.commitInputGating =
             commitInputGatingAttribute != options.attributes.end() &&
             commitInputGatingAttribute->second == "true";
+        const auto commitInputProducerChangeAttribute =
+            options.attributes.find("commitInputProducerChangeGating");
+        state.commitInputProducerChangeGating =
+            state.commitInputGating &&
+            commitInputProducerChangeAttribute != options.attributes.end() &&
+            commitInputProducerChangeAttribute->second == "true";
         const auto commitInputSparseGatingAttribute =
             options.attributes.find("commitInputSparseGating");
         state.commitInputSparseGating =
@@ -8942,7 +9041,9 @@ namespace wolvrix::lib::grhsim::am
                       << " dirty_edges=" << state.commitInputDirtyEdgeCount
                       << " snapshots=" << state.commitInputSnapshotCount
                       << " instrs=" << state.commitInputGatedInstructions
-                      << " writes=" << state.commitInputGatedWrites << '\n';
+                      << " writes=" << state.commitInputGatedWrites
+                      << " producer_change="
+                      << (state.commitInputProducerChangeGating ? 1 : 0) << '\n';
         }
         // Guard-event gating (attribute "guardEventGating", default off):
         // pure fatal-guard compute Blocks get a scan-site event gate over
@@ -11304,6 +11405,11 @@ namespace
                     {
                         blockSource << indentation << "}\n";
                     }
+                    writeIndentedLines(
+                        blockSource,
+                        commitInputProducerChangeMarks(
+                            state, static_cast<uint32_t>(blockIndex)),
+                        indentation);
                     endLocalityBlock(state);
                     return true;
                 };
@@ -11492,6 +11598,11 @@ namespace
                     {
                         blockSource << indentation << "}\n";
                     }
+                    writeIndentedLines(
+                        blockSource,
+                        commitInputProducerChangeMarks(
+                            state, static_cast<uint32_t>(blockIndex)),
+                        indentation);
                     state.activeChunkedBlock = kInvalidLocalityBlock;
                     endLocalityBlock(state);
                     return true;
