@@ -4705,6 +4705,346 @@ int main()
         return buildAndRun(onDirectory, "InlineScalarTop", "inline-scalar-helpers");
     }
 
+    // concatInsertUnroll fixture: wide Concat / Replicate builds whose
+    // operands miss the single-word inline form, plus a 256-bit window chain
+    // (head + 3 steps) exercising the replace forms. out_aligned_256 and
+    // out_rep_384 hit aligned full-word copies (Case A, dead zero preambles),
+    // out_cross_80 a narrow word-crossing insert (Case B orForm),
+    // out_wide_136 / out_wide_164 wide insert unrolls (Case C orForm,
+    // partial top words), and out_huge_1152's 576-bit operands stay outlined
+    // (more than 8 source words). Chain step 1 carries a narrow crossing
+    // replace (Case B), steps 2/3 wide replace unrolls (Case C, full and
+    // partial top source words).
+    ExecutableModel makeConcatInsertUnrollModel()
+    {
+        LinearProgramBuilder linear;
+        const TypeId u8Type = linear.addType(Type::bitVector(8));
+        const TypeId u32Type = linear.addType(Type::bitVector(32));
+        const TypeId u40Type = linear.addType(Type::bitVector(40));
+        const TypeId u48Type = linear.addType(Type::bitVector(48));
+        const TypeId u56Type = linear.addType(Type::bitVector(56));
+        const TypeId u64Type = linear.addType(Type::bitVector(64));
+        const TypeId u80Type = linear.addType(Type::bitVector(80));
+        const TypeId u96Type = linear.addType(Type::bitVector(96));
+        const TypeId u100Type = linear.addType(Type::bitVector(100));
+        const TypeId u128Type = linear.addType(Type::bitVector(128));
+        const TypeId u136Type = linear.addType(Type::bitVector(136));
+        const TypeId u164Type = linear.addType(Type::bitVector(164));
+        const TypeId u184Type = linear.addType(Type::bitVector(184));
+        const TypeId u256Type = linear.addType(Type::bitVector(256));
+        const TypeId u384Type = linear.addType(Type::bitVector(384));
+        const TypeId u576Type = linear.addType(Type::bitVector(576));
+        const TypeId u1152Type = linear.addType(Type::bitVector(1152));
+
+        const std::array<uint64_t, 1> a8Words = {UINT64_C(0xa5)};
+        const std::array<uint64_t, 1> a32Words = {UINT64_C(0x89abcdef)};
+        const std::array<uint64_t, 1> b48Words = {UINT64_C(0x0123456789ab)};
+        const std::array<uint64_t, 1> e40Words = {UINT64_C(0xa5a5a5a5a5)};
+        const std::array<uint64_t, 1> e56Words = {UINT64_C(0x0123456789abcd)};
+        const std::array<uint64_t, 1> b64Words = {UINT64_C(0xfedcba9876543210)};
+        const std::array<uint64_t, 1> h0Words = {UINT64_C(0x1111111111111111)};
+        const std::array<uint64_t, 1> h1Words = {UINT64_C(0x2222222222222222)};
+        const std::array<uint64_t, 1> h2Words = {UINT64_C(0x3333333333333333)};
+        const std::array<uint64_t, 1> h3Words = {UINT64_C(0x4444444444444444)};
+        const std::array<uint64_t, 1> e32aWords = {UINT64_C(0x55555555)};
+        const std::array<uint64_t, 1> e32bWords = {UINT64_C(0x66666666)};
+        const std::array<uint64_t, 2> c100Words = {UINT64_C(0xdeadbeefcafef00d),
+                                                   UINT64_C(0x5a5a5a5a5)};
+        const std::array<uint64_t, 2> c128aWords = {UINT64_C(0x0123456789abcdef),
+                                                    UINT64_C(0xfedcba9876543210)};
+        const std::array<uint64_t, 2> c128bWords = {UINT64_C(0x0f0f0f0f0f0f0f0f),
+                                                    UINT64_C(0xf0f0f0f0f0f0f0f0)};
+        const std::array<uint64_t, 2> e128Words = {UINT64_C(0xa5a5a5a5a5a5a5a5),
+                                                   UINT64_C(0x5a5a5a5a5a5a5a5a)};
+        const std::array<uint64_t, 9> c576aWords = {
+            UINT64_C(0x1111111111111111), UINT64_C(0x2222222222222222),
+            UINT64_C(0x3333333333333333), UINT64_C(0x4444444444444444),
+            UINT64_C(0x5555555555555555), UINT64_C(0x6666666666666666),
+            UINT64_C(0x7777777777777777), UINT64_C(0x8888888888888888),
+            UINT64_C(0x9999999999999999)};
+        const std::array<uint64_t, 9> c576bWords = {
+            UINT64_C(0xaaaaaaaaaaaaaaaa), UINT64_C(0xbbbbbbbbbbbbbbbb),
+            UINT64_C(0xcccccccccccccccc), UINT64_C(0xdddddddddddddddd),
+            UINT64_C(0xeeeeeeeeeeeeeeee), UINT64_C(0xffffffffffffffff),
+            UINT64_C(0x0123456789abcdef), UINT64_C(0xfedcba9876543210),
+            UINT64_C(0x0f1e2d3c4b5a6978)};
+        const VariableId a8 = addBitConstant(linear, u8Type, a8Words);
+        const VariableId a32 = addBitConstant(linear, u32Type, a32Words);
+        const VariableId b48 = addBitConstant(linear, u48Type, b48Words);
+        const VariableId e40 = addBitConstant(linear, u40Type, e40Words);
+        const VariableId e56 = addBitConstant(linear, u56Type, e56Words);
+        const VariableId b64 = addBitConstant(linear, u64Type, b64Words);
+        const VariableId h0 = addBitConstant(linear, u64Type, h0Words);
+        const VariableId h1 = addBitConstant(linear, u64Type, h1Words);
+        const VariableId h2 = addBitConstant(linear, u64Type, h2Words);
+        const VariableId h3 = addBitConstant(linear, u64Type, h3Words);
+        const VariableId e32a = addBitConstant(linear, u32Type, e32aWords);
+        const VariableId e32b = addBitConstant(linear, u32Type, e32bWords);
+        const VariableId c100 = addBitConstant(linear, u100Type, c100Words);
+        const VariableId c128a = addBitConstant(linear, u128Type, c128aWords);
+        const VariableId c128b = addBitConstant(linear, u128Type, c128bWords);
+        const VariableId e128 = addBitConstant(linear, u128Type, e128Words);
+        const VariableId c576a = addBitConstant(linear, u576Type, c576aWords);
+        const VariableId c576b = addBitConstant(linear, u576Type, c576bWords);
+
+        const VariableId outAligned256 =
+            linear.addVariable(u256Type, linear.zeroInit());
+        const VariableId outCross80 = linear.addVariable(u80Type, linear.zeroInit());
+        const VariableId outWide136 =
+            linear.addVariable(u136Type, linear.zeroInit());
+        const VariableId outWide164 =
+            linear.addVariable(u164Type, linear.zeroInit());
+        const VariableId outHuge1152 =
+            linear.addVariable(u1152Type, linear.zeroInit());
+        const VariableId outRep384 =
+            linear.addVariable(u384Type, linear.zeroInit());
+        const VariableId chain0 = linear.addVariable(u256Type, linear.zeroInit());
+        const VariableId chain1 = linear.addVariable(u256Type, linear.zeroInit());
+        const VariableId chain2 = linear.addVariable(u256Type, linear.zeroInit());
+        const VariableId outChain256 =
+            linear.addVariable(u256Type, linear.zeroInit());
+        const VariableId slice1 = linear.addVariable(u184Type, linear.zeroInit());
+        const VariableId slice2 = linear.addVariable(u96Type, linear.zeroInit());
+        const VariableId slice3 = linear.addVariable(u100Type, linear.zeroInit());
+        const auto addPure = [&](Opcode opcode, VariableId result,
+                                 std::initializer_list<VariableId> ops) {
+            const std::array<VariableId, 1> results = {result};
+            return linear.addInstruction(
+                opcode, results,
+                std::span<const VariableId>(ops.begin(), ops.size()));
+        };
+        const std::array<InstructionId, 13> instructions = {
+            addPure(Opcode::Concat, outAligned256, {c128a, c128b}),
+            addPure(Opcode::Concat, outCross80, {a32, b48}),
+            addPure(Opcode::Concat, outWide136, {c128b, a8}),
+            addPure(Opcode::Concat, outWide164, {c100, b64}),
+            addPure(Opcode::Concat, outHuge1152, {c576a, c576b}),
+            addPure(Opcode::Replicate, outRep384, {c128a}),
+            addPure(Opcode::Concat, chain0, {h0, h1, h2, h3}),
+            addPure(Opcode::SliceStatic, slice1, {chain0}),
+            addPure(Opcode::Concat, chain1, {e32a, e40, slice1}),
+            addPure(Opcode::SliceStatic, slice2, {chain1}),
+            addPure(Opcode::Concat, chain2, {e32b, e128, slice2}),
+            addPure(Opcode::SliceStatic, slice3, {chain2}),
+            addPure(Opcode::Concat, outChain256, {e56, c100, slice3}),
+        };
+        // Backbone slices keep the low bits of the previous chain member, so
+        // each step's element operands land above them.
+        linear.setSliceStaticAttributes(instructions[7], 0);
+        linear.setSliceStaticAttributes(instructions[9], 0);
+        linear.setSliceStaticAttributes(instructions[11], 0);
+
+        ProgramInterface interface;
+        for (const auto &[name, variable] :
+             {std::pair{"out_aligned_256", outAligned256},
+              {"out_cross_80", outCross80}, {"out_wide_136", outWide136},
+              {"out_wide_164", outWide164}, {"out_huge_1152", outHuge1152},
+              {"out_rep_384", outRep384}, {"out_chain_256", outChain256}})
+        {
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Output,
+                .output = variable,
+            });
+        }
+        ScheduledProgramBuilder scheduled(linear.finish());
+        scheduled.addBlock(instructions);
+        return ExecutableModel{
+            .program = scheduled.finish(),
+            .interface = std::move(interface),
+        };
+    }
+
+    int testConcatInsertUnroll(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        ExecutableModel model = makeConcatInsertUnrollModel();
+        const ValidationResult validation =
+            validate(model, ValidationOptions{.level = ValidationLevel::Semantic});
+        if (!validation.success())
+        {
+            return fail("concat-insert-unroll fixture failed validation: " +
+                        validation.errors.front());
+        }
+        GrhSimAmCppEmitter emitter;
+        wolvrix::lib::diag::Diagnostics offDiagnostics;
+        const GrhSimAmCppResult offResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "stock",
+                .modelName = "ConcatUnrollStockTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            offDiagnostics);
+        wolvrix::lib::diag::Diagnostics unrollOnlyDiagnostics;
+        const GrhSimAmCppResult unrollOnlyResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "unroll-only",
+                .modelName = "ConcatUnrollOnlyTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"concatInsertUnroll", "true"}},
+            },
+            unrollOnlyDiagnostics);
+        wolvrix::lib::diag::Diagnostics onDiagnostics;
+        const GrhSimAmCppResult onResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "ConcatInsertUnrollTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"concatInsertInline", "true"},
+                              {"concatInsertUnroll", "true"}},
+            },
+            onDiagnostics);
+        if (!offResult.success || offDiagnostics.hasError() ||
+            !unrollOnlyResult.success || unrollOnlyDiagnostics.hasError() ||
+            !onResult.success || onDiagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the concat-insert-unroll fixture");
+        }
+        const std::optional<std::string> stockBlocks = readTextFile(
+            outputDirectory / "stock" / "grhsim_ConcatUnrollStockTop_blocks_0.cpp");
+        const std::optional<std::string> unrollOnlyBlocks = readTextFile(
+            outputDirectory / "unroll-only" /
+            "grhsim_ConcatUnrollOnlyTop_blocks_0.cpp");
+        const std::optional<std::string> unrollBlocks = readTextFile(
+            outputDirectory / "grhsim_ConcatInsertUnrollTop_blocks_0.cpp");
+        if (!stockBlocks || !unrollOnlyBlocks || !unrollBlocks)
+        {
+            return fail("AM C++ emitter produced no concat-insert-unroll blocks source");
+        }
+        // concatInsertUnroll without concatInsertInline is inert: the block
+        // source must match the stock emission textually (only the class name
+        // differs).
+        std::string unrollOnlyNormalized = *unrollOnlyBlocks;
+        std::string stockNormalized = *stockBlocks;
+        const auto replaceAll = [](std::string &text, const std::string &from,
+                                   const std::string &to) {
+            std::size_t position = 0;
+            while ((position = text.find(from, position)) != std::string::npos)
+            {
+                text.replace(position, from.size(), to);
+                position += to.size();
+            }
+        };
+        replaceAll(unrollOnlyNormalized, "ConcatUnrollOnlyTop", "ConcatUnrollStockTop");
+        if (unrollOnlyNormalized != stockNormalized)
+        {
+            return fail("concatInsertUnroll without concatInsertInline changed the "
+                        "generated block source");
+        }
+        // Stock form: 17 outlined inserts (2+2+2+2+2 plain concats, 3
+        // replicate, 4 chain head), 6 chain-step replaces, 7 zero preambles.
+        if (countOccurrences(*stockBlocks, "insert_words(") != 17 ||
+            countOccurrences(*stockBlocks, "replace_window_words(") != 6 ||
+            countOccurrences(*stockBlocks, "zero_words(") != 7)
+        {
+            return fail("stock concat emission lost its outlined splice shape");
+        }
+        // Unroll form: only the two 576-bit operands keep insert_words; the
+        // zero preambles of the all-owning aligned builds and the chain head
+        // are dead.
+        if (countOccurrences(*unrollBlocks, "insert_words(") != 2 ||
+            countOccurrences(*unrollBlocks, "replace_window_words(") != 0 ||
+            countOccurrences(*unrollBlocks, "zero_words(") != 4)
+        {
+            return fail("concat-insert-unroll did not keep exactly the >8-word fallbacks");
+        }
+        // Case A: 10 per-word plain stores (out_aligned_256 2x2, out_rep_384
+        // 3x2).
+        if (countOccurrences(*unrollBlocks, "] = (wideValues_.data() + ") != 10)
+        {
+            return fail("concat-insert-unroll lost the aligned full-word stores");
+        }
+        // Case B orForm (a32 at lsb 48) and replace (e40 at lsb 184, shift
+        // 56).
+        if (countOccurrences(*unrollBlocks, " << 48);") != 1 ||
+            countOccurrences(*unrollBlocks, " >> 16);") != 1 ||
+            countOccurrences(*unrollBlocks, " << 56);") != 1 ||
+            countOccurrences(*unrollBlocks, " >> 8);") != 1)
+        {
+            return fail("concat-insert-unroll lost the narrow word-crossing splices");
+        }
+        // Case C orForm (c128b at lsb 8: two >> 56 spills), replace full
+        // words (e128 at lsb 96, shift 32), replace partial top source word
+        // (c100 at lsb 100, shift 36: two >> 28 spills).
+        if (countOccurrences(*unrollBlocks, " >> 56);") != 2 ||
+            countOccurrences(*unrollBlocks, " << 32) & ") != 2 ||
+            countOccurrences(*unrollBlocks, " >> 32);") != 2 ||
+            countOccurrences(*unrollBlocks, " >> 28);") != 2)
+        {
+            return fail("concat-insert-unroll lost the wide per-word unroll splices");
+        }
+
+        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << R"CPP(#include "grhsim_ConcatInsertUnrollTop.hpp"
+#include "grhsim_ConcatUnrollStockTop.hpp"
+#include <array>
+#include <cstdint>
+int main()
+{
+    GrhSIM_ConcatInsertUnrollTop unroll;
+    GrhSIM_ConcatUnrollStockTop stock;
+    unroll.init();
+    stock.init();
+    unroll.eval();
+    stock.eval();
+    // Anchors against hand-computed values; the remaining outputs compare
+    // against the outlined reference model bit for bit.
+    if (unroll.out_aligned_256 != std::array<std::uint64_t, 4>{
+                                      UINT64_C(0x0f0f0f0f0f0f0f0f),
+                                      UINT64_C(0xf0f0f0f0f0f0f0f0),
+                                      UINT64_C(0x0123456789abcdef),
+                                      UINT64_C(0xfedcba9876543210)}) return 1;
+    if (unroll.out_cross_80 != std::array<std::uint64_t, 2>{
+                                   UINT64_C(0xcdef0123456789ab),
+                                   UINT64_C(0x89ab)}) return 2;
+    if (unroll.out_wide_136 != stock.out_wide_136) return 3;
+    if (unroll.out_wide_164 != stock.out_wide_164) return 4;
+    if (unroll.out_huge_1152 != stock.out_huge_1152) return 5;
+    if (unroll.out_rep_384 != stock.out_rep_384) return 6;
+    if (unroll.out_chain_256 != stock.out_chain_256) return 7;
+    if (unroll.out_aligned_256 != stock.out_aligned_256) return 8;
+    if (unroll.out_cross_80 != stock.out_cross_80) return 9;
+    return 0;
+}
+)CPP";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the concat-insert-unroll harness");
+        }
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2' && make -C '" +
+            (outputDirectory / "stock").string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated concat-insert-unroll model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' -I'" +
+            (outputDirectory / "stock").string() + "' '" + harnessPath.string() +
+            "' '" + (outputDirectory / "libgrhsim_ConcatInsertUnrollTop.a").string() +
+            "' '" +
+            (outputDirectory / "stock" / "libgrhsim_ConcatUnrollStockTop.a").string() +
+            "' -o '" + harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated concat-insert-unroll harness failed to compile");
+        }
+        const std::string runCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(runCommand.c_str()) != 0)
+        {
+            return fail("concat-insert-unroll changed generated-model semantics");
+        }
+        return 0;
+    }
+
     // NO0008 production-form fusion: same-select muxes lowered into an
     // AmGraph, scheduled through graphToProgram (split -> tree-atom fold ->
     // partition -> materialize), then emitted. The pinned outputs keep each
@@ -5338,6 +5678,13 @@ int main()
     if (const int result = testInlineScalarHelpers(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-inline-scalar-helpers");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testConcatInsertUnroll(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-concat-insert-unroll");
         result != 0)
     {
         return result;

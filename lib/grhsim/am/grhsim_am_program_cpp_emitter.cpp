@@ -266,6 +266,28 @@ namespace wolvrix::lib::grhsim::am
             // shift / signed-compare sites. With the switch off the output is
             // byte-identical to the stock form.
             bool inlineScalarHelpers = false;
+            // Compile-time concat-insert unrolling (attribute
+            // "concatInsertUnroll", default off; only effective together with
+            // concatInsertInline). An operand that misses the single-word
+            // inline form is emitted as a short unrolled statement sequence
+            // instead of the outlined helper: aligned full-word runs become
+            // per-word plain stores (up to 8 words, owning their words
+            // exclusively like the inline full-word store), narrow
+            // word-crossing operands become the two insert-OR / replace-RMW
+            // statements of one straddling source word, and wider operands
+            // (up to 8 source words) become per-word covered/spill
+            // statements with constant-folded masks. Wider operands keep the
+            // outlined insert_words / replace_window_words call.
+            bool concatInsertUnroll = false;
+            // Unrolled splice counts: aligned full-word copies, narrow
+            // word-crossing splices, wide per-word unrolls. Emission runs
+            // twice per site (block-source measure pass, then write pass),
+            // so increments are gated on emitStatsCounting, which turns on
+            // once the measure pass (planBlockSources) has finished.
+            mutable uint64_t concatUnrollAlignedCount = 0;
+            mutable uint64_t concatUnrollCrossingCount = 0;
+            mutable uint64_t concatUnrollWideCount = 0;
+            mutable bool emitStatsCounting = false;
             // Compile-time wide-storage layout switch (attribute
             // "wideStorageFirstTouch", default off). Wide BitVector / Array
             // slots are packed by their first operand/result touch in
@@ -1851,6 +1873,189 @@ namespace wolvrix::lib::grhsim::am
                              false};
         }
 
+        // concatInsertUnroll (requires concatInsertInline): emit an operand
+        // splice that misses the single-word inline form as a short unrolled
+        // statement sequence, bit-identical to the outlined helpers.
+        // orForm selects the insert_words (OR into zeroed words) form,
+        // otherwise the replace_window_words (RMW) form. Three shapes:
+        //   A) aligned full-word copy (width >= 128, width % 64 == 0,
+        //      shift == 0, words <= 8): per-word plain stores; concat operand
+        //      ranges never overlap, so every copied word is owned
+        //      exclusively and the store covers insert and replace semantics
+        //      alike (returned bool true, keeps no zero_words preamble
+        //      alive). More than 8 words keeps the outlined helper.
+        //   B) narrow word-crossing (width <= 63, shift != 0,
+        //      shift + width > 64): the two statements of a single source
+        //      word straddling a target word boundary; the window masks on
+        //      the value terms are redundant once the value is masked to
+        //      width bits and are dropped.
+        //   C) wide unroll (width > 64, ceil(width / 64) <= 8, not shape A):
+        //      per source word the covered (+spill) statements of
+        //      insert_words / replace_window_words with constant-folded
+        //      masks and shifts; a full covered word degenerates to a plain
+        //      store. Returned bool stays false even then (conservative:
+        //      only shape A joins the zero_words preamble elision).
+        // Everything else (width > 512, non-BitVector, out-of-range splice)
+        // returns nullopt and keeps the outlined helper. The unrolled forms
+        // never write bits outside [targetLsb, targetLsb+width), matching
+        // insert_words' trailing top-word mask, which never clears in-range
+        // bits of a legal splice.
+        std::optional<std::pair<std::string, bool>> emitUnrolledSplice(
+            const EmitState &state, const std::string &targetWords,
+            uint32_t targetWidth, uint32_t targetLsb, VariableId operand,
+            bool orForm)
+        {
+            const Type &type = variableType(state, operand);
+            if (type.kind != TypeKind::BitVector || type.bitWidth == 0U ||
+                type.bitWidth > 512U)
+            {
+                return std::nullopt;
+            }
+            const uint32_t width = type.bitWidth;
+            const uint32_t shift = targetLsb % 64U;
+            const uint32_t base = targetLsb / 64U;
+            if (targetLsb + width > targetWidth)
+            {
+                return std::nullopt;
+            }
+            const auto targetWord = [&](uint32_t index) {
+                return "(" + targetWords + ")[" + std::to_string(index) + "]";
+            };
+            if (width >= 128U && width % 64U == 0U && shift == 0U)
+            {
+                const uint32_t words = width / 64U;
+                if (words > 8U)
+                {
+                    return std::nullopt;
+                }
+                const std::string source = wordDataExpr(state, operand);
+                std::string code;
+                for (uint32_t word = 0; word < words; ++word)
+                {
+                    code += targetWord(base + word) + " = (" + source + ")[" +
+                            std::to_string(word) + "];\n";
+                }
+                if (state.emitStatsCounting)
+                {
+                    ++state.concatUnrollAlignedCount;
+                }
+                return std::pair{code, true};
+            }
+            if (width <= 63U && shift != 0U && shift + width > 64U)
+            {
+                const std::string mask =
+                    wordMaskLiteral((UINT64_C(1) << width) - UINT64_C(1));
+                const std::string masked =
+                    "(" + valueExpr(state, operand) + " & " + mask + ")";
+                const std::string low = targetWord(base);
+                const std::string high = targetWord(base + 1U);
+                std::string code;
+                if (orForm)
+                {
+                    code += low + " |= (" + masked + " << " +
+                            std::to_string(shift) + ");\n";
+                    code += high + " |= (" + masked + " >> " +
+                            std::to_string(64U - shift) + ");\n";
+                }
+                else
+                {
+                    // covered = 64 - shift low bits of the window stay; the
+                    // spill overwrites bit_mask(spill) of the next word.
+                    const std::string keep =
+                        wordMaskLiteral((UINT64_C(1) << shift) - UINT64_C(1));
+                    const uint32_t spill = width - (64U - shift);
+                    const std::string spillMask =
+                        wordMaskLiteral((UINT64_C(1) << spill) - UINT64_C(1));
+                    code += low + " = (" + low + " & " + keep + ") | (" +
+                            masked + " << " + std::to_string(shift) + ");\n";
+                    code += high + " = (" + high + " & ~" + spillMask +
+                            ") | (" + masked + " >> " +
+                            std::to_string(64U - shift) + ");\n";
+                }
+                if (state.emitStatsCounting)
+                {
+                    ++state.concatUnrollCrossingCount;
+                }
+                return std::pair{code, false};
+            }
+            if (width > 64U)
+            {
+                const uint32_t words = (width + 63U) / 64U;
+                if (words > 8U)
+                {
+                    return std::nullopt;
+                }
+                const std::string source = wordDataExpr(state, operand);
+                std::string code;
+                for (uint32_t index = 0; index < words; ++index)
+                {
+                    const uint32_t bits =
+                        index + 1U == words ? width - 64U * (words - 1U) : 64U;
+                    std::string value =
+                        "(" + source + ")[" + std::to_string(index) + "]";
+                    if (bits < 64U)
+                    {
+                        value = "(" + value + " & " +
+                                wordMaskLiteral((UINT64_C(1) << bits) -
+                                                UINT64_C(1)) +
+                                ")";
+                    }
+                    if (orForm)
+                    {
+                        code += targetWord(base + index) + " |= " +
+                                (shift == 0U ? value
+                                             : "(" + value + " << " +
+                                                   std::to_string(shift) + ")") +
+                                ";\n";
+                        if (shift != 0U && bits > 64U - shift)
+                        {
+                            code += targetWord(base + index + 1U) + " |= (" +
+                                    value + " >> " +
+                                    std::to_string(64U - shift) + ");\n";
+                        }
+                        continue;
+                    }
+                    const uint32_t covered =
+                        bits < 64U - shift ? bits : 64U - shift;
+                    const std::string low = targetWord(base + index);
+                    if (covered == 64U)
+                    {
+                        // shift == 0 && bits == 64: the word is owned
+                        // exclusively, so the RMW degenerates to a store.
+                        code += low + " = " + value + ";\n";
+                    }
+                    else
+                    {
+                        const std::string window =
+                            "(" +
+                            wordMaskLiteral((UINT64_C(1) << covered) -
+                                            UINT64_C(1)) +
+                            " << " + std::to_string(shift) + ")";
+                        code += low + " = (" + low + " & ~" + window +
+                                ") | ((" + value + " << " +
+                                std::to_string(shift) + ") & " + window +
+                                ");\n";
+                    }
+                    if (shift != 0U && bits > covered)
+                    {
+                        const uint32_t spill = bits - covered;
+                        code += targetWord(base + index + 1U) + " = (" +
+                                targetWord(base + index + 1U) + " & ~" +
+                                wordMaskLiteral((UINT64_C(1) << spill) -
+                                                UINT64_C(1)) +
+                                ") | (" + value + " >> " +
+                                std::to_string(64U - shift) + ");\n";
+                    }
+                }
+                if (state.emitStatsCounting)
+                {
+                    ++state.concatUnrollWideCount;
+                }
+                return std::pair{code, false};
+            }
+            return std::nullopt;
+        }
+
         // NO0013 F1/F2 windowed emission (plan fields documented in
         // EmitState). Handles the per-instruction actions planned by
         // planWindowedChains; returns nullopt only on plan inconsistency.
@@ -1888,6 +2093,17 @@ namespace wolvrix::lib::grhsim::am
                         {
                             code += splice->first;
                             continue;
+                        }
+                        if (state.concatInsertUnroll)
+                        {
+                            if (std::optional<std::pair<std::string, bool>> splice =
+                                    emitUnrolledSplice(state, target, width,
+                                                       remaining, operand,
+                                                       /*orForm=*/false))
+                            {
+                                code += splice->first;
+                                continue;
+                            }
                         }
                     }
                     code += "replace_window_words(" + target + ", " +
@@ -1927,6 +2143,19 @@ namespace wolvrix::lib::grhsim::am
                             zeroNeeded = zeroNeeded || !splice->second;
                             body += splice->first;
                             continue;
+                        }
+                        if (state.concatInsertUnroll)
+                        {
+                            if (std::optional<std::pair<std::string, bool>> splice =
+                                    emitUnrolledSplice(state, chainTarget,
+                                                       plan.width,
+                                                       remainingInline, operand,
+                                                       /*orForm=*/true))
+                            {
+                                zeroNeeded = zeroNeeded || !splice->second;
+                                body += splice->first;
+                                continue;
+                            }
                         }
                         zeroNeeded = true;
                         body += "insert_words(" + chainTarget + ", " +
@@ -1989,6 +2218,18 @@ namespace wolvrix::lib::grhsim::am
                         {
                             code += splice->first;
                             continue;
+                        }
+                        if (state.concatInsertUnroll)
+                        {
+                            if (std::optional<std::pair<std::string, bool>> splice =
+                                    emitUnrolledSplice(state, chainTarget,
+                                                       plan.width, offset,
+                                                       operand,
+                                                       /*orForm=*/false))
+                            {
+                                code += splice->first;
+                                continue;
+                            }
                         }
                     }
                     code += "replace_window_words(" + chainTarget + ", " +
@@ -2301,6 +2542,19 @@ namespace wolvrix::lib::grhsim::am
                                 body += splice->first;
                                 continue;
                             }
+                            if (state.concatInsertUnroll)
+                            {
+                                if (std::optional<std::pair<std::string, bool>> splice =
+                                        emitUnrolledSplice(state, target,
+                                                           resultType.bitWidth,
+                                                           remainingInline, operand,
+                                                           /*orForm=*/true))
+                                {
+                                    zeroNeeded = zeroNeeded || !splice->second;
+                                    body += splice->first;
+                                    continue;
+                                }
+                            }
                             zeroNeeded = true;
                             body += "insert_words(" + target + ", " +
                                     std::to_string(resultType.bitWidth) + ", " +
@@ -2345,6 +2599,19 @@ namespace wolvrix::lib::grhsim::am
                                 zeroNeeded = zeroNeeded || !splice->second;
                                 body += splice->first;
                                 continue;
+                            }
+                            if (state.concatInsertUnroll)
+                            {
+                                if (std::optional<std::pair<std::string, bool>> splice =
+                                        emitUnrolledSplice(state, target,
+                                                           resultType.bitWidth,
+                                                           offset, operands.front(),
+                                                           /*orForm=*/true))
+                                {
+                                    zeroNeeded = zeroNeeded || !splice->second;
+                                    body += splice->first;
+                                    continue;
+                                }
                             }
                             zeroNeeded = true;
                             body += "insert_words(" + target + ", " +
@@ -7259,6 +7526,11 @@ namespace wolvrix::lib::grhsim::am
         state.inlineScalarHelpers =
             inlineScalarHelpersAttribute != options.attributes.end() &&
             inlineScalarHelpersAttribute->second == "true";
+        const auto concatInsertUnrollAttribute =
+            options.attributes.find("concatInsertUnroll");
+        state.concatInsertUnroll =
+            concatInsertUnrollAttribute != options.attributes.end() &&
+            concatInsertUnrollAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -8090,6 +8362,9 @@ namespace wolvrix::lib::grhsim::am
         {
             return result;
         }
+        // The measure pass is done; from here on every emitted instruction is
+        // a written one, so emission-stats counters may count.
+        state.emitStatsCounting = true;
         std::size_t blockPartCount = 0;
         for (const std::vector<BlockSourcePart> &sourceParts : *blockSourcePlan)
         {
@@ -10719,6 +10994,20 @@ namespace
         {
             discardStaging();
             return result;
+        }
+
+        // concatInsertUnroll counters are only final once every block source
+        // has been written, so they report separately from the (pre-emission)
+        // locality stats above.
+        if (statsAttribute != options.attributes.end() && statsAttribute->second == "true")
+        {
+            diagnostics.info("AM C++ emitter concat unroll stats: concat_unroll_aligned=" +
+                                 std::to_string(state.concatUnrollAlignedCount) +
+                                 " concat_unroll_crossing=" +
+                                 std::to_string(state.concatUnrollCrossingCount) +
+                                 " concat_unroll_wide=" +
+                                 std::to_string(state.concatUnrollWideCount),
+                             std::string(kContext));
         }
 
         std::vector<StagedArtifact> stagedArtifacts;

@@ -393,6 +393,25 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   暴露常量传播与内联机会；`divide_value` / `modulo_value` / `resized_word` /
   `slice_array_value` 保持 outlined（后两者本身就会间接受益于头文件内
   `slice_value` / `signed_value` 的定义可见性）。off 时输出与既往逐字节一致。
+- `concatInsertUnroll`（`--concat-insert-unroll`，默认关；仅与
+  `concatInsertInline` 同开时生效）：落在单字内联形式之外的操作数不再回退
+  outlined 调用，而是发射一小段 unroll 语句序列，与 outlined 语义逐位等价。
+  三种形式：（A）对齐满字拷贝——`width >= 128`、`width % 64 == 0`、`shift == 0`
+  且 word 数 ≤ 8 时逐 word 直接 store（拼接操作数区间互不重叠，满字被独占覆写，
+  insert/replace 语义等价，同 concatInsertInline 满字论证），超过 8 word
+  （即 width > 512）保持 outlined；（B）窄跨 word——`width <= 63`、`shift != 0`
+  且 `shift + width > 64` 时发射单个源 word 跨界的两条语句（insert 系
+  `|= (v & M) << s` / `|= (v & M) >> (64-s)`；replace 系 covered/spill 两条
+  RMW，value 已被宽度 mask 截断故省略 window 二次掩码）；（C）宽
+  unroll——`width > 64` 且源 word 数 ≤ 8（且不属于 A）时逐源 word 发射
+  covered/spill 语句，mask 与 shift 全部常量折叠；insert 系省略恒 0 的 spill
+  项，replace 系 `covered == 64`（仅 `shift == 0` 且源 word 满 64 bit）时退化为
+  直接 store。与 `zero_words` 前导消除的交互：只有形式 A 返回「独占整 word」
+  标记参与前导消除；形式 B/C 一律保守返回非独占（即使 C 内含满字 store），
+  前导保留。非法拼接区间（`lsb + width > targetWidth`）、非 BitVector 操作数、
+  `width > 512` 一律回退 outlined。off 时输出与既往逐字节一致。三种形式的
+  站点计数经 diagnostics 报告
+  （`concat_unroll_aligned/crossing/wide`，随 collectStats 输出）。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
