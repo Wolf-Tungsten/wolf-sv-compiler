@@ -185,6 +185,7 @@ int main(int argc, char **argv)
     bool sourcePartActivityGuard = false;
     bool sourceWordActivityGuard = false;
     bool wideStorageFirstTouch = false;
+    bool concatInsertInline = false;
     bool traceComments = true;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
@@ -446,6 +447,10 @@ int main(int argc, char **argv)
         else if (argument == "--wide-storage-first-touch")
         {
             wideStorageFirstTouch = true;
+        }
+        else if (argument == "--concat-insert-inline")
+        {
+            concatInsertInline = true;
         }
         else if (argument == "--no-trace-comments")
         {
@@ -848,6 +853,10 @@ int main(int argc, char **argv)
                 if (wideStorageFirstTouch)
                 {
                     emitOptions.attributes.emplace("wideStorageFirstTouch", "true");
+                }
+                if (concatInsertInline)
+                {
+                    emitOptions.attributes.emplace("concatInsertInline", "true");
                 }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,

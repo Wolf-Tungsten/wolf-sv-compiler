@@ -249,6 +249,14 @@ namespace wolvrix::lib::grhsim::am
             // are wrapped in one exact owned-bit probe. This skips empty words
             // inside an active source part while preserving byte relay.
             bool sourceWordActivityGuard = false;
+            // Compile-time concat-insert inlining (attribute
+            // "concatInsertInline", default off). A Concat / Replicate /
+            // window-chain operand that lands inside a single target word is
+            // spliced with one inline OR / RMW / plain-store statement instead
+            // of an outlined insert_words / replace_window_words call; a
+            // zero_words preamble becomes dead once every operand stores full
+            // aligned words directly.
+            bool concatInsertInline = false;
             // Compile-time wide-storage layout switch (attribute
             // "wideStorageFirstTouch", default off). Wide BitVector / Array
             // slots are packed by their first operand/result touch in
@@ -1779,6 +1787,61 @@ namespace wolvrix::lib::grhsim::am
             return code;
         }
 
+        // concatInsertInline: emit a narrow Concat / Replicate / window-chain
+        // operand splice as one inline statement when the operand bit range
+        // [targetLsb, targetLsb+width) stays inside a single target word.
+        // orForm selects the insert (OR into a zeroed word) form used by the
+        // Concat / Replicate / chain-head preamble; otherwise the replace
+        // (RMW) form of chain steps and F2 concats is emitted. The returned
+        // bool marks a full-word plain store, which owns its word exclusively
+        // and therefore keeps no zero_words preamble alive. Returns nullopt
+        // for wide / word-crossing operands, which keep the outlined helper.
+        std::optional<std::pair<std::string, bool>> emitInlineWordSplice(
+            const EmitState &state, const std::string &targetWords,
+            uint32_t targetWidth, uint32_t targetLsb, VariableId operand,
+            bool orForm)
+        {
+            const Type &type = variableType(state, operand);
+            if (type.kind != TypeKind::BitVector || type.bitWidth == 0 ||
+                type.bitWidth > 64U)
+            {
+                return std::nullopt;
+            }
+            const uint32_t shift = targetLsb % 64U;
+            if (shift + type.bitWidth > 64U ||
+                targetLsb + type.bitWidth > targetWidth)
+            {
+                return std::nullopt;
+            }
+            const std::string word = "(" + targetWords + ")[" +
+                                     std::to_string(targetLsb / 64U) + "]";
+            const std::string value = valueExpr(state, operand);
+            if (type.bitWidth == 64U)
+            {
+                // Full aligned word: the operand owns it exclusively (concat
+                // operand ranges never overlap), so a plain store covers both
+                // the insert and the replace semantics.
+                return std::pair{word + " = " + value + ";\n", true};
+            }
+            const std::string mask =
+                wordMaskLiteral((UINT64_C(1) << type.bitWidth) - UINT64_C(1));
+            const std::string masked = "(" + value + " & " + mask + ")";
+            const std::string shifted =
+                shift == 0U ? masked
+                            : "(" + masked + " << " + std::to_string(shift) + ")";
+            if (orForm)
+            {
+                return std::pair{word + " |= " + shifted + ";\n", false};
+            }
+            const std::string window = shift == 0U
+                                           ? mask
+                                           : "(" + mask + " << " +
+                                                 std::to_string(shift) + ")";
+            return std::pair{word + " = (" + word + " & ~" + window + ") | " +
+                                 shifted + ";\n",
+                             false};
+        }
+
         // NO0013 F1/F2 windowed emission (plan fields documented in
         // EmitState). Handles the per-instruction actions planned by
         // planWindowedChains; returns nullopt only on plan inconsistency.
@@ -1807,6 +1870,17 @@ namespace wolvrix::lib::grhsim::am
                 {
                     const Type &type = variableType(state, operand);
                     remaining -= type.bitWidth;
+                    if (state.concatInsertInline)
+                    {
+                        if (std::optional<std::pair<std::string, bool>> splice =
+                                emitInlineWordSplice(state, target, width,
+                                                     remaining, operand,
+                                                     /*orForm=*/false))
+                        {
+                            code += splice->first;
+                            continue;
+                        }
+                    }
                     code += "replace_window_words(" + target + ", " +
                             std::to_string(width) + ", " + std::to_string(remaining) + ", " +
                             wordDataExpr(state, operand) + ", " +
@@ -1825,8 +1899,43 @@ namespace wolvrix::lib::grhsim::am
             if (action == kWindowActionChainHead)
             {
                 // C_0 full build, straight into the chain final slot D.
-                std::string code = "zero_words(" + chainTarget + ", " +
-                                   std::to_string(plan.width) + ");\n";
+                const std::string zeroPreamble = "zero_words(" + chainTarget + ", " +
+                                                 std::to_string(plan.width) + ");\n";
+                if (state.concatInsertInline)
+                {
+                    std::string body;
+                    bool zeroNeeded = false;
+                    uint32_t remainingInline = plan.width;
+                    for (VariableId operand : operands)
+                    {
+                        const Type &type = variableType(state, operand);
+                        remainingInline -= type.bitWidth;
+                        if (std::optional<std::pair<std::string, bool>> splice =
+                                emitInlineWordSplice(state, chainTarget, plan.width,
+                                                     remainingInline, operand,
+                                                     /*orForm=*/true))
+                        {
+                            zeroNeeded = zeroNeeded || !splice->second;
+                            body += splice->first;
+                            continue;
+                        }
+                        zeroNeeded = true;
+                        body += "insert_words(" + chainTarget + ", " +
+                                std::to_string(plan.width) + ", " +
+                                std::to_string(remainingInline) + ", " +
+                                wordDataExpr(state, operand) + ", " +
+                                std::to_string(type.bitWidth) + ");\n";
+                    }
+                    std::string code = zeroNeeded ? zeroPreamble + body : body;
+                    if (state.instructionWindowMaterialize[instruction.value] != 0)
+                    {
+                        code += "assign_words(" + wordDataExpr(state, results.front()) + ", " +
+                                std::to_string(plan.width) + ", " + chainTarget + ", " +
+                                std::to_string(plan.width) + ", false);\n";
+                    }
+                    return code;
+                }
+                std::string code = zeroPreamble;
                 uint32_t remaining = plan.width;
                 for (VariableId operand : operands)
                 {
@@ -1862,6 +1971,17 @@ namespace wolvrix::lib::grhsim::am
                 {
                     const VariableId operand = operands[operandIndex];
                     const Type &type = variableType(state, operand);
+                    if (state.concatInsertInline)
+                    {
+                        if (std::optional<std::pair<std::string, bool>> splice =
+                                emitInlineWordSplice(state, chainTarget, plan.width,
+                                                     offset, operand,
+                                                     /*orForm=*/false))
+                        {
+                            code += splice->first;
+                            continue;
+                        }
+                    }
                     code += "replace_window_words(" + chainTarget + ", " +
                             std::to_string(plan.width) + ", " + std::to_string(offset) +
                             ", " + wordDataExpr(state, operand) + ", " +
@@ -2151,14 +2271,42 @@ namespace wolvrix::lib::grhsim::am
                 case Opcode::Concat:
                 {
                     const Type &resultType = variableType(state, results.front());
-                    std::string code = "zero_words(" + wordDataExpr(state, results.front()) +
-                                       ", " + std::to_string(resultType.bitWidth) + ");\n";
+                    const std::string target = wordDataExpr(state, results.front());
+                    const std::string zeroPreamble = "zero_words(" + target +
+                                                     ", " + std::to_string(resultType.bitWidth) + ");\n";
+                    if (state.concatInsertInline)
+                    {
+                        std::string body;
+                        bool zeroNeeded = false;
+                        uint32_t remainingInline = resultType.bitWidth;
+                        for (VariableId operand : operands)
+                        {
+                            const Type &type = variableType(state, operand);
+                            remainingInline -= type.bitWidth;
+                            if (std::optional<std::pair<std::string, bool>> splice =
+                                    emitInlineWordSplice(state, target, resultType.bitWidth,
+                                                         remainingInline, operand,
+                                                         /*orForm=*/true))
+                            {
+                                zeroNeeded = zeroNeeded || !splice->second;
+                                body += splice->first;
+                                continue;
+                            }
+                            zeroNeeded = true;
+                            body += "insert_words(" + target + ", " +
+                                    std::to_string(resultType.bitWidth) + ", " +
+                                    std::to_string(remainingInline) + ", " + wordDataExpr(state, operand) +
+                                    ", " + std::to_string(type.bitWidth) + ");\n";
+                        }
+                        return zeroNeeded ? zeroPreamble + body : body;
+                    }
+                    std::string code = zeroPreamble;
                     uint32_t remaining = resultType.bitWidth;
                     for (VariableId operand : operands)
                     {
                         const Type &type = variableType(state, operand);
                         remaining -= type.bitWidth;
-                        code += "insert_words(" + wordDataExpr(state, results.front()) + ", " +
+                        code += "insert_words(" + target + ", " +
                                 std::to_string(resultType.bitWidth) + ", " +
                                 std::to_string(remaining) + ", " + wordDataExpr(state, operand) +
                                 ", " + std::to_string(type.bitWidth) + ");\n";
@@ -2170,11 +2318,38 @@ namespace wolvrix::lib::grhsim::am
                     const Type &resultType = variableType(state, results.front());
                     const Type &sourceType = variableType(state, operands.front());
                     const uint32_t count = resultType.bitWidth / sourceType.bitWidth;
-                    std::string code = "zero_words(" + wordDataExpr(state, results.front()) +
-                                       ", " + std::to_string(resultType.bitWidth) + ");\n";
+                    const std::string target = wordDataExpr(state, results.front());
+                    const std::string zeroPreamble = "zero_words(" + target +
+                                                     ", " + std::to_string(resultType.bitWidth) + ");\n";
+                    if (state.concatInsertInline)
+                    {
+                        std::string body;
+                        bool zeroNeeded = false;
+                        for (uint32_t index = 0; index < count; ++index)
+                        {
+                            const uint32_t offset = index * sourceType.bitWidth;
+                            if (std::optional<std::pair<std::string, bool>> splice =
+                                    emitInlineWordSplice(state, target, resultType.bitWidth,
+                                                         offset, operands.front(),
+                                                         /*orForm=*/true))
+                            {
+                                zeroNeeded = zeroNeeded || !splice->second;
+                                body += splice->first;
+                                continue;
+                            }
+                            zeroNeeded = true;
+                            body += "insert_words(" + target + ", " +
+                                    std::to_string(resultType.bitWidth) + ", " +
+                                    std::to_string(offset) + ", " +
+                                    wordDataExpr(state, operands.front()) + ", " +
+                                    std::to_string(sourceType.bitWidth) + ");\n";
+                        }
+                        return zeroNeeded ? zeroPreamble + body : body;
+                    }
+                    std::string code = zeroPreamble;
                     for (uint32_t index = 0; index < count; ++index)
                     {
-                        code += "insert_words(" + wordDataExpr(state, results.front()) + ", " +
+                        code += "insert_words(" + target + ", " +
                                 std::to_string(resultType.bitWidth) + ", " +
                                 std::to_string(index * sourceType.bitWidth) + ", " +
                                 wordDataExpr(state, operands.front()) + ", " +
@@ -7065,6 +7240,11 @@ namespace wolvrix::lib::grhsim::am
         state.wideStorageFirstTouch =
             wideStorageFirstTouchAttribute != options.attributes.end() &&
             wideStorageFirstTouchAttribute->second == "true";
+        const auto concatInsertInlineAttribute =
+            options.attributes.find("concatInsertInline");
+        state.concatInsertInline =
+            concatInsertInlineAttribute != options.attributes.end() &&
+            concatInsertInlineAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());

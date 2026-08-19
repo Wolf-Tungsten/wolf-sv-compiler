@@ -373,6 +373,17 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   布局是否有足够的空间局部性杠杆；`*_touched_span_words` 与
   `*_touched_pages` 另报告所有 Block-touched 变量覆盖的地址跨度与 4 KiB page
   并集。它们都是静态 footprint，不等同于动态 miss 数。
+- `concatInsertInline`（`--concat-insert-inline`，默认关）：宽 `Concat` /
+  `Replicate` 及 window-chain（chain head / chain step / F2 concat）中，
+  bit 区间落在单个目标 word 内的窄操作数（`lsb % 64 + width <= 64`）不再走
+  outlined `insert_words` / `replace_window_words` 调用，而是一条内联语句：
+  64-bit 对齐满字操作数退化为直接 word store（该 word 由拼接区间独占，
+  insert 与 replace 语义等价），其余单字操作数退化为 `|= (v & mask) << shift`
+  （insert 系）或 `(w & ~window) | (...)` RMW（replace 系）。单字情形的内联
+  形式与 outlined 调用逐位等价：跨 word 溢出项恒为 0，`insert_words` 末尾的
+  top-word mask 在合法拼接区间内本就不置位越界位。`zero_words` 前导仅当所有
+  操作数都是满字 store（每个 word 都被独占覆写）时消除；任何操作数回退到
+  outlined 调用或 OR 形式时前导保留。off 时输出与既往逐字节一致。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成

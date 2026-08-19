@@ -4235,6 +4235,192 @@ int main()
         return 0;
     }
 
+    // concatInsertInline fixture: one block of wide Concat / Replicate builds
+    // over narrow constant operands. concat128/replicate192 operands are all
+    // aligned full-word (plain stores, dead zero preamble), concat88 mixes two
+    // single-word OR splices with one full-word store (zero preamble stays),
+    // and concat130's 65-bit operands cross words (stock insert_words kept).
+    ExecutableModel makeConcatInsertInlineModel()
+    {
+        LinearProgramBuilder linear;
+        const TypeId u8Type = linear.addType(Type::bitVector(8));
+        const TypeId u16Type = linear.addType(Type::bitVector(16));
+        const TypeId u64Type = linear.addType(Type::bitVector(64));
+        const TypeId u65Type = linear.addType(Type::bitVector(65));
+        const TypeId u88Type = linear.addType(Type::bitVector(88));
+        const TypeId u128Type = linear.addType(Type::bitVector(128));
+        const TypeId u130Type = linear.addType(Type::bitVector(130));
+        const TypeId u192Type = linear.addType(Type::bitVector(192));
+
+        const std::array<uint64_t, 1> a64Words = {UINT64_C(0x0123456789abcdef)};
+        const std::array<uint64_t, 1> b64Words = {UINT64_C(0xfedcba9876543210)};
+        const std::array<uint64_t, 1> a16Words = {UINT64_C(0x1234)};
+        const std::array<uint64_t, 1> a8Words = {UINT64_C(0xa5)};
+        const std::array<uint64_t, 2> a65Words = {UINT64_C(0xdeadbeefcafef00d),
+                                                  UINT64_C(0x1)};
+        const std::array<uint64_t, 2> b65Words = {UINT64_C(0x0f0f0f0f0f0f0f0f),
+                                                  UINT64_C(0x0)};
+        const VariableId a64 = addBitConstant(linear, u64Type, a64Words);
+        const VariableId b64 = addBitConstant(linear, u64Type, b64Words);
+        const VariableId a16 = addBitConstant(linear, u16Type, a16Words);
+        const VariableId a8 = addBitConstant(linear, u8Type, a8Words);
+        const VariableId a65 = addBitConstant(linear, u65Type, a65Words);
+        const VariableId b65 = addBitConstant(linear, u65Type, b65Words);
+
+        const VariableId out128 = linear.addVariable(u128Type, linear.zeroInit());
+        const VariableId out88 = linear.addVariable(u88Type, linear.zeroInit());
+        const VariableId out130 = linear.addVariable(u130Type, linear.zeroInit());
+        const VariableId out192 = linear.addVariable(u192Type, linear.zeroInit());
+        const auto addPure = [&](Opcode opcode, VariableId result,
+                                 std::initializer_list<VariableId> ops) {
+            const std::array<VariableId, 1> results = {result};
+            return linear.addInstruction(
+                opcode, results,
+                std::span<const VariableId>(ops.begin(), ops.size()));
+        };
+        const std::array<InstructionId, 4> instructions = {
+            addPure(Opcode::Concat, out128, {a64, b64}),
+            addPure(Opcode::Concat, out88, {a16, a8, a64}),
+            addPure(Opcode::Concat, out130, {a65, b65}),
+            addPure(Opcode::Replicate, out192, {a64}),
+        };
+
+        ProgramInterface interface;
+        for (const auto &[name, variable] :
+             {std::pair{"out128", out128}, {"out88", out88},
+              {"out130", out130}, {"out192", out192}})
+        {
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Output,
+                .output = variable,
+            });
+        }
+        ScheduledProgramBuilder scheduled(linear.finish());
+        scheduled.addBlock(instructions);
+        return ExecutableModel{
+            .program = scheduled.finish(),
+            .interface = std::move(interface),
+        };
+    }
+
+    int testConcatInsertInline(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        ExecutableModel model = makeConcatInsertInlineModel();
+        const ValidationResult validation =
+            validate(model, ValidationOptions{.level = ValidationLevel::Semantic});
+        if (!validation.success())
+        {
+            return fail("concat-insert-inline fixture failed validation: " +
+                        validation.errors.front());
+        }
+        GrhSimAmCppEmitter emitter;
+        wolvrix::lib::diag::Diagnostics offDiagnostics;
+        const GrhSimAmCppResult offResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "stock",
+                .modelName = "ConcatInsertStockTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            offDiagnostics);
+        wolvrix::lib::diag::Diagnostics onDiagnostics;
+        const GrhSimAmCppResult onResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "ConcatInsertInlineTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"concatInsertInline", "true"}},
+            },
+            onDiagnostics);
+        if (!offResult.success || offDiagnostics.hasError() || !onResult.success ||
+            onDiagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the concat-insert-inline fixture");
+        }
+        const std::optional<std::string> stockBlocks = readTextFile(
+            outputDirectory / "stock" / "grhsim_ConcatInsertStockTop_blocks_0.cpp");
+        const std::optional<std::string> inlineBlocks = readTextFile(
+            outputDirectory / "grhsim_ConcatInsertInlineTop_blocks_0.cpp");
+        if (!stockBlocks || !inlineBlocks)
+        {
+            return fail("AM C++ emitter produced no concat-insert-inline blocks source");
+        }
+        // Stock form: every wide operand splice is an outlined insert_words
+        // call behind a zero_words preamble (2+3+2+3 inserts, 4 preambles).
+        if (countOccurrences(*stockBlocks, "insert_words(") != 10 ||
+            countOccurrences(*stockBlocks, "zero_words(") != 4)
+        {
+            return fail("stock concat emission lost its insert_words/zero_words shape");
+        }
+        // Inline form: only the two word-crossing 65-bit operands keep
+        // insert_words; the OR splices in concat88 keep their zero preamble.
+        if (countOccurrences(*inlineBlocks, "insert_words(") != 2 ||
+            countOccurrences(*inlineBlocks, "zero_words(") != 2)
+        {
+            return fail("concat-insert-inline did not keep exactly the crossing fallbacks");
+        }
+        // a16 splices into word 1 with shift 8, a8 into word 1 with shift 0.
+        if (countOccurrences(*inlineBlocks, "] |= ((") != 1 ||
+            countOccurrences(*inlineBlocks, "<< 8);") != 1 ||
+            countOccurrences(*inlineBlocks, "] |= (v") != 1)
+        {
+            return fail("concat-insert-inline lost the single-word OR splices");
+        }
+
+        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << R"CPP(#include "grhsim_ConcatInsertInlineTop.hpp"
+int main()
+{
+    GrhSIM_ConcatInsertInlineTop model;
+    model.init();
+    model.eval();
+    if (model.out128 != std::array<std::uint64_t, 2>{UINT64_C(0xfedcba9876543210),
+                                                     UINT64_C(0x0123456789abcdef)}) return 1;
+    if (model.out88 != std::array<std::uint64_t, 2>{UINT64_C(0x0123456789abcdef),
+                                                    UINT64_C(0x1234a5)}) return 2;
+    if (model.out130 != std::array<std::uint64_t, 3>{UINT64_C(0x0f0f0f0f0f0f0f0f),
+                                                     UINT64_C(0xbd5b7ddf95fde01a),
+                                                     UINT64_C(0x3)}) return 3;
+    if (model.out192 != std::array<std::uint64_t, 3>{UINT64_C(0x0123456789abcdef),
+                                                     UINT64_C(0x0123456789abcdef),
+                                                     UINT64_C(0x0123456789abcdef)}) return 4;
+    return 0;
+}
+)CPP";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the concat-insert-inline harness");
+        }
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated concat-insert-inline model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (outputDirectory / "libgrhsim_ConcatInsertInlineTop.a").string() +
+            "' -o '" + harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated concat-insert-inline harness failed to compile");
+        }
+        const std::string runCommand = "'" + harnessExecutable.string() + "'";
+        if (std::system(runCommand.c_str()) != 0)
+        {
+            return fail("concat-insert-inline changed generated-model semantics");
+        }
+        return 0;
+    }
+
     // NO0008 production-form fusion: same-select muxes lowered into an
     // AmGraph, scheduled through graphToProgram (split -> tree-atom fold ->
     // partition -> materialize), then emitted. The pinned outputs keep each
@@ -4854,6 +5040,13 @@ int main()
     if (const int result = testWideStorageFirstTouch(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-wide-storage-first-touch");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testConcatInsertInline(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-concat-insert-inline");
         result != 0)
     {
         return result;
