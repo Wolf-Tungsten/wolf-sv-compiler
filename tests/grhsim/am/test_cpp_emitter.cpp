@@ -2802,6 +2802,320 @@ int main()
         return 0;
     }
 
+    struct WideDetectFastPathFixture
+    {
+        ExecutableModel model;
+        VariableId clock;
+        VariableId lo;
+        VariableId hi;
+        VariableId stateLo;
+        VariableId stateHi;
+    };
+
+    // wideDetectFastPath fixture: the phased-commit shape with a 128-bit
+    // register, so the ST00013 write-point raise on the wide target takes the
+    // outlined assign_words_detect form the knob rewrites.
+    WideDetectFastPathFixture makeWideDetectFastPathFixture()
+    {
+        LinearProgramBuilder linear;
+        const TypeId u1Type = linear.addType(Type::bitVector(1));
+        const TypeId u64Type = linear.addType(Type::bitVector(64));
+        const TypeId u128Type = linear.addType(Type::bitVector(128));
+
+        ProgramInterface interface;
+        const auto addInput = [&](TypeId type, std::string_view name) {
+            const VariableId variable = linear.addVariable(type, linear.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Input,
+                .input = variable,
+            });
+            return variable;
+        };
+        const auto addOutput = [&](TypeId type, std::string_view name) {
+            const VariableId variable = linear.addVariable(type, linear.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Output,
+                .output = variable,
+            });
+            return variable;
+        };
+        const auto addInstruction = [&](Opcode opcode,
+                                        std::initializer_list<VariableId> results,
+                                        std::initializer_list<VariableId> operands) {
+            return linear.addInstruction(
+                opcode,
+                std::span<const VariableId>(results.begin(), results.size()),
+                std::span<const VariableId>(operands.begin(), operands.size()));
+        };
+
+        const VariableId clock = addInput(u1Type, "clock");
+        const VariableId lo = addInput(u64Type, "lo");
+        const VariableId hi = addInput(u64Type, "hi");
+        const VariableId stateLo = addOutput(u64Type, "state_lo");
+        const VariableId stateHi = addOutput(u64Type, "state_hi");
+        const VariableId clockOld = linear.addVariable(u1Type, linear.undefInit());
+        const VariableId entryEvent = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId loOld = linear.addVariable(u64Type, linear.undefInit());
+        const VariableId hiOld = linear.addVariable(u64Type, linear.undefInit());
+        const VariableId loChanged = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId hiChanged = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId posedgeOld = linear.addVariable(u1Type, linear.undefInit());
+        const VariableId posedge = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId nextState = linear.addVariable(u128Type, linear.zeroInit());
+        const VariableId state = linear.addVariable(u128Type, linear.zeroInit());
+        const VariableId stateOld = linear.addVariable(u128Type, linear.undefInit());
+        const VariableId stateChanged = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId commitClockOld =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId commitPosedge = linear.addVariable(u1Type, linear.zeroInit());
+
+        const InstructionId watchClock =
+            addInstruction(Opcode::ChangedAny, {entryEvent}, {clock, clockOld});
+        const InstructionId watchLo =
+            addInstruction(Opcode::ChangedAny, {loChanged}, {lo, loOld});
+        const InstructionId watchHi =
+            addInstruction(Opcode::ChangedAny, {hiChanged}, {hi, hiOld});
+        const InstructionId detectPosedge =
+            addInstruction(Opcode::ChangedPos, {posedge}, {clock, posedgeOld});
+        const InstructionId buildNext =
+            addInstruction(Opcode::Concat, {nextState}, {lo, hi});
+        const InstructionId sampleLo = addInstruction(
+            Opcode::SliceStatic, {stateLo}, {state});
+        const InstructionId sampleHi = addInstruction(
+            Opcode::SliceStatic, {stateHi}, {state});
+        linear.setSliceStaticAttributes(sampleLo, 0);
+        linear.setSliceStaticAttributes(sampleHi, 64);
+        const InstructionId gateDetect = addInstruction(
+            Opcode::ChangedPos, {commitPosedge}, {clock, commitClockOld});
+        const InstructionId writeState = addInstruction(
+            Opcode::RegisterWrite, {}, {nextState, state, commitPosedge});
+        const InstructionId detectState =
+            addInstruction(Opcode::ChangedAny, {stateChanged}, {state, stateOld});
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        const auto addScheduledInstruction =
+            [&](Opcode opcode, std::initializer_list<VariableId> operands) {
+                return scheduled.addInstruction(
+                    opcode, {},
+                    std::span<const VariableId>(operands.begin(), operands.size()));
+            };
+        const auto addBlock = [&](std::initializer_list<InstructionId> instructions) {
+            scheduled.addBlock(std::span<const InstructionId>(instructions.begin(),
+                                                               instructions.size()));
+        };
+        const InstructionId enterClock =
+            addScheduledInstruction(Opcode::ActForward, {entryEvent});
+        const InstructionId enterLo =
+            addScheduledInstruction(Opcode::ActForward, {loChanged});
+        const InstructionId enterHi =
+            addScheduledInstruction(Opcode::ActForward, {hiChanged});
+        const InstructionId activateReaders =
+            addScheduledInstruction(Opcode::ActBackward, {stateChanged});
+        scheduled.setActivationTargets(enterClock, std::array{BlockId{1}, BlockId{3}});
+        scheduled.setActivationTargets(enterLo, std::array{BlockId{1}});
+        scheduled.setActivationTargets(enterHi, std::array{BlockId{1}});
+        scheduled.setActivationTargets(activateReaders, std::array{BlockId{2}});
+        addBlock({watchClock, watchLo, watchHi, enterClock, enterLo, enterHi});
+        addBlock({detectPosedge, buildNext});
+        addBlock({sampleLo, sampleHi});
+        addBlock({gateDetect, writeState, detectState, activateReaders});
+
+        return WideDetectFastPathFixture{
+            .model =
+                ExecutableModel{
+                    .program = scheduled.finish(),
+                    .interface = std::move(interface),
+                    .commitBlockBegin = 3,
+                    .commitBlockEnd = 4,
+                },
+            .clock = clock,
+            .lo = lo,
+            .hi = hi,
+            .stateLo = stateLo,
+            .stateHi = stateHi,
+        };
+    }
+
+    int testWideDetectFastPath(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        WideDetectFastPathFixture fixture = makeWideDetectFastPathFixture();
+
+        // Oracle: the Interpreter walks the same transaction sequence; each
+        // row is (clock, lo, hi) and the expected (state_lo, state_hi) pair
+        // after the eval.
+        struct Transaction
+        {
+            uint64_t clock;
+            uint64_t lo;
+            uint64_t hi;
+        };
+        const std::array<Transaction, 8> transactions = {
+            Transaction{0, UINT64_C(0x0123456789abcdef), UINT64_C(0xfedcba9876543210)},
+            Transaction{1, UINT64_C(0x0123456789abcdef), UINT64_C(0xfedcba9876543210)},
+            Transaction{0, UINT64_C(0x0123456789abcdef), UINT64_C(0xfedcba9876543210)},
+            // The repeat posedge with an unchanged payload is the idle wide
+            // station: the fast path must report no change and skip the write.
+            Transaction{1, UINT64_C(0x0123456789abcdef), UINT64_C(0xfedcba9876543210)},
+            Transaction{0, UINT64_C(0x0123456789abcdef), UINT64_C(0xfedcba9876543210)},
+            Transaction{1, UINT64_C(0x5555555555555555), UINT64_C(0xaaaaaaaaaaaaaaaa)},
+            Transaction{0, UINT64_C(0x5555555555555555), UINT64_C(0xaaaaaaaaaaaaaaaa)},
+            Transaction{1, UINT64_C(0x5555555555555555), UINT64_C(0xaaaaaaaaaaaaaaaa)},
+        };
+        Interpreter reference(fixture.model);
+        if (!reference.ready())
+        {
+            if (reference.initializationDiagnostic())
+            {
+                std::cerr << "[wide-detect] interpreter init: "
+                          << reference.initializationDiagnostic()->message << '\n';
+            }
+            return fail("AM reference executor rejected the wide-detect fixture");
+        }
+        std::vector<std::array<uint64_t, 2>> oracle;
+        oracle.reserve(transactions.size());
+        const auto writeValue = [&](VariableId variable, uint32_t width,
+                                    uint64_t value) {
+            const std::array<uint64_t, 1> words = {value};
+            return reference
+                .write(variable,
+                       InterpreterValue::bitVector(width, Signedness::Unsigned, words))
+                .success();
+        };
+        for (const Transaction &transaction : transactions)
+        {
+            if (!writeValue(fixture.clock, 1, transaction.clock) ||
+                !writeValue(fixture.lo, 64, transaction.lo) ||
+                !writeValue(fixture.hi, 64, transaction.hi) ||
+                !reference.eval().success())
+            {
+                return fail("AM Interpreter failed a wide-detect transaction");
+            }
+            oracle.push_back({reference.value(fixture.stateLo).lowWord(),
+                              reference.value(fixture.stateHi).lowWord()});
+        }
+
+        wolvrix::lib::diag::Diagnostics offDiagnostics;
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult offResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "stock",
+                .modelName = "WideDetectStockTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            offDiagnostics);
+        wolvrix::lib::diag::Diagnostics onDiagnostics;
+        const GrhSimAmCppResult onResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "WideDetectFastPathTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"wideDetectFastPath", "true"}},
+            },
+            onDiagnostics);
+        if (!offResult.success || offDiagnostics.hasError() || !onResult.success ||
+            onDiagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the wide-detect fixture");
+        }
+
+        const std::optional<std::string> stockRuntime = readTextFile(
+            outputDirectory / "stock" / "grhsim_WideDetectStockTop_runtime.cpp");
+        const std::optional<std::string> stockBlocks = readTextFile(
+            outputDirectory / "stock" / "grhsim_WideDetectStockTop_blocks_0.cpp");
+        const std::optional<std::string> onRuntime = readTextFile(
+            outputDirectory / "grhsim_WideDetectFastPathTop_runtime.cpp");
+        const std::optional<std::string> onBlocks = readTextFile(
+            outputDirectory / "grhsim_WideDetectFastPathTop_blocks_0.cpp");
+        if (!stockRuntime || !stockBlocks || !onRuntime || !onBlocks)
+        {
+            return fail("AM C++ emitter produced unreadable wide-detect artifacts");
+        }
+        const std::string fastPathMarker =
+            "std::memcmp(target, source, (targetWords - 1U) * 8U) == 0 &&";
+        if (stockRuntime->find(fastPathMarker) != std::string::npos ||
+            onRuntime->find(fastPathMarker) == std::string::npos)
+        {
+            return fail("wideDetectFastPath did not confine itself to the "
+                        "assign_words_detect body");
+        }
+        // The knob only rewrites the helper body: the scheduled block source
+        // must match stock textually (class name aside), and the wide commit
+        // write must use the outlined detect form.
+        std::string onNormalized = *onBlocks;
+        std::string stockNormalized = *stockBlocks;
+        const auto replaceAll = [](std::string &text, const std::string &from,
+                                   const std::string &to) {
+            std::size_t position = 0;
+            while ((position = text.find(from, position)) != std::string::npos)
+            {
+                text.replace(position, from.size(), to);
+                position += to.size();
+            }
+        };
+        replaceAll(onNormalized, "WideDetectFastPathTop", "WideDetectStockTop");
+        if (onNormalized != stockNormalized ||
+            countOccurrences(*stockBlocks, "assign_words_detect(") == 0)
+        {
+            return fail("wideDetectFastPath changed the block source or lost the "
+                        "outlined detect call");
+        }
+
+        const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << "#include \"grhsim_WideDetectFastPathTop.hpp\"\n"
+                   "#include <cstdint>\n\n"
+                   "int main()\n"
+                   "{\n"
+                   "    GrhSIM_WideDetectFastPathTop model;\n"
+                   "    model.init();\n";
+        int returnCode = 1;
+        for (std::size_t index = 0; index < transactions.size(); ++index)
+        {
+            const Transaction &transaction = transactions[index];
+            harness << "    model.clock = UINT64_C(" << transaction.clock << ");\n"
+                    << "    model.lo = UINT64_C(" << transaction.lo << ");\n"
+                    << "    model.hi = UINT64_C(" << transaction.hi << ");\n"
+                    << "    model.eval();\n"
+                    << "    if (static_cast<std::uint64_t>(model.state_lo) != UINT64_C("
+                    << oracle[index][0] << ")) return " << returnCode++ << ";\n"
+                    << "    if (static_cast<std::uint64_t>(model.state_hi) != UINT64_C("
+                    << oracle[index][1] << ")) return " << returnCode++ << ";\n";
+        }
+        harness << "    return 0;\n}\n";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the wide-detect harness");
+        }
+        const std::string buildCommand =
+            "make -C '" + outputDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated wide-detect AM model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = outputDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + outputDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (outputDirectory / "libgrhsim_WideDetectFastPathTop.a").string() +
+            "' -o '" + harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0)
+        {
+            return fail("generated wide-detect harness failed to compile");
+        }
+        if (std::system(("'" + harnessExecutable.string() + "'").c_str()) != 0)
+        {
+            return fail("generated wide-detect model disagreed with the Interpreter");
+        }
+        return 0;
+    }
+
     LinearProgramArtifact makeProductionCommitCycleProgram()
     {
         LinearProgramBuilder builder;
@@ -5685,6 +5999,13 @@ int main()
     if (const int result = testConcatInsertUnroll(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-concat-insert-unroll");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testWideDetectFastPath(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-wide-detect-fast-path");
         result != 0)
     {
         return result;

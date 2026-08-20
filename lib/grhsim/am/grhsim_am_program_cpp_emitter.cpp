@@ -249,6 +249,16 @@ namespace wolvrix::lib::grhsim::am
             // are wrapped in one exact owned-bit probe. This skips empty words
             // inside an active source part while preserving byte relay.
             bool sourceWordActivityGuard = false;
+            // Wide write-station detect fast path (attribute
+            // "wideDetectFastPath", default off). assign_words_detect sites all
+            // pass equal widths without sign extension; the generic per-word
+            // compare/store loop compiles to scalar code (clang does not
+            // vectorize the reduction), while the stations are ~97% idle
+            // compares (r001 commit-station stats, r002 recon). The fast path
+            // answers the idle case with one whole-range memcmp and falls back
+            // to one memcpy when anything differs, preserving the exact
+            // compare/store semantics of the generic loop.
+            bool wideDetectFastPath = false;
             // Compile-time concat-insert inlining (attribute
             // "concatInsertInline", default off). A Concat / Replicate /
             // window-chain operand that lands inside a single target word is
@@ -986,6 +996,30 @@ namespace wolvrix::lib::grhsim::am
             }
             code += "}\n";
             return code;
+        }
+
+        // The wideDetectFastPath prologue for assign_words_detect: one
+        // whole-range memcmp answers the dominant idle station and a single
+        // memcpy covers the changed case, preserving the generic loop's exact
+        // masked last-word compare/store semantics. Empty unless the knob is
+        // on, which keeps the off path byte-identical.
+        std::string assignWordsDetectFastPathSource(const EmitState &state)
+        {
+            if (!state.wideDetectFastPath)
+            {
+                return {};
+            }
+            return
+                "    if (!signExtend && targetWidth == sourceWidth) {\n"
+                "        if (targetWords == 0U) return false;\n"
+                "        const std::uint64_t lastMask = bit_mask(targetWidth - static_cast<std::uint32_t>((targetWords - 1U) * 64U));\n"
+                "        const std::uint64_t sourceLast = source[targetWords - 1U] & lastMask;\n"
+                "        if (std::memcmp(target, source, (targetWords - 1U) * 8U) == 0 &&\n"
+                "            target[targetWords - 1U] == sourceLast) return false;\n"
+                "        std::memcpy(target, source, (targetWords - 1U) * 8U);\n"
+                "        target[targetWords - 1U] = sourceLast;\n"
+                "        return true;\n"
+                "    }\n";
         }
 
         bool isWideBitVector(const EmitState &state, VariableId variable)
@@ -7531,6 +7565,11 @@ namespace wolvrix::lib::grhsim::am
         state.concatInsertUnroll =
             concatInsertUnrollAttribute != options.attributes.end() &&
             concatInsertUnrollAttribute->second == "true";
+        const auto wideDetectFastPathAttribute =
+            options.attributes.find("wideDetectFastPath");
+        state.wideDetectFastPath =
+            wideDetectFastPathAttribute != options.attributes.end() &&
+            wideDetectFastPathAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -9295,6 +9334,7 @@ namespace
                << "::assign_words_detect(std::uint64_t *target, std::uint32_t targetWidth, const std::uint64_t *source, std::uint32_t sourceWidth, bool signExtend) {\n"
                << "    const std::size_t targetWords = word_count(targetWidth);\n"
                << "    const std::size_t sourceWords = word_count(sourceWidth);\n"
+               << assignWordsDetectFastPathSource(state)
                << "    const bool negative = signExtend && targetWidth > sourceWidth && ((source[(sourceWidth - 1U) / 64U] >> ((sourceWidth - 1U) % 64U)) & 1U);\n"
                << "    const std::size_t signIndex = sourceWidth / 64U;\n"
                << "    const std::uint32_t signBit = sourceWidth % 64U;\n"

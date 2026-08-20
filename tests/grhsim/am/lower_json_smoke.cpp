@@ -145,6 +145,7 @@ int main(int argc, char **argv)
                      "[--source-part-activity-guard] [--source-word-activity-guard] "
                      "[--wide-storage-first-touch] [--concat-insert-inline] "
                      "[--concat-insert-unroll] [--inline-scalar-helpers] [--no-trace-comments] "
+                     "[--wide-detect-fast-path] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -189,6 +190,7 @@ int main(int argc, char **argv)
     bool concatInsertInline = false;
     bool inlineScalarHelpers = false;
     bool concatInsertUnroll = false;
+    bool wideDetectFastPath = false;
     bool traceComments = true;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
@@ -462,6 +464,10 @@ int main(int argc, char **argv)
         else if (argument == "--concat-insert-unroll")
         {
             concatInsertUnroll = true;
+        }
+        else if (argument == "--wide-detect-fast-path")
+        {
+            wideDetectFastPath = true;
         }
         else if (argument == "--no-trace-comments")
         {
@@ -876,6 +882,10 @@ int main(int argc, char **argv)
                 if (concatInsertUnroll)
                 {
                     emitOptions.attributes.emplace("concatInsertUnroll", "true");
+                }
+                if (wideDetectFastPath)
+                {
+                    emitOptions.attributes.emplace("wideDetectFastPath", "true");
                 }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,

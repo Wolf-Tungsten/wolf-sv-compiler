@@ -412,6 +412,16 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   `width > 512` 一律回退 outlined。off 时输出与既往逐字节一致。三种形式的
   站点计数经 diagnostics 报告
   （`concat_unroll_aligned/crossing/wide`，随 collectStats 输出）。
+- `wideDetectFastPath`（`--wide-detect-fast-path`，默认关）：为
+  `assign_words_detect` 增加同宽、无符号扩展站点（当前全部调用点都是此形）
+  的快速路径——先用一次整区间 `std::memcmp` 回答占绝对多数的 idle 写站
+  （r001 commit 写站统计 idle≈97%；r002 recon 显示 commit 相约占块周期
+  32%，集中于每 eval 触发的数十个宽站巨块），有任何差异时退化为一次
+  `std::memcpy` 加末词掩码写入。末词保持写侧掩码纪律（source 掩码后做全词
+  比较/写入），与通用逐词循环的返回值和存储结果逐位等价；通用循环本身保留
+  为非同宽/符号扩展情形的 fallback。动机：clang 不会向量化带归约的通用循环
+  （实测每词 ~12-15 条标量指令），而 idle 站点只需要一次向量比较。off 时
+  输出与既往逐字节一致。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
