@@ -259,6 +259,29 @@ namespace wolvrix::lib::grhsim::am
             // to one memcpy when anything differs, preserving the exact
             // compare/store semantics of the generic loop.
             bool wideDetectFastPath = false;
+            // Compile-time system-task body outlining (attribute
+            // "sysTaskBodyOutline", default off). A non-final fwrite station's
+            // body (TaskFormatter construction, per-argument append, ostream
+            // output) moves out of the block function into a noinline member
+            // function sys_task_body_<InstructionId>: the hot path keeps the
+            // preamble/fire-condition evaluation inline, materializes the
+            // handle and every narrow scalar argument into block-local consts
+            // (they may name block-local values), and performs one call. The
+            // preamble and the once/pending epilogue stay inline. With the
+            // switch off the output is byte-identical to the stock form.
+            bool sysTaskBodyOutline = false;
+            // Outlined fwrite bodies collected during emission: instruction id
+            // -> parameter list + indented body statements. The body text is
+            // context-free (member storage and parameters only), so the
+            // measure pass and the write pass re-derive identical entries and
+            // the map insert is idempotent. Consumed by the header
+            // declaration loop and the runtime-source definition block.
+            struct SysTaskOutline
+            {
+                std::string parameters;
+                std::string body;
+            };
+            mutable std::map<uint32_t, SysTaskOutline> sysTaskOutlinedBodies;
             // Compile-time concat-insert inlining (attribute
             // "concatInsertInline", default off). A Concat / Replicate /
             // window-chain operand that lands inside a single target word is
@@ -1575,22 +1598,75 @@ namespace wolvrix::lib::grhsim::am
                 const std::string formatterName = "task_formatter_" + suffix;
                 code += "const std::uint64_t " + handleName + " = " + valueExpr(state, handle) +
                         " & " + maskExpr(handleType.bitWidth) + ";\n";
-                code += "TaskFormatter " + formatterName + "(stringValues_[" +
-                        std::to_string(variableStorage(state, format).offset) + "]);\n";
-                for (std::size_t index = 3; index < argumentEnd; ++index)
+                if (state.sysTaskBodyOutline && !finalPhase)
                 {
-                    const std::string argument = taskArgumentExpr(state, operands[index]);
-                    if (argument.empty())
+                    // sysTaskBodyOutline: the fwrite body moves into the
+                    // noinline member sys_task_body_<id> (declaration in the
+                    // model header, definition in the runtime source). Narrow
+                    // scalar arguments may name block-local values, so they
+                    // are materialized into block-local consts here and passed
+                    // by value; wide / real / string arguments name only
+                    // member storage and are referenced directly inside the
+                    // outlined body, keeping its text context-free.
+                    EmitState::SysTaskOutline outline;
+                    outline.parameters = "std::uint64_t " + handleName;
+                    outline.body = "    TaskFormatter " + formatterName + "(stringValues_[" +
+                                   std::to_string(variableStorage(state, format).offset) + "]);\n";
+                    std::string call = "sys_task_body_" + suffix + "(" + handleName;
+                    for (std::size_t index = 3; index < argumentEnd; ++index)
                     {
-                        error = "fwrite system.task encountered an unsupported argument type";
-                        return std::nullopt;
+                        const Type &argumentType = variableType(state, operands[index]);
+                        if (argumentType.kind == TypeKind::BitVector && argumentType.bitWidth <= 64)
+                        {
+                            const std::string argumentName =
+                                "task_arg_" + suffix + "_" + std::to_string(index);
+                            code += "const std::uint64_t " + argumentName + " = " +
+                                    valueExpr(state, operands[index]) + ";\n";
+                            outline.parameters += ", std::uint64_t " + argumentName;
+                            call += ", " + argumentName;
+                            outline.body +=
+                                "    " + formatterName + ".append(TaskArgument::logic_scalar(" +
+                                argumentName + ", " + std::to_string(argumentType.bitWidth) +
+                                ", " +
+                                (argumentType.signedness == Signedness::Signed ? "true" : "false") +
+                                "));\n";
+                            continue;
+                        }
+                        const std::string argument = taskArgumentExpr(state, operands[index]);
+                        if (argument.empty())
+                        {
+                            error = "fwrite system.task encountered an unsupported argument type";
+                            return std::nullopt;
+                        }
+                        outline.body += "    " + formatterName + ".append(" + argument + ");\n";
                     }
-                    code += formatterName + ".append(" + argument + ");\n";
+                    outline.body += "    std::ostream &task_output_" + suffix + " = (" + handleName +
+                                    " == UINT64_C(2) || " + handleName +
+                                    " == UINT64_C(0x80000002)) ? std::cerr : std::cout;\n";
+                    outline.body += "    task_output_" + suffix + " << " + formatterName +
+                                    ".finish();\n";
+                    state.sysTaskOutlinedBodies[instruction.value] = std::move(outline);
+                    code += call + ");\n";
                 }
-                code += "std::ostream &task_output_" + suffix + " = (" + handleName +
-                        " == UINT64_C(2) || " + handleName +
-                        " == UINT64_C(0x80000002)) ? std::cerr : std::cout;\n";
-                code += "task_output_" + suffix + " << " + formatterName + ".finish();\n";
+                else
+                {
+                    code += "TaskFormatter " + formatterName + "(stringValues_[" +
+                            std::to_string(variableStorage(state, format).offset) + "]);\n";
+                    for (std::size_t index = 3; index < argumentEnd; ++index)
+                    {
+                        const std::string argument = taskArgumentExpr(state, operands[index]);
+                        if (argument.empty())
+                        {
+                            error = "fwrite system.task encountered an unsupported argument type";
+                            return std::nullopt;
+                        }
+                        code += formatterName + ".append(" + argument + ");\n";
+                    }
+                    code += "std::ostream &task_output_" + suffix + " = (" + handleName +
+                            " == UINT64_C(2) || " + handleName +
+                            " == UINT64_C(0x80000002)) ? std::cerr : std::cout;\n";
+                    code += "task_output_" + suffix + " << " + formatterName + ".finish();\n";
+                }
             }
             else
             {
@@ -7570,6 +7646,11 @@ namespace wolvrix::lib::grhsim::am
         state.wideDetectFastPath =
             wideDetectFastPathAttribute != options.attributes.end() &&
             wideDetectFastPathAttribute->second == "true";
+        const auto sysTaskBodyOutlineAttribute =
+            options.attributes.find("sysTaskBodyOutline");
+        state.sysTaskBodyOutline =
+            sysTaskBodyOutlineAttribute != options.attributes.end() &&
+            sysTaskBodyOutlineAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -8520,6 +8601,16 @@ namespace wolvrix::lib::grhsim::am
                                << parameterList << ");\n";
                     }
                 }
+            }
+        }
+        if (state.sysTaskBodyOutline)
+        {
+            // sysTaskBodyOutline: one noinline member per non-final fwrite
+            // station; the definitions live in the runtime source.
+            for (const auto &[instructionId, outline] : state.sysTaskOutlinedBodies)
+            {
+                header << "    void sys_task_body_" << instructionId << "("
+                       << outline.parameters << ") __attribute__((noinline));\n";
             }
         }
         header << "    // Byte view of the packed activity words for the static compute scan, which\n"
@@ -10423,6 +10514,18 @@ namespace
                 << "const std::string &" << className
                 << "::dumpfile_path() const { return emptyPath_; }\n"
                 << "bool " << className << "::dumpvars_enabled() const { return false; }\n";
+
+        if (state.sysTaskBodyOutline)
+        {
+            // sysTaskBodyOutline: outlined fwrite bodies, one per non-final
+            // fwrite station; the declarations sit in the model header.
+            for (const auto &[instructionId, outline] : state.sysTaskOutlinedBodies)
+            {
+                runtime << "void " << className << "::sys_task_body_" << instructionId << "("
+                        << outline.parameters << ") {\n"
+                        << outline.body << "}\n";
+            }
+        }
 
         std::vector<std::string> sourceNames;
         sourceNames.reserve(blockPartCount + 1U);

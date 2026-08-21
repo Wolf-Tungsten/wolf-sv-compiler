@@ -3116,6 +3116,403 @@ int main()
         return 0;
     }
 
+    struct SysTaskOutlineFixture
+    {
+        ExecutableModel model;
+        InstructionId bootTask;
+        InstructionId dataTask;
+    };
+
+    // sysTaskBodyOutline fixture: the phased-commit shape plus two fwrite
+    // stations in the compute block — a Once task and a Pending-mode task with
+    // two narrow scalar arguments (one input member, one same-block slice
+    // result) — so the knob must outline both bodies while the preamble, fire
+    // condition and once/pending epilogues stay inline.
+    SysTaskOutlineFixture makeSysTaskOutlineFixture()
+    {
+        LinearProgramBuilder linear;
+        const TypeId u1Type = linear.addType(Type::bitVector(1));
+        const TypeId u64Type = linear.addType(Type::bitVector(64));
+        const TypeId u128Type = linear.addType(Type::bitVector(128));
+        const TypeId stringType = linear.addType(Type::string());
+
+        ProgramInterface interface;
+        const auto addInput = [&](TypeId type, std::string_view name) {
+            const VariableId variable = linear.addVariable(type, linear.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Input,
+                .input = variable,
+            });
+            return variable;
+        };
+        const auto addOutput = [&](TypeId type, std::string_view name) {
+            const VariableId variable = linear.addVariable(type, linear.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Output,
+                .output = variable,
+            });
+            return variable;
+        };
+        const auto addInstruction = [&](Opcode opcode,
+                                        std::initializer_list<VariableId> results,
+                                        std::initializer_list<VariableId> operands) {
+            return linear.addInstruction(
+                opcode,
+                std::span<const VariableId>(results.begin(), results.size()),
+                std::span<const VariableId>(operands.begin(), operands.size()));
+        };
+
+        const VariableId clock = addInput(u1Type, "clock");
+        const VariableId fire = addInput(u1Type, "fire");
+        const VariableId lo = addInput(u64Type, "lo");
+        const VariableId hi = addInput(u64Type, "hi");
+        const VariableId stateLo = addOutput(u64Type, "state_lo");
+        const VariableId stateHi = addOutput(u64Type, "state_hi");
+        const VariableId clockOld = linear.addVariable(u1Type, linear.undefInit());
+        const VariableId entryEvent = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId fireOld = linear.addVariable(u1Type, linear.undefInit());
+        const VariableId fireChanged = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId loOld = linear.addVariable(u64Type, linear.undefInit());
+        const VariableId hiOld = linear.addVariable(u64Type, linear.undefInit());
+        const VariableId loChanged = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId hiChanged = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId posedgeOld = linear.addVariable(u1Type, linear.undefInit());
+        const VariableId posedge = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId handle = linear.addVariable(u64Type, linear.zeroInit());
+        const VariableId formatBoot = linear.addVariable(
+            stringType,
+            linear.addConstantInit(linear.addStringLiteral(stringType, "boot\n")));
+        const VariableId formatData = linear.addVariable(
+            stringType,
+            linear.addConstantInit(
+                linear.addStringLiteral(stringType, "data=%d local=%d\n")));
+        const VariableId nextState = linear.addVariable(u128Type, linear.zeroInit());
+        const VariableId state = linear.addVariable(u128Type, linear.zeroInit());
+        const VariableId stateOld = linear.addVariable(u128Type, linear.undefInit());
+        const VariableId stateChanged = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId commitClockOld =
+            linear.addVariable(u1Type, linear.undefInit());
+        const VariableId commitPosedge = linear.addVariable(u1Type, linear.zeroInit());
+        const VariableId localVal = linear.addVariable(u64Type, linear.undefInit());
+
+        const InstructionId watchClock =
+            addInstruction(Opcode::ChangedAny, {entryEvent}, {clock, clockOld});
+        const InstructionId watchFire =
+            addInstruction(Opcode::ChangedAny, {fireChanged}, {fire, fireOld});
+        const InstructionId watchLo =
+            addInstruction(Opcode::ChangedAny, {loChanged}, {lo, loOld});
+        const InstructionId watchHi =
+            addInstruction(Opcode::ChangedAny, {hiChanged}, {hi, hiOld});
+        const InstructionId detectPosedge =
+            addInstruction(Opcode::ChangedPos, {posedge}, {clock, posedgeOld});
+        const InstructionId buildNext =
+            addInstruction(Opcode::Concat, {nextState}, {lo, hi});
+        const InstructionId sampleLo = addInstruction(
+            Opcode::SliceStatic, {stateLo}, {state});
+        const InstructionId sampleHi = addInstruction(
+            Opcode::SliceStatic, {stateHi}, {state});
+        linear.setSliceStaticAttributes(sampleLo, 0);
+        linear.setSliceStaticAttributes(sampleHi, 64);
+        // Defined and read only inside block 1: the outlined call site
+        // materializes the argument whether or not ST00009 localizes it.
+        const InstructionId sampleLocal = addInstruction(
+            Opcode::SliceStatic, {localVal}, {state});
+        linear.setSliceStaticAttributes(sampleLocal, 0);
+        const InstructionId gateDetect = addInstruction(
+            Opcode::ChangedPos, {commitPosedge}, {clock, commitClockOld});
+        const InstructionId writeState = addInstruction(
+            Opcode::RegisterWrite, {}, {nextState, state, commitPosedge});
+        const InstructionId detectState =
+            addInstruction(Opcode::ChangedAny, {stateChanged}, {state, stateOld});
+
+        ScheduledProgramBuilder scheduled(linear.finish());
+        const StringId fwriteName = scheduled.addString("fwrite");
+        const auto addScheduledInstruction =
+            [&](Opcode opcode, std::initializer_list<VariableId> operands) {
+                return scheduled.addInstruction(
+                    opcode, {},
+                    std::span<const VariableId>(operands.begin(), operands.size()));
+            };
+        const auto addBlock = [&](std::initializer_list<InstructionId> instructions) {
+            scheduled.addBlock(std::span<const InstructionId>(instructions.begin(),
+                                                               instructions.size()));
+        };
+        const InstructionId enterClock =
+            addScheduledInstruction(Opcode::ActForward, {entryEvent});
+        const InstructionId enterFire =
+            addScheduledInstruction(Opcode::ActForward, {fireChanged});
+        const InstructionId enterLo =
+            addScheduledInstruction(Opcode::ActForward, {loChanged});
+        const InstructionId enterHi =
+            addScheduledInstruction(Opcode::ActForward, {hiChanged});
+        const InstructionId bootTask =
+            addScheduledInstruction(Opcode::SystemTask, {fire, handle, formatBoot});
+        scheduled.setSystemTaskAttributes(
+            bootTask,
+            SystemTaskAttributes{
+                .name = fwriteName,
+                .eventCount = 0,
+                .schedule = CallSchedule::Once,
+                .eventMode = HostEventMode::Immediate,
+            });
+        const InstructionId dataTask = addScheduledInstruction(
+            Opcode::SystemTask, {fire, handle, formatData, lo, localVal, posedge});
+        scheduled.setSystemTaskAttributes(
+            dataTask,
+            SystemTaskAttributes{
+                .name = fwriteName,
+                .eventCount = 1,
+                .schedule = CallSchedule::Normal,
+                .eventMode = HostEventMode::Pending,
+            });
+        const InstructionId activateReaders =
+            addScheduledInstruction(Opcode::ActBackward, {stateChanged});
+        scheduled.setActivationTargets(enterClock, std::array{BlockId{1}, BlockId{3}});
+        scheduled.setActivationTargets(enterFire, std::array{BlockId{1}});
+        scheduled.setActivationTargets(enterLo, std::array{BlockId{1}});
+        scheduled.setActivationTargets(enterHi, std::array{BlockId{1}});
+        scheduled.setActivationTargets(activateReaders, std::array{BlockId{2}});
+        addBlock({watchClock, watchFire, watchLo, watchHi, enterClock, enterFire, enterLo,
+                  enterHi});
+        addBlock({detectPosedge, buildNext, sampleLocal, bootTask, dataTask});
+        addBlock({sampleLo, sampleHi});
+        addBlock({gateDetect, writeState, detectState, activateReaders});
+
+        return SysTaskOutlineFixture{
+            .model =
+                ExecutableModel{
+                    .program = scheduled.finish(),
+                    .interface = std::move(interface),
+                    .commitBlockBegin = 3,
+                    .commitBlockEnd = 4,
+                },
+            .bootTask = bootTask,
+            .dataTask = dataTask,
+        };
+    }
+
+    int testSysTaskBodyOutline(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        const SysTaskOutlineFixture fixture = makeSysTaskOutlineFixture();
+        const std::string bootId = std::to_string(fixture.bootTask.value);
+        const std::string dataId = std::to_string(fixture.dataTask.value);
+
+        wolvrix::lib::diag::Diagnostics offDiagnostics;
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult offResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "stock",
+                .modelName = "SysTaskStockTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            offDiagnostics);
+        wolvrix::lib::diag::Diagnostics onDiagnostics;
+        const GrhSimAmCppResult onResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "SysTaskOutlineTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"sysTaskBodyOutline", "true"}},
+            },
+            onDiagnostics);
+        if (!offResult.success || offDiagnostics.hasError() || !onResult.success ||
+            onDiagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the sys-task-outline fixture");
+        }
+
+        const std::optional<std::string> stockHeader = readTextFile(
+            outputDirectory / "stock" / "grhsim_SysTaskStockTop.hpp");
+        const std::optional<std::string> stockRuntime = readTextFile(
+            outputDirectory / "stock" / "grhsim_SysTaskStockTop_runtime.cpp");
+        const std::optional<std::string> stockBlocks = readTextFile(
+            outputDirectory / "stock" / "grhsim_SysTaskStockTop_blocks_0.cpp");
+        const std::optional<std::string> onHeader = readTextFile(
+            outputDirectory / "grhsim_SysTaskOutlineTop.hpp");
+        const std::optional<std::string> onRuntime = readTextFile(
+            outputDirectory / "grhsim_SysTaskOutlineTop_runtime.cpp");
+        const std::optional<std::string> onBlocks = readTextFile(
+            outputDirectory / "grhsim_SysTaskOutlineTop_blocks_0.cpp");
+        if (!stockHeader || !stockRuntime || !stockBlocks || !onHeader || !onRuntime ||
+            !onBlocks)
+        {
+            return fail("AM C++ emitter produced unreadable sys-task-outline artifacts");
+        }
+        // The knob is default-off inert: stock artifacts never mention the
+        // outlined form.
+        if (stockHeader->find("sys_task_body_") != std::string::npos ||
+            stockRuntime->find("sys_task_body_") != std::string::npos ||
+            stockBlocks->find("sys_task_body_") != std::string::npos)
+        {
+            return fail("stock AM C++ output references sys_task_body_");
+        }
+        // On-mode block source: the bodies become calls; the preamble, the
+        // fire evaluation and the once/pending epilogues stay inline.
+        const std::string bootCall =
+            "sys_task_body_" + bootId + "(task_handle_" + bootId + ");";
+        const std::string dataCall = "sys_task_body_" + dataId + "(task_handle_" + dataId +
+                                     ", task_arg_" + dataId + "_3, task_arg_" + dataId +
+                                     "_4);";
+        if (onBlocks->find(bootCall) == std::string::npos ||
+            onBlocks->find(dataCall) == std::string::npos ||
+            onBlocks->find("const std::uint64_t task_arg_" + dataId + "_3 = ") ==
+                std::string::npos ||
+            onBlocks->find("const std::uint64_t task_arg_" + dataId + "_4 = ") ==
+                std::string::npos ||
+            onBlocks->find("pendingHostEvents_[0] = true;") == std::string::npos ||
+            onBlocks->find("pendingHostEvents_[0] = false;") == std::string::npos ||
+            onBlocks->find("onceCompleted_[0] = true;") == std::string::npos ||
+            onBlocks->find("if (!onceCompleted_[0] && ") == std::string::npos ||
+            onBlocks->find("TaskFormatter") != std::string::npos)
+        {
+            return fail("sysTaskBodyOutline did not keep the fwrite scaffolding inline");
+        }
+        // On-mode header/runtime: one noinline declaration per station and one
+        // definition each in the runtime source.
+        if (onHeader->find("void sys_task_body_" + bootId + "(std::uint64_t task_handle_" +
+                           bootId + ") __attribute__((noinline));") == std::string::npos ||
+            onHeader->find("void sys_task_body_" + dataId + "(std::uint64_t task_handle_" +
+                           dataId + ", std::uint64_t task_arg_" + dataId +
+                           "_3, std::uint64_t task_arg_" + dataId +
+                           "_4) __attribute__((noinline));") == std::string::npos ||
+            onRuntime->find("void GrhSIM_SysTaskOutlineTop::sys_task_body_" + bootId + "(") ==
+                std::string::npos ||
+            onRuntime->find("void GrhSIM_SysTaskOutlineTop::sys_task_body_" + dataId + "(") ==
+                std::string::npos ||
+            onRuntime->find("TaskFormatter task_formatter_" + dataId + "(stringValues_[") ==
+                std::string::npos ||
+            onRuntime->find("task_formatter_" + dataId +
+                            ".append(TaskArgument::logic_scalar(task_arg_" + dataId +
+                            "_3, 64, false));") == std::string::npos ||
+            onRuntime->find("task_output_" + dataId + " << task_formatter_" + dataId +
+                            ".finish();") == std::string::npos)
+        {
+            return fail("sysTaskBodyOutline did not outline the fwrite bodies");
+        }
+        // Outside the block sources the knob only adds text: stripping the
+        // declaration lines from the header and the appended definitions from
+        // the runtime reproduces the stock artifacts byte for byte.
+        const auto replaceAll = [](std::string &text, const std::string &from,
+                                   const std::string &to) {
+            std::size_t position = 0;
+            while ((position = text.find(from, position)) != std::string::npos)
+            {
+                text.replace(position, from.size(), to);
+                position += to.size();
+            }
+        };
+        const auto removeLinesContaining = [](const std::string &text,
+                                              const std::string &needle) {
+            std::string kept;
+            std::size_t cursor = 0;
+            while (cursor < text.size())
+            {
+                const std::size_t newline = text.find('\n', cursor);
+                const std::size_t end =
+                    newline == std::string::npos ? text.size() : newline + 1;
+                if (std::string_view(text).substr(cursor, end - cursor).find(needle) ==
+                    std::string_view::npos)
+                {
+                    kept.append(text, cursor, end - cursor);
+                }
+                cursor = end;
+            }
+            return kept;
+        };
+        std::string onHeaderNormalized = removeLinesContaining(*onHeader, "sys_task_body_");
+        replaceAll(onHeaderNormalized, "SysTaskOutlineTop", "SysTaskStockTop");
+        if (onHeaderNormalized != *stockHeader)
+        {
+            return fail("sysTaskBodyOutline changed the header beyond the declarations");
+        }
+        std::string onRuntimeNormalized = *onRuntime;
+        replaceAll(onRuntimeNormalized, "SysTaskOutlineTop", "SysTaskStockTop");
+        if (onRuntimeNormalized.size() <= stockRuntime->size() ||
+            onRuntimeNormalized.compare(0, stockRuntime->size(), *stockRuntime) != 0 ||
+            onRuntimeNormalized.find("void GrhSIM_SysTaskStockTop::sys_task_body_",
+                                     stockRuntime->size()) != stockRuntime->size())
+        {
+            return fail("sysTaskBodyOutline changed the runtime beyond appended definitions");
+        }
+
+        // Functional check: both models must print byte-identical fwrite
+        // output (Once boot line, Pending data lines).
+        const std::array<std::array<uint64_t, 3>, 6> transactions = {{
+            {0, UINT64_C(0x0123456789abcdef), UINT64_C(0xfedcba9876543210)},
+            {1, UINT64_C(0x0123456789abcdef), UINT64_C(0xfedcba9876543210)},
+            {0, UINT64_C(0x0123456789abcdef), UINT64_C(0xfedcba9876543210)},
+            {1, UINT64_C(0x0123456789abcdef), UINT64_C(0xfedcba9876543210)},
+            {0, UINT64_C(0x5555555555555555), UINT64_C(0xaaaaaaaaaaaaaaaa)},
+            {1, UINT64_C(0x5555555555555555), UINT64_C(0xaaaaaaaaaaaaaaaa)},
+        }};
+        const auto writeHarness = [&](const std::filesystem::path &path,
+                                      const std::string &top) {
+            std::ofstream harness(path);
+            harness << "#include \"grhsim_" << top
+                    << ".hpp\"\n#include <cstdint>\n\n"
+                       "int main()\n{\n    GrhSIM_"
+                    << top << " model;\n    model.init();\n    model.fire = UINT64_C(1);\n";
+            for (const auto &[clock, lo, hi] : transactions)
+            {
+                harness << "    model.clock = UINT64_C(" << clock << ");\n"
+                        << "    model.lo = UINT64_C(" << lo << ");\n"
+                        << "    model.hi = UINT64_C(" << hi << ");\n"
+                        << "    model.eval();\n";
+            }
+            harness << "    return 0;\n}\n";
+            return harness.good();
+        };
+        const auto buildAndRun = [&](const std::filesystem::path &directory,
+                                     const std::string &top,
+                                     const std::filesystem::path &stdoutPath) {
+            const std::string buildCommand =
+                "make -C '" + directory.string() + "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+            if (std::system(buildCommand.c_str()) != 0)
+            {
+                return false;
+            }
+            const std::filesystem::path harnessPath = directory / "harness.cpp";
+            if (!writeHarness(harnessPath, top))
+            {
+                return false;
+            }
+            const std::filesystem::path harnessExecutable = directory / "harness";
+            const std::string harnessCompileCommand =
+                "clang++ -std=c++20 -O2 -I'" + directory.string() + "' '" +
+                harnessPath.string() + "' '" +
+                (directory / ("libgrhsim_" + top + ".a")).string() + "' -o '" +
+                harnessExecutable.string() + "'";
+            if (std::system(harnessCompileCommand.c_str()) != 0)
+            {
+                return false;
+            }
+            return std::system(("'" + harnessExecutable.string() + "' > '" +
+                                stdoutPath.string() + "'")
+                                   .c_str()) == 0;
+        };
+        const std::filesystem::path stockStdoutPath = outputDirectory / "stock_stdout.txt";
+        const std::filesystem::path onStdoutPath = outputDirectory / "outline_stdout.txt";
+        if (!buildAndRun(outputDirectory / "stock", "SysTaskStockTop", stockStdoutPath) ||
+            !buildAndRun(outputDirectory, "SysTaskOutlineTop", onStdoutPath))
+        {
+            return fail("generated sys-task-outline models failed to build or run");
+        }
+        const std::optional<std::string> stockStdout = readTextFile(stockStdoutPath);
+        const std::optional<std::string> onStdout = readTextFile(onStdoutPath);
+        if (!stockStdout || !onStdout || *stockStdout != *onStdout ||
+            countOccurrences(*stockStdout, "boot") != 1 ||
+            countOccurrences(*stockStdout, "data=") != 3)
+        {
+            return fail("sysTaskBodyOutline changed the fwrite runtime behavior");
+        }
+        return 0;
+    }
+
     LinearProgramArtifact makeProductionCommitCycleProgram()
     {
         LinearProgramBuilder builder;
@@ -6006,6 +6403,13 @@ int main()
     if (const int result = testWideDetectFastPath(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-wide-detect-fast-path");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testSysTaskBodyOutline(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-sys-task-body-outline");
         result != 0)
     {
         return result;

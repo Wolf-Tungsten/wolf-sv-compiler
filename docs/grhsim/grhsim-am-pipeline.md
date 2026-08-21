@@ -422,6 +422,16 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   为非同宽/符号扩展情形的 fallback。动机：clang 不会向量化带归约的通用循环
   （实测每词 ~12-15 条标量指令），而 idle 站点只需要一次向量比较。off 时
   输出与既往逐字节一致。
+- `sysTaskBodyOutline`（`--sys-task-body-outline`，默认关）：非 final 的
+  `fwrite` 站的函数体（`TaskFormatter` 构造、逐参数 `append`、ostream 输出）
+  从块函数内热路径抽成独立的 noinline 成员函数
+  `sys_task_body_<InstructionId>`（声明在模型头文件、定义集中在 runtime
+  .cpp）；热路径只保留 preamble 与 fire 条件求值、把 handle 与每个窄标量
+  实参物化为块内局部 const（它们可能引用块局部量）、以及一次调用，
+  once/pending 收尾仍留在内联 `if` 内。宽 / real / String 实参只引用成员
+  存储，在 outlined 函数体内直接访问。动机：守卫块里每 atom 一条的
+  `if (fire) { ...fwrite body... }` 让巨块函数体的前端流式成本成为病灶，
+  抽出的冷体不再挤占热路径的取指/解码流。off 时输出与既往逐字节一致。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
