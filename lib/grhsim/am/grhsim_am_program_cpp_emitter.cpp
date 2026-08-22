@@ -270,6 +270,11 @@ namespace wolvrix::lib::grhsim::am
             // preamble and the once/pending epilogue stay inline. With the
             // switch off the output is byte-identical to the stock form.
             bool sysTaskBodyOutline = false;
+            // Static branch hints for sparse activity scans (attribute
+            // "scanBranchHints", default off).  The condition is unchanged;
+            // the hint lets clang keep the cold Block bodies off the
+            // fall-through scan path.
+            bool scanBranchHints = false;
             // Outlined fwrite bodies collected during emission: instruction id
             // -> parameter list + indented body statements. The body text is
             // context-free (member storage and parameters only), so the
@@ -4575,8 +4580,12 @@ namespace wolvrix::lib::grhsim::am
         // In full-evaluation mode the snapshot is forced to the owned mask, so
         // every owned block test passes unconditionally.
         std::string scanByteChunkPrologue(std::size_t byteIndex, uint8_t ownedMask,
-                                          bool fullEvaluation)
+                                          bool fullEvaluation,
+                                          bool scanBranchHints = false)
         {
+            const std::string test =
+                scanBranchHints ? "__builtin_expect(byteFlags != 0, 0)"
+                                : "byteFlags != 0";
             if (fullEvaluation)
             {
                 return "    {\n        std::uint8_t byteFlags = " +
@@ -4587,13 +4596,13 @@ namespace wolvrix::lib::grhsim::am
                                std::to_string(byteIndex) + ")";
             if (ownedMask == 0xffU)
             {
-                text += ";\n        if (byteFlags != 0) {\n            active_byte_ref(" +
+                text += ";\n        if (" + test + ") {\n            active_byte_ref(" +
                         std::to_string(byteIndex) + ") = 0;\n";
             }
             else
             {
                 text += " & " + byteMaskLiteral(ownedMask) +
-                        ";\n        if (byteFlags != 0) {\n            active_byte_ref(" +
+                        ";\n        if (" + test + ") {\n            active_byte_ref(" +
                         std::to_string(byteIndex) + ") &= " +
                         byteMaskLiteral(static_cast<uint8_t>(~ownedMask)) + ";\n";
             }
@@ -4614,12 +4623,18 @@ namespace wolvrix::lib::grhsim::am
         constexpr std::string_view kScanWordActivityGuardEpilogue = "    }\n";
 
         std::string scanBlockTestPrologue(std::size_t blockIndex,
-                                          bool runtimeProfile)
+                                          bool runtimeProfile,
+                                          bool scanBranchHints = false)
         {
-            std::string text =
-                "            if ((byteFlags & " +
+            const std::string condition =
+                "(byteFlags & " +
                 byteMaskLiteral(static_cast<uint8_t>(1U << (blockIndex % 8U))) +
-                ") != 0) {\n";
+                ") != 0";
+            std::string text =
+                "            if (" +
+                (scanBranchHints ? "__builtin_expect(" + condition + ", 0)"
+                                 : condition) +
+                ") {\n";
             if (runtimeProfile)
             {
                 // NO0010: the t0 local lives in this Block's if-scope (sibling
@@ -4649,14 +4664,20 @@ namespace wolvrix::lib::grhsim::am
         }
 
         std::string commitBlockTestPrologue(std::size_t blockIndex,
-                                            bool runtimeProfile)
+                                            bool runtimeProfile,
+                                            bool scanBranchHints = false)
         {
             // Commit Blocks are activation-filtered exactly like compute
             // Blocks: the byte-chunk scan above owns the bit snapshot/clear.
-            std::string text =
-                "            if ((byteFlags & " +
+            const std::string condition =
+                "(byteFlags & " +
                 byteMaskLiteral(static_cast<uint8_t>(1U << (blockIndex % 8U))) +
-                ") != 0) {\n";
+                ") != 0";
+            std::string text =
+                "            if (" +
+                (scanBranchHints ? "__builtin_expect(" + condition + ", 0)"
+                                 : condition) +
+                ") {\n";
             if (runtimeProfile)
             {
                 text += "                std::uint64_t profileBlockT0 = 0;\n";
@@ -5033,7 +5054,9 @@ namespace wolvrix::lib::grhsim::am
                 return static_cast<uint64_t>(0);
             }
             uint64_t byteCount = static_cast<uint64_t>(
-                scanBlockTestPrologue(blockIndex, state.runtimeProfile).size());
+                scanBlockTestPrologue(blockIndex, state.runtimeProfile,
+                                      state.scanBranchHints)
+                    .size());
             if (!addByteCount(byteCount, *bodyBytes) ||
                 !addByteCount(byteCount,
                               scanBlockTestEpilogue(blockIndex, state.runtimeProfile).size()))
@@ -5059,7 +5082,9 @@ namespace wolvrix::lib::grhsim::am
                 return std::nullopt;
             }
             uint64_t byteCount = static_cast<uint64_t>(
-                commitBlockTestPrologue(blockIndex, state.runtimeProfile).size());
+                commitBlockTestPrologue(blockIndex, state.runtimeProfile,
+                                        state.scanBranchHints)
+                    .size());
             const auto &commitGate = state.blockCommitGate[blockIndex];
             if (commitGate.headCount != 0 &&
                 (!addByteCount(byteCount,
@@ -5205,7 +5230,8 @@ namespace wolvrix::lib::grhsim::am
                         pendingBytes,
                         static_cast<uint64_t>(
                             scanByteChunkPrologue(scanByte, ownedMask,
-                                                  state.fullEvaluation)
+                                                  state.fullEvaluation,
+                                                  state.scanBranchHints)
                                 .size()) +
                             static_cast<uint64_t>(kScanByteChunkEpilogue.size()));
                 };
@@ -7651,6 +7677,11 @@ namespace wolvrix::lib::grhsim::am
         state.sysTaskBodyOutline =
             sysTaskBodyOutlineAttribute != options.attributes.end() &&
             sysTaskBodyOutlineAttribute->second == "true";
+        const auto scanBranchHintsAttribute =
+            options.attributes.find("scanBranchHints");
+        state.scanBranchHints =
+            scanBranchHintsAttribute != options.attributes.end() &&
+            scanBranchHintsAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -10997,7 +11028,8 @@ namespace
                         {
                             blockSource << scanByteChunkPrologue(chunk.byteIndex,
                                                                  chunk.ownedMask,
-                                                                 state.fullEvaluation);
+                                                                 state.fullEvaluation,
+                                                                 state.scanBranchHints);
                             state.scanRelayByte =
                                 static_cast<int32_t>(chunk.byteIndex);
                             state.scanRelayMask = chunk.ownedMask;
@@ -11010,7 +11042,8 @@ namespace
                                     continue;
                                 }
                                 blockSource << scanBlockTestPrologue(
-                                    blockIndex, state.runtimeProfile);
+                                    blockIndex, state.runtimeProfile,
+                                    state.scanBranchHints);
                                 if (!writeBlockBodyOrChunks(blockIndex, "                "))
                                 {
                                     blocksGenerated = false;
@@ -11072,7 +11105,8 @@ namespace
                         {
                             blockSource << scanByteChunkPrologue(chunk.byteIndex,
                                                                  chunk.ownedMask,
-                                                                 state.fullEvaluation);
+                                                                 state.fullEvaluation,
+                                                                 state.scanBranchHints);
                             state.scanRelayByte =
                                 static_cast<int32_t>(chunk.byteIndex);
                             state.scanRelayMask = chunk.ownedMask;
@@ -11081,7 +11115,8 @@ namespace
                                  ++blockIndex)
                             {
                                 blockSource << commitBlockTestPrologue(
-                                    blockIndex, state.runtimeProfile);
+                                    blockIndex, state.runtimeProfile,
+                                    state.scanBranchHints);
                                 const EmitState::CommitGate &commitGate =
                                     state.blockCommitGate[blockIndex];
                                 const EmitState::CommitGate *gate =

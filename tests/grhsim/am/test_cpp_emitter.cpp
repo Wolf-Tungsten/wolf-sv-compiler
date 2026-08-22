@@ -3513,6 +3513,36 @@ int main()
         return 0;
     }
 
+    int testScanBranchHints(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        const SysTaskOutlineFixture fixture = makeSysTaskOutlineFixture();
+        wolvrix::lib::diag::Diagnostics diagnostics;
+        GrhSimAmCppEmitter emitter;
+        const GrhSimAmCppResult result = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory,
+                .modelName = "ScanHintsTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"scanBranchHints", "true"}},
+            },
+            diagnostics);
+        if (!result.success || diagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the scan-hints fixture");
+        }
+        const std::optional<std::string> blocks = readTextFile(
+            outputDirectory / "grhsim_ScanHintsTop_blocks_0.cpp");
+        if (!blocks || blocks->find("__builtin_expect(byteFlags != 0, 0)") ==
+                           std::string::npos ||
+            blocks->find("__builtin_expect((byteFlags & ") == std::string::npos)
+        {
+            return fail("scanBranchHints did not annotate the activity scan");
+        }
+        return 0;
+    }
+
     LinearProgramArtifact makeProductionCommitCycleProgram()
     {
         LinearProgramBuilder builder;
@@ -6410,6 +6440,13 @@ int main()
     if (const int result = testSysTaskBodyOutline(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-sys-task-body-outline");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testScanBranchHints(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-scan-branch-hints");
         result != 0)
     {
         return result;

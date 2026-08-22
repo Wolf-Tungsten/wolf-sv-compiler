@@ -432,6 +432,11 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   存储，在 outlined 函数体内直接访问。动机：守卫块里每 atom 一条的
   `if (fire) { ...fwrite body... }` 让巨块函数体的前端流式成本成为病灶，
   抽出的冷体不再挤占热路径的取指/解码流。off 时输出与既往逐字节一致。
+- `scanBranchHints`（`--scan-branch-hints`，默认关）：compute/commit 扫描
+  函数里每个 byte 组的序言测试和每个 Block 的活动位测试加
+  `__builtin_expect(..., 0)` 静态分支提示。每轮活动稀疏时，提示让编译器把
+  冷 Block 体移出 fall-through 检查链，压紧全模型扫描的跳过取指流；条件、
+  byte 快照/清除和同 byte relay 语义均不变。off 时输出与既往逐字节一致。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
