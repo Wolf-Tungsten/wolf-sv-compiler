@@ -147,6 +147,7 @@ int main(int argc, char **argv)
                      "[--concat-insert-unroll] [--inline-scalar-helpers] [--no-trace-comments] "
                      "[--wide-detect-fast-path] [--sys-task-body-outline] "
                      "[--host-call-guard-cache] [--scan-branch-hints] "
+                     "[--memory-read-pow2-index] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -195,6 +196,7 @@ int main(int argc, char **argv)
     bool sysTaskBodyOutline = false;
     bool hostCallGuardCache = false;
     bool scanBranchHints = false;
+    bool memoryReadPow2Index = false;
     bool traceComments = true;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
@@ -484,6 +486,10 @@ int main(int argc, char **argv)
         else if (argument == "--scan-branch-hints")
         {
             scanBranchHints = true;
+        }
+        else if (argument == "--memory-read-pow2-index")
+        {
+            memoryReadPow2Index = true;
         }
         else if (argument == "--no-trace-comments")
         {
@@ -914,6 +920,10 @@ int main(int argc, char **argv)
                 if (scanBranchHints)
                 {
                     emitOptions.attributes.emplace("scanBranchHints", "true");
+                }
+                if (memoryReadPow2Index)
+                {
+                    emitOptions.attributes.emplace("memoryReadPow2Index", "true");
                 }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,

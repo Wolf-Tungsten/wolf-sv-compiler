@@ -444,6 +444,12 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   `__builtin_expect(..., 0)` 静态分支提示。每轮活动稀疏时，提示让编译器把
   冷 Block 体移出 fall-through 检查链，压紧全模型扫描的跳过取指流；条件、
   byte 快照/清除和同 byte relay 语义均不变。off 时输出与既往逐字节一致。
+- `memoryReadPow2Index`（`--memory-read-pow2-index`，默认关）：当
+  `MemoryRead` 的窄 BitVector 地址位宽恰好覆盖 2 的幂 memory 深度时，直接把
+  已存储标量按声明位宽掩码并转成 `size_t` 索引，删除通用 `index_words` 调用和
+  不可达的 `index == depth` 越界分支。只有 `2^addressWidth == elementCount` 且
+  `addressWidth < 64` 才命中；非幂次深度、较宽地址、宽地址和所有 memory write
+  保持通用路径，因此越界读零语义不变。开关缺席时生成代码与既有路径一致。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成

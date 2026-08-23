@@ -284,6 +284,13 @@ namespace wolvrix::lib::grhsim::am
             // the hint lets clang keep the cold Block bodies off the
             // fall-through scan path.
             bool scanBranchHints = false;
+            // Power-of-two memory-read index specialization (attribute
+            // "memoryReadPow2Index", default off). When a narrow address
+            // width exactly spans a power-of-two memory depth, masking the
+            // stored scalar yields an in-range index by construction. The
+            // specialized read drops index_words and its unreachable bounds
+            // branch; writes and non-exact domains keep the generic path.
+            bool memoryReadPow2Index = false;
             // Outlined fwrite bodies collected during emission: instruction id
             // -> parameter list + indented body statements. The body text is
             // context-free (member storage and parameters only), so the
@@ -3712,10 +3719,39 @@ namespace wolvrix::lib::grhsim::am
                     const std::string index = "memory_index_" + suffix;
                     const std::string row = wordDataExpr(state, operands[0]) + " + " + index +
                                             " * " + std::to_string(stride);
-                    std::string code = "{ const std::size_t " + index + " = index_words(" +
-                                       wordDataExpr(state, operands[1]) + ", " +
-                                       std::to_string(addressType.bitWidth) + ", " +
-                                       std::to_string(memoryType.elementCount) + ");\n";
+                    const bool exactPow2Index =
+                        state.memoryReadPow2Index &&
+                        addressType.kind == TypeKind::BitVector &&
+                        addressType.bitWidth < 64U &&
+                        memoryType.elementCount != 0U &&
+                        (memoryType.elementCount & (memoryType.elementCount - 1U)) == 0U &&
+                        (UINT64_C(1) << addressType.bitWidth) == memoryType.elementCount;
+                    std::string code;
+                    if (exactPow2Index)
+                    {
+                        code = "{ const std::size_t " + index +
+                               " = static_cast<std::size_t>(" +
+                               valueExpr(state, operands[1]) + " & " +
+                               maskExpr(addressType.bitWidth) + ");\n";
+                        if (resultType.bitWidth <= 64)
+                        {
+                            code += valueExpr(state, results.front()) + " = (" + row +
+                                    ")[0] & " + maskExpr(resultType.bitWidth) + ";\n";
+                        }
+                        else
+                        {
+                            code += "assign_words(" + wordDataExpr(state, results.front()) +
+                                    ", " + std::to_string(resultType.bitWidth) + ", " + row +
+                                    ", " + std::to_string(memoryType.bitWidth) +
+                                    ", false);\n";
+                        }
+                        code += "}\n";
+                        return code;
+                    }
+                    code = "{ const std::size_t " + index + " = index_words(" +
+                           wordDataExpr(state, operands[1]) + ", " +
+                           std::to_string(addressType.bitWidth) + ", " +
+                           std::to_string(memoryType.elementCount) + ");\n";
                     code += "if (" + index + " == " +
                             std::to_string(memoryType.elementCount) + ") { ";
                     if (resultType.bitWidth <= 64)
@@ -7838,6 +7874,11 @@ namespace wolvrix::lib::grhsim::am
         state.scanBranchHints =
             scanBranchHintsAttribute != options.attributes.end() &&
             scanBranchHintsAttribute->second == "true";
+        const auto memoryReadPow2IndexAttribute =
+            options.attributes.find("memoryReadPow2Index");
+        state.memoryReadPow2Index =
+            memoryReadPow2IndexAttribute != options.attributes.end() &&
+            memoryReadPow2IndexAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());

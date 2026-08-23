@@ -1381,7 +1381,7 @@ namespace
     ArrayInitFixture makeArrayInitFixture()
     {
         LinearProgramBuilder builder;
-        const TypeId indexType = builder.addType(Type::bitVector(8));
+        const TypeId indexType = builder.addType(Type::bitVector(6));
         const TypeId elementType = builder.addType(Type::bitVector(70));
         const TypeId arrayType = builder.addType(Type::array(5, 70));
         const TypeId narrowElementType = builder.addType(Type::bitVector(64));
@@ -1535,12 +1535,27 @@ namespace
         }
 
         GrhSimAmCppEmitter emitter;
+        const std::filesystem::path stockDirectory = outputDirectory / "stock";
+        wolvrix::lib::diag::Diagnostics stockDiagnostics;
+        const GrhSimAmCppResult stockResult = emitter.emit(
+            *model,
+            GrhSimAmCppOptions{
+                .outputDirectory = stockDirectory,
+                .modelName = "ArrayInitTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            stockDiagnostics);
+        if (!stockResult.success || stockDiagnostics.hasError())
+        {
+            return fail("AM C++ emitter failed to generate the stock power-of-two memory-read model");
+        }
         const GrhSimAmCppResult emitResult = emitter.emit(
             *model,
             GrhSimAmCppOptions{
                 .outputDirectory = outputDirectory,
                 .modelName = "ArrayInitTop",
                 .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"memoryReadPow2Index", "true"}},
             },
             diagnostics);
         if (!emitResult.success || diagnostics.hasError())
@@ -1554,6 +1569,21 @@ namespace
             countOccurrences(*runtimeText, "for (std::size_t initElement_") != 2)
         {
             return fail("AM C++ emitter did not coalesce adjacent literal Array Fill actions");
+        }
+        const std::optional<std::string> stockBlocksText =
+            readTextFile(stockDirectory / "grhsim_ArrayInitTop_blocks_0.cpp");
+        const std::optional<std::string> blocksText =
+            readTextFile(outputDirectory / "grhsim_ArrayInitTop_blocks_0.cpp");
+        const std::string indexMask = "((UINT64_C(1) << 6) - UINT64_C(1))";
+        if (!stockBlocksText || !blocksText ||
+            countOccurrences(*stockBlocksText, "index_words(") != 6 ||
+            stockBlocksText->find("== 64") == std::string::npos ||
+            countOccurrences(*blocksText, "index_words(") != 5 ||
+            blocksText->find("== 64") != std::string::npos ||
+            blocksText->find("static_cast<std::size_t>(") == std::string::npos ||
+            blocksText->find(" & " + indexMask + ");") == std::string::npos)
+        {
+            return fail("AM C++ emitter did not specialize the exact power-of-two memory-read index");
         }
 
         const std::filesystem::path harnessPath = outputDirectory / "harness.cpp";
