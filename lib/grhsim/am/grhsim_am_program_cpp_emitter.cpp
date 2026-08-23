@@ -270,6 +270,15 @@ namespace wolvrix::lib::grhsim::am
             // preamble and the once/pending epilogue stay inline. With the
             // switch off the output is byte-identical to the stock form.
             bool sysTaskBodyOutline = false;
+            // Compile-time adjacent host-call guard cache (attribute
+            // "hostCallGuardCache", default off). Consecutive immediate
+            // fwrite / DPI stations with the same condition and event suffix
+            // share one block-local bool. Pending/once/final calls and groups
+            // that write a guard operand remain unchanged.
+            bool hostCallGuardCache = false;
+            mutable std::unordered_map<uint32_t, std::string>
+                activeHostGuardAliases;
+            mutable std::unordered_set<uint32_t> activeHostGuardLeaders;
             // Static branch hints for sparse activity scans (attribute
             // "scanBranchHints", default off).  The condition is unchanged;
             // the hint lets clang keep the cold Block bodies off the
@@ -1507,6 +1516,140 @@ namespace wolvrix::lib::grhsim::am
             return expression;
         }
 
+        std::optional<std::vector<uint32_t>>
+        cacheableHostGuardSignature(const EmitState &state,
+                                    InstructionId instruction)
+        {
+            const Opcode opcode = state.program.opcode(instruction);
+            uint32_t eventCount = 0;
+            if (opcode == Opcode::SystemTask)
+            {
+                const auto attributes =
+                    state.program.systemTaskAttributes(instruction);
+                if (!attributes || attributes->schedule != CallSchedule::Normal ||
+                    attributes->eventMode != HostEventMode::Immediate ||
+                    state.program.string(attributes->name) != "fwrite")
+                {
+                    return std::nullopt;
+                }
+                eventCount = attributes->eventCount;
+            }
+            else if (opcode == Opcode::DpiCall)
+            {
+                const auto attributes = state.program.dpiCallAttributes(instruction);
+                if (!attributes || attributes->eventMode != HostEventMode::Immediate)
+                {
+                    return std::nullopt;
+                }
+                eventCount = attributes->eventCount;
+            }
+            else
+            {
+                return std::nullopt;
+            }
+            const auto operands = state.program.operands(instruction);
+            if (eventCount == 0 || operands.empty() ||
+                eventCount > operands.size() - 1U)
+            {
+                return std::nullopt;
+            }
+
+            std::vector<uint32_t> signature;
+            signature.reserve(eventCount + 1U);
+            signature.push_back(operands.front().value);
+            const std::size_t eventBegin = operands.size() - eventCount;
+            for (std::size_t index = eventBegin; index < operands.size(); ++index)
+            {
+                signature.push_back(operands[index].value);
+            }
+            for (VariableId result : state.program.results(instruction))
+            {
+                if (std::find(signature.begin(), signature.end(), result.value) !=
+                    signature.end())
+                {
+                    return std::nullopt;
+                }
+            }
+            return signature;
+        }
+
+        void beginHostCallGuardCache(const ScheduledProgram &program,
+                                     const EmitState &state,
+                                     BlockId block,
+                                     std::size_t firstPosition,
+                                     std::size_t endPosition)
+        {
+            state.activeHostGuardAliases.clear();
+            state.activeHostGuardLeaders.clear();
+            if (!state.hostCallGuardCache)
+            {
+                return;
+            }
+            std::size_t position = firstPosition;
+            while (position < endPosition)
+            {
+                const InstructionId first =
+                    program.blockInstruction(block, position);
+                const auto signature =
+                    cacheableHostGuardSignature(state, first);
+                if (!signature)
+                {
+                    ++position;
+                    continue;
+                }
+                std::size_t runEnd = position + 1U;
+                while (runEnd < endPosition)
+                {
+                    const InstructionId next =
+                        program.blockInstruction(block, runEnd);
+                    const auto nextSignature =
+                        cacheableHostGuardSignature(state, next);
+                    if (!nextSignature || *nextSignature != *signature)
+                    {
+                        break;
+                    }
+                    ++runEnd;
+                }
+                if (runEnd - position >= 2U)
+                {
+                    const std::string alias =
+                        "host_guard_" + std::to_string(first.value);
+                    state.activeHostGuardLeaders.insert(first.value);
+                    for (std::size_t index = position; index < runEnd; ++index)
+                    {
+                        const InstructionId member =
+                            program.blockInstruction(block, index);
+                        state.activeHostGuardAliases.emplace(member.value, alias);
+                    }
+                }
+                position = runEnd;
+            }
+        }
+
+        void endHostCallGuardCache(const EmitState &state)
+        {
+            state.activeHostGuardAliases.clear();
+            state.activeHostGuardLeaders.clear();
+        }
+
+        std::string applyCachedHostGuard(const EmitState &state,
+                                         InstructionId instruction,
+                                         std::string fire,
+                                         std::string &preamble)
+        {
+            const auto alias =
+                state.activeHostGuardAliases.find(instruction.value);
+            if (alias == state.activeHostGuardAliases.end())
+            {
+                return fire;
+            }
+            if (state.activeHostGuardLeaders.contains(instruction.value))
+            {
+                preamble += "const bool " + alias->second + " = " + fire + ";\n";
+            }
+            return alias->second;
+        }
+
         std::optional<std::string> emitSystemTaskInstruction(const EmitState &state,
                                                              InstructionId instruction,
                                                              bool finalPhase,
@@ -1571,6 +1714,7 @@ namespace wolvrix::lib::grhsim::am
                 }
                 fire = "!onceCompleted_[" + std::to_string(slot->second) + "] && (" + fire + ")";
             }
+            fire = applyCachedHostGuard(state, instruction, std::move(fire), preamble);
 
             std::string code = preamble + "if (" + fire + ") {\n";
             if (name == "fatal")
@@ -1889,6 +2033,7 @@ namespace wolvrix::lib::grhsim::am
             {
                 fire = eventFireExpr(state, operands, attributes->eventCount, false);
             }
+            fire = applyCachedHostGuard(state, instruction, std::move(fire), preamble);
 
             std::string code = preamble + "if (" + fire + ") {\n";
             for (const std::string &declaration : declarations)
@@ -4967,7 +5112,9 @@ namespace wolvrix::lib::grhsim::am
                 state.traceComments ? blockAtomTraceBoundaries(model.program, block)
                                     : std::vector<AtomTraceBoundary>{};
             std::size_t atomBoundaryCursor = 0;
-            for (std::size_t index = 0; index < model.program.blockSize(block); ++index)
+            const std::size_t blockSize = model.program.blockSize(block);
+            beginHostCallGuardCache(model.program, state, block, 0, blockSize);
+            for (std::size_t index = 0; index < blockSize; ++index)
             {
                 const InstructionId instruction =
                     model.program.blockInstruction(block, index);
@@ -4986,6 +5133,7 @@ namespace wolvrix::lib::grhsim::am
                                 indentation);
                         if (!commentBytes || !addByteCount(byteCount, *commentBytes))
                         {
+                            endHostCallGuardCache(state);
                             endLocalityBlock(state);
                             diagnostics.error("AM C++ emitter source size overflow: block=" +
                                                   std::to_string(blockIndex),
@@ -5003,6 +5151,7 @@ namespace wolvrix::lib::grhsim::am
                                           detectorGroupDeclared, error);
                 if (!code)
                 {
+                    endHostCallGuardCache(state);
                     endLocalityBlock(state);
                     diagnostics.error(error + ": instruction=" +
                                           std::to_string(instruction.value),
@@ -5013,6 +5162,7 @@ namespace wolvrix::lib::grhsim::am
                     indentedLineByteCount(*code, indentation);
                 if (!codeBytes || !addByteCount(byteCount, *codeBytes))
                 {
+                    endHostCallGuardCache(state);
                     endLocalityBlock(state);
                     diagnostics.error("AM C++ emitter source size overflow: block=" +
                                           std::to_string(blockIndex),
@@ -5020,6 +5170,7 @@ namespace wolvrix::lib::grhsim::am
                     return std::nullopt;
                 }
             }
+            endHostCallGuardCache(state);
             endLocalityBlock(state);
             return byteCount;
         }
@@ -7677,6 +7828,11 @@ namespace wolvrix::lib::grhsim::am
         state.sysTaskBodyOutline =
             sysTaskBodyOutlineAttribute != options.attributes.end() &&
             sysTaskBodyOutlineAttribute->second == "true";
+        const auto hostCallGuardCacheAttribute =
+            options.attributes.find("hostCallGuardCache");
+        state.hostCallGuardCache =
+            hostCallGuardCacheAttribute != options.attributes.end() &&
+            hostCallGuardCacheAttribute->second == "true";
         const auto scanBranchHintsAttribute =
             options.attributes.find("scanBranchHints");
         state.scanBranchHints =
@@ -10720,6 +10876,7 @@ namespace
                         state.traceComments ? blockAtomTraceBoundaries(model.program, block)
                                             : std::vector<AtomTraceBoundary>{};
                     std::size_t atomBoundaryCursor = 0;
+                    beginHostCallGuardCache(model.program, state, block, 0, blockSize);
                     for (std::size_t index = 0;
                          index < blockSize;
                          ++index)
@@ -10760,6 +10917,7 @@ namespace
                                                   detectorGroupDeclared, error);
                         if (!code)
                         {
+                            endHostCallGuardCache(state);
                             endLocalityBlock(state);
                             diagnostics.error(error + ": instruction=" +
                                                   std::to_string(instruction.value),
@@ -10771,6 +10929,7 @@ namespace
                                                ? gatedIndentation
                                                : indentation);
                     }
+                    endHostCallGuardCache(state);
                     if (gate != nullptr && gate->headCount < blockSize)
                     {
                         blockSource << indentation << "}\n";
@@ -10872,6 +11031,8 @@ namespace
                             }
                         }
                         const auto [firstPosition, endPosition] = chunkRanges[chunk];
+                        beginHostCallGuardCache(model.program, state, block,
+                                                firstPosition, endPosition);
                         for (std::size_t index = firstPosition;
                              index < endPosition;
                              ++index)
@@ -10902,6 +11063,7 @@ namespace
                                                       detectorGroupDeclared, error);
                             if (!code)
                             {
+                                endHostCallGuardCache(state);
                                 state.activeChunkedBlock = kInvalidLocalityBlock;
                                 endLocalityBlock(state);
                                 diagnostics.error(error + ": instruction=" +
@@ -10911,6 +11073,7 @@ namespace
                             }
                             writeIndentedLines(chunkDefs, *code, "    ");
                         }
+                        endHostCallGuardCache(state);
                         chunkDefs << "}\n";
                     }
                     if (state.traceComments)

@@ -3121,13 +3121,14 @@ int main()
         ExecutableModel model;
         InstructionId bootTask;
         InstructionId dataTask;
+        InstructionId cacheTask;
+        InstructionId cacheTaskTwin;
     };
 
-    // sysTaskBodyOutline fixture: the phased-commit shape plus two fwrite
-    // stations in the compute block — a Once task and a Pending-mode task with
-    // two narrow scalar arguments (one input member, one same-block slice
-    // result) — so the knob must outline both bodies while the preamble, fire
-    // condition and once/pending epilogues stay inline.
+    // sysTaskBodyOutline fixture: a Once task, a Pending-mode task with two
+    // narrow scalar arguments, and two adjacent Immediate tasks that share a
+    // guard. This covers outlining plus host-call guard reuse while keeping
+    // the preamble and once/pending epilogues inline.
     SysTaskOutlineFixture makeSysTaskOutlineFixture()
     {
         LinearProgramBuilder linear;
@@ -3188,6 +3189,10 @@ int main()
             stringType,
             linear.addConstantInit(
                 linear.addStringLiteral(stringType, "data=%d local=%d\n")));
+        const VariableId formatCache = linear.addVariable(
+            stringType,
+            linear.addConstantInit(
+                linear.addStringLiteral(stringType, "cache\n")));
         const VariableId nextState = linear.addVariable(u128Type, linear.zeroInit());
         const VariableId state = linear.addVariable(u128Type, linear.zeroInit());
         const VariableId stateOld = linear.addVariable(u128Type, linear.undefInit());
@@ -3267,6 +3272,26 @@ int main()
                 .schedule = CallSchedule::Normal,
                 .eventMode = HostEventMode::Pending,
             });
+        const InstructionId cacheTask = addScheduledInstruction(
+            Opcode::SystemTask, {fire, handle, formatCache, posedge});
+        scheduled.setSystemTaskAttributes(
+            cacheTask,
+            SystemTaskAttributes{
+                .name = fwriteName,
+                .eventCount = 1,
+                .schedule = CallSchedule::Normal,
+                .eventMode = HostEventMode::Immediate,
+            });
+        const InstructionId cacheTaskTwin = addScheduledInstruction(
+            Opcode::SystemTask, {fire, handle, formatCache, posedge});
+        scheduled.setSystemTaskAttributes(
+            cacheTaskTwin,
+            SystemTaskAttributes{
+                .name = fwriteName,
+                .eventCount = 1,
+                .schedule = CallSchedule::Normal,
+                .eventMode = HostEventMode::Immediate,
+            });
         const InstructionId activateReaders =
             addScheduledInstruction(Opcode::ActBackward, {stateChanged});
         scheduled.setActivationTargets(enterClock, std::array{BlockId{1}, BlockId{3}});
@@ -3276,7 +3301,8 @@ int main()
         scheduled.setActivationTargets(activateReaders, std::array{BlockId{2}});
         addBlock({watchClock, watchFire, watchLo, watchHi, enterClock, enterFire, enterLo,
                   enterHi});
-        addBlock({detectPosedge, buildNext, sampleLocal, bootTask, dataTask});
+        addBlock({detectPosedge, buildNext, sampleLocal, bootTask, dataTask,
+                  cacheTask, cacheTaskTwin});
         addBlock({sampleLo, sampleHi});
         addBlock({gateDetect, writeState, detectState, activateReaders});
 
@@ -3290,6 +3316,8 @@ int main()
                 },
             .bootTask = bootTask,
             .dataTask = dataTask,
+            .cacheTask = cacheTask,
+            .cacheTaskTwin = cacheTaskTwin,
         };
     }
 
@@ -3299,6 +3327,7 @@ int main()
         const SysTaskOutlineFixture fixture = makeSysTaskOutlineFixture();
         const std::string bootId = std::to_string(fixture.bootTask.value);
         const std::string dataId = std::to_string(fixture.dataTask.value);
+        const std::string cacheId = std::to_string(fixture.cacheTask.value);
 
         wolvrix::lib::diag::Diagnostics offDiagnostics;
         GrhSimAmCppEmitter emitter;
@@ -3320,8 +3349,22 @@ int main()
                 .attributes = {{"sysTaskBodyOutline", "true"}},
             },
             onDiagnostics);
+        wolvrix::lib::diag::Diagnostics cacheDiagnostics;
+        const GrhSimAmCppResult cacheResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "cache",
+                .modelName = "SysTaskGuardCacheTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {
+                    {"sysTaskBodyOutline", "true"},
+                    {"hostCallGuardCache", "true"},
+                },
+            },
+            cacheDiagnostics);
         if (!offResult.success || offDiagnostics.hasError() || !onResult.success ||
-            onDiagnostics.hasError())
+            onDiagnostics.hasError() || !cacheResult.success ||
+            cacheDiagnostics.hasError())
         {
             return fail("AM C++ emitter failed to generate the sys-task-outline fixture");
         }
@@ -3338,8 +3381,11 @@ int main()
             outputDirectory / "grhsim_SysTaskOutlineTop_runtime.cpp");
         const std::optional<std::string> onBlocks = readTextFile(
             outputDirectory / "grhsim_SysTaskOutlineTop_blocks_0.cpp");
+        const std::optional<std::string> cacheBlocks = readTextFile(
+            outputDirectory / "cache" /
+            "grhsim_SysTaskGuardCacheTop_blocks_0.cpp");
         if (!stockHeader || !stockRuntime || !stockBlocks || !onHeader || !onRuntime ||
-            !onBlocks)
+            !onBlocks || !cacheBlocks)
         {
             return fail("AM C++ emitter produced unreadable sys-task-outline artifacts");
         }
@@ -3350,6 +3396,15 @@ int main()
             stockBlocks->find("sys_task_body_") != std::string::npos)
         {
             return fail("stock AM C++ output references sys_task_body_");
+        }
+        const std::string cachedGuard = "host_guard_" + cacheId;
+        if (stockBlocks->find("host_guard_") != std::string::npos ||
+            onBlocks->find("host_guard_") != std::string::npos ||
+            countOccurrences(*cacheBlocks,
+                             "const bool " + cachedGuard + " = ") != 1 ||
+            countOccurrences(*cacheBlocks, "if (" + cachedGuard + ")") != 2)
+        {
+            return fail("hostCallGuardCache did not reuse the adjacent task guard");
         }
         // On-mode block source: the bodies become calls; the preamble, the
         // fire evaluation and the once/pending epilogues stay inline.
@@ -3497,16 +3552,22 @@ int main()
         };
         const std::filesystem::path stockStdoutPath = outputDirectory / "stock_stdout.txt";
         const std::filesystem::path onStdoutPath = outputDirectory / "outline_stdout.txt";
+        const std::filesystem::path cacheStdoutPath = outputDirectory / "cache_stdout.txt";
         if (!buildAndRun(outputDirectory / "stock", "SysTaskStockTop", stockStdoutPath) ||
-            !buildAndRun(outputDirectory, "SysTaskOutlineTop", onStdoutPath))
+            !buildAndRun(outputDirectory, "SysTaskOutlineTop", onStdoutPath) ||
+            !buildAndRun(outputDirectory / "cache", "SysTaskGuardCacheTop",
+                         cacheStdoutPath))
         {
             return fail("generated sys-task-outline models failed to build or run");
         }
         const std::optional<std::string> stockStdout = readTextFile(stockStdoutPath);
         const std::optional<std::string> onStdout = readTextFile(onStdoutPath);
-        if (!stockStdout || !onStdout || *stockStdout != *onStdout ||
+        const std::optional<std::string> cacheStdout = readTextFile(cacheStdoutPath);
+        if (!stockStdout || !onStdout || !cacheStdout ||
+            *stockStdout != *onStdout || *stockStdout != *cacheStdout ||
             countOccurrences(*stockStdout, "boot") != 1 ||
-            countOccurrences(*stockStdout, "data=") != 3)
+            countOccurrences(*stockStdout, "data=") != 3 ||
+            countOccurrences(*stockStdout, "cache") != 6)
         {
             return fail("sysTaskBodyOutline changed the fwrite runtime behavior");
         }

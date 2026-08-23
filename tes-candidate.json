@@ -1,0 +1,7 @@
+{
+  "hypothesis": "From e00085, blocks 90656 and 90657 account for 4.629% of dynamic block cycles and contain adjacent fwrite/DPI stations with identical fire and event operands; caching each shared guard once per block chunk should remove repeated member loads across outlined calls and reduce the pool cost measurably without changing host-call state semantics.",
+  "emit_args_add": [
+    "--host-call-guard-cache"
+  ],
+  "emit_args_remove": []
+}

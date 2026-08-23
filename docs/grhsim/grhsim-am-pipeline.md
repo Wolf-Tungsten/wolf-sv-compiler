@@ -432,6 +432,13 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   存储，在 outlined 函数体内直接访问。动机：守卫块里每 atom 一条的
   `if (fire) { ...fwrite body... }` 让巨块函数体的前端流式成本成为病灶，
   抽出的冷体不再挤占热路径的取指/解码流。off 时输出与既往逐字节一致。
+- `hostCallGuardCache`（`--host-call-guard-cache`，默认关）：同一 Block（巨块按
+  chunk 分界）内连续的 immediate `fwrite` / DPI 站若 condition 与 event 尾部
+  完全相同，则先把完整 fire 谓词物化为一个局部 `bool`，组内调用复用它。该规则
+  只处理 normal `fwrite` 与 immediate DPI，且任一调用把 guard/event 变量写为
+  Result 时拒绝合并；pending、once、final 的状态机保持原样。动机是 assertion
+  形态常把同一 fire/event 同时送给日志 task 与检查 DPI，outlined 冷体调用会阻止
+  编译器可靠地跨调用复用成员读取。off 时输出与既往逐字节一致。
 - `scanBranchHints`（`--scan-branch-hints`，默认关）：compute/commit 扫描
   函数里每个 byte 组的序言测试和每个 Block 的活动位测试加
   `__builtin_expect(..., 0)` 静态分支提示。每轮活动稀疏时，提示让编译器把

@@ -145,7 +145,8 @@ int main(int argc, char **argv)
                      "[--source-part-activity-guard] [--source-word-activity-guard] "
                      "[--wide-storage-first-touch] [--concat-insert-inline] "
                      "[--concat-insert-unroll] [--inline-scalar-helpers] [--no-trace-comments] "
-                     "[--wide-detect-fast-path] [--sys-task-body-outline] [--scan-branch-hints] "
+                     "[--wide-detect-fast-path] [--sys-task-body-outline] "
+                     "[--host-call-guard-cache] [--scan-branch-hints] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -192,6 +193,7 @@ int main(int argc, char **argv)
     bool concatInsertUnroll = false;
     bool wideDetectFastPath = false;
     bool sysTaskBodyOutline = false;
+    bool hostCallGuardCache = false;
     bool scanBranchHints = false;
     bool traceComments = true;
     AmOptimizeOptions amOptimize;
@@ -474,6 +476,10 @@ int main(int argc, char **argv)
         else if (argument == "--sys-task-body-outline")
         {
             sysTaskBodyOutline = true;
+        }
+        else if (argument == "--host-call-guard-cache")
+        {
+            hostCallGuardCache = true;
         }
         else if (argument == "--scan-branch-hints")
         {
@@ -900,6 +906,10 @@ int main(int argc, char **argv)
                 if (sysTaskBodyOutline)
                 {
                     emitOptions.attributes.emplace("sysTaskBodyOutline", "true");
+                }
+                if (hostCallGuardCache)
+                {
+                    emitOptions.attributes.emplace("hostCallGuardCache", "true");
                 }
                 if (scanBranchHints)
                 {
