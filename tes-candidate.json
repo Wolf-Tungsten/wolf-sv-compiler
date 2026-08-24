@@ -1,8 +1,9 @@
 {
-  "hypothesis": "Migrating confirmed e00093 power-of-two memory-read indexing onto e00089 should retain its host-call guard-cache effect while removing 3,072 index_words calls and unreachable bounds branches from six e00085-recon blocks carrying 3.140% of cycles; the combination should improve Host by at least 5% versus e00089.",
+  "hypothesis": "From e00102, post-change recon shows b69157/b69158/b69159 still carry 1.697% of block cycles; migrating confirmed e00106 ArrayBroadcast-to-ArrayMux chain fusion should retain host-call guard caching and power-of-two indexing while reducing this independent pool and improving Host by at least 1% versus e00102.",
   "emit_args_add": [
     "--host-call-guard-cache",
-    "--memory-read-pow2-index"
+    "--memory-read-pow2-index",
+    "--array-broadcast-mux-chain-fuse"
   ],
   "emit_args_remove": []
 }

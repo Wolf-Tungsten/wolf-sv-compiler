@@ -450,6 +450,16 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   不可达的 `index == depth` 越界分支。只有 `2^addressWidth == elementCount` 且
   `addressWidth < 64` 才命中；非幂次深度、较宽地址、宽地址和所有 memory write
   保持通用路径，因此越界读零语义不变。开关缺席时生成代码与既有路径一致。
+- `arrayBroadcastMuxChainFuse`（`--array-broadcast-mux-chain-fuse`，默认关）：
+  对同一 Block 内严格相邻的 64-bit lane 链
+  `ArrayBroadcast(s0); (ArrayBroadcast(si); ArrayMux(sel_i, bi, prev))+`
+  做 emit-time 融合。只有 packed width 至少 256 bit、每个中间 broadcast/mux
+  结果全局唯一使用且不可由端口或 declared variable 观察、链至少 16 级时命中；
+  任一间隔指令、额外使用、跨 Block 使用或前向读取都会保留通用路径。命中后首个
+  broadcast 直接写链尾槽，每级 mux 只遍历 selector 的置位 lane，把 64-bit
+  标量 true value 原地写入，内部宽 broadcast/mux 槽不再物化。指令仍在原位置
+  求值，故 operand 定义顺序与 round 语义不变；off 时输出保持既有形态。lower-json
+  以 `array_broadcast_mux_chains/steps` 报告实际命中数。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成

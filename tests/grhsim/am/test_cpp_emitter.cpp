@@ -1371,6 +1371,260 @@ namespace
         return 0;
     }
 
+    ExecutableModel makeArrayBroadcastMuxChainFixture(bool gap, bool extraUse)
+    {
+        LinearProgramBuilder linear;
+        ProgramInterface interface;
+        const TypeId u1Type = linear.addType(Type::bitVector(1));
+        const TypeId u4Type = linear.addType(Type::bitVector(4));
+        const TypeId u64Type = linear.addType(Type::bitVector(64));
+        const TypeId u256Type = linear.addType(Type::bitVector(256));
+        const auto addInput = [&](TypeId type, std::string_view name) {
+            const VariableId variable = linear.addVariable(type, linear.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString(name),
+                .direction = PortDirection::Input,
+                .input = variable,
+            });
+            return variable;
+        };
+        const VariableId base = addInput(u64Type, "base");
+        std::array<VariableId, 16> scalars;
+        std::array<VariableId, 16> selects;
+        for (std::size_t index = 0; index < scalars.size(); ++index)
+        {
+            scalars[index] = addInput(u64Type, "scalar" + std::to_string(index));
+            selects[index] = addInput(u4Type, "select" + std::to_string(index));
+        }
+        const VariableId broadcast0 = linear.addVariable(u256Type, linear.zeroInit());
+        std::array<VariableId, 16> broadcasts;
+        std::array<VariableId, 16> muxes;
+        for (std::size_t index = 0; index < broadcasts.size(); ++index)
+        {
+            broadcasts[index] = linear.addVariable(u256Type, linear.zeroInit());
+            muxes[index] = linear.addVariable(u256Type, linear.zeroInit());
+        }
+        interface.ports.push_back(PortBinding{
+            .name = linear.addString("out"),
+            .direction = PortDirection::Output,
+            .output = muxes.back(),
+        });
+        const auto addInstruction = [&](Opcode opcode,
+                                        std::initializer_list<VariableId> results,
+                                        std::initializer_list<VariableId> operands) {
+            return linear.addInstruction(
+                opcode,
+                std::span<const VariableId>(results.begin(), results.size()),
+                std::span<const VariableId>(operands.begin(), operands.size()));
+        };
+        const InstructionId head =
+            addInstruction(Opcode::ArrayBroadcast, {broadcast0}, {base});
+        std::vector<InstructionId> instructions = {head};
+        VariableId previous = broadcast0;
+        for (std::size_t index = 0; index < broadcasts.size(); ++index)
+        {
+            const InstructionId broadcast = addInstruction(
+                Opcode::ArrayBroadcast, {broadcasts[index]}, {scalars[index]});
+            instructions.push_back(broadcast);
+            if (gap && index == 0)
+            {
+                const VariableId gapValue =
+                    linear.addVariable(u64Type, linear.zeroInit());
+                instructions.push_back(
+                    addInstruction(Opcode::Assign, {gapValue}, {scalars[index]}));
+            }
+            const InstructionId mux = addInstruction(
+                Opcode::ArrayMux, {muxes[index]},
+                {selects[index], broadcasts[index], previous});
+            instructions.push_back(mux);
+            previous = muxes[index];
+        }
+        if (extraUse)
+        {
+            const VariableId observed = linear.addVariable(u1Type, linear.zeroInit());
+            interface.ports.push_back(PortBinding{
+                .name = linear.addString("observed"),
+                .direction = PortDirection::Output,
+                .output = observed,
+            });
+            instructions.push_back(
+                addInstruction(Opcode::ArrayReduceOr, {observed}, {muxes.front()}));
+        }
+        ScheduledProgramBuilder scheduled(linear.finish());
+        std::vector<InstructionId> entry;
+        std::vector<VariableId> inputs = {base};
+        inputs.insert(inputs.end(), scalars.begin(), scalars.end());
+        inputs.insert(inputs.end(), selects.begin(), selects.end());
+        for (const VariableId input : inputs)
+        {
+            const TypeId type = scheduled.view().variable(input).type;
+            const VariableId oldValue =
+                scheduled.addVariable(type, scheduled.undefInit());
+            const VariableId changed =
+                scheduled.addVariable(u1Type, scheduled.zeroInit());
+            const InstructionId detect = scheduled.addInstruction(
+                Opcode::ChangedAny, std::array{changed},
+                std::array{input, oldValue});
+            const InstructionId activate = scheduled.addInstruction(
+                Opcode::ActForward, std::span<const VariableId>{},
+                std::array{changed});
+            scheduled.setActivationTargets(activate, std::array{BlockId{1}});
+            entry.push_back(detect);
+            entry.push_back(activate);
+        }
+        scheduled.addBlock(entry);
+        scheduled.addBlock(instructions);
+        return ExecutableModel{
+            .program = scheduled.finish(),
+            .interface = std::move(interface),
+        };
+    }
+
+    int testArrayBroadcastMuxChainFusion(const std::filesystem::path &outputDirectory)
+    {
+        std::filesystem::remove_all(outputDirectory);
+        ExecutableModel model = makeArrayBroadcastMuxChainFixture(false, false);
+        GrhSimAmCppEmitter emitter;
+        wolvrix::lib::diag::Diagnostics stockDiagnostics;
+        const std::filesystem::path stockDirectory = outputDirectory / "stock";
+        const GrhSimAmCppResult stockResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = stockDirectory,
+                .modelName = "ArrayBroadcastMuxChainTop",
+                .maxOutputFileBytes = 1024 * 1024,
+            },
+            stockDiagnostics);
+        wolvrix::lib::diag::Diagnostics fusedDiagnostics;
+        const std::filesystem::path fusedDirectory = outputDirectory / "fused";
+        const GrhSimAmCppResult fusedResult = emitter.emit(
+            model,
+            GrhSimAmCppOptions{
+                .outputDirectory = fusedDirectory,
+                .modelName = "ArrayBroadcastMuxChainTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"arrayBroadcastMuxChainFuse", "true"}},
+            },
+            fusedDiagnostics);
+        if (!stockResult.success || stockDiagnostics.hasError() ||
+            !fusedResult.success || fusedDiagnostics.hasError())
+        {
+            for (const auto &diagnostic : stockDiagnostics.messages())
+            {
+                std::cerr << "[array-broadcast-mux-stock] " << diagnostic.message
+                          << " [" << diagnostic.context << "]\n";
+            }
+            for (const auto &diagnostic : fusedDiagnostics.messages())
+            {
+                std::cerr << "[array-broadcast-mux-fused] " << diagnostic.message
+                          << " [" << diagnostic.context << "]\n";
+            }
+            return fail("AM C++ emitter failed the ArrayBroadcast/ArrayMux chain fixture");
+        }
+        const std::optional<std::string> stockBlocks = readTextFile(
+            stockDirectory / "grhsim_ArrayBroadcastMuxChainTop_blocks_0.cpp");
+        const std::optional<std::string> fusedBlocks = readTextFile(
+            fusedDirectory / "grhsim_ArrayBroadcastMuxChainTop_blocks_0.cpp");
+        const std::optional<std::string> stockRuntime = readTextFile(
+            stockDirectory / "grhsim_ArrayBroadcastMuxChainTop_runtime.cpp");
+        const std::optional<std::string> fusedRuntime = readTextFile(
+            fusedDirectory / "grhsim_ArrayBroadcastMuxChainTop_runtime.cpp");
+        if (!stockBlocks || !fusedBlocks || !stockRuntime || !fusedRuntime ||
+            stockResult.arrayBroadcastMuxChains != 0 ||
+            stockResult.arrayBroadcastMuxSteps != 0 ||
+            fusedResult.arrayBroadcastMuxChains != 1 ||
+            fusedResult.arrayBroadcastMuxSteps != 16 ||
+            countOccurrences(*stockBlocks, "array_broadcast_words(") != 17 ||
+            countOccurrences(*stockBlocks, "array_mux_words(") != 16 ||
+            countOccurrences(*fusedBlocks, "array_broadcast_words(") != 1 ||
+            countOccurrences(*fusedBlocks, "array_mux_words(") != 0 ||
+            countOccurrences(*fusedBlocks, "array_mux_scalar64_true_inplace(") != 16 ||
+            stockRuntime->find("array_mux_scalar64_true_inplace") != std::string::npos ||
+            fusedRuntime->find("array_mux_scalar64_true_inplace") == std::string::npos)
+        {
+            return fail("AM C++ emitter did not materialize only the tail of the "
+                        "ArrayBroadcast/ArrayMux chain");
+        }
+
+        for (const auto &[name, blockedModel] :
+             std::array<std::pair<std::string_view, ExecutableModel>, 2>{
+                 std::pair{"gap", makeArrayBroadcastMuxChainFixture(true, false)},
+                 std::pair{"extra-use", makeArrayBroadcastMuxChainFixture(false, true)},
+             })
+        {
+            wolvrix::lib::diag::Diagnostics diagnostics;
+            const GrhSimAmCppResult result = emitter.emit(
+                blockedModel,
+                GrhSimAmCppOptions{
+                    .outputDirectory = outputDirectory / name,
+                    .modelName = "ArrayBroadcastMuxChainBlockedTop",
+                    .maxOutputFileBytes = 1024 * 1024,
+                    .attributes = {{"arrayBroadcastMuxChainFuse", "true"}},
+                },
+                diagnostics);
+            if (!result.success || diagnostics.hasError() ||
+                result.arrayBroadcastMuxChains != 0 ||
+                result.arrayBroadcastMuxSteps != 0)
+            {
+                return fail("AM C++ emitter fused a non-adjacent or non-sole-use "
+                            "ArrayBroadcast/ArrayMux chain");
+            }
+        }
+
+        const std::filesystem::path harnessPath = fusedDirectory / "harness.cpp";
+        std::ofstream harness(harnessPath);
+        harness << "#include \"grhsim_ArrayBroadcastMuxChainTop.hpp\"\n"
+                   "#include <array>\n"
+                   "#include <cstdint>\n\n"
+                   "int main() {\n"
+                   "    GrhSIM_ArrayBroadcastMuxChainTop model;\n"
+                   "    model.init();\n"
+                   "    model.base = UINT64_C(0x11);\n";
+        for (std::size_t index = 0; index < 16; ++index)
+        {
+            harness << "    model.scalar" << index << " = UINT64_C(0x"
+                    << std::hex << (0x20 + index) << std::dec << ");\n"
+                    << "    model.select" << index << " = 0x"
+                    << std::hex << (UINT64_C(1) << (index % 4)) << std::dec << ";\n";
+        }
+        harness << "    model.eval();\n"
+                   "    if (model.out != std::array<std::uint64_t, 4>{"
+                   "UINT64_C(0x2c), UINT64_C(0x2d), UINT64_C(0x2e), UINT64_C(0x2f)}) return 1;\n";
+        for (std::size_t index = 0; index < 16; ++index)
+        {
+            harness << "    model.select" << index << " = 0x0;\n";
+        }
+        harness << "    model.eval();\n"
+                   "    if (model.out != std::array<std::uint64_t, 4>{"
+                   "UINT64_C(0x11), UINT64_C(0x11), UINT64_C(0x11), UINT64_C(0x11)}) return 2;\n"
+                   "    return 0;\n"
+                   "}\n";
+        harness.close();
+        if (!harness)
+        {
+            return fail("failed to write the ArrayBroadcast/ArrayMux fusion harness");
+        }
+        const std::string buildCommand =
+            "make -C '" + fusedDirectory.string() +
+            "' CXX=clang++ CXXFLAGS='-std=c++20 -O2'";
+        if (std::system(buildCommand.c_str()) != 0)
+        {
+            return fail("generated ArrayBroadcast/ArrayMux fusion model failed to compile");
+        }
+        const std::filesystem::path harnessExecutable = fusedDirectory / "harness";
+        const std::string harnessCompileCommand =
+            "clang++ -std=c++20 -O2 -I'" + fusedDirectory.string() + "' '" +
+            harnessPath.string() + "' '" +
+            (fusedDirectory / "libgrhsim_ArrayBroadcastMuxChainTop.a").string() +
+            "' -o '" + harnessExecutable.string() + "'";
+        if (std::system(harnessCompileCommand.c_str()) != 0 ||
+            std::system(("'" + harnessExecutable.string() + "'").c_str()) != 0)
+        {
+            return fail("generated ArrayBroadcast/ArrayMux fusion model is not equivalent");
+        }
+        return 0;
+    }
+
     struct ArrayInitFixture
     {
         LinearProgramArtifact artifact;
@@ -6426,6 +6680,13 @@ int main()
     if (const int result = testArrayOperations(
             std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
             "cpp-emitter-array-ops");
+        result != 0)
+    {
+        return result;
+    }
+    if (const int result = testArrayBroadcastMuxChainFusion(
+            std::filesystem::path(WOLVRIX_GRHSIM_AM_EMIT_ARTIFACT_DIR) /
+            "cpp-emitter-array-broadcast-mux-chain");
         result != 0)
     {
         return result;

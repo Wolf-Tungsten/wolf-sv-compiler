@@ -291,6 +291,13 @@ namespace wolvrix::lib::grhsim::am
             // specialized read drops index_words and its unreachable bounds
             // branch; writes and non-exact domains keep the generic path.
             bool memoryReadPow2Index = false;
+            // Adjacent ArrayBroadcast -> ArrayMux chain fusion (attribute
+            // "arrayBroadcastMuxChainFuse", default off). Exact 64-bit-lane
+            // chains with sole-use, non-visible intermediates materialize only
+            // the final mux result. The head broadcasts directly into that
+            // slot; every later mux sparsely overwrites selected lanes from its
+            // scalar true value.
+            bool arrayBroadcastMuxChainFuse = false;
             // Outlined fwrite bodies collected during emission: instruction id
             // -> parameter list + indented body statements. The body text is
             // context-free (member storage and parameters only), so the
@@ -588,6 +595,21 @@ namespace wolvrix::lib::grhsim::am
             // Re-entrancy guard: emitMuxFusionRun emits the preamble through
             // emitInstruction, which must not re-enter the run hook.
             mutable bool muxRunEmissionActive = false;
+            struct ArrayBroadcastMuxChainPlan
+            {
+                VariableId finalVar;
+                uint32_t packedWidth = 0;
+                uint32_t rows = 0;
+            };
+            // Actions: -1 none, 0 head broadcast redirected to finalVar,
+            // 1 internal broadcast skipped, 2 mux emitted as an in-place
+            // sparse scalar overwrite of finalVar.
+            std::vector<int32_t> instructionArrayBroadcastMuxPlan;
+            std::vector<int8_t> instructionArrayBroadcastMuxAction;
+            std::vector<VariableId> instructionArrayBroadcastMuxScalar;
+            std::vector<ArrayBroadcastMuxChainPlan> arrayBroadcastMuxPlans;
+            uint64_t arrayBroadcastMuxChainCount = 0;
+            uint64_t arrayBroadcastMuxStepCount = 0;
             // NO0013 F1/F2 windowed emission of lane-build concat cones. A
             // lane-build chain is Concat C_0..C_n where every step C_j
             // (j >= 1) re-splices a few narrow element windows over the
@@ -700,6 +722,9 @@ namespace wolvrix::lib::grhsim::am
         constexpr int8_t kWindowActionSkip = 2;
         constexpr int8_t kWindowActionRemapSlice = 3;
         constexpr int8_t kWindowActionConcat = 4;
+        constexpr int8_t kArrayBroadcastMuxHead = 0;
+        constexpr int8_t kArrayBroadcastMuxBroadcastSkip = 1;
+        constexpr int8_t kArrayBroadcastMuxStep = 2;
         // NO0014 dynblend cone actions (EmitState::instructionDynBlendAction).
         constexpr int8_t kDynBlendHead = 0;
         constexpr int8_t kDynBlendCone = 1;
@@ -3051,6 +3076,53 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
+        std::optional<std::string>
+        emitArrayBroadcastMuxChainInstruction(const EmitState &state,
+                                              InstructionId instruction,
+                                              std::string &error)
+        {
+            const int32_t planId =
+                state.instructionArrayBroadcastMuxPlan[instruction.value];
+            const int8_t action =
+                state.instructionArrayBroadcastMuxAction[instruction.value];
+            if (planId < 0 ||
+                static_cast<std::size_t>(planId) >= state.arrayBroadcastMuxPlans.size())
+            {
+                error = "invalid ArrayBroadcast/ArrayMux chain plan";
+                return std::nullopt;
+            }
+            const EmitState::ArrayBroadcastMuxChainPlan &plan =
+                state.arrayBroadcastMuxPlans[planId];
+            if (action == kArrayBroadcastMuxBroadcastSkip)
+            {
+                return std::string();
+            }
+            const VariableId scalar =
+                state.instructionArrayBroadcastMuxScalar[instruction.value];
+            if (!scalar.valid())
+            {
+                error = "ArrayBroadcast/ArrayMux chain plan is missing its scalar";
+                return std::nullopt;
+            }
+            if (action == kArrayBroadcastMuxHead)
+            {
+                return "array_broadcast_words(" + wordDataExpr(state, plan.finalVar) +
+                       ", " + std::to_string(plan.packedWidth) + ", " +
+                       wordDataExpr(state, scalar) + ", 64);\n";
+            }
+            if (action == kArrayBroadcastMuxStep)
+            {
+                const auto operands = state.program.operands(instruction);
+                return "array_mux_scalar64_true_inplace(" +
+                       wordDataExpr(state, plan.finalVar) + ", " +
+                       std::to_string(plan.rows) + ", " +
+                       wordDataExpr(state, operands[0]) + ", " +
+                       valueExpr(state, scalar) + ");\n";
+            }
+            error = "invalid ArrayBroadcast/ArrayMux chain action";
+            return std::nullopt;
+        }
+
         // One fused if/else for a same-select mux arm list (NO0006/NO0007
         // P2): the select evaluates once per structure and each branch
         // carries every member's arm assignment in list order, so a chained
@@ -3193,6 +3265,11 @@ namespace wolvrix::lib::grhsim::am
                 state.instructionWindowAction[instruction.value] >= 0)
             {
                 return emitWindowedInstruction(state, instruction, error);
+            }
+            if (instruction.value < state.instructionArrayBroadcastMuxAction.size() &&
+                state.instructionArrayBroadcastMuxAction[instruction.value] >= 0)
+            {
+                return emitArrayBroadcastMuxChainInstruction(state, instruction, error);
             }
 
             if (opcode == Opcode::Assign &&
@@ -6858,6 +6935,233 @@ namespace wolvrix::lib::grhsim::am
             }
         }
 
+        // Fuse only the exact wide-lane shape emitted by packed shared-scalar
+        // mux chains:
+        //
+        //   b0 = ArrayBroadcast(s0)
+        //   bi = ArrayBroadcast(si); mi = ArrayMux(sel_i, bi, m_{i-1})
+        //
+        // Every pair must be adjacent in one Block and every non-final value
+        // must have exactly that one consumer. The generated code broadcasts
+        // b0 directly into the final mux slot, then updates selected 64-bit
+        // lanes in place. The scheduled Program remains unchanged.
+        void planArrayBroadcastMuxChains(const ExecutableModel &model, EmitState &state)
+        {
+            // Recon-backed production targets are 23-level chains. Keeping a
+            // high minimum avoids folding unrelated short chains whose sparse
+            // selector economics were not measured for this mechanism.
+            constexpr std::size_t kMinSteps = 16;
+            constexpr uint32_t kMinPackedWidth = 256;
+            const std::size_t instructionCount = state.program.instructionCount();
+            const std::size_t variableCount = state.program.variableCount();
+            state.instructionArrayBroadcastMuxPlan.assign(instructionCount, -1);
+            state.instructionArrayBroadcastMuxAction.assign(instructionCount, -1);
+            state.instructionArrayBroadcastMuxScalar.assign(
+                instructionCount, VariableId::invalid());
+            state.arrayBroadcastMuxPlans.clear();
+            state.arrayBroadcastMuxChainCount = 0;
+            state.arrayBroadcastMuxStepCount = 0;
+            if (!state.arrayBroadcastMuxChainFuse)
+            {
+                return;
+            }
+
+            std::vector<uint8_t> candidate(variableCount, 0);
+            for (uint32_t index = 0; index < instructionCount; ++index)
+            {
+                const InstructionId instruction{index};
+                const Opcode opcode = state.program.opcode(instruction);
+                if (opcode != Opcode::ArrayBroadcast && opcode != Opcode::ArrayMux)
+                {
+                    continue;
+                }
+                const auto results = state.program.results(instruction);
+                if (results.size() == 1 && results.front().valid())
+                {
+                    candidate[results.front().value] = 1;
+                }
+            }
+            std::vector<uint32_t> useCount(variableCount, 0);
+            std::vector<uint32_t> soleUser(
+                variableCount, std::numeric_limits<uint32_t>::max());
+            for (uint32_t index = 0; index < instructionCount; ++index)
+            {
+                const InstructionId instruction{index};
+                for (const VariableId operand : state.program.operands(instruction))
+                {
+                    if (!operand.valid() || candidate[operand.value] == 0)
+                    {
+                        continue;
+                    }
+                    uint32_t &count = useCount[operand.value];
+                    if (count == 0)
+                    {
+                        soleUser[operand.value] = index;
+                    }
+                    ++count;
+                }
+            }
+            std::vector<uint8_t> visible(variableCount, 0);
+            for (const PortBinding &port : model.interface.ports)
+            {
+                if (port.input.valid()) visible[port.input.value] = 1;
+                if (port.output.valid()) visible[port.output.value] = 1;
+                if (port.outputEnable.valid()) visible[port.outputEnable.value] = 1;
+            }
+            for (const VariableLabel &declared : model.interface.declaredVariables)
+            {
+                visible[declared.variable.value] = 1;
+            }
+            const auto soleUseBy = [&](VariableId variable, InstructionId user) {
+                return variable.valid() && useCount[variable.value] == 1 &&
+                       soleUser[variable.value] == user.value;
+            };
+
+            struct Step
+            {
+                InstructionId broadcast;
+                InstructionId mux;
+                VariableId scalar;
+            };
+            for (uint32_t blockIndex = 0; blockIndex < state.blockCount; ++blockIndex)
+            {
+                const BlockId block{blockIndex};
+                const std::size_t blockSize = model.program.blockSize(block);
+                std::size_t position = 0;
+                while (position < blockSize)
+                {
+                    const InstructionId head =
+                        model.program.blockInstruction(block, position);
+                    if (state.program.opcode(head) != Opcode::ArrayBroadcast)
+                    {
+                        ++position;
+                        continue;
+                    }
+                    const auto headOperands = state.program.operands(head);
+                    const auto headResults = state.program.results(head);
+                    if (headOperands.size() != 1 || headResults.size() != 1 ||
+                        !headOperands.front().valid() || !headResults.front().valid())
+                    {
+                        ++position;
+                        continue;
+                    }
+                    const VariableId headScalar = headOperands.front();
+                    const VariableId headResult = headResults.front();
+                    const Type &scalarType = variableType(state, headScalar);
+                    const Type &headType = variableType(state, headResult);
+                    if (scalarType.kind != TypeKind::BitVector ||
+                        scalarType.bitWidth != 64 ||
+                        headType.kind != TypeKind::BitVector ||
+                        headType.bitWidth < kMinPackedWidth ||
+                        headType.bitWidth % 64U != 0 ||
+                        state.variableDefBlock[headResult.value] != blockIndex ||
+                        state.variableDefPosition[headResult.value] != position ||
+                        visible[headResult.value] != 0)
+                    {
+                        ++position;
+                        continue;
+                    }
+
+                    const uint32_t packedWidth = headType.bitWidth;
+                    const uint32_t rows = packedWidth / 64U;
+                    VariableId accumulator = headResult;
+                    std::vector<Step> steps;
+                    std::size_t cursor = position + 1;
+                    while (cursor + 1 < blockSize)
+                    {
+                        const InstructionId broadcast =
+                            model.program.blockInstruction(block, cursor);
+                        const InstructionId mux =
+                            model.program.blockInstruction(block, cursor + 1);
+                        if (state.program.opcode(broadcast) != Opcode::ArrayBroadcast ||
+                            state.program.opcode(mux) != Opcode::ArrayMux)
+                        {
+                            break;
+                        }
+                        const auto broadcastOperands = state.program.operands(broadcast);
+                        const auto broadcastResults = state.program.results(broadcast);
+                        const auto muxOperands = state.program.operands(mux);
+                        const auto muxResults = state.program.results(mux);
+                        if (broadcastOperands.size() != 1 ||
+                            broadcastResults.size() != 1 || muxOperands.size() != 3 ||
+                            muxResults.size() != 1)
+                        {
+                            break;
+                        }
+                        const VariableId scalar = broadcastOperands.front();
+                        const VariableId broadcastResult = broadcastResults.front();
+                        const VariableId muxResult = muxResults.front();
+                        const Type &stepScalarType = variableType(state, scalar);
+                        const Type &broadcastType =
+                            variableType(state, broadcastResult);
+                        const Type &selectType = variableType(state, muxOperands[0]);
+                        const Type &muxType = variableType(state, muxResult);
+                        if (stepScalarType.kind != TypeKind::BitVector ||
+                            stepScalarType.bitWidth != 64 ||
+                            broadcastType.kind != TypeKind::BitVector ||
+                            broadcastType.bitWidth != packedWidth ||
+                            selectType.kind != TypeKind::BitVector ||
+                            selectType.bitWidth != rows ||
+                            muxType.kind != TypeKind::BitVector ||
+                            muxType.bitWidth != packedWidth ||
+                            muxOperands[1] != broadcastResult ||
+                            muxOperands[2] != accumulator ||
+                            state.variableDefBlock[broadcastResult.value] != blockIndex ||
+                            state.variableDefPosition[broadcastResult.value] != cursor ||
+                            state.variableDefBlock[muxResult.value] != blockIndex ||
+                            state.variableDefPosition[muxResult.value] != cursor + 1 ||
+                            visible[accumulator.value] != 0 ||
+                            visible[broadcastResult.value] != 0 ||
+                            !soleUseBy(accumulator, mux) ||
+                            !soleUseBy(broadcastResult, mux))
+                        {
+                            break;
+                        }
+                        steps.push_back(Step{
+                            .broadcast = broadcast,
+                            .mux = mux,
+                            .scalar = scalar,
+                        });
+                        accumulator = muxResult;
+                        cursor += 2;
+                    }
+                    if (steps.size() < kMinSteps ||
+                        (state.variableEscapeFlags[accumulator.value] & kEscapeEarlyUse) != 0)
+                    {
+                        ++position;
+                        continue;
+                    }
+
+                    const int32_t planId =
+                        static_cast<int32_t>(state.arrayBroadcastMuxPlans.size());
+                    state.arrayBroadcastMuxPlans.push_back(
+                        EmitState::ArrayBroadcastMuxChainPlan{
+                            .finalVar = accumulator,
+                            .packedWidth = packedWidth,
+                            .rows = rows,
+                        });
+                    state.instructionArrayBroadcastMuxPlan[head.value] = planId;
+                    state.instructionArrayBroadcastMuxAction[head.value] =
+                        kArrayBroadcastMuxHead;
+                    state.instructionArrayBroadcastMuxScalar[head.value] = headScalar;
+                    for (const Step &step : steps)
+                    {
+                        state.instructionArrayBroadcastMuxPlan[step.broadcast.value] = planId;
+                        state.instructionArrayBroadcastMuxAction[step.broadcast.value] =
+                            kArrayBroadcastMuxBroadcastSkip;
+                        state.instructionArrayBroadcastMuxPlan[step.mux.value] = planId;
+                        state.instructionArrayBroadcastMuxAction[step.mux.value] =
+                            kArrayBroadcastMuxStep;
+                        state.instructionArrayBroadcastMuxScalar[step.mux.value] =
+                            step.scalar;
+                    }
+                    ++state.arrayBroadcastMuxChainCount;
+                    state.arrayBroadcastMuxStepCount += steps.size();
+                    position = cursor;
+                }
+            }
+        }
+
         // NO0016 narrow-value storage classification: picks the C storage
         // class (0=uint8_t, 1=uint16_t, 2=uint32_t, 3=uint64_t) of every
         // localizable block value. A value may narrow only when no emission
@@ -7879,6 +8183,11 @@ namespace wolvrix::lib::grhsim::am
         state.memoryReadPow2Index =
             memoryReadPow2IndexAttribute != options.attributes.end() &&
             memoryReadPow2IndexAttribute->second == "true";
+        const auto arrayBroadcastMuxChainFuseAttribute =
+            options.attributes.find("arrayBroadcastMuxChainFuse");
+        state.arrayBroadcastMuxChainFuse =
+            arrayBroadcastMuxChainFuseAttribute != options.attributes.end() &&
+            arrayBroadcastMuxChainFuseAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -8622,6 +8931,8 @@ namespace wolvrix::lib::grhsim::am
         // NO0014 dynamic bit-field functional-update cone collapse
         // (intRat/vecRat/vlRat-style multi-port table updates).
         planDynBlendCones(model, state);
+        // Wide shared-scalar lane mux chains: materialize only their tail.
+        planArrayBroadcastMuxChains(model, state);
         // NO0016 narrow-value storage classes: planned last because the
         // classification reads the windowed/dynblend plans.
         classifyLocalValueStorage(model, state);
@@ -8918,6 +9229,9 @@ namespace wolvrix::lib::grhsim::am
                << "    static void array_write_scatter(std::uint64_t *target, const std::uint64_t *laneMask, const std::uint64_t *data, std::uint32_t elemWidth, std::uint32_t rows);\n"
                << "    static bool array_write_scatter_detect(std::uint64_t *target, const std::uint64_t *laneMask, const std::uint64_t *data, std::uint32_t elemWidth, std::uint32_t rows);\n"
                << "    static void array_mux_words(std::uint64_t *target, std::uint32_t packedWidth, const std::uint64_t *sel, const std::uint64_t *t, const std::uint64_t *f, std::uint32_t elemWidth);\n"
+               << (state.arrayBroadcastMuxChainFuse
+                       ? "    static void array_mux_scalar64_true_inplace(std::uint64_t *target, std::uint32_t rows, const std::uint64_t *sel, std::uint64_t trueValue);\n"
+                       : "")
                << "    static void array_broadcast_words(std::uint64_t *target, std::uint32_t packedWidth, const std::uint64_t *source, std::uint32_t sourceWidth);\n"
                << "    static void array_onehot_words(std::uint64_t *target, std::uint32_t rows, const std::uint64_t *index, std::uint32_t indexWidth);\n"
                << "    static void array_reduce_lanes_words(std::uint64_t *target, std::uint32_t rows, const std::uint64_t *source, std::uint32_t elemWidth, std::uint32_t operation);\n"
@@ -9987,8 +10301,24 @@ namespace
                << "        }\n"
                << "        target[index] = (t[index] & mask) | (f[index] & ~mask & liveMask);\n"
                << "    }\n"
-               << "}\n"
-               << "void " << className
+               << "}\n";
+        if (state.arrayBroadcastMuxChainFuse)
+        {
+            runtime << "void " << className
+                    << "::array_mux_scalar64_true_inplace(std::uint64_t *target, std::uint32_t rows, const std::uint64_t *sel, std::uint64_t trueValue) {\n"
+                    << "    const std::size_t selWords = word_count(rows);\n"
+                    << "    for (std::size_t index = 0; index < selWords; ++index) {\n"
+                    << "        const std::uint32_t bits = index + 1U == selWords ? rows - static_cast<std::uint32_t>(index * 64U) : 64U;\n"
+                    << "        std::uint64_t lanes = sel[index] & bit_mask(bits);\n"
+                    << "        while (lanes != 0) {\n"
+                    << "            const std::size_t lane = index * 64U + std::countr_zero(lanes);\n"
+                    << "            target[lane] = trueValue;\n"
+                    << "            lanes &= lanes - 1U;\n"
+                    << "        }\n"
+                    << "    }\n"
+                    << "}\n";
+        }
+        runtime << "void " << className
                << "::array_broadcast_words(std::uint64_t *target, std::uint32_t packedWidth, const std::uint64_t *source, std::uint32_t sourceWidth) {\n"
                << "    const std::size_t words = word_count(packedWidth);\n"
                << "    if (sourceWidth == 1U) {\n"
@@ -11414,6 +11744,8 @@ namespace
 
         result.success = true;
         result.muxAtomFused = state.muxAtomFusedCount;
+        result.arrayBroadcastMuxChains = state.arrayBroadcastMuxChainCount;
+        result.arrayBroadcastMuxSteps = state.arrayBroadcastMuxStepCount;
         result.windowedChains = state.windowedChainCount;
         result.windowedSteps = state.windowedStepCount;
         result.windowedConcatsF2 = state.windowedConcatCount;

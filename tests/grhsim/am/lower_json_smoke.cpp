@@ -147,7 +147,7 @@ int main(int argc, char **argv)
                      "[--concat-insert-unroll] [--inline-scalar-helpers] [--no-trace-comments] "
                      "[--wide-detect-fast-path] [--sys-task-body-outline] "
                      "[--host-call-guard-cache] [--scan-branch-hints] "
-                     "[--memory-read-pow2-index] "
+                     "[--memory-read-pow2-index] [--array-broadcast-mux-chain-fuse] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -197,6 +197,7 @@ int main(int argc, char **argv)
     bool hostCallGuardCache = false;
     bool scanBranchHints = false;
     bool memoryReadPow2Index = false;
+    bool arrayBroadcastMuxChainFuse = false;
     bool traceComments = true;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
@@ -491,6 +492,10 @@ int main(int argc, char **argv)
         {
             memoryReadPow2Index = true;
         }
+        else if (argument == "--array-broadcast-mux-chain-fuse")
+        {
+            arrayBroadcastMuxChainFuse = true;
+        }
         else if (argument == "--no-trace-comments")
         {
             traceComments = false;
@@ -764,6 +769,8 @@ int main(int argc, char **argv)
         uint64_t emitMs = 0;
         uint64_t emittedArtifacts = 0;
         uint64_t muxAtomFused = 0;
+        uint64_t arrayBroadcastMuxChains = 0;
+        uint64_t arrayBroadcastMuxSteps = 0;
         uint64_t windowedChains = 0;
         uint64_t windowedSteps = 0;
         uint64_t windowedConcatsF2 = 0;
@@ -925,6 +932,10 @@ int main(int argc, char **argv)
                 {
                     emitOptions.attributes.emplace("memoryReadPow2Index", "true");
                 }
+                if (arrayBroadcastMuxChainFuse)
+                {
+                    emitOptions.attributes.emplace("arrayBroadcastMuxChainFuse", "true");
+                }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,
                     emitOptions,
@@ -940,6 +951,8 @@ int main(int argc, char **argv)
                 }
                 emittedArtifacts = emitResult.artifacts.size();
                 muxAtomFused = emitResult.muxAtomFused;
+                arrayBroadcastMuxChains = emitResult.arrayBroadcastMuxChains;
+                arrayBroadcastMuxSteps = emitResult.arrayBroadcastMuxSteps;
                 windowedChains = emitResult.windowedChains;
                 windowedSteps = emitResult.windowedSteps;
                 windowedConcatsF2 = emitResult.windowedConcatsF2;
@@ -999,6 +1012,10 @@ int main(int argc, char **argv)
                   << "  \"emit_ms\": " << emitMs << ",\n"
                   << "  \"emitted_artifacts\": " << emittedArtifacts << ",\n"
                   << "  \"mux_atom_fused\": " << muxAtomFused << ",\n"
+                  << "  \"array_broadcast_mux_chains\": "
+                  << arrayBroadcastMuxChains << ",\n"
+                  << "  \"array_broadcast_mux_steps\": "
+                  << arrayBroadcastMuxSteps << ",\n"
                   << "  \"windowed_chains\": " << windowedChains << ",\n"
                   << "  \"windowed_steps\": " << windowedSteps << ",\n"
                   << "  \"windowed_concats_f2\": " << windowedConcatsF2 << ",\n"

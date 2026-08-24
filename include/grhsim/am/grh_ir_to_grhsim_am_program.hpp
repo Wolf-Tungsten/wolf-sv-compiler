@@ -204,6 +204,10 @@ namespace wolvrix::lib::grhsim::am
         // mux-rooted atoms): number of mux assignments covered by fused
         // if/else segments in the emitted sources.
         uint64_t muxAtomFused = 0;
+        // Adjacent 64-bit-lane ArrayBroadcast -> ArrayMux chains emitted into
+        // one tail slot: chain count and covered mux-step count.
+        uint64_t arrayBroadcastMuxChains = 0;
+        uint64_t arrayBroadcastMuxSteps = 0;
         // NO0013 windowed emission of lane-build concat cones (F1 chains,
         // F2 standalone concats): planned/rewritten instruction counts.
         uint64_t windowedChains = 0;
