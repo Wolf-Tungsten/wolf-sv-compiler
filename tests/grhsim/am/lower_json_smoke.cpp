@@ -148,6 +148,7 @@ int main(int argc, char **argv)
                      "[--wide-detect-fast-path] [--sys-task-body-outline] "
                      "[--host-call-guard-cache] [--scan-branch-hints] "
                      "[--memory-read-pow2-index] [--array-broadcast-mux-chain-fuse] "
+                     "[--commit-scratch-lazy-init] "
                      "[--am-optimize=<dce,fold,cse,alias,statealias,unify,muxabsorb,notunify,slicefuse,memfold,ifacealias>] [--no-am-optimize]\n";
         return 2;
     }
@@ -198,6 +199,7 @@ int main(int argc, char **argv)
     bool scanBranchHints = false;
     bool memoryReadPow2Index = false;
     bool arrayBroadcastMuxChainFuse = false;
+    bool commitScratchLazyInit = false;
     bool traceComments = true;
     AmOptimizeOptions amOptimize;
     for (int index = 2; index < argc; ++index)
@@ -495,6 +497,10 @@ int main(int argc, char **argv)
         else if (argument == "--array-broadcast-mux-chain-fuse")
         {
             arrayBroadcastMuxChainFuse = true;
+        }
+        else if (argument == "--commit-scratch-lazy-init")
+        {
+            commitScratchLazyInit = true;
         }
         else if (argument == "--no-trace-comments")
         {
@@ -935,6 +941,10 @@ int main(int argc, char **argv)
                 if (arrayBroadcastMuxChainFuse)
                 {
                     emitOptions.attributes.emplace("arrayBroadcastMuxChainFuse", "true");
+                }
+                if (commitScratchLazyInit)
+                {
+                    emitOptions.attributes.emplace("commitScratchLazyInit", "true");
                 }
                 const GrhSimAmCppResult emitResult = emitter.emit(
                     *model,

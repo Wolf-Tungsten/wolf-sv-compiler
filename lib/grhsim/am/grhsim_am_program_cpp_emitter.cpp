@@ -298,6 +298,9 @@ namespace wolvrix::lib::grhsim::am
             // slot; every later mux sparsely overwrites selected lanes from its
             // scalar true value.
             bool arrayBroadcastMuxChainFuse = false;
+            // Defer zeroing chunk-shared commit scratch until the commit event
+            // gate opens (attribute "commitScratchLazyInit", default off).
+            bool commitScratchLazyInit = false;
             // Outlined fwrite bodies collected during emission: instruction id
             // -> parameter list + indented body statements. The body text is
             // context-free (member storage and parameters only), so the
@@ -4165,39 +4168,61 @@ namespace wolvrix::lib::grhsim::am
         // Chunked-form watch flags: same reset-at-Block-entry semantics as
         // the inline declarations, as a zero-initialized parent-scope array.
         std::string chunkedScalarWatchDeclarations(const EmitState &state,
-                                                   const EmitState::ScalarWatchPlan *plan)
+                                                   const EmitState::ScalarWatchPlan *plan,
+                                                   bool initialize = true)
         {
             if (plan == nullptr || plan->flagCount == 0)
             {
                 return {};
             }
             return "bool wrChgblk_" + std::to_string(state.activeChunkedBlock) + "[" +
-                   std::to_string(plan->flagCount) + "] = {};\n";
+                   std::to_string(plan->flagCount) + "]" + (initialize ? " = {}" : "") +
+                   ";\n";
         }
 
         std::string chunkedArrayWatchDeclarations(const EmitState &state,
-                                                  const EmitState::ArrayWatchPlan *plan)
+                                                  const EmitState::ArrayWatchPlan *plan,
+                                                  bool initialize = true)
         {
             if (plan == nullptr || plan->accumCount == 0)
             {
                 return {};
             }
             return "bool arrChgblk_" + std::to_string(state.activeChunkedBlock) + "[" +
-                   std::to_string(plan->accumCount) + "] = {};\n";
+                   std::to_string(plan->accumCount) + "]" + (initialize ? " = {}" : "") +
+                   ";\n";
         }
 
         // Chunked-form detector-group flags: the inline form declares each
         // flag at its first accumulate; the chunks share one zero-initialized
         // parent-scope array instead.
         std::string chunkedDetectorGroupDeclarations(const EmitState &state,
-                                                     const EmitState::DetectorGroupPlan *plan)
+                                                     const EmitState::DetectorGroupPlan *plan,
+                                                     bool initialize = true)
         {
             if (plan == nullptr || plan->groups.empty())
             {
                 return {};
             }
             return "bool detGrpblk_" + std::to_string(state.activeChunkedBlock) + "[" +
-                   std::to_string(plan->groups.size()) + "] = {};\n";
+                   std::to_string(plan->groups.size()) + "]" +
+                   (initialize ? " = {}" : "") + ";\n";
+        }
+
+        std::string chunkedCommitScratchReset(const EmitState &state,
+                                              const EmitState::ArrayWatchPlan *arrayPlan,
+                                              const EmitState::ScalarWatchPlan *scalarPlan,
+                                              const EmitState::DetectorGroupPlan *detectorPlan)
+        {
+            const std::string suffix = "_" + std::to_string(state.activeChunkedBlock);
+            std::string code;
+            if (arrayPlan != nullptr && arrayPlan->accumCount != 0)
+                code += "for (bool &flag : arrChgblk" + suffix + ") flag = false;\n";
+            if (scalarPlan != nullptr && scalarPlan->flagCount != 0)
+                code += "for (bool &flag : wrChgblk" + suffix + ") flag = false;\n";
+            if (detectorPlan != nullptr && !detectorPlan->groups.empty())
+                code += "for (bool &flag : detGrpblk" + suffix + ") flag = false;\n";
+            return code;
         }
 
         // ST00010: emits the branchless accumulate for one folded detector:
@@ -8188,6 +8213,11 @@ namespace wolvrix::lib::grhsim::am
         state.arrayBroadcastMuxChainFuse =
             arrayBroadcastMuxChainFuseAttribute != options.attributes.end() &&
             arrayBroadcastMuxChainFuseAttribute->second == "true";
+        const auto commitScratchLazyInitAttribute =
+            options.attributes.find("commitScratchLazyInit");
+        state.commitScratchLazyInit =
+            commitScratchLazyInitAttribute != options.attributes.end() &&
+            commitScratchLazyInitAttribute->second == "true";
         state.traceComments = options.traceComments;
         state.variableTypes.reserve(program.variableCount());
         state.variableStorage.resize(program.variableCount());
@@ -11349,6 +11379,13 @@ namespace
                         scalarWatchPlanFor(state, blockIndex);
                     const EmitState::DetectorGroupPlan *detectorPlan =
                         detectorPlanFor(state, blockIndex);
+                    const std::size_t ungatedChunks =
+                        gateBoundary == 0
+                            ? chunkRanges.size()
+                            : (gateBoundary + *blockChunkInstructions - 1U) /
+                                  *blockChunkInstructions;
+                    const bool lazyScratch = state.commitScratchLazyInit && gate != nullptr &&
+                                             ungatedChunks < chunkRanges.size();
                     // First-use declaration state is continuous across the
                     // Block's chunks (chunked references never re-declare).
                     std::vector<uint8_t> detectorGroupDeclared(
@@ -11457,19 +11494,17 @@ namespace
                                        chunkedLocalValueDeclarations(state),
                                        indentation);
                     writeIndentedLines(blockSource,
-                                       chunkedArrayWatchDeclarations(state, arrayPlan),
+                                       chunkedArrayWatchDeclarations(state, arrayPlan,
+                                                                     !lazyScratch),
                                        indentation);
                     writeIndentedLines(blockSource,
-                                       chunkedScalarWatchDeclarations(state, scalarPlan),
+                                       chunkedScalarWatchDeclarations(state, scalarPlan,
+                                                                      !lazyScratch),
                                        indentation);
                     writeIndentedLines(blockSource,
-                                       chunkedDetectorGroupDeclarations(state, detectorPlan),
+                                       chunkedDetectorGroupDeclarations(state, detectorPlan,
+                                                                        !lazyScratch),
                                        indentation);
-                    const std::size_t ungatedChunks =
-                        gateBoundary == 0
-                            ? chunkRanges.size()
-                            : (gateBoundary + *blockChunkInstructions - 1U) /
-                                  *blockChunkInstructions;
                     const std::string gatedIndentation = std::string(indentation) + "    ";
                     for (std::size_t chunk = 0; chunk < chunkRanges.size(); ++chunk)
                     {
@@ -11480,6 +11515,14 @@ namespace
                             // fired (the inline form wraps the instructions).
                             blockSource << indentation << "if (" << gate->expression
                                         << ") {\n";
+                            if (lazyScratch)
+                            {
+                                writeIndentedLines(
+                                    blockSource,
+                                    chunkedCommitScratchReset(state, arrayPlan, scalarPlan,
+                                                              detectorPlan),
+                                    gatedIndentation);
+                            }
                         }
                         blockSource << (chunk < ungatedChunks ? indentation
                                                               : gatedIndentation)

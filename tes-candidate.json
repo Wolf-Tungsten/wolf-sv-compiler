@@ -1,9 +1,10 @@
 {
-  "hypothesis": "From e00102, post-change recon shows b69157/b69158/b69159 still carry 1.697% of block cycles; migrating confirmed e00106 ArrayBroadcast-to-ArrayMux chain fusion should retain host-call guard caching and power-of-two indexing while reducing this independent pool and improving Host by at least 1% versus e00102.",
+  "hypothesis": "From e00113 and the latest t1 recon, b93159/b93141 still account for 9.194% of block cycles; correcting e00114's fixture and deferring oversized commit scratch clearing until the event gate opens should preserve the current guard-cache, power-of-two-index, and wide-mux gains while improving Host by at least 1% versus e00113.",
   "emit_args_add": [
     "--host-call-guard-cache",
     "--memory-read-pow2-index",
-    "--array-broadcast-mux-chain-fuse"
+    "--array-broadcast-mux-chain-fuse",
+    "--commit-scratch-lazy-init"
   ],
   "emit_args_remove": []
 }

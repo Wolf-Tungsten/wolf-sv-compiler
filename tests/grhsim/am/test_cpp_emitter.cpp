@@ -3327,6 +3327,27 @@ int main()
             return fail("wideDetectFastPath did not confine itself to the "
                         "assign_words_detect body");
         }
+        wolvrix::lib::diag::Diagnostics lazyDiagnostics;
+        const GrhSimAmCppResult lazyResult = emitter.emit(
+            fixture.model,
+            GrhSimAmCppOptions{
+                .outputDirectory = outputDirectory / "lazy",
+                .modelName = "CommitScratchLazyTop",
+                .maxOutputFileBytes = 1024 * 1024,
+                .attributes = {{"commitScratchLazyInit", "true"},
+                               {"blockChunkInstructions", "1"}},
+            },
+            lazyDiagnostics);
+        const std::optional<std::string> lazyBlocks = readTextFile(
+            outputDirectory / "lazy" / "grhsim_CommitScratchLazyTop_blocks_0.cpp");
+        if (!lazyResult.success || lazyDiagnostics.hasError() || !lazyBlocks ||
+            lazyBlocks->find("bool wrChgblk_3[1];") == std::string::npos ||
+            lazyBlocks->find("for (bool &flag : wrChgblk_3) flag = false;") ==
+                std::string::npos ||
+            lazyBlocks->find("bool wrChgblk_3[1] = {};") != std::string::npos)
+        {
+            return fail("commitScratchLazyInit did not defer chunked commit scratch reset");
+        }
         // The knob only rewrites the helper body: the scheduled block source
         // must match stock textually (class name aside), and the wide commit
         // write must use the outlined detect form.

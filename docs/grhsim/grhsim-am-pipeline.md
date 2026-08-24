@@ -460,6 +460,11 @@ AM emitter 的可观测性/实验属性（`GrhSimAmCppOptions.attributes`，CLI/
   标量 true value 原地写入，内部宽 broadcast/mux 槽不再物化。指令仍在原位置
   求值，故 operand 定义顺序与 round 语义不变；off 时输出保持既有形态。lower-json
   以 `array_broadcast_mux_chains/steps` 报告实际命中数。
+- `commitScratchLazyInit`（`--commit-scratch-lazy-init`，默认关）：对带事件门的
+  oversized commit Block，把 chunk 共享的 `arrChgblk` / `wrChgblk` /
+  `detGrpblk` 清零从 Block 入口后延到事件门内部。门前 detector 不读取这些 scratch，
+  因而静默轮不再清零大数组；门开启时仍在首个主体 chunk 前完整清零，写回顺序与
+  changed/activation 语义不变。非 chunked 或无事件门的 Block 保持原发射。
 
 > 历史基线（2026-07-22）：早期 single-TU full emit 为 5,080,563 条 linear 指令、
 > 9,574,478 条 scheduled 指令、1,021,857 个 Block 和 2,040,184 个 detector，生成
