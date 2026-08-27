@@ -1,5 +1,8 @@
 # GRHSIM 抽象机
 
+> **DEPRECATED（已废弃）**：本文档自 2026-08-25 起废弃，内容仅保留作历史参考。
+> GRHSIM 架构正在重新规划，新架构文档就绪前请勿将本文作为设计或实现依据。
+
 > GRHSIM-AM（Abstract Machine）是 GRH 与具体仿真后端之间的统一执行模型。
 > 本文只介绍核心概念和执行流程；具体 opcode 见
 > [GRHSIM-AM 指令集](grhsim-am-instructions.md)，宿主服务边界见
@@ -595,7 +598,7 @@ temporary；端口到 VarId 的映射属于集成层契约，不能依赖不唯�
   `mem.read/mem.write/mem.fill`；
 - `kLatch` 映射为可写 BV Variable，`kLatchReadPort` 直接映射到该 VarId，
   `kLatchWritePort` 映射为 `latch.write`；lower 前建议运行
-  [`latch-transparent-read`](../transform/latch-transparent-read.md)，将透明读旁路显式
+  [`latch-transparent-read`](../../transform/latch-transparent-read.md)，将透明读旁路显式
   改写为组合逻辑；
 - EntryBlock 只包含 `changed`、event 派生所需的组合指令和 `act.f`，且目标都是
   严格更大的 BlockId；

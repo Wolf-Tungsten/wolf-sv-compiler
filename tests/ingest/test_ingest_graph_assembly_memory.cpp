@@ -344,6 +344,46 @@ int testGraphAssemblyMemoryReadCoalesce(const std::filesystem::path& sourcePath)
     return 0;
 }
 
+int testGraphAssemblyMemoryPriority(const std::filesystem::path& sourcePath) {
+    auto bundle = compileInput(sourcePath, "graph_assembly_memory_priority");
+    if (!bundle || !bundle->compilation) {
+        return fail("Failed to compile memory priority fixture");
+    }
+
+    wolvrix::lib::ingest::ConvertDriver driver;
+    wolvrix::lib::grh::Design design = driver.convert(bundle->compilation->getRoot());
+    const wolvrix::lib::grh::Graph* graph =
+        design.findGraph("graph_assembly_memory_priority");
+    if (!graph) {
+        return fail("Missing graph_assembly_memory_priority graph");
+    }
+
+    std::optional<std::string> group;
+    std::vector<int64_t> priorities;
+    for (wolvrix::lib::grh::OperationId opId : graph->operations()) {
+        const wolvrix::lib::grh::Operation op = graph->getOperation(opId);
+        if (op.kind() != wolvrix::lib::grh::OperationKind::kMemoryWritePort) {
+            continue;
+        }
+        const auto currentGroup = getAttrString(
+            op, wolvrix::lib::grh::kMemoryWritePriorityGroupAttr);
+        const auto priority = getAttrInt(
+            op, wolvrix::lib::grh::kMemoryWritePriorityAttr);
+        if (!currentGroup || currentGroup->empty() || !priority) {
+            return fail("Memory write priority attributes are incomplete");
+        }
+        if (group && *group != *currentGroup) {
+            return fail("Memory writes do not share one priority group");
+        }
+        group = *currentGroup;
+        priorities.push_back(*priority);
+    }
+    if (priorities != std::vector<int64_t>{1, 0}) {
+        return fail("Memory write priorities do not preserve source order");
+    }
+    return 0;
+}
+
 int testGraphAssemblyPackedAggregateInstanceSink(const std::filesystem::path& sourcePath) {
     auto bundle = compileInput(sourcePath, "graph_assembly_packed_aggregate_instance_sink");
     if (!bundle || !bundle->compilation) {
@@ -439,6 +479,9 @@ int main() {
         return result;
     }
     if (int result = testGraphAssemblyMemoryReadCoalesce(sourcePath); result != 0) {
+        return result;
+    }
+    if (int result = testGraphAssemblyMemoryPriority(sourcePath); result != 0) {
         return result;
     }
     return testGraphAssemblyPackedAggregateInstanceSink(sourcePath);

@@ -1,5 +1,8 @@
 # GRHSIM-AM 指令集
 
+> **DEPRECATED（已废弃）**：本文档自 2026-08-25 起废弃，内容仅保留作历史参考。
+> GRHSIM 架构正在重新规划，新架构文档就绪前请勿将本文作为设计或实现依据。
+
 > 状态：讨论稿 v0。本稿定义简单组合指令、变化检测、状态单元、外部调用和 Block 激活指令。
 
 Program、Variable、Block 和理想存储见 [GRHSIM Abstract Machine 基础设计](grhsim-am.md)，
@@ -742,7 +745,7 @@ latch 写的门控/数据 operand（`%cond?/%mask?/%data`）各一条 `changed.a
 `changed.any %target, %targetOld` 检测并经 `act.b` 传播。
 
 建议在 lower 到 GRHSIM-AM 前运行 GRH
-[`latch-transparent-read`](../transform/latch-transparent-read.md) transform。该 pass
+[`latch-transparent-read`](../../transform/latch-transparent-read.md) transform。该 pass
 把每个 read user 改写成显式透明读逻辑；对部分 mask，其等价形式为：
 
 ```text

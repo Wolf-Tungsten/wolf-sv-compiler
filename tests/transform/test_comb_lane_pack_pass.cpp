@@ -634,6 +634,15 @@ int main()
                 graph.setAttr(reg, "width", static_cast<int64_t>(8));
                 graph.setAttr(reg, "isSigned", false);
 
+                const auto readValue =
+                    makeLogicValue(graph, "reg_q_read_" + std::to_string(lane), 8);
+                const auto read = graph.createOperation(
+                    wolvrix::lib::grh::OperationKind::kRegisterReadPort,
+                    graph.internSymbol("reg_read_" + std::to_string(lane)));
+                graph.setAttr(read, "regSymbol", std::string("reg_q_" + std::to_string(lane)));
+                graph.addResult(read, readValue);
+                graph.bindOutputPort("reg_q_out_" + std::to_string(lane), readValue);
+
                 const auto andValue = makeBinary(graph,
                                                  wolvrix::lib::grh::OperationKind::kAnd,
                                                  "storage_and_" + std::to_string(lane),
@@ -677,17 +686,26 @@ int main()
             {
                 return fail("Expected storage frontier comb-lane-pack to change graph");
             }
-            if (countKind(graph, wolvrix::lib::grh::OperationKind::kAnd) != 1)
+            const std::size_t packedAndCount =
+                countKind(graph, wolvrix::lib::grh::OperationKind::kAnd);
+            const std::size_t packedOrCount =
+                countKind(graph, wolvrix::lib::grh::OperationKind::kOr);
+            const std::size_t resultSliceCount =
+                countKind(graph, wolvrix::lib::grh::OperationKind::kSliceStatic);
+            if (packedAndCount != 1)
             {
-                return fail("Expected one packed kAnd for storage frontier rewrite");
+                return fail("Expected one packed kAnd for storage frontier rewrite, got " +
+                            std::to_string(packedAndCount));
             }
-            if (countKind(graph, wolvrix::lib::grh::OperationKind::kOr) != 1)
+            if (packedOrCount != 1)
             {
-                return fail("Expected one packed kOr for storage frontier rewrite");
+                return fail("Expected one packed kOr for storage frontier rewrite, got " +
+                            std::to_string(packedOrCount));
             }
-            if (countKind(graph, wolvrix::lib::grh::OperationKind::kSliceStatic) != 4)
+            if (resultSliceCount != 4)
             {
-                return fail("Expected four result slices for storage frontier rewrite");
+                return fail("Expected four result slices for storage frontier rewrite, got " +
+                            std::to_string(resultSliceCount));
             }
             if (countKind(graph, wolvrix::lib::grh::OperationKind::kRegisterWritePort) != 4)
             {

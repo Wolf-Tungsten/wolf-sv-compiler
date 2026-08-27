@@ -110,6 +110,13 @@ set(WOLVRIX_LIB_SOURCES
     lib/core/load.cpp
     lib/core/emit.cpp
     lib/core/toposort.cpp
+    lib/grhsim/ir/module.cpp
+    lib/grhsim/ir/generic.cpp
+    lib/grhsim/ir/lower.cpp
+    lib/grhsim/ir/json.cpp
+    lib/grhsim/ir/pass.cpp
+    lib/grhsim/emit/cpu_single_thread.cpp
+    lib/grhsim/pass/schedule_topo.cpp
     lib/grhsim/am/grhsim_am_program.cpp
     lib/grhsim/am/grhsim_am_graph.cpp
     lib/grhsim/am/grhsim_am_program_validate.cpp
@@ -444,6 +451,46 @@ target_compile_definitions(emit-sv-storage-ports
 )
 
 register_test_exe(emit-sv-storage-ports)
+
+# GRHSIM IR tests
+add_executable(grhsim-ir-roundtrip
+    tests/grhsim/ir/test_roundtrip.cpp
+)
+
+target_link_libraries(grhsim-ir-roundtrip
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(grhsim-ir-roundtrip)
+
+add_executable(grhsim-schedule-topo
+    tests/grhsim/ir/test_schedule_topo.cpp
+)
+
+target_link_libraries(grhsim-schedule-topo
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(grhsim-schedule-topo)
+
+add_executable(grhsim-cpu-single-thread
+    tests/grhsim/emit/test_cpu_single_thread.cpp
+)
+
+target_link_libraries(grhsim-cpu-single-thread
+    PRIVATE
+        wolvrix-lib
+)
+
+target_compile_definitions(grhsim-cpu-single-thread
+    PRIVATE
+        WOLVRIX_GRHSIM_CPU_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+        WOLVRIX_TEST_CXX_COMPILER="${CMAKE_CXX_COMPILER}"
+)
+
+register_test_exe(grhsim-cpu-single-thread)
 
 # GRHSIM-AM framework tests
 add_executable(grhsim-am-program

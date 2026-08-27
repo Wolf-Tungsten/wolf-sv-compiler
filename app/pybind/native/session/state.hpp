@@ -5,6 +5,7 @@
 
 #include "core/grh.hpp"
 #include "core/transform.hpp"
+#include "grhsim/ir/module.hpp"
 
 #include <memory>
 #include <string>
@@ -25,6 +26,23 @@ namespace wolvrix::app::pybind
     {
         wolvrix::lib::grh::Design design;
         std::shared_ptr<slang::ast::Compilation> compilation;
+    };
+
+    struct SimModuleSlot final : wolvrix::lib::transform::SessionSlot
+    {
+        explicit SimModuleSlot(wolvrix::lib::grhsim::Module moduleValue)
+            : module(std::move(moduleValue))
+        {
+        }
+
+        wolvrix::lib::grhsim::Module module;
+
+        std::unique_ptr<wolvrix::lib::transform::SessionSlot> clone() const override
+        {
+            return std::make_unique<SimModuleSlot>(module);
+        }
+
+        std::string_view kind() const noexcept override { return "grhsim-module"; }
     };
 
     struct PythonSessionValue

@@ -1,5 +1,6 @@
 #include "core/ingest.hpp"
 #include "emit/system_verilog.hpp"
+#include "grhsim/ir.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -22,6 +23,96 @@ namespace {
 int fail(const std::string& message) {
     std::cerr << "[ingest-graph-assembly-dpi-display] " << message << '\n';
     return 1;
+}
+
+std::string diagnosticsText(const wolvrix::lib::diag::Diagnostics& diagnostics) {
+    std::string result;
+    for (const auto& message : diagnostics.messages()) {
+        if (!result.empty()) {
+            result += "; ";
+        }
+        result += message.message;
+        if (!message.context.empty()) {
+            result += " [" + message.context + "]";
+        }
+    }
+    return result;
+}
+
+wolvrix::lib::grhsim::OpId findHostCall(const wolvrix::lib::grhsim::Module& module,
+                                        std::string_view entry) {
+    using namespace wolvrix::lib::grhsim;
+    OpId result = OpId::invalid();
+    for (OpId op : module.ops()) {
+        if (module.kind(op) != genericOp(GenericOpcode::HostCall)) {
+            continue;
+        }
+        const AttrValue* attr = module.attr(op, "entry");
+        const SymbolId* symbol = attr ? std::get_if<SymbolId>(attr) : nullptr;
+        if (!symbol || module.symbol(*symbol) != entry) {
+            continue;
+        }
+        if (result.valid()) {
+            return OpId::invalid();
+        }
+        result = op;
+    }
+    return result;
+}
+
+bool hasDpiInputAdapters(const wolvrix::lib::grhsim::Module& module,
+                         std::string_view entry,
+                         std::size_t expectedAdapterCount) {
+    using namespace wolvrix::lib::grhsim;
+    const HostId hostId = module.findHost(entry);
+    const HostEntry* host = module.host(hostId);
+    const OpId call = findHostCall(module, entry);
+    if (!host || !call.valid()) {
+        return false;
+    }
+    const auto operands = module.operands(call);
+    std::size_t operandIndex = host->kind == HostKind::Effect ? 1U : 0U;
+    std::size_t adapterCount = 0;
+    for (const HostParam& parameter : module.hostSignature(hostId)) {
+        if (parameter.direction != HostParamDirection::Input &&
+            parameter.direction != HostParamDirection::InOut) {
+            continue;
+        }
+        if (operandIndex >= operands.size()) {
+            return false;
+        }
+        const EdgeId actual = operands[operandIndex++];
+        if (module.edgeType(actual) != parameter.type) {
+            return false;
+        }
+        const OpId producer = module.def(actual);
+        if (module.kind(producer) == genericOp(GenericOpcode::Assign)) {
+            const auto adapterOperands = module.operands(producer);
+            if (adapterOperands.size() != 1 ||
+                module.edgeType(adapterOperands[0]) == parameter.type) {
+                return false;
+            }
+            ++adapterCount;
+        }
+    }
+    return operandIndex == operands.size() && adapterCount == expectedAdapterCount;
+}
+
+std::size_t countStringConstants(const wolvrix::lib::grhsim::Module& module) {
+    using namespace wolvrix::lib::grhsim;
+    std::size_t count = 0;
+    for (OpId op : module.ops()) {
+        if (module.kind(op) != genericOp(GenericOpcode::Const) ||
+            module.results(op).size() != 1) {
+            continue;
+        }
+        const TypeRec* type = module.type(module.edgeType(module.results(op)[0]));
+        if (type && type->track == TypeTrack::Generic &&
+            type->kind == static_cast<uint8_t>(GenericTypeKind::String)) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 std::string readFile(const std::filesystem::path& path) {
@@ -206,6 +297,25 @@ int testGraphAssemblyDpiDisplay(const std::filesystem::path& sourcePath) {
     const wolvrix::lib::grh::Graph* graph = design.findGraph("graph_assembly_dpi_display");
     if (!graph) {
         return fail("Missing graph_assembly_dpi_display graph");
+    }
+
+    wolvrix::lib::diag::Diagnostics lowerDiagnostics;
+    const auto lowered = wolvrix::lib::grhsim::lowerGrhToGrhsim(*graph, lowerDiagnostics);
+    if (!lowered || lowerDiagnostics.hasError()) {
+        return fail("GRHSIM lowering failed for display/DPI fixture: " +
+                    diagnosticsText(lowerDiagnostics));
+    }
+    if (countStringConstants(*lowered) < 2) {
+        return fail("GRHSIM lowering lost display/error string constants");
+    }
+    if (!hasDpiInputAdapters(*lowered, "dpi_add", 2) ||
+        !hasDpiInputAdapters(*lowered, "dpi_capture", 0)) {
+        return fail("GRHSIM lowering did not adapt DPI inputs to their formal Types");
+    }
+    const auto restored = wolvrix::lib::grhsim::loadJson(
+        wolvrix::lib::grhsim::storeJson(*lowered, false));
+    if (!wolvrix::lib::grhsim::structurallyEquivalent(*lowered, restored)) {
+        return fail("display/DPI GRHSIM module failed its JSON round trip");
     }
 
     wolvrix::lib::grh::OperationId displayOpId = wolvrix::lib::grh::OperationId::invalid();
@@ -442,6 +552,21 @@ int testGraphAssemblyDpiCombReturn(const std::filesystem::path& sourcePath) {
         design.findGraph("graph_assembly_dpi_comb_return");
     if (!graph) {
         return fail("Missing graph_assembly_dpi_comb_return graph");
+    }
+
+    wolvrix::lib::diag::Diagnostics lowerDiagnostics;
+    const auto lowered = wolvrix::lib::grhsim::lowerGrhToGrhsim(*graph, lowerDiagnostics);
+    if (!lowered || lowerDiagnostics.hasError()) {
+        return fail("GRHSIM lowering failed for combinational DPI fixture: " +
+                    diagnosticsText(lowerDiagnostics));
+    }
+    if (!hasDpiInputAdapters(*lowered, "difftest_ram_read", 1)) {
+        return fail("GRHSIM lowering did not adapt longint DPI input signedness");
+    }
+    const auto restored = wolvrix::lib::grhsim::loadJson(
+        wolvrix::lib::grhsim::storeJson(*lowered, false));
+    if (!wolvrix::lib::grhsim::structurallyEquivalent(*lowered, restored)) {
+        return fail("combinational DPI GRHSIM module failed its JSON round trip");
     }
 
     wolvrix::lib::grh::OperationId importId =

@@ -457,6 +457,64 @@ int testWriteBackSliceMember(const std::filesystem::path& sourcePath) {
     return 0;
 }
 
+int testWriteBackSliceContextResize(const std::filesystem::path& sourcePath) {
+    wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
+    wolvrix::lib::ingest::ModulePlan plan;
+    wolvrix::lib::ingest::LoweringPlan lowering;
+    wolvrix::lib::ingest::WriteBackPlan writeBack;
+    if (!buildWriteBackPlan(sourcePath, "write_back_slice_context_resize", diagnostics,
+                            plan, lowering, writeBack)) {
+        return fail("Failed to build context-sized slice write-back plan for " +
+                    sourcePath.string());
+    }
+
+    const auto* entry = findEntryForSymbol(plan, writeBack, "y");
+    if (!entry ||
+        entry->nextValue >= static_cast<wolvrix::lib::ingest::ExprNodeId>(
+                               lowering.values.size())) {
+        return fail("Missing context-sized y write-back entry");
+    }
+    bool sawConcat = false;
+    std::unordered_set<wolvrix::lib::ingest::ExprNodeId> seen;
+    std::vector<wolvrix::lib::ingest::ExprNodeId> stack{entry->nextValue};
+    while (!stack.empty()) {
+        const wolvrix::lib::ingest::ExprNodeId current = stack.back();
+        stack.pop_back();
+        if (current >= static_cast<wolvrix::lib::ingest::ExprNodeId>(lowering.values.size()) ||
+            !seen.insert(current).second) {
+            continue;
+        }
+        const auto& node = lowering.values[current];
+        if (node.kind != wolvrix::lib::ingest::ExprNodeKind::Operation) {
+            continue;
+        }
+        if (node.op == wolvrix::lib::grh::OperationKind::kConcat) {
+            sawConcat = true;
+            int64_t operandWidth = 0;
+            for (wolvrix::lib::ingest::ExprNodeId operand : node.operands) {
+                if (operand >= static_cast<wolvrix::lib::ingest::ExprNodeId>(
+                                   lowering.values.size())) {
+                    return fail("Context-sized slice concat has an invalid operand");
+                }
+                operandWidth += lowering.values[operand].widthHint;
+            }
+            if (operandWidth != node.widthHint) {
+                return fail("Context-sized slice concat width does not match its operands");
+            }
+        }
+        for (wolvrix::lib::ingest::ExprNodeId operand : node.operands) {
+            stack.push_back(operand);
+        }
+    }
+    if (!sawConcat) {
+        return fail("Context-sized slice write-back did not produce a concat");
+    }
+    if (diagnostics.hasError()) {
+        return fail("Unexpected Convert diagnostics errors in context-sized slice write-back");
+    }
+    return 0;
+}
+
 int testWriteBackWholeSelfSliceAcyclic(const std::filesystem::path& sourcePath) {
     wolvrix::lib::ingest::ConvertDiagnostics diagnostics;
     wolvrix::lib::ingest::ModulePlan plan;
@@ -842,6 +900,9 @@ int main() {
         return status;
     }
     if (int status = testWriteBackSliceMember(sourcePath); status != 0) {
+        return status;
+    }
+    if (int status = testWriteBackSliceContextResize(sourcePath); status != 0) {
         return status;
     }
     if (int status = testWriteBackWholeSelfSliceAcyclic(sourcePath); status != 0) {

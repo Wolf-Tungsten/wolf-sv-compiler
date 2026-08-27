@@ -23,6 +23,13 @@ namespace wolvrix::app::pybind
     PyObject *py_session_load_json_text(PyObject *self, PyObject *args, PyObject *kwargs);
     PyObject *py_session_clone_design(PyObject *self, PyObject *args, PyObject *kwargs);
     PyObject *py_session_run_pass(PyObject *self, PyObject *args, PyObject *kwargs);
+    PyObject *py_session_lower_grhsim(PyObject *self, PyObject *args, PyObject *kwargs);
+    PyObject *py_session_read_grhsim_json_file(PyObject *self, PyObject *args, PyObject *kwargs);
+    PyObject *py_session_load_grhsim_json_text(PyObject *self, PyObject *args, PyObject *kwargs);
+    PyObject *py_session_grhsim_json_text(PyObject *self, PyObject *args, PyObject *kwargs);
+    PyObject *py_session_store_grhsim_json(PyObject *self, PyObject *args, PyObject *kwargs);
+    PyObject *py_session_run_sim_pass(PyObject *self, PyObject *args, PyObject *kwargs);
+    PyObject *py_session_emit_grhsim(PyObject *self, PyObject *args, PyObject *kwargs);
 
     PyObject *py_session_store_json(PyObject *self, PyObject *args, PyObject *kwargs);
     PyObject *py_session_emit_sv(PyObject *self, PyObject *args, PyObject *kwargs);
@@ -30,6 +37,7 @@ namespace wolvrix::app::pybind
     PyObject *py_session_emit_verilator_repcut_package(PyObject *self, PyObject *args, PyObject *kwargs);
 
     PyObject *py_list_passes(PyObject *self, PyObject *args);
+    PyObject *py_list_sim_passes(PyObject *self, PyObject *args);
 
 } // namespace wolvrix::app::pybind
 

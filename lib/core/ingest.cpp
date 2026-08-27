@@ -11648,6 +11648,18 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
     auto spliceStatic = [&](ExprNodeId base, const SliceSelection& slice, ExprNodeId value,
                             int64_t baseWidth,
                             slang::SourceLocation location) -> ExprNodeId {
+        if (slice.width <= 0 || slice.width > std::numeric_limits<int32_t>::max())
+        {
+            return kInvalidPlanIndex;
+        }
+        const bool isSigned = value < static_cast<ExprNodeId>(lowering.values.size()) &&
+                              lowering.values[value].isSigned;
+        value = builder.resizeValueToWidth(value, static_cast<int32_t>(slice.width),
+                                           isSigned, location);
+        if (value == kInvalidPlanIndex)
+        {
+            return kInvalidPlanIndex;
+        }
         if (slice.width == baseWidth && slice.low == 0)
         {
             return value;
@@ -11686,6 +11698,18 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
     auto spliceDynamic = [&](ExprNodeId base, const SliceSelection& slice, ExprNodeId value,
                              int64_t baseWidth,
                              slang::SourceLocation location) -> ExprNodeId {
+        if (slice.width <= 0 || slice.width > std::numeric_limits<int32_t>::max())
+        {
+            return kInvalidPlanIndex;
+        }
+        const bool isSigned = value < static_cast<ExprNodeId>(lowering.values.size()) &&
+                              lowering.values[value].isSigned;
+        value = builder.resizeValueToWidth(value, static_cast<int32_t>(slice.width),
+                                           isSigned, location);
+        if (value == kInvalidPlanIndex)
+        {
+            return kInvalidPlanIndex;
+        }
         int32_t widthHint = baseWidth > 0
                                 ? static_cast<int32_t>(
                                       std::min<int64_t>(baseWidth,
@@ -13637,6 +13661,7 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
                 int64_t low = 0;
                 int64_t width = 0;
                 ExprNodeId value = kInvalidPlanIndex;
+                bool isSigned = false;
             };
             std::vector<SliceAssignment> assignments;
             assignments.reserve(group.writes.size());
@@ -13657,8 +13682,11 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
                     canConcat = false;
                     break;
                 }
+                const bool isSigned =
+                    write.value < static_cast<ExprNodeId>(lowering.values.size()) &&
+                    lowering.values[write.value].isSigned;
                 assignments.push_back(
-                    SliceAssignment{selection.low, selection.width, write.value});
+                    SliceAssignment{selection.low, selection.width, write.value, isSigned});
             }
             if (canConcat)
             {
@@ -13686,14 +13714,30 @@ WriteBackPlan WriteBackPass::lower(ModulePlan& plan, LoweringPlan& lowering)
                     operands.reserve(assignments.size());
                     for (const auto& assignment : assignments)
                     {
-                        operands.push_back(assignment.value);
+                        if (assignment.width > std::numeric_limits<int32_t>::max())
+                        {
+                            canConcat = false;
+                            break;
+                        }
+                        const ExprNodeId operand = builder.resizeValueToWidth(
+                            assignment.value, static_cast<int32_t>(assignment.width),
+                            assignment.isSigned, entry.location);
+                        if (operand == kInvalidPlanIndex)
+                        {
+                            canConcat = false;
+                            break;
+                        }
+                        operands.push_back(operand);
                     }
-                    const int32_t widthHint =
-                        static_cast<int32_t>(std::min<int64_t>(
-                            baseWidth, std::numeric_limits<int32_t>::max()));
-                    directConcatValue =
-                        builder.makeConcat(std::move(operands), widthHint,
-                                           entry.location);
+                    if (canConcat)
+                    {
+                        const int32_t widthHint =
+                            static_cast<int32_t>(std::min<int64_t>(
+                                baseWidth, std::numeric_limits<int32_t>::max()));
+                        directConcatValue =
+                            builder.makeConcat(std::move(operands), widthHint,
+                                               entry.location);
+                    }
                 }
             }
         }
@@ -16660,6 +16704,7 @@ public:
             }
         }
         initStorageKinds();
+        initMemoryWritePriorities();
     }
 
     void build()
@@ -16687,6 +16732,88 @@ private:
         Register,
         Latch
     };
+
+    void initMemoryWritePriorities()
+    {
+        memoryFillPriorities_.assign(lowering_.memoryFills.size(), -1);
+        memoryWritePriorities_.assign(lowering_.memoryWrites.size(), -1);
+        memoryPriorityGroups_.assign(plan_.symbolTable.size(), std::string());
+
+        struct EventSignature {
+            bool initialized = false;
+            bool compatible = true;
+            std::vector<EventEdge> edges;
+            std::vector<ExprNodeId> operands;
+        };
+        std::vector<std::size_t> counts(plan_.symbolTable.size(), 0);
+        std::vector<EventSignature> signatures(plan_.symbolTable.size());
+        const auto account = [&](PlanSymbolId memory,
+                                 const std::vector<EventEdge>& edges,
+                                 const std::vector<ExprNodeId>& operands) {
+            if (!memory.valid() || memory.index >= counts.size())
+            {
+                return;
+            }
+            ++counts[memory.index];
+            EventSignature& signature = signatures[memory.index];
+            if (!signature.initialized)
+            {
+                signature.initialized = true;
+                signature.edges = edges;
+                signature.operands = operands;
+            }
+            else if (signature.edges != edges || signature.operands != operands)
+            {
+                signature.compatible = false;
+            }
+        };
+        for (const MemoryFillPort& entry : lowering_.memoryFills)
+        {
+            account(entry.memory, entry.eventEdges, entry.eventOperands);
+        }
+        for (const MemoryWritePort& entry : lowering_.memoryWrites)
+        {
+            account(entry.memory, entry.eventEdges, entry.eventOperands);
+        }
+
+        std::vector<std::size_t> remaining = counts;
+        const auto assign = [&](PlanSymbolId memory, int64_t& priority) {
+            if (!memory.valid() || memory.index >= counts.size() ||
+                counts[memory.index] < 2 || !signatures[memory.index].compatible)
+            {
+                return;
+            }
+            priority = static_cast<int64_t>(--remaining[memory.index]);
+            if (memoryPriorityGroups_[memory.index].empty())
+            {
+                memoryPriorityGroups_[memory.index] =
+                    "wolvrix.memory-write." + std::to_string(memory.index);
+            }
+        };
+        for (std::size_t index = 0; index < lowering_.memoryFills.size(); ++index)
+        {
+            assign(lowering_.memoryFills[index].memory, memoryFillPriorities_[index]);
+        }
+        for (std::size_t index = 0; index < lowering_.memoryWrites.size(); ++index)
+        {
+            assign(lowering_.memoryWrites[index].memory, memoryWritePriorities_[index]);
+        }
+    }
+
+    void setMemoryWritePriorityAttrs(wolvrix::lib::grh::OperationId op,
+                                     PlanSymbolId memory,
+                                     int64_t priority)
+    {
+        if (priority < 0 || !memory.valid() ||
+            memory.index >= memoryPriorityGroups_.size() ||
+            memoryPriorityGroups_[memory.index].empty())
+        {
+            return;
+        }
+        graph_.setAttr(op, wolvrix::lib::grh::kMemoryWritePriorityGroupAttr,
+                       memoryPriorityGroups_[memory.index]);
+        graph_.setAttr(op, wolvrix::lib::grh::kMemoryWritePriorityAttr, priority);
+    }
 
     std::optional<wolvrix::lib::grh::SrcLoc> resolveSrcLoc(slang::SourceLocation location) const
     {
@@ -18022,8 +18149,10 @@ private:
 
     void emitMemoryWrites()
     {
-        for (const auto& entry : lowering_.memoryWrites)
+        for (std::size_t entryIndex = 0; entryIndex < lowering_.memoryWrites.size();
+             ++entryIndex)
         {
+            const MemoryWritePort& entry = lowering_.memoryWrites[entryIndex];
             if (!entry.memory.valid())
             {
                 continue;
@@ -18080,13 +18209,17 @@ private:
             }
             graph_.setAttr(op, "eventEdge", std::move(edges));
             graph_.setAttr(op, "memSymbol", std::string(memSymbol));
+            setMemoryWritePriorityAttrs(op, entry.memory,
+                                        memoryWritePriorities_[entryIndex]);
         }
     }
 
     void emitMemoryFills()
     {
-        for (const auto& entry : lowering_.memoryFills)
+        for (std::size_t entryIndex = 0; entryIndex < lowering_.memoryFills.size();
+             ++entryIndex)
         {
+            const MemoryFillPort& entry = lowering_.memoryFills[entryIndex];
             if (!entry.memory.valid())
             {
                 continue;
@@ -18139,6 +18272,8 @@ private:
             }
             graph_.setAttr(op, "eventEdge", std::move(edges));
             graph_.setAttr(op, "memSymbol", std::string(memSymbol));
+            setMemoryWritePriorityAttrs(op, entry.memory,
+                                        memoryFillPriorities_[entryIndex]);
         }
     }
 
@@ -21586,6 +21721,9 @@ private:
     std::vector<wolvrix::lib::grh::OperationId> storageOpBySymbol_;
     std::vector<slang::SourceLocation> storageLocation_;
     std::vector<int32_t> memoryReadIndexByExpr_;
+    std::vector<int64_t> memoryFillPriorities_;
+    std::vector<int64_t> memoryWritePriorities_;
+    std::vector<std::string> memoryPriorityGroups_;
     ConnectionExprLowerer connectionLowerer_;
     struct EmittedMemoryRead {
         PlanSymbolId memory;

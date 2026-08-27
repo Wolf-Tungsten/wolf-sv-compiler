@@ -37,6 +37,24 @@ module write_back_slice_member(
     end
 endmodule
 
+module write_back_slice_context_resize(
+    input logic clk,
+    input logic reset,
+    input logic select,
+    output logic [2:0] y
+);
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            y = 3'b0;
+        end
+        else begin
+            y[0] = select ? 32'd1 : 32'd0;
+            y[1] = select ? 32'd0 : 32'd1;
+            y[2] = select ? 32'd1 : 32'd0;
+        end
+    end
+endmodule
+
 module write_back_whole_self_slice_acyclic(
     input logic [7:0] data,
     output logic [6:0] y

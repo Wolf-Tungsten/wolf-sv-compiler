@@ -5,6 +5,7 @@ import sys
 from typing import Any
 
 from . import _wolvrix as _native
+from . import pipelines as pipelines
 from .adapters import adapt_session_value
 
 __all__ = [
@@ -12,6 +13,8 @@ __all__ = [
     "Session",
     "format_diagnostics",
     "list_passes",
+    "list_sim_passes",
+    "pipelines",
     "print_diagnostics",
 ]
 
@@ -187,6 +190,106 @@ class Session:
             out_design=out_design,
         )
 
+    def lower_grhsim(
+        self,
+        *,
+        design: str,
+        module: str = "grhsim.main",
+        top: str | None = None,
+        replace: bool = False,
+    ) -> list[dict]:
+        self._ensure_open()
+        success, diagnostics = _native.session_lower_grhsim(
+            self._capsule,
+            design=design,
+            module=module,
+            top=top,
+            replace=replace,
+        )
+        return self._complete_action(
+            "lower_grhsim",
+            diagnostics,
+            success=bool(success),
+            design=design,
+            module=module,
+            top=top,
+        )
+
+    def read_grhsim_json_file(
+        self,
+        path: str,
+        *,
+        module: str = "grhsim.main",
+        replace: bool = False,
+    ) -> list[dict]:
+        self._ensure_open()
+        success, diagnostics = _native.session_read_grhsim_json_file(
+            self._capsule,
+            path=path,
+            module=module,
+            replace=replace,
+        )
+        return self._complete_action(
+            "read_grhsim_json_file",
+            diagnostics,
+            success=bool(success),
+            path=path,
+            module=module,
+        )
+
+    def load_grhsim_json_text(
+        self,
+        text: str,
+        *,
+        module: str = "grhsim.main",
+        replace: bool = False,
+    ) -> list[dict]:
+        self._ensure_open()
+        success, diagnostics = _native.session_load_grhsim_json_text(
+            self._capsule,
+            text=text,
+            module=module,
+            replace=replace,
+        )
+        return self._complete_action(
+            "load_grhsim_json_text",
+            diagnostics,
+            success=bool(success),
+            module=module,
+        )
+
+    def grhsim_json_text(self, *, module: str, pretty: bool = True) -> str:
+        self._ensure_open()
+        return str(
+            _native.session_grhsim_json_text(
+                self._capsule,
+                module=module,
+                pretty=pretty,
+            )
+        )
+
+    def store_grhsim_json(
+        self,
+        *,
+        module: str,
+        output: str,
+        pretty: bool = True,
+    ) -> list[dict]:
+        self._ensure_open()
+        success, diagnostics = _native.session_store_grhsim_json(
+            self._capsule,
+            module=module,
+            output=output,
+            pretty=pretty,
+        )
+        return self._complete_action(
+            "store_grhsim_json",
+            diagnostics,
+            success=bool(success),
+            module=module,
+            output=output,
+        )
+
     def clone_design(self, *, design: str, out_design: str, replace: bool = False) -> list[dict]:
         self._ensure_open()
         success, diagnostics = _native.session_clone_design(
@@ -234,6 +337,38 @@ class Session:
             dryrun=dryrun,
         )
 
+    def run_sim_pass(
+        self,
+        name: str,
+        *,
+        module: str,
+        args: list[str] | None = None,
+        dryrun: bool = False,
+        **named_args,
+    ) -> list[dict]:
+        self._ensure_open()
+        canonical_name = _canonical_pass_name(name)
+        if named_args:
+            keys = ", ".join(sorted(named_args))
+            raise TypeError(f"{name} does not accept named SimPass parameters: {keys}")
+        success, changed, diagnostics = _native.session_run_sim_pass(
+            self._capsule,
+            name=canonical_name,
+            module=module,
+            args=list(args or []),
+            dryrun=dryrun,
+            log_level=self._log_level,
+        )
+        return self._complete_action(
+            "run_sim_pass",
+            diagnostics,
+            success=bool(success),
+            changed=bool(changed),
+            name=canonical_name,
+            module=module,
+            dryrun=dryrun,
+        )
+
     def store_json(
         self,
         *,
@@ -255,6 +390,33 @@ class Session:
             diagnostics,
             success=bool(success),
             design=design,
+            output=output,
+        )
+
+    def emit_grhsim(
+        self,
+        *,
+        module: str,
+        backend: str = "cpu",
+        output: str,
+        ops_per_source_file: int = 50000,
+        fixed_point_iteration_limit: int = 100,
+    ) -> list[dict]:
+        self._ensure_open()
+        success, diagnostics = _native.session_emit_grhsim(
+            self._capsule,
+            module=module,
+            backend=backend,
+            output=output,
+            ops_per_source_file=ops_per_source_file,
+            fixed_point_iteration_limit=fixed_point_iteration_limit,
+        )
+        return self._complete_action(
+            "emit_grhsim",
+            diagnostics,
+            success=bool(success),
+            module=module,
+            backend=backend,
             output=output,
         )
 
@@ -387,6 +549,10 @@ class Session:
 
 def list_passes() -> list[str]:
     return list(_native.list_passes())
+
+
+def list_sim_passes() -> list[str]:
+    return list(_native.list_sim_passes())
 
 
 def _compile_run_pass(name: str, args: list[str], named: dict[str, Any]) -> tuple[str, list[str]]:

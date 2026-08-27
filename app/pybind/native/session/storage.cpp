@@ -135,6 +135,18 @@ namespace wolvrix::app::pybind
         return &it->second.design;
     }
 
+    wolvrix::lib::grhsim::Module *sessionSimModule(SessionHandle &session,
+                                                   std::string_view key)
+    {
+        const auto found = session.nativeValues.find(std::string(key));
+        if (found == session.nativeValues.end() || !found->second)
+        {
+            return nullptr;
+        }
+        auto *slot = dynamic_cast<SimModuleSlot *>(found->second.get());
+        return slot ? &slot->module : nullptr;
+    }
+
     bool ensureSessionInsertable(const SessionHandle &session,
                                  std::string_view key,
                                  bool replace,

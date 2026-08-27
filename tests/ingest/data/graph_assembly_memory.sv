@@ -46,6 +46,26 @@ module graph_assembly_memory_read_coalesce(
     assign bit1 = mem[addr][1];
 endmodule
 
+module graph_assembly_memory_priority(
+    input logic clk,
+    input logic en0,
+    input logic en1,
+    input logic [3:0] addr0,
+    input logic [3:0] addr1,
+    input logic [7:0] data0,
+    input logic [7:0] data1,
+    output logic [7:0] q
+);
+    logic [7:0] mem [0:15];
+    always_ff @(posedge clk) begin
+        if (en0)
+            mem[addr0] <= data0;
+        if (en1)
+            mem[addr1] <= data1;
+    end
+    assign q = mem[addr0];
+endmodule
+
 module graph_assembly_packed_aggregate_sink(
     input logic [8:0] in,
     output logic [8:0] out

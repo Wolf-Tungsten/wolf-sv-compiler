@@ -1,5 +1,8 @@
 # GRHSIM-AM lowering、调度与 C++ emit 流水线
 
+> **DEPRECATED（已废弃）**：本文档自 2026-08-25 起废弃，内容仅保留作历史参考。
+> GRHSIM 架构正在重新规划，新架构文档就绪前请勿将本文作为设计或实现依据。
+
 本文定义 GRHSIM-AM 新流水线的代码框架和分阶段落地边界。它是实现设计，不是
 [GRHSIM-AM 规范](grhsim-am.md)的语义修订。规范中的 `Program` 始终表示可以交给
 `Machine` 执行、已经具有 `B0`/`B1+`、`changed`/`act` 和完整 `eval()` 语义的最终程序。
@@ -1485,9 +1488,9 @@ Gate：仓库没有第二套 runtime schedule 真相；所有生产入口都经�
 - 最终可执行语义：[GRHSIM-AM 规范](grhsim-am.md)
 - opcode、operand 和 Attribute：[GRHSIM-AM 指令集](grhsim-am-instructions.md)
 - DPI/system 宿主边界：[HostEnvironment](grhsim-host-environment.md)
-- 迁移前的 Graph 调度实现：[当前 activity-schedule](../transform/activity-schedule.md)
-- 迁移前的生成模型：[当前 GrhSIM C++ 模型](../emit/grhsim-model.md)
-- 迁移前的 compute/commit 细节：[当前 GrhSIM 调度方法](../emit/grhsim-scheduling.md)
+- 迁移前的 Graph 调度实现：[当前 activity-schedule](../../transform/activity-schedule.md)
+- 迁移前的生成模型：[当前 GrhSIM C++ 模型](../../emit/grhsim-model.md)
+- 迁移前的 compute/commit 细节：[当前 GrhSIM 调度方法](../../emit/grhsim-scheduling.md)
 
 后三篇描述的是 legacy Graph + session 路径。在 Phase 5 之前它们仍是当前代码事实，但不能
 用来覆盖本流水线最终输出必须满足的 AM Program 语义。
